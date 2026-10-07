@@ -21,6 +21,16 @@ one. The two that put the broker on the internet also require every device to
 **log in**, each with a login of its own that you can add, reset and remove
 while it runs ([logins.md](logins.md)).
 
+**Until the image is published**, build it from this checkout: the compose
+files below each have a `build:` beside their `image:`, so
+`docker compose up -d --build` builds it (a few minutes, the first time) and
+then starts everything. That needs the compose file where it is, inside the
+repository. Once the image is published, `--build` can be left off, and the
+files can be copied anywhere. `MODBEE_IMAGE` in `.env` names another image -
+your own registry's, say - for the stack to run instead. For the `docker run`
+commands, build it once under the published name, from the repository root:
+`docker build -t ghcr.io/mod-bee/modbee-mqtt -f docker/Dockerfile .`
+
 ---
 
 ## Just the broker
@@ -52,7 +62,7 @@ docker exec modbee modbee pub -t test/hello -m hi -q 1
 
 ```bash
 git clone https://github.com/mod-bee/modbee-mqtt && cd modbee-mqtt
-docker compose -f docker/compose.yml up -d
+docker compose -f docker/compose.yml up -d --build    # --build: until the image is published
 docker compose -f docker/compose.yml exec modbee modbee pub -t plant/tank-01/level -m 4.25 -q 1
 ```
 
@@ -89,7 +99,7 @@ how Let's Encrypt checks the domain is yours; 8883 is where devices connect.
 cd docker/stack                 # or copy these three files anywhere
 cp .env.example .env
 nano .env                       # set DOMAIN, EMAIL and MQTT_PASSWORD - the only three settings
-docker compose up -d
+docker compose up -d --build    # --build: until the image is published
 ```
 
 A minute later the certificate is in place. Check from any computer with
@@ -130,8 +140,9 @@ Good to know:
   cross the LAN readable; keep that port off the internet.
 - **The broker sees Traefik's address**, not the device's, for each
   connection. Traefik's own log has the devices' addresses.
-- The stack's name is `modbee`: `docker compose logs -f modbee`,
-  `docker compose ps`.
+- The stack's name is `modbee-stack` (`modbee-all-in-one` for the one with
+  Kafka), so the two can run on one server side by side:
+  `docker compose logs -f modbee`, `docker compose ps`.
 
 ---
 
@@ -145,16 +156,17 @@ The same three files, and the same three settings:
 cd docker/all-in-one            # or copy these three files anywhere
 cp .env.example .env
 nano .env                       # set DOMAIN, EMAIL and MQTT_PASSWORD
-docker compose up -d
+docker compose up -d --build    # --build: until the image is published
 ```
 
 Devices connect to **`mqtts://mqtt.example.com:8883`**, as above, and as it
 ships:
 
 - **every MQTT message goes to the Kafka topic `mqtt-messages`.** The record's
-  key is the MQTT topic, its value is the payload exactly as sent, and its
-  headers carry the topic, QoS and MQTT 5 properties. The publisher's PUBACK
-  comes back only once Kafka has the record.
+  key is the publisher (its MQTT client id), so each device's messages are
+  read in the order it sent them; its value is the payload exactly as sent;
+  and its headers carry the topic (`mqtt-topic`), QoS and MQTT 5 properties.
+  The publisher's PUBACK comes back only once Kafka has the record.
 - **a record written to the Kafka topic `mqtt-commands` is published to MQTT**,
   on the topic named by its key.
 
@@ -223,12 +235,13 @@ Any Kafka client library or tool, with `localhost:9094` as its bootstrap
 server, e.g. [kcat](https://github.com/edenhill/kcat):
 
 ```bash
-kcat -b localhost:9094 -t mqtt-messages -C -f '%k  %s\n'
+kcat -b localhost:9094 -t mqtt-messages -C -f '%k  %s  %h\n'    # publisher, payload, headers (topic among them)
 ```
 
 #### From another compose project
 
-The stack's network is named `modbee`. Another compose project joins it with
+The stack's network is named `modbee` (`MODBEE_NETWORK` in `.env` renames
+it - then use the same name below). Another compose project joins it with
 three lines, and then reaches Kafka as `kafka:9092` and the broker as
 `modbee:1883` (plain MQTT - TLS is only needed from outside):
 
@@ -410,6 +423,20 @@ place in it - which suits a compose file:
 Passwords never need to be in either: `password-file:` in the YAML, or
 `MODBEE_..._PASSWORD_FILE` in the environment, names a Docker secret.
 
+**Changing settings over MQTT.** `docker/stack/` and `docker/all-in-one/`
+keep logins in a database, and the settings can be kept there too - changed
+from `modbee config`, or from your own platform, with no shell on the server
+and no edit to the file:
+
+```bash
+docker compose exec modbee modbee config set broker.max-session-expiry=86400 --restart
+```
+
+A stored setting goes over the file and under the environment, and applies
+when modbee restarts; `--restart` restarts it once the change is stored, and
+the compose files' `restart: unless-stopped` brings it back. Logins, by
+contrast, change live. [settings.md](settings.md) has the whole of it.
+
 ---
 
 ## Your own Kafka
@@ -444,14 +471,22 @@ named `kafka-password`.
   `mem_limit` for a fleet of more than a few hundred thousand.
 - **Open files:** one per connection. The compose files set `nofile` to a
   million; with `docker run`, add `--ulimit nofile=1048576:1048576`.
-- **Health:** the image checks its own MQTT port, so `docker ps` shows
-  `healthy`. `--metrics-port 9464` (or a `metrics:` section) adds Prometheus
-  metrics at `/metrics` and `/healthz`.
+- **Health:** the image checks its own MQTT ports, so `docker ps` shows
+  `healthy` once the plain port or the TLS port accepts a connection - either
+  will do, so a broker with plain MQTT turned off is healthy too.
+  `--metrics-port 9464` (or a `metrics:` section) adds Prometheus metrics at
+  `/metrics`, and two checks for an orchestrator or a load balancer:
+  `/healthz` answers while the process does (liveness), and `/readyz` answers
+  `200 ready` only while the broker is running and Kafka can be reached -
+  `503 not ready: Kafka cannot be reached` otherwise (readiness;
+  [kafka.md](kafka.md#metrics)).
 - **Stopping:** `docker stop` is graceful. Kafka offsets are committed,
   messages in flight to Kafka are given up to 5 seconds, and every device is
   told "server shutting down" so it reconnects at once to the next one.
 - **Upgrading:** `docker compose pull && docker compose up -d`. Pin a release
-  with `MODBEE_VERSION=1.0.0` in `.env` rather than following `latest`.
+  with `MODBEE_VERSION=1.0.0` in `.env` rather than following `latest`. Built
+  from this checkout instead (no published image yet): `git pull`, then
+  `docker compose up -d --build`.
 
 ## Where messages are kept
 
@@ -506,11 +541,19 @@ time.
 
 ### Sessions
 
+While modbee runs, a device that drops off keeps its session - its
+subscriptions, and the QoS 1 and 2 messages queued for it - for as long as it
+asked, up to `broker: max-session-expiry`: **an hour** by default, whatever an
+MQTT 5 client asks for, so a device that reboots or loses its link for a while
+is sent what it missed. `4294967295` keeps sessions until modbee restarts. (A
+3.1.1 client has no interval to ask for: with Clean Session 0 its session is
+kept until the restart.) `broker: queue` (64 by default) is how many messages
+are held for one device.
+
 A restart ends every session, so devices subscribe again. This library's
 client does that by itself; with another client, subscribe in its on-connect
-handler, as its documentation advises. QoS 1 and 2 messages that were queued
-for a device while it was away are lost, and `broker: queue` (64 by default)
-is how many are held for one.
+handler, as its documentation advises. Messages that were queued for a device
+while it was away are lost.
 
 ### Kafka
 
@@ -525,7 +568,26 @@ volume and the data with it.
 docker build -t modbee -f docker/Dockerfile .      # from the repository root
 ```
 
-It builds the Kafka client library (librdkafka) from its release and the
-broker from this source, and runs as an unprivileged user. The published
+The compose files do the same with `docker compose up -d --build`, tagging the
+result with the name in their `image:`.
+
+It builds the Kafka client library (librdkafka) from its release, wolfSSL
+from a pinned release, and the broker from this source, and runs as an
+unprivileged user.
+
+**MQTT's TLS is wolfSSL** - the engine a board runs, so a broker and a
+controller fail the same way ([security.md](security.md)). OpenSSL is in the
+image too, but only for librdkafka's TLS to Kafka. To build the broker on
+OpenSSL instead:
+
+```bash
+docker build --build-arg TLS_ENGINE=openssl -t modbee -f docker/Dockerfile .
+```
+
+Which engine an image has, three ways: `docker run --rm <image> --version`
+prints `modbee 0.1.0 (TLS: wolfSSL)`; `modbee serve`'s start-up line says
+`tls 8883 (wolfSSL, ...)`; and the image is labelled,
+`docker inspect -f '{{index .Config.Labels "io.modbee.tls-engine"}}' <image>`.
+TLS 1.2 and 1.3 only. The published
 image is built the same way by `.github/workflows/docker.yml`, which starts it
 and publishes a message through it before anything is pushed.

@@ -107,6 +107,20 @@ struct MqttBrokerRequest {
     // when the transport cannot say.
     const char* peerName = "";
 
+    // A client certificate the TLS handshake VERIFIED: its subject's Common
+    // Name and the SHA-256 of its DER (64 lowercase hex). Empty when there was
+    // none - see MqttTransport::peerCertificateName().
+    const char* certificateName = "";
+    const char* certificateFingerprint = "";
+
+    // Connect only, and only for a hook that authenticated the client by
+    // something OTHER than the user name it sent - a certificate. The hook
+    // writes the login it accepted here, and the session carries that name
+    // instead of the CONNECT's: in what the broker reports about the client,
+    // in every later Publish and Subscribe request, and in
+    // disconnectUser(). Null for every other action.
+    std::string* login = nullptr;
+
     MqttVersion version = MqttVersion::V5;
 };
 
@@ -134,6 +148,31 @@ typedef void (*MqttBrokerTapFn)(void* context, const MqttSpan& clientId,
 typedef void (*MqttBrokerConnectionFn)(void* context, const MqttSpan& clientId,
                                        bool connected, uint8_t reasonCode);
 
+// Told what a client DID that something outside the broker may need to know:
+// it connected (with its user name), went (with the reason), was granted a
+// subscription, or removed one. A server exports these (modbee serve's
+// `events:`), so an application that reads them learns, for example, which
+// command topics a device listens on - which only the broker ever sees.
+// Spans are valid only during the call.
+enum class MqttBrokerClientEventKind : uint8_t {
+    Connected = 0,
+    Disconnected,
+    Subscribed,
+    Unsubscribed,
+};
+
+struct MqttBrokerClientEvent {
+    MqttBrokerClientEventKind kind = MqttBrokerClientEventKind::Connected;
+    MqttSpan clientId;
+    MqttSpan userName;
+    MqttSpan filter;                   // Subscribed / Unsubscribed
+    uint8_t qos = 0;                   // Subscribed: the QoS granted
+    uint8_t reasonCode = 0;            // Disconnected: what we sent, or 0
+    bool resumed = false;              // Connected: an existing session was resumed (CONNACK session present)
+};
+
+typedef void (*MqttBrokerClientEventFn)(void* context, const MqttBrokerClientEvent& event);
+
 // --- Hooks for a server that runs one broker per core (host only) ---
 //
 // A broker is single-threaded and instance-scoped (R5), so a multi-core server
@@ -149,6 +188,7 @@ struct MqttBrokerRouted {
     bool retain = false;
     const MqttProperties* properties = nullptr;   // never null when offered
     MqttSpan clientId;                            // the publisher; empty for the broker's own
+    MqttSpan userName;                            // the publisher's login; empty without one
     size_t matched = 0;
     size_t dropped = 0;
     // Where a message from outside any connection came from, as the host that
@@ -444,6 +484,7 @@ public:
     void onAuthorise(MqttBrokerAuthFn handler, void* context);
     void onMessage(MqttBrokerTapFn handler, void* context);
     void onConnection(MqttBrokerConnectionFn handler, void* context);
+    void onClientEvent(MqttBrokerClientEventFn handler, void* context);
 
 #if defined(MQTT_PLATFORM_HOST)
     // --- One broker per core; see the hook types above ---
@@ -527,6 +568,11 @@ private:
     void* _tapContext = nullptr;
     MqttBrokerConnectionFn _onConnection = nullptr;
     void* _connectionContext = nullptr;
+    MqttBrokerClientEventFn _onClientEvent = nullptr;
+    void* _clientEventContext = nullptr;
+    void clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSession& session,
+                     const MqttSpan& filter, uint8_t qos, uint8_t reasonCode,
+                     bool resumed = false);
 
     // Assigned client identifiers are "auto-<n>". Per broker instance, never a
     // process-wide counter - R5, and two brokers in one test binary.
@@ -613,7 +659,8 @@ private:
     uint32_t egress(const MqttSpan& topic, const MqttSpan& payload, uint8_t qos,
                     bool retain, const MqttProperties& properties,
                     const MqttSpan& clientId, size_t matched, size_t dropped,
-                    uint64_t deferral, const void* origin = nullptr);
+                    uint64_t deferral, const void* origin = nullptr,
+                    const MqttSpan& userName = MqttSpan());
     uint64_t openDeferred(MqttBrokerConnection& connection, uint16_t packetId,
                           uint8_t qos, size_t matched, size_t dropped, bool retainedFull);
     void closeDeferred(uint64_t deferral);
@@ -766,7 +813,8 @@ private:
     bool authorise(MqttBrokerConnection& connection, MqttBrokerAction action,
                    const MqttSpan& topic, uint8_t qos, bool retain,
                    const MqttSpan& clientId, const MqttSpan& userName,
-                   const MqttSpan& password, uint8_t& reasonCode);
+                   const MqttSpan& password, uint8_t& reasonCode,
+                   std::string* login = nullptr);
 
     // The static trampoline the retained store visits through, and what it
     // needs to know. A file-static would be process-wide state, which R5

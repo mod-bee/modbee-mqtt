@@ -47,15 +47,31 @@ struct BrokerSection {
     std::string address = "0.0.0.0";
     bool plain = true;                 // the plain-TCP listener
     uint16_t port = 1883;
-    bool tls = false;                  // a `tls:` section is present
+    // The TLS listener: on when the file has a `tls:` section, or when a
+    // certificate and its key are given as PEM text (below).
+    bool tls = false;
     uint16_t tlsPort = 8883;
     std::string certificateFile, keyFile, clientCaFile;
+    // The same material as PEM TEXT rather than paths - cert-pem, key-pem,
+    // client-ca-pem - set from the settings database (config.set) or the
+    // environment. Text wins over a path, as every stored setting wins over
+    // the file. While the server runs, a change to these is applied to the
+    // listeners at once (server/auth/TlsSettings.h); nothing restarts.
+    std::string certificatePem, keyPem, clientCaPem;
+    // With a client CA: "required" - every client must present a certificate
+    // it signed (the default) - or "optional": one is asked for and verified
+    // when offered, and a client that offers none logs in as usual.
+    std::string clientCertificates = "required";
     size_t shards = 0;                 // 0: one per core
     long long maxConnections = 100000; // whole server
     long long maxSessions = 0;         // 0: = maxConnections
     uint32_t maxPacket = 65536;
     size_t queue = 64;                 // messages held per session
     size_t subscriptions = 32;         // per session
+    // The longest a disconnected session (and its queued messages) is kept, in
+    // seconds, whatever an MQTT 5 client asks for. 4294967295 = until the
+    // broker restarts (sessions are held in memory).
+    long long maxSessionExpiry = 3600;
     // Retained topics the server keeps. Every shard holds all of them (a
     // retained message must reach a subscriber on any shard), so the memory
     // is this times the shard count: about 216 bytes a slot, reserved at
@@ -140,6 +156,15 @@ struct MetricsSection {
     uint16_t port = 9464;              // Prometheus's registry convention for exporters
 };
 
+// --- events: ------------------------------------------------------------------
+//
+// Publish what clients do - connect, go, subscribe, unsubscribe - on
+// $modbee/events/... (server/events/BrokerEvents.h). A Kafka mapping with the
+// filter "$modbee/events/#" makes them durable.
+struct EventsSection {
+    bool enabled = false;              // an events: section turns it on
+};
+
 // --- retained: ---------------------------------------------------------------
 //
 // Where retained messages are kept AS WELL AS memory, so a restart does not
@@ -178,11 +203,17 @@ struct AuthenticationSection {
     // Device logins in a SQLite file, changed live - added, removed,
     // provisioned - through the admin topics and `modbee user` / `modbee key`.
     std::string database;
+
+    // A client certificate the TLS listener verified IS the login: the login
+    // is its subject's CN, and no password is asked for (docs/logins.md).
+    // Needs the database, whose logins it names.
+    bool certificateLogin = false;
 };
 
 struct ServerConfig {
     BrokerSection broker;
     MetricsSection metrics;
+    EventsSection events;
     RetainedSection retained;
     AuthenticationSection authentication;
     std::vector<KafkaClusterConfig> clusters;
@@ -216,6 +247,35 @@ bool loadServerConfigFile(const std::string& path, ServerConfig& out,
 
 // "modbee.yaml:12:5: kafka.mqtt-to-kafka[0].kafka-acks: expected ..."
 std::string describe(const ConfigProblem& problem, const std::string& fileName);
+
+// --- Settings kept in the database ---------------------------------------------
+//
+// THE FILE IS THE BOOTSTRAP; THE DATABASE CAN HOLD THE REST. A server with a
+// login database keeps its settings beside the logins, changed over MQTT
+// ($modbee/admin config.*): a whole document that replaces the file, and
+// per-setting overrides named by path ("broker.port"). The ENVIRONMENT STILL
+// WINS over both - a setting pinned by a variable is reported as pinned - and
+// an override goes through exactly the loader and validator the file does.
+struct StoredSettings {
+    bool hasDocument = false;
+    std::string document;                                        // YAML, like modbee.yaml
+    std::vector<std::pair<std::string, std::string>> overrides;  // path -> value
+};
+
+struct EffectiveConfigInfo {
+    // Environment variables that set something (they win over the database).
+    std::vector<std::string> pinned;
+};
+
+// The file (or the stored document in its place), with the stored overrides
+// under the environment. An override for a path the schema does not have is an
+// error, like a misspelt key in the file.
+bool loadEffectiveConfig(const std::string& fileText, const std::string& fileName,
+                         const StoredSettings& stored, ServerConfig& out,
+                         std::vector<ConfigProblem>& problems, EffectiveConfigInfo* info = nullptr);
+
+// "broker.tls.port" -> "MODBEE_BROKER_TLS_PORT"
+std::string configEnvironmentName(const std::string& path);
 
 // The placeholders a mqtt-to-kafka `headers:` list may name, and that
 // `headers: all` writes. Null-terminated.

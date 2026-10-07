@@ -32,7 +32,10 @@ walks the whole scenario through, from what the devices do differently
 
 ## What it is not
 
-Stated plainly, so nobody discovers it at an awkward moment:
+Stated plainly, so nobody discovers it at an awkward moment. This is the
+library's broker, with the library's defaults; `modbee serve`, the server
+built on it, sets its own (below the Capacity table) and can keep retained
+messages.
 
 - **No persistence.** A restart loses sessions and retained messages.
   [V5:4.1] permits that, and this broker takes the permission. A program that
@@ -242,6 +245,13 @@ guessing.
 | `receiveBufferSize` / `transmitBufferSize` | 8192 | One whole packet each. |
 | `reserveUpFront` | true | Reserve every slot and buffer at `begin()`. False reserves a session's slots on first use and starts each connection's buffers at 512 bytes, growing them only when a packet needs it. The limits are unchanged. |
 
+These are the library's defaults. `modbee serve` sets its own, from
+`modbee.yaml` or its flags: `max-packet` 65536 (both buffers and the
+advertised Maximum Packet Size), `max-retained` 10000, `queue` 64,
+`max-session-expiry` 3600 (`maximumSessionExpiry`, below) - and it can
+keep retained messages across a restart with `retained: store: file` or
+`kafka` ([kafka.md](kafka.md#every-key-and-the-environment)).
+
 Everything is allocated once at `begin()` and never grows, so the memory the
 broker will use is knowable before it starts rather than discovered on a busy
 afternoon.
@@ -405,6 +415,25 @@ broker.onAuthorise(authorise, nullptr);
 `MqttBrokerRequest` carries the client identifier, user name, password, the
 topic or filter, the QoS, the retain flag, the protocol version, and
 `peerName` — where the connection came from, for an allowlist.
+
+Over TLS with a client CA it also carries `certificateName` and
+`certificateFingerprint`: the Common Name and SHA-256 (64 lowercase hex, of
+the DER) of a client certificate the handshake **verified** - empty when there
+was none. A hook that takes the login from the certificate rather than from
+the user name writes it to `*request.login` on a Connect, and the session
+carries that name from then on: in every later request, in client events,
+and in `disconnectUser()`. With `allowAnonymous` off, a connection with a
+verified certificate and no user name reaches the hook instead of being
+refused before it - with no hook installed it is still refused.
+
+```cpp
+static bool byCertificate(void*, const MqttBrokerRequest& request, uint8_t& reason) {
+    if (request.action != MqttBrokerAction::Connect) return true;
+    if (request.certificateName[0] == '\0') return false;     // no verified certificate
+    if (request.login) *request.login = request.certificateName;
+    return true;
+}
+```
 
 **Its spans are valid only for the call.** Copy anything you keep.
 

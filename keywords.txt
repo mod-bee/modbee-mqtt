@@ -14,6 +14,8 @@ MqttBridgeStatus	KEYWORD1
 MqttBridgeTopic	KEYWORD1
 MqttBroker	KEYWORD1
 MqttBrokerAction	KEYWORD1
+MqttBrokerClientEvent	KEYWORD1
+MqttBrokerClientEventKind	KEYWORD1
 MqttBrokerConfig	KEYWORD1
 MqttBrokerConnection	KEYWORD1
 MqttBrokerRequest	KEYWORD1
@@ -37,6 +39,7 @@ MqttQuality	KEYWORD1
 MqttReportType	KEYWORD1
 MqttResult	KEYWORD1
 MqttSparkplugCommand	KEYWORD1
+MqttSparkplugCommandOutcome	KEYWORD1
 MqttSparkplugDataType	KEYWORD1
 MqttSparkplugError	KEYWORD1
 MqttSparkplugHost	KEYWORD1
@@ -73,6 +76,7 @@ allowsPacketSize	KEYWORD2
 allowsProperties	KEYWORD2
 allowsQos	KEYWORD2
 allowsTopicAliases	KEYWORD2
+applied	KEYWORD2
 applyV311Defaults	KEYWORD2
 applyV5	KEYWORD2
 asNumber	KEYWORD2
@@ -190,6 +194,7 @@ mq_spUInt32	KEYWORD2
 mq_spUInt64	KEYWORD2
 mq_spUInt8	KEYWORD2
 mq_spUuid	KEYWORD2
+mq_sparkplugCommandOutcomeName	KEYWORD2
 mq_sparkplugDataTypeName	KEYWORD2
 mq_sparkplugDataTypeSupported	KEYWORD2
 mq_sparkplugErrorName	KEYWORD2
@@ -218,7 +223,9 @@ node	KEYWORD2
 nodeAt	KEYWORD2
 nodeCount	KEYWORD2
 onAuthorise	KEYWORD2
+onClientEvent	KEYWORD2
 onCommand	KEYWORD2
+onCommandRefused	KEYWORD2
 onConnected	KEYWORD2
 onConnection	KEYWORD2
 onDisconnected	KEYWORD2
@@ -331,6 +338,7 @@ withdraw	KEYWORD2
 
 # Constants (LITERAL1)
 AckTimeout	LITERAL1
+Applied	LITERAL1
 Authenticating	LITERAL1
 AwaitingConnAck	LITERAL1
 Bad	LITERAL1
@@ -355,6 +363,7 @@ DataTypeNotSupported	LITERAL1
 DateTime	LITERAL1
 DateTimeArray	LITERAL1
 Degraded	LITERAL1
+Disconnected	LITERAL1
 Disconnecting	LITERAL1
 Double	LITERAL1
 DoubleArray	LITERAL1
@@ -510,6 +519,7 @@ NDeath	LITERAL1
 NoMatchingSubscribers	LITERAL1
 NoPacketIdentifier	LITERAL1
 None	LITERAL1
+NotARequest	LITERAL1
 NotAuthorized	LITERAL1
 NotConnected	LITERAL1
 NotInitialised	LITERAL1
@@ -532,6 +542,7 @@ QueueFull	LITERAL1
 Queued	LITERAL1
 QuotaExceeded	LITERAL1
 QuotaExceededByPeer	LITERAL1
+ReadOnly	LITERAL1
 Reconnecting	LITERAL1
 Refused	LITERAL1
 Registering	LITERAL1
@@ -541,6 +552,7 @@ State	LITERAL1
 String	LITERAL1
 StringArray	LITERAL1
 Subscribe	LITERAL1
+Subscribed	LITERAL1
 Superseded	LITERAL1
 Template	LITERAL1
 Text	LITERAL1
@@ -557,10 +569,15 @@ UInt8	LITERAL1
 UInt8Array	LITERAL1
 UUID	LITERAL1
 Uncertain	LITERAL1
+Undecodable	LITERAL1
 Unknown	LITERAL1
+UnknownDevice	LITERAL1
+UnknownMetric	LITERAL1
+Unsubscribed	LITERAL1
 Up	LITERAL1
 V311	LITERAL1
 V5	LITERAL1
 ValueTypeMismatch	LITERAL1
 VarintTooLong	LITERAL1
 WireTypeMismatch	LITERAL1
+WrongType	LITERAL1

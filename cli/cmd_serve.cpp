@@ -11,6 +11,7 @@
 #include "Args.h"
 #include "Common.h"
 
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 
@@ -22,6 +23,8 @@
 #include "RetainedKeeper.h"
 #include "ShardAccounts.h"
 #include "AuthGate.h"
+#include "TlsSettings.h"
+#include "BrokerEvents.h"
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
 #include "KafkaRetained.h"
@@ -46,6 +49,7 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"cert", 0, true, "the broker's certificate, PEM file (with --tls-port)"},
         {"key", 0, true, "the broker's private key, PEM file (with --tls-port)"},
         {"client-ca", 0, true, "require client certificates signed by this CA, PEM file (mutual TLS)"},
+        {"client-certificates", 0, true, "with --client-ca: required (default) or optional"},
         {"shards", 's', true, "brokers, one per core (default: one per core)"},
         {"max-connections", 'c', true, "connections, whole server (default 100000)"},
         {"max-sessions", 0, true, "sessions, whole server (default = connections)"},
@@ -73,6 +77,15 @@ struct MetricsSources {
     KafkaPipe* pipe = nullptr;
 #endif
 };
+
+bool serverReady(void* context, std::string& why) {
+    MetricsSources& sources = *static_cast<MetricsSources*>(context);
+    if (sources.server->shardCount() == 0) { why = "the broker is not running"; return false; }
+#if defined(MODBEE_HAVE_KAFKA)
+    if (sources.pipe && !sources.pipe->status().kafkaReachable) { why = "Kafka cannot be reached"; return false; }
+#endif
+    return true;
+}
 
 void renderMetrics(void* context, std::string& out) {
     MetricsSources& sources = *static_cast<MetricsSources*>(context);
@@ -119,6 +132,39 @@ int cmdServe(int argc, char** argv) {
             std::fprintf(stderr, "modbee serve: %s would not load (modbee check -c %s)\n",
                          path.c_str(), path.c_str());
             return 2;
+        }
+        // SETTINGS STORED IN THE DATABASE, over the file and under the
+        // environment (and the flags below). They were validated when they were
+        // stored; if they no longer load - a newer version, a changed file - the
+        // server starts from the file alone and says so, rather than not at all.
+        if (!file.authentication.database.empty()) {
+            AuthStore stored;
+            std::string why;
+            if (stored.open(file.authentication.database, 0, why)) {
+                StoredSettings settings;
+                settings.hasDocument = stored.getSetting("config.document", settings.document);
+                std::vector<std::pair<std::string, std::string>> rows;
+                stored.listSettings("config.override.", rows);
+                for (const auto& r : rows) settings.overrides.emplace_back(r.first.substr(16), r.second);
+                stored.close();
+                if (settings.hasDocument || !settings.overrides.empty()) {
+                    std::string text;
+                    readWholeFile(path, text);
+                    ServerConfig effective;
+                    std::vector<ConfigProblem> problems;
+                    if (loadEffectiveConfig(text, path, settings, effective, problems)) {
+                        file = effective;
+                        std::printf("modbee serve: settings from the database (%s, %zu override(s))\n",
+                                    settings.hasDocument ? "a stored document" : "the file", settings.overrides.size());
+                    } else {
+                        for (const ConfigProblem& problem : problems) {
+                            std::fprintf(stderr, "%s\n", describe(problem, "stored settings").c_str());
+                        }
+                        std::fprintf(stderr, "modbee serve: the stored settings would not load - starting from %s alone\n",
+                                     path.c_str());
+                    }
+                }
+            }
         }
     }
     BrokerSection& b = file.broker;
@@ -191,7 +237,16 @@ int cmdServe(int argc, char** argv) {
     if (args.has("cert")) b.certificateFile = args.get("cert");
     if (args.has("key")) b.keyFile = args.get("key");
     if (args.has("client-ca")) b.clientCaFile = args.get("client-ca");
-    if (b.tls && (b.certificateFile.empty() || b.keyFile.empty())) {
+    if (args.has("client-certificates")) {
+        b.clientCertificates = args.get("client-certificates");
+        if (b.clientCertificates != "required" && b.clientCertificates != "optional") {
+            std::fprintf(stderr, "modbee serve: --client-certificates is required or optional, not \"%s\"\n",
+                         b.clientCertificates.c_str());
+            return 2;
+        }
+    }
+    const bool pemPair = !b.certificatePem.empty() && !b.keyPem.empty();
+    if (b.tls && !pemPair && (b.certificateFile.empty() || b.keyFile.empty())) {
         std::fprintf(stderr, "modbee serve: TLS needs a certificate and a key (--cert, --key)\n");
         return 2;
     }
@@ -204,13 +259,13 @@ int cmdServe(int argc, char** argv) {
     config.address = b.address;
     config.port = b.port;
     config.plain = b.plain;
-    if (b.tls) {
-        config.tls.enabled = true;
-        config.tls.port = b.tlsPort;
-        config.tls.certificateFile = b.certificateFile;
-        config.tls.keyFile = b.keyFile;
-        if (!b.clientCaFile.empty() && !readWholeFile(b.clientCaFile, config.tls.clientCaPem)) {
-            std::fprintf(stderr, "modbee serve: cannot read %s\n", b.clientCaFile.c_str());
+    // The certificate, its key and the client CA as PEM text, whether the
+    // settings name files or hold the text itself - the form the listeners
+    // serve and a live change replaces (server/auth/TlsSettings.h).
+    {
+        std::string why;
+        if (!tlsFromSettings(b, config.tls, why)) {
+            std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
             return 2;
         }
     }
@@ -230,6 +285,7 @@ int cmdServe(int argc, char** argv) {
     config.broker.maximumPacketSize = b.maxPacket;
     config.broker.maxQueuedPerSession = b.queue;
     config.broker.maxSubscriptionsPerSession = b.subscriptions;
+    config.broker.maximumSessionExpiry = (uint32_t)b.maxSessionExpiry;
     config.broker.maxRetained = b.maxRetained;
     config.broker.reserveUpFront = args.has("reserve-up-front");
 
@@ -267,13 +323,32 @@ int cmdServe(int argc, char** argv) {
     }
 #endif
     if (keeper) extensions.add(keeper.get());
+    // EVENTS BEFORE THE PIPE SEES THEM? Order does not matter: an event is a
+    // message published from the shard's service pass, offered to every
+    // extension - the Kafka pipe takes it when a mapping's filter matches.
+    std::unique_ptr<BrokerEvents> events;
+    if (file.events.enabled) {
+        events.reset(new BrokerEvents());
+        extensions.add(events.get());
+    }
     // Logins: a live database of device logins (AuthGate), or a fixed list
     // from the file (ShardAccounts), or none.
     ShardAccounts accounts;
     std::unique_ptr<AuthGate> gate;
+    // Declared before it is started, so the login gate can be told where it
+    // is: config.* reports what its TLS listeners serve and changes their
+    // certificate while it runs.
+    ShardedBroker server;
     if (!file.authentication.database.empty()) {
         AuthGateConfig g;
         g.database = file.authentication.database;
+        g.configFile = args.has("config") ? args.get("config") : std::string();
+        // config.* with "restart": true: the same graceful stop as a SIGTERM.
+        // Under Docker the restart policy starts it again; without a supervisor
+        // the server stays stopped, which config.set's reply says.
+        g.restart = [](void*) { std::raise(SIGTERM); };
+        g.certificateLogin = file.authentication.certificateLogin;
+        g.server = &server;
         for (size_t i = 0; i < file.authentication.accounts.size(); i++) {
             const MqttAccount& a = file.authentication.accounts[i];
             (i == 0 && file.authentication.hasAdmin ? g.admins : g.logins)
@@ -290,7 +365,6 @@ int cmdServe(int argc, char** argv) {
     if (!extensions.empty()) config.extension = &extensions;
 
     cliInstallSignalHandlers();
-    ShardedBroker server;
     if (!server.start(config)) {
         std::fprintf(stderr, "modbee serve: %s\n", server.lastError().c_str());
         return 3;
@@ -298,8 +372,10 @@ int cmdServe(int argc, char** argv) {
     std::printf("modbee serve: %zu shard(s) on %s", server.shardCount(), config.address.c_str());
     if (config.plain) std::printf(" port %u", server.port());
     if (config.tls.enabled) {
-        std::printf(" tls %u%s", server.tlsPort(),
-                    config.tls.clientCaPem.empty() ? "" : " (client certificates required)");
+        std::printf(" tls %u (%s%s)", server.tlsPort(), MQTT_TLS_ENGINE_NAME,
+                    config.tls.clientCaPem.empty() ? ""
+                    : config.tls.clientCertificateOptional ? ", client certificates optional"
+                                                          : ", client certificates required");
     }
     std::printf(", up to %lld connections\n", b.maxConnections);
     if (gate) {
@@ -311,6 +387,11 @@ int cmdServe(int argc, char** argv) {
     } else {
         std::printf("modbee serve: MQTT clients need no user name or password\n");
     }
+    if (gate && file.authentication.certificateLogin) {
+        std::printf("modbee serve: a verified client certificate logs in as the login its CN "
+                    "names, without a password (certificate-login)\n");
+    }
+    if (events) std::printf("modbee serve: client events published on $modbee/events/...\n");
     if (keeper) {
         std::printf("modbee serve: retained messages kept in %s: %zu restored",
                     keeper->where().c_str(), keeper->loaded() - (size_t)keeper->expired() -
@@ -327,6 +408,7 @@ int cmdServe(int argc, char** argv) {
     sources.pipe = pipe.get();
 #endif
     MetricsEndpoint metrics;
+    metrics.setReadiness(&serverReady, &sources);
     if (file.metrics.enabled) {
         std::string why;
         if (!metrics.start(file.metrics.address, file.metrics.port, &renderMetrics, &sources, why)) {
@@ -385,6 +467,11 @@ int cmdServe(int argc, char** argv) {
                 std::printf(" | logins ok %llu refused %llu provisioned %llu",
                             (unsigned long long)a.accepted, (unsigned long long)a.refused,
                             (unsigned long long)a.provisioned);
+                if (a.certificateAccepted + a.certificateRefused > 0) {
+                    std::printf(" (by certificate: ok %llu refused %llu)",
+                                (unsigned long long)a.certificateAccepted,
+                                (unsigned long long)a.certificateRefused);
+                }
             }
             if (keeper && keeper->failures() > 0) {
                 std::printf(" | retained store failures %llu",

@@ -41,7 +41,7 @@ programs to that Kafka, and through using a Nginx Proxy Manager you already
 have.
 
 ```bash
-docker compose -f docker/compose.yml up -d
+docker compose -f docker/compose.yml up -d --build    # --build: until the image is published
 modbee pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
 ```
 
@@ -133,7 +133,7 @@ written twice, and retries never reorder a partition. Setting a mapping to
   | `key:` | The key | Keeps in order |
   | --- | --- | --- |
   | `topic` (default) | The MQTT topic | Each topic's messages |
-  | `clientid` | The publisher's client identifier | Each device's messages |
+  | `clientid` | The publisher's client identifier; no key for a message that came from Kafka | Each device's messages, across all its topics |
   | `none` | No key | Nothing; records spread over partitions |
   | a template | e.g. `"${MQTT_TOPIC_LEVEL_1}/${MQTT_TOPIC_LEVEL_3}"` | Whatever the template groups |
 
@@ -141,6 +141,12 @@ written twice, and retries never reorder a partition. Setting a mapping to
   `${MQTT_TOPIC_LEVEL_n}` (levels counted from 0). Partitioning is murmur2,
   the Java client's, so a key lands on the same partition whichever client
   wrote it. `partition-strategy: uniform` ignores the key for partitioning.
+
+  For **one mapping that carries everything** (`mqtt-topic-filters: ["#"]`),
+  `clientid` is the one to choose: it keeps the order MQTT itself promises,
+  each publisher's messages as it sent them, which `topic` does not once one
+  device publishes on several topics. `docker/all-in-one` ships this way. The
+  topic is then read from the `mqtt-topic` header (`headers: all`).
 
 - **Headers** (`headers:`): none by default. `headers: all` writes every one
   below; a list writes the ones named, and `name: value` entries add fixed
@@ -151,7 +157,8 @@ written twice, and retries never reorder a partition. Setting a mapping to
   | `mqtt-topic` | The topic |
   | `mqtt-qos` | `0`, `1` or `2` |
   | `mqtt-retain` | `true` or `false` |
-  | `mqtt-clientid` | The publisher (absent for the broker's own messages, such as Wills) |
+  | `mqtt-clientid` | The publisher. A Will carries the client id of the session it belonged to. Absent only for a message that came from Kafka, or one the broker publishes itself (its replies to admin and provisioning requests) |
+  | `mqtt-username` | The login the publisher connected with, as the broker checked it - so a reader knows whose message it is without trusting the payload or the topic. For a device that logged in by its client certificate it is the login the certificate named ([logins.md](logins.md#logging-in-with-a-certificate)), not whatever user name the CONNECT carried. A Will carries its session's. Absent without a login, and for the same messages as `mqtt-clientid` |
   | `mqtt-content-type` | MQTT 5 Content Type, if present |
   | `mqtt-correlation-data` | MQTT 5 Correlation Data, raw bytes, if present |
   | `mqtt-payload-format-indicator` | `0` or `1`, if present |
@@ -191,10 +198,21 @@ written twice, and retries never reorder a partition. Setting a mapping to
   produced.
 - **Consumer groups:** one per mapping, `modbee-<id>-group` unless
   `consumer-group:` says otherwise. Several `modbee serve` processes with the
-  same file share the group, so Kafka spreads the partitions between them.
-- **At-least-once:** a record's offset is committed only after the broker has
-  taken the message. After a crash, a record may be published twice; it is
-  never skipped.
+  same file share the group, so Kafka spreads the partitions between them -
+  and each record is then published on **only one** of those servers. A device
+  connected to another of them does not receive it: servers do not pass MQTT
+  messages between each other (one `modbee serve` is one process; see "Not a
+  multi-machine cluster" in the [README](../README.md#what-it-is-not)). Give
+  each server its own `consumer-group:` for every server to publish every
+  record.
+- **At-least-once:** a record's offset is stored for commit once the record
+  has been handed to the broker. After a crash, a record may be published
+  twice; it is never skipped. Handed over is not the same as delivered: a
+  record on a topic no session subscribes to reaches nobody and is still
+  committed - MQTT keeps nothing for a client that has no session (a retained
+  record is kept as the retained message, as it would be from any publisher).
+  One the broker could not take - a subscriber's queue, or the retained store,
+  was full - is counted as `refused`.
 - **A new group starts at the latest offset**, not the beginning of the topic.
   To replay, set `auto.offset.reset: earliest` under the cluster's
   `properties:`.
@@ -209,17 +227,41 @@ such an overlap, because it is rarely intended.
 
 ---
 
+## Client events
+
+Which devices are connected now, and which topics each one listens on, are
+known only to the broker. `events: enabled: true` publishes them - connected,
+disconnected, subscribed, unsubscribed - on `$modbee/events/...`, and a
+mapping makes them durable in Kafka:
+
+```yaml
+  mqtt-to-kafka:
+    - id: events
+      mqtt-topic-filters: ["$modbee/events/#"]
+      kafka-topic: modbee-events
+      key: clientid
+```
+
+A `["#"]` mapping does not carry them, because `#` never matches a topic
+starting with `$`. [events.md](events.md) has the messages.
+
+---
+
 ## Sparkplug B
 
-Nothing special is needed: births, data, deaths (through Wills), commands and
-STATE all pass as they are. Choose the **key**, though:
+Births, data, deaths (through Wills), commands and STATE all pass as they
+are. With a mapping keyed by publisher - `key: clientid`, as
+`docker/all-in-one` ships - nothing Sparkplug-specific is needed: a node's
+NBIRTH, NDATA and DDATA, and its Will (NDEATH), all carry its client id, so
+they share a partition and are read in the order they were published, which
+keeps Sparkplug's `seq` in order.
 
-- A node's NBIRTH, NDATA and DDATA have different topics. With the default
-  `key: topic` they can land in different partitions and be read out of
-  order, which breaks Sparkplug's `seq`.
-- Use `key: clientid`, or a template giving group and node:
-  `"${MQTT_TOPIC_LEVEL_1}/${MQTT_TOPIC_LEVEL_3}"`. Each node's messages then
-  share a partition, in the order they were published.
+With the default `key: topic` they have different topics, can land in
+different partitions, and are read out of order.[^sparkplug-key]
+
+[^sparkplug-key]: A template giving group and node,
+    `"${MQTT_TOPIC_LEVEL_1}/${MQTT_TOPIC_LEVEL_3}"`, also keeps one node's
+    messages together, and does not depend on the node's client id.
 
 ---
 
@@ -247,20 +289,44 @@ The pipe sets `linger.ms: 5`, `compression.type: lz4` and
 `message.timeout.ms: 30000`; `properties:` overrides any of them. Topic-level
 librdkafka settings work here too.
 
+**TLS and SCRAM are tested end to end** against Kafka 4.3 with a SASL_SSL
+listener and SCRAM-SHA-512 (`docker/testing/kafka/run-sasl-ssl.sh`):
+
+- `tls.ca` is the CA that signed the Kafka brokers' certificates.
+- Host names are verified by default. Each broker's certificate must name
+  the host modbee connects to - the bootstrap address and every advertised
+  listener - or the handshake fails (`certificate verify failed` in the log).
+  `verify-hostname: false` turns this off.
+- A wrong password or a certificate that does not verify is never silent:
+  the log names it, `/readyz` answers `503 not ready: Kafka cannot be
+  reached` within a second, QoS 1 and 2 publishers are answered `0x97` once
+  `message.timeout.ms` has passed, and nothing reaches Kafka.
+- `properties:` reach both the producing and the consuming side, so one
+  that only a consumer knows - `auto.offset.reset` - makes the producer log a
+  harmless CONFWARN line.
+
+Kafka's TLS is librdkafka's, which is OpenSSL in the published image,
+whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)).
+
 ---
 
 ## Every key, and the environment
 
 | Section | Keys |
 | --- | --- |
-| `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca}`, `shards`, `max-connections`, `max-sessions`, `max-packet`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
-| `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required |
+| `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca, client-certificates, cert-pem, key-pem, client-ca-pem}` ([below](#tls-for-mqtt)), `shards`, `max-connections`, `max-sessions`, `max-session-expiry`, `max-packet`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
+| `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required. `certificate-login`: a verified client certificate logs in as the login its CN names ([logins.md](logins.md#logging-in-with-a-certificate)) |
 | `retained:` | `store` (`memory`, `file` or `kafka`), `file` (default `/var/lib/modbee/retained.db`), `topic` (default `modbee-retained`), `cluster` |
 | `metrics:` | `enabled`, `address`, `port` (default 9464) |
+| `events:` | `enabled`: publish what clients do on `$modbee/events/...` ([events.md](events.md)) |
 | `kafka.clusters[]` | `id`, `bootstrap-servers`, `tls`, `authentication`, `properties` |
 | `kafka.mqtt-to-kafka[]` | `id`, `cluster`, `mqtt-topic-filters`, `kafka-topic`, `kafka-acks` (`zero`, `one`, `all`), `max-record-bytes` (1 MB), `key`, `headers`, `partition-strategy` (`key-based`, `uniform`), `acknowledge` (`kafka`, `routed`) |
 | `kafka.kafka-to-mqtt[]` | `id`, `cluster`, `kafka-topics` or `kafka-topic-pattern`, `mqtt-topic`, `from-headers`, `qos`, `retain`, `consumer-group`, `properties: {content-type, response-topic, payload-format-indicator, message-expiry-interval, user-properties}` |
 
+- **`broker: max-session-expiry`** is the longest a disconnected session, and
+  the messages queued for it, is kept: in seconds, whatever an MQTT 5 client
+  asks for; 3600 by default. `4294967295` keeps it until the broker restarts,
+  since sessions are held in memory.
 - **Any value can come from the environment**, named after its path:
   `kafka.clusters[0].bootstrap-servers` is
   `MODBEE_KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS`. A list of values is one
@@ -272,12 +338,56 @@ librdkafka settings work here too.
 - **An unknown key is an error**, with the nearest real key suggested. A
   misspelt setting is a setting that is silently not set.
 
+### TLS for MQTT
+
+```yaml
+broker:
+  tls:
+    port: 8883
+    cert: /etc/modbee/broker.pem         # the certificate, or its full chain
+    key: /etc/modbee/broker.key
+    client-ca: /etc/modbee/devices-ca.pem   # optional: verify client certificates
+    client-certificates: required        # or optional
+```
+
+| Key | |
+| --- | --- |
+| `port` | 8883 by default |
+| `cert`, `key` | PEM files: the certificate (a full chain is presented whole) and its unencrypted key |
+| `client-ca` | One or more PEM certificates. Set, client certificates are verified against it |
+| `client-certificates` | `required` (the default): every client must present a certificate the CA signed. `optional`: one is asked for and verified when offered - a bad one still fails the handshake - and a client that offers none logs in with a user name and password as usual |
+| `cert-pem`, `key-pem`, `client-ca-pem` | The same material as PEM **text**, for the settings database (`config.set`) or the environment. Text wins over a path. A certificate and its key given this way turn the listener on by themselves, with no `tls:` section in the file |
+
+A change to the material - `cert-pem`, `key-pem`, `client-ca-pem` or
+`client-certificates` - is applied to the running server at once, with no
+restart: new handshakes see it, connections already up carry on
+([settings.md](settings.md#the-tls-material-applied-while-it-runs)).
+- **With a login database, settings can be stored in it** and changed over
+  MQTT - `modbee config set broker.max-session-expiry=86400` - applied at
+  the next restart; the environment still wins over them
+  ([settings.md](settings.md)).
+
 ---
 
 ## Metrics
 
 `metrics:` (or `--metrics-port`) serves `GET /metrics` in the Prometheus text
-format, and `GET /healthz`. Besides the broker's own counters
+format, `GET /healthz` and `GET /readyz`:
+
+| | Answers | Means |
+| --- | --- | --- |
+| `/healthz` | `200 ok` | **Liveness**: the process answers. Restart it only if this fails |
+| `/readyz` | `200 ready`, or `503 not ready: <why>` | **Readiness**: give it clients. Not ready while the broker is not running, or while Kafka cannot be reached |
+
+Kafka holds publishers' acknowledgements, so a server that cannot reach it
+cannot finish a QoS 1 or 2 publish - it is alive, and not ready.
+`/readyz` turns `503 not ready: Kafka cannot be reached` the moment
+librdkafka reports that every broker is down, and back to ready when its
+statistics (every 5 seconds, `statistics.interval.ms`) show a broker up again (or Kafka acknowledges a
+record). Only producers report this, so a server whose only mappings are
+`kafka-to-mqtt` always reads ready; so does one with no Kafka at all.
+
+Besides the broker's own counters
 (`modbee_connections`, `modbee_messages_published_total`, …), each mapping has:
 
 | Metric | |
@@ -290,6 +400,7 @@ format, and `GET /healthz`. Besides the broker's own counters
 | `modbee_kafka_kafka_to_mqtt_polled_total{mapping}` | Records read |
 | `modbee_kafka_kafka_to_mqtt_published_total{mapping}` | MQTT messages published |
 | `modbee_kafka_kafka_to_mqtt_invalid_total{mapping}` | Records that made no valid MQTT message |
+| `modbee_kafka_kafka_to_mqtt_refused_total{mapping}` | Records the broker could not take: a subscriber's queue was full, or the retained store was full |
 | `modbee_kafka_held_acknowledgements` | PUBACK/PUBRECs waiting on Kafka now |
 
 ---

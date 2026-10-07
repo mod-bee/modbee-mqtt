@@ -309,6 +309,26 @@ void MqttBroker::onConnection(MqttBrokerConnectionFn handler, void* context) {
     _connectionContext = context;
 }
 
+void MqttBroker::onClientEvent(MqttBrokerClientEventFn handler, void* context) {
+    _onClientEvent = handler;
+    _clientEventContext = context;
+}
+
+void MqttBroker::clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSession& session,
+                             const MqttSpan& filter, uint8_t qos, uint8_t reasonCode,
+                             bool resumed) {
+    if (_onClientEvent == nullptr) return;
+    MqttBrokerClientEvent event;
+    event.kind = kind;
+    event.clientId = asSpan(session.clientId());
+    event.userName = asSpan(session.userName);
+    event.filter = filter;
+    event.qos = qos;
+    event.reasonCode = reasonCode;
+    event.resumed = resumed;
+    _onClientEvent(_clientEventContext, event);
+}
+
 // =============================================================================
 // THE POLL
 // =============================================================================
@@ -633,7 +653,7 @@ void MqttBroker::onPlace(MqttBrokerPlaceFn place, MqttBrokerHandOffFn handOff, v
 uint32_t MqttBroker::egress(const MqttSpan& topic, const MqttSpan& payload, uint8_t qos,
                             bool retain, const MqttProperties& properties,
                             const MqttSpan& clientId, size_t matched, size_t dropped,
-                            uint64_t deferral, const void* origin) {
+                            uint64_t deferral, const void* origin, const MqttSpan& userName) {
     if (_onEgress == nullptr) return 0;
     MqttBrokerRouted message;
     message.topic = topic;
@@ -642,6 +662,7 @@ uint32_t MqttBroker::egress(const MqttSpan& topic, const MqttSpan& payload, uint
     message.retain = retain;
     message.properties = &properties;
     message.clientId = clientId;
+    message.userName = userName;
     message.matched = matched;
     message.dropped = dropped;
     message.origin = origin;
@@ -1294,6 +1315,7 @@ void MqttBroker::closeConnection(MqttBrokerConnection& connection,
             _onConnection(_connectionContext, asSpan(session->clientId()), false,
                           reasonCode);
         }
+        clientEvent(MqttBrokerClientEventKind::Disconnected, *session, MqttSpan(), 0, reasonCode);
 
         // [V5:3.1.2.11.2] A Session Expiry Interval of 0 means the Session
         // ends when the Network Connection does. At 3.1.1 that is Clean
@@ -1658,7 +1680,7 @@ void MqttBroker::publishWill(MqttBrokerSession& session) {
                                  will.retain, properties, &session, &dropped);
 #if defined(MQTT_PLATFORM_HOST)
     egress(asSpan(will.topic), asSpan(will.payload), will.qos, will.retain, properties,
-           asSpan(session.clientId()), matched, dropped, 0);
+           asSpan(session.clientId()), matched, dropped, 0, nullptr, asSpan(session.userName));
 #else
     (void)matched;
 #endif
@@ -1698,14 +1720,22 @@ void MqttBroker::serviceWills(mq_time_t now) {
 bool MqttBroker::authorise(MqttBrokerConnection& connection, MqttBrokerAction action,
                            const MqttSpan& topic, uint8_t qos, bool retain,
                            const MqttSpan& clientId, const MqttSpan& userName,
-                           const MqttSpan& password, uint8_t& reasonCode) {
+                           const MqttSpan& password, uint8_t& reasonCode,
+                           std::string* login) {
     reasonCode = MQ_REASON_NOT_AUTHORIZED;
 
+    const char* certificateName =
+        connection.transport ? connection.transport->peerCertificateName() : "";
+    if (certificateName == nullptr) certificateName = "";
+
+    // A VERIFIED CERTIFICATE IS NOT ANONYMOUS, but only a hook can say whose
+    // it is - so a connection that has one and sent no user name is passed to
+    // the hook rather than refused here. With no hook installed nothing
+    // changes: refused before anything runs, so a deployment that turns
+    // anonymous access off is safe even with no hook at all. A policy that
+    // depends on somebody remembering to write a callback is not a policy.
     if (action == MqttBrokerAction::Connect && !_config.allowAnonymous &&
-        userName.length == 0) {
-        // Refused before the hook runs, so a deployment that turns anonymous
-        // access off is safe even with no hook installed at all. A policy that
-        // depends on somebody remembering to write a callback is not a policy.
+        userName.length == 0 && (certificateName[0] == '\0' || _onAuthorise == nullptr)) {
         reasonCode = MQ_REASON_BAD_USER_NAME_OR_PASSWORD;
         return false;
     }
@@ -1722,6 +1752,11 @@ bool MqttBroker::authorise(MqttBrokerConnection& connection, MqttBrokerAction ac
     request.retain = retain;
     request.version = connection.version;
     request.peerName = connection.transport ? connection.transport->peerName() : "";
+    request.certificateName = certificateName;
+    request.certificateFingerprint =
+        connection.transport ? connection.transport->peerCertificateFingerprint() : "";
+    if (request.certificateFingerprint == nullptr) request.certificateFingerprint = "";
+    request.login = action == MqttBrokerAction::Connect ? login : nullptr;
 
     return _onAuthorise(_authoriseContext, request, reasonCode);
 }
@@ -1880,9 +1915,11 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // --- May they? ---
     uint8_t refusal = MQ_REASON_NOT_AUTHORIZED;
     MqttSpan noTopic;
+    std::string login;      // set by a hook that took the login from somewhere else
     if (!authorise(connection, MqttBrokerAction::Connect, noTopic, 0, false,
                    clientId, request.hasUserName ? request.userName : MqttSpan(),
-                   request.hasPassword ? request.password : MqttSpan(), refusal)) {
+                   request.hasPassword ? request.password : MqttSpan(), refusal,
+                   &login)) {
         if (!isV5) {
             // 3.1.1's value space is different and much smaller. Mapping 0x87
             // to 0x05 rather than sending it raw matters: 0x87 is "Granted
@@ -2041,8 +2078,12 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     }
 
     session->connected = true;
-    session->userName.assign(request.hasUserName ? (const char*)request.userName.data : "",
-                             request.hasUserName ? request.userName.length : 0);
+    if (!login.empty()) {
+        session->userName = login;
+    } else {
+        session->userName.assign(request.hasUserName ? (const char*)request.userName.data : "",
+                                 request.hasUserName ? request.userName.length : 0);
+    }
     session->connectionSlot = (uint32_t)(&connection - _connections.data());
 #if defined(MQTT_PLATFORM_HOST)
     // Back before its deadlines: the Will is cancelled by the reconnect
@@ -2069,6 +2110,8 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         _onConnection(_connectionContext, asSpan(session->clientId()), true,
                       MQ_REASON_SUCCESS);
     }
+    clientEvent(MqttBrokerClientEventKind::Connected, *session, MqttSpan(), 0, MQ_REASON_SUCCESS,
+                sessionPresent);
 
     // A resumed session may have messages waiting from while the client was
     // away, and a half-finished QoS 2 exchange to complete [V5:4.4].
@@ -2949,7 +2992,7 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
             const uint32_t parties =
                 egress(topic, message.payload, message.qos, message.retain,
                        message.properties, asSpan(session->clientId()), matched,
-                       refusedByQueue, deferral);
+                       refusedByQueue, deferral, nullptr, asSpan(session->userName));
             if (deferral != 0) {
                 if (parties == 0) {
                     closeDeferred(deferral);
@@ -3284,6 +3327,7 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
                                              subscriptionId, replaced)) {
                     granted = qos;
                     accepted[index] = true;
+                    clientEvent(MqttBrokerClientEventKind::Subscribed, *session, filter.filter, qos, 0);
 
                     // [V5:3.8.3.1] Retain Handling:
                     //   0 - send retained messages at subscribe time
@@ -3364,6 +3408,7 @@ void MqttBroker::handleUnsubscribe(MqttBrokerConnection& connection,
 
     for (uint8_t index = 0; index < request.count; index++) {
         const bool removed = session->removeSubscription(request.filters[index]);
+        if (removed) clientEvent(MqttBrokerClientEventKind::Unsubscribed, *session, request.filters[index], 0, 0);
         // [V5:3.11.3] 0x11 No subscription existed. 3.1.1 has no reason codes
         // on UNSUBACK at all, and the codec drops the list for that version -
         // so this is filled in either way and simply not encoded at 3.1.1.
@@ -3438,7 +3483,7 @@ bool MqttBroker::publishMessage(const MqttBrokerRouted& message) {
     const size_t matched = route(message.topic, message.payload, message.qos, message.retain,
                                  properties, nullptr, &refusedByQueue);
     egress(message.topic, message.payload, message.qos, message.retain, properties,
-           message.clientId, matched, refusedByQueue, 0, message.origin);
+           message.clientId, matched, refusedByQueue, 0, message.origin, message.userName);
     _status.published++;
     // The same answer as publish(), for the same reasons.
     if (!kept) return false;

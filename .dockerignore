@@ -1,17 +1,17 @@
-# The image is built from the source tree only - never from build output,
-# captures or the development tree.
+# Every image built from this repository: never build output, the git tree or
+# secrets. The PRODUCT image excludes much more (tests, the interop rig,
+# internal/) in docker/Dockerfile.dockerignore - kept apart, because the
+# interop rig (docker/testing/) builds from this same root and needs those
+# files. Excluding docker/testing/ here once broke every rig image.
 build/
 build-*/
 build2/
 .git/
 .vscode/
 .idea/
-docker/testing/
 
 **/*.o
 **/*.a
 **/*.log
-internal/
-test/
 **/.env
 **/node_modules/

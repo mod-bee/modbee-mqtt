@@ -5,6 +5,8 @@
 
 #include "AuthStore.h"
 
+#include <ctime>
+
 #include <chrono>
 #include <cstdio>
 
@@ -45,7 +47,8 @@ int64_t now() {
 }
 
 const char kUserColumns[] =
-    "username, hash, generated, enabled, pending, admin, publish, subscribe, provisioned_by, created, updated";
+    "username, hash, generated, enabled, pending, admin, publish, subscribe, provisioned_by, created, updated, "
+    "fingerprint";
 
 void readUser(sqlite3_stmt* s, AuthUser& u) {
     u.username = column(s, 0);
@@ -59,6 +62,7 @@ void readUser(sqlite3_stmt* s, AuthUser& u) {
     u.provisionedBy = column(s, 8);
     u.created = sqlite3_column_int64(s, 9);
     u.updated = sqlite3_column_int64(s, 10);
+    u.fingerprint = column(s, 11);
 }
 
 void readKey(sqlite3_stmt* s, AuthKey& k) {
@@ -93,6 +97,16 @@ bool AuthStore::exec(const char* sql) {
     return sqlite3_exec(_writer, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
 }
 
+bool AuthStore::hasColumn(const char* table, const char* column, const char* declaration) {
+    const std::string query = std::string("SELECT count(*) FROM pragma_table_info('") + table +
+                              "') WHERE name = '" + column + "'";
+    Statement st(_writer, query.c_str());
+    if (!st.ok() || st.step() != SQLITE_ROW) return false;
+    if (sqlite3_column_int(st.s, 0) > 0) return true;
+    const std::string add = std::string("ALTER TABLE ") + table + " ADD COLUMN " + column + " " + declaration;
+    return exec(add.c_str());
+}
+
 std::string AuthStore::lastError() const {
     return _writer ? sqlite3_errmsg(_writer) : "the login store is not open";
 }
@@ -116,12 +130,20 @@ bool AuthStore::open(const std::string& path, size_t readers, std::string& error
              " username TEXT PRIMARY KEY, hash TEXT NOT NULL, generated INTEGER NOT NULL,"
              " enabled INTEGER NOT NULL, pending INTEGER NOT NULL, admin INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, provisioned_by TEXT NOT NULL,"
-             " created INTEGER NOT NULL, updated INTEGER NOT NULL) WITHOUT ROWID") &&
+             " created INTEGER NOT NULL, updated INTEGER NOT NULL,"
+             " fingerprint TEXT NOT NULL DEFAULT '') WITHOUT ROWID") &&
+        // A file made before logins could be bound to a certificate has no
+        // fingerprint column. It is the table's shape, not anybody's data, so
+        // it is added in place - empty, which is what "no certificate bound"
+        // means - rather than the server refusing every login over it.
+        hasColumn("users", "fingerprint", "TEXT NOT NULL DEFAULT ''") &&
         exec("CREATE TABLE IF NOT EXISTS keys ("
              " name TEXT PRIMARY KEY, hash TEXT NOT NULL, manual INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, uses_left INTEGER NOT NULL,"
              " expires INTEGER NOT NULL, device TEXT NOT NULL, created INTEGER NOT NULL)") &&
         exec("CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)") &&
+        exec("CREATE TABLE IF NOT EXISTS settings ("
+             " name TEXT PRIMARY KEY, value TEXT NOT NULL, updated INTEGER NOT NULL) WITHOUT ROWID") &&
         exec("INSERT OR IGNORE INTO meta VALUES ('schema', '1')");
     if (!schema) {
         error = "cannot set up the login store " + path + ": " + sqlite3_errmsg(_writer);
@@ -170,7 +192,7 @@ AuthResult AuthStore::putUser(const AuthUser& u, bool replace) {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return AuthResult::Failed;
     const std::string sql = std::string(replace ? "INSERT OR REPLACE" : "INSERT") + " INTO users (" +
-                            kUserColumns + ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)";
+                            kUserColumns + ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)";
     Statement st(_writer, sql.c_str());
     if (!st.ok()) return AuthResult::Failed;
     const int64_t t = now();
@@ -185,6 +207,7 @@ AuthResult AuthStore::putUser(const AuthUser& u, bool replace) {
     st.text(9, u.provisionedBy);
     st.integer(10, u.created ? u.created : t);
     st.integer(11, t);
+    st.text(12, u.fingerprint);
     const int rc = st.step();
     if (rc == SQLITE_CONSTRAINT) return AuthResult::Exists;
     if (rc != SQLITE_DONE) return AuthResult::Failed;
@@ -264,6 +287,48 @@ AuthResult AuthStore::putKey(const AuthKey& k) {
     if (rc != SQLITE_DONE) return AuthResult::Failed;
     changed();
     return AuthResult::Ok;
+}
+
+bool AuthStore::getSetting(const std::string& name, std::string& out) {
+    std::lock_guard<std::mutex> lock(_write);
+    if (!_writer) return false;
+    Statement st(_writer, "SELECT value FROM settings WHERE name = ?1");
+    st.text(1, name);
+    if (st.step() != SQLITE_ROW) return false;
+    out = column(st.s, 0);
+    return true;
+}
+
+AuthResult AuthStore::putSetting(const std::string& name, const std::string& value) {
+    std::lock_guard<std::mutex> lock(_write);
+    if (!_writer) return AuthResult::Failed;
+    Statement st(_writer, "INSERT INTO settings (name, value, updated) VALUES (?1, ?2, ?3)"
+                          " ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated = excluded.updated");
+    st.text(1, name);
+    st.text(2, value);
+    st.integer(3, (int64_t)std::time(nullptr));
+    return st.step() == SQLITE_DONE ? AuthResult::Ok : AuthResult::Failed;
+}
+
+AuthResult AuthStore::removeSetting(const std::string& name) {
+    std::lock_guard<std::mutex> lock(_write);
+    if (!_writer) return AuthResult::Failed;
+    Statement st(_writer, "DELETE FROM settings WHERE name = ?1");
+    st.text(1, name);
+    if (st.step() != SQLITE_DONE) return AuthResult::Failed;
+    return sqlite3_changes(_writer) == 0 ? AuthResult::NotFound : AuthResult::Ok;
+}
+
+bool AuthStore::listSettings(const std::string& prefix, std::vector<std::pair<std::string, std::string>>& out) {
+    std::lock_guard<std::mutex> lock(_write);
+    if (!_writer) return false;
+    Statement st(_writer, "SELECT name, value FROM settings WHERE substr(name, 1, ?2) = ?1 ORDER BY name");
+    st.text(1, prefix);
+    st.integer(2, (int64_t)prefix.size());
+    out.clear();
+    int rc;
+    while ((rc = st.step()) == SQLITE_ROW) out.emplace_back(column(st.s, 0), column(st.s, 1));
+    return rc == SQLITE_DONE;
 }
 
 AuthResult AuthStore::removeKey(const std::string& name) {

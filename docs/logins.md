@@ -55,7 +55,7 @@ Put `tank-01` and that password into the device (for this library:
 rules are [what it may do](#what-a-device-may-do).
 
 **The secret is shown once, and the broker cannot show it again** - it keeps
-only a fingerprint of it, so a copy of the database is no use to anyone. If a
+only a salted hash of it, so a copy of the database is no use to anyone. If a
 secret is lost, you do not need it back: `modbee user reset tank-01` gives the
 device a new one, and the old one stops working.
 
@@ -68,6 +68,7 @@ device a new one, and the old one stops working.
 | `modbee user permissions tank-01 --publish ... --subscribe ...` | Change what it may do |
 | `modbee user password tank-01 --secret '...'` | A password you choose, for equipment where you must type one |
 | `modbee user admin someone` | Make a login an admin (`--no-admin` to undo) |
+| `modbee user set tank-01 --fingerprint ...` | Change several things at once - `--fingerprint`, `--publish`/`--subscribe`, `--admin`/`--no-admin`, `--secret` - and nothing else |
 | `modbee user remove tank-01` | Delete it (disconnected at once) |
 
 ---
@@ -87,7 +88,8 @@ key site-north
 ```
 
 Flash that key into every device for the site. Each device also needs a
-**unique name** (`tank-07`, a serial number, a tag) - it becomes its user name.
+**unique name** (`tank-07`, a serial number, a tag) - it becomes its user name,
+so it may not contain `/`, `+` or `#`, or start with `$`.
 With this library that is two lines in the sketch, plus where to keep the
 login ([`Provisioned_Device`](../examples/arduino/Provisioned_Device) is the
 whole ESP32 sketch):
@@ -159,12 +161,116 @@ replaced by the device's own, so one rule fits every device:
 | no rules at all | use every topic (except the broker's own `$` topics) |
 
 A subscription is allowed only if everything it could ever match is allowed,
-so a device limited to `plant/tank-07/#` cannot subscribe to `plant/#`. A
-device's name may not contain `/`, `+` or `#`, so it can never widen its own
-rules. When you change a device's rules it is disconnected, and reconnects
-under the new ones.
+so a device limited to `plant/tank-07/#` cannot subscribe to `plant/#`. When
+you change a device's rules it is disconnected, and reconnects under the new
+ones.
 
 A key's rules are given to every device that registers with it.
+
+### Names with `/` in them
+
+A login you add may be named with a `/`: a platform that names its devices
+`<namespace>/<device>` can give each one exactly that, `acme/riverbend/pump-plc`.
+A login's name may be anything MQTT allows in a user name except empty,
+longer than 256 bytes, starting with `$`, or holding a control character.
+
+Such a login takes **explicit** rules, because a `${username}` rule never
+fits it:
+
+```bash
+docker compose exec modbee modbee user add acme/riverbend/pump-plc \
+  --publish 'acme/riverbend/#' --subscribe 'acme/riverbend/#'
+```
+
+**A `${username}` or `${clientid}` rule never widens.** The broker will not
+put a value containing `/`, `+` or `#` into a filter - for such a login the
+rule simply does not match, and grants nothing. Otherwise `plant/${username}/#`
+for a login named `+` would become `plant/+/#` - every device's topics - and
+one named `acme/riverbend` would reach into the levels of every device below
+it. (Mosquitto made the same choice for the same reason: CVE-2017-7650.)
+
+**A name that becomes a topic keeps the strict rule.** The name a device
+registers itself with, and a key's `--device`, may not contain `/`, `+` or
+`#`, or start with `$`: the name is part of the device's provisioning topics,
+and a key's rules are written with `${username}`. A key's own name is letters,
+digits, `-` and `_`.
+
+---
+
+## Logging in with a certificate
+
+A device can log in with **its client certificate instead of a password**.
+Its certificate's Common Name is its login; the TLS handshake has already
+proved it holds the key, so no password is asked for, and nothing secret is
+ever typed into it or kept for it.
+
+It needs TLS with a client CA - the authority that issues the devices'
+certificates - and one setting, in `modbee.yaml` or the environment:
+
+```yaml
+broker:
+  tls:
+    cert: /etc/modbee/broker.pem
+    key: /etc/modbee/broker.key
+    client-ca: /etc/modbee/devices-ca.pem
+    client-certificates: required        # or optional
+authentication:
+  database: /var/lib/modbee/auth.db
+  certificate-login: true                # MODBEE_AUTHENTICATION_CERTIFICATE_LOGIN=true
+```
+
+The CA can be given over MQTT instead, and changed while the broker runs
+([settings.md](settings.md#the-tls-material-applied-while-it-runs)).
+`certificate-login` itself is file and environment only, like the rest of
+`authentication:`.
+
+Then add the login the certificate names, with its rules, as for any device:
+
+```bash
+docker compose exec modbee modbee user add tank-01 --publish 'plant/${username}/#'
+```
+
+and the device connects over TLS presenting a certificate the CA issued to
+`CN=tank-01` - with no user name and no password.
+
+| When a client certificate the handshake VERIFIED arrives | |
+| --- | --- |
+| The login | Its CN. The login's rules apply exactly as for a password, `${username}` is the CN, and the Kafka header `mqtt-username` and the client events carry it |
+| The CONNECT has a user name | It must BE the CN, or the device is refused (0x86) - a certificate is not a ticket to be somebody else. Its password is not checked |
+| No login has that name | Refused (0x86) |
+| The login is disabled or waiting for approval | Refused (0x87) |
+| The login has a `fingerprint` | Only the certificate with that fingerprint is accepted; another the same CA issued with the same CN is refused (0x86) |
+| The certificate is expired, or from another CA | The handshake fails: there is no connection to refuse |
+| The subject has two CNs | It names nobody, and is refused |
+
+A device that presents **no** certificate - where `client-certificates` is
+`optional` - logs in with a user name and password as usual. Every refusal is
+counted with the rest (`status`, and the server's status line, which shows
+certificate logins separately) and printed to the server's log with the CN,
+where the device came from and the certificate's fingerprint:
+
+```
+modbee serve: certificate login refused for "tank-01" from 10.0.4.7:51544 (certificate cfb913...84ae): the login is bound to a different certificate (its fingerprint)
+```
+
+### Binding a login to one certificate
+
+A CA may issue more than one certificate with the same CN - a replaced
+device, a copied file. To accept **one**, give the login that certificate's
+fingerprint:
+
+```bash
+openssl x509 -noout -fingerprint -sha256 -in tank-01.crt
+docker compose exec modbee modbee user set tank-01 --fingerprint 'CF:B9:13:...:84:AE'
+```
+
+The fingerprint is SHA-256 of the certificate's DER, stored as 64 lowercase
+hexadecimal characters; openssl's own spelling - upper case, colons,
+`sha256 Fingerprint=` in front - is accepted and tidied. Binding a new one
+disconnects a device on any other certificate at once. `--fingerprint ""`
+clears it, and `modbee user add ... --fingerprint` sets it from the start. A
+login with a fingerprint can still log in with its password, where it has
+one.
 
 ---
 
@@ -192,8 +298,9 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 
 | `command` | Fields | Answer |
 | --- | --- | --- |
-| `user.add` | `username`; optional `password` (else one is generated), `publish`, `subscribe`, `admin` | `password` if generated |
-| `user.get` | `username` | `user` |
+| `user.add` | `username`; optional `password` (else one is generated), `publish`, `subscribe`, `admin`, `fingerprint` | `password` if generated |
+| `user.set` | `username`, and any of `fingerprint` (`""` clears it), `publish`, `subscribe`, `admin`, `enabled`, `password` - only those named change | `user`, as it now is |
+| `user.get` | `username` | `user`, with its `fingerprint` (`""` for none) |
 | `user.list` | optional `prefix`, `after`, `limit` (up to 1000) | `users`, `total`, and `next` when there are more |
 | `user.reset` | `username` | the new `password` |
 | `user.password` | `username`, `password` | |
@@ -203,9 +310,16 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 | `key.create` | `name`; optional `approval` (`auto`/`manual`), `publish`, `subscribe`, `uses`, `days`, `device` | `key` - shown once |
 | `key.list`, `key.remove` | `name` for remove | `keys` |
 | `backup` | | `file` |
-| `status` | | counts of logins, accepted, refused, provisioned |
+| `status` | | counts of logins, accepted, refused, provisioned, and of logins by certificate: `certificate_accepted`, `certificate_refused` |
 
-A user or key record never includes a secret or its fingerprint.
+A user or key record never includes a secret or its hash. A user's
+`fingerprint` is a certificate's, which is public.
+
+The same channel carries the server's **settings**: `config.get`,
+`config.check`, `config.set`, `config.apply` and `config.reset` read and
+change them, applied at the next restart ([settings.md](settings.md)). With
+`events:` turned on, an admin can also follow what clients do - connect, go,
+subscribe - on `$modbee/events/#` ([events.md](events.md)).
 
 The device side is just as open, for firmware that does not use this library:
 CONNECT with user name `$provision`, the key as password and the device's name
@@ -248,9 +362,9 @@ beside the old database is dealt with rather than replayed over the backup.
 - **The logins are in SQLite**, built into modbee: one file, nothing extra to
   run. Finding a login by name takes microseconds whether there are a thousand
   devices or ten million, and uses little memory.
-- **Secrets are never stored**, only salted fingerprints. A secret the broker
+- **Secrets are never stored**, only salted hashes. A secret the broker
   generated is 32 random characters, which cannot be guessed, so one fast
-  SHA-256 fingerprint protects it - and a million devices reconnecting after
+  SHA-256 hash protects it - and a million devices reconnecting after
   an outage cost the broker seconds, not hours. A password a person chose is
   stretched with PBKDF2 (4096 rounds) instead, because people choose
   guessable ones.

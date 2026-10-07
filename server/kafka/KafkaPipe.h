@@ -38,6 +38,7 @@ struct KafkaMappingCounters {
     std::atomic<uint64_t> polled{0};      // kafka-to-mqtt: records read
     std::atomic<uint64_t> published{0};   //   published into the broker
     std::atomic<uint64_t> invalid{0};     //   could not be published (bad topic, ...)
+    std::atomic<uint64_t> refused{0};     //   the broker could not take it (a queue or the retained store full)
 };
 
 struct KafkaPipeStatus {
@@ -45,10 +46,14 @@ struct KafkaPipeStatus {
         std::string id;
         bool toKafka = true;
         uint64_t send = 0, success = 0, failed = 0, tooLarge = 0, latencyMicros = 0;
-        uint64_t polled = 0, published = 0, invalid = 0;
+        uint64_t polled = 0, published = 0, invalid = 0, refused = 0;
     };
     std::vector<Mapping> mappings;
     uint64_t heldAcknowledgements = 0;    // PUBACK/PUBRECs waiting on Kafka now
+    // False from librdkafka's "all brokers down" (or statistics showing no
+    // broker UP) until a statistics report shows one UP again, or Kafka
+    // acknowledges a record - what /readyz reports.
+    bool kafkaReachable = true;
 };
 
 // The pipe's counters, appended in the Prometheus text format, one series
@@ -89,4 +94,5 @@ private:
     std::vector<std::unique_ptr<ToKafka>> _toKafka;
     std::vector<std::unique_ptr<FromKafka>> _fromKafka;
     std::vector<std::unique_ptr<Shard>> _shards;
+    std::atomic<bool> _brokersDown{false};
 };

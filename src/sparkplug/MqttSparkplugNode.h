@@ -67,6 +67,26 @@
 
 // --- What a command looks like when it arrives ---
 
+// What became of one metric in an NCMD or DCMD.
+//
+// Every refusal used to be a counter and nothing else: commandsRefused() went
+// up and the application could not say WHICH write, from which host, for what
+// reason. A commissioning engineer whose setpoint "does nothing" needs exactly
+// that, so each reason is named - and they are different faults: an unknown
+// metric is a host with the wrong tag list, a read-only one is a host that
+// thinks it can write a sensor, a wrong type is a host that ignored the birth.
+enum class MqttSparkplugCommandOutcome : uint8_t {
+    Applied = 0,     // written to the metric, or a rebirth performed
+    Undecodable,     // the payload was not a Sparkplug payload at all
+    UnknownDevice,   // a DCMD for a device this node never added
+    UnknownMetric,   // a name or alias this node never declared
+    ReadOnly,        // declared, but not with declareWritable()
+    WrongType,       // a value that is not the declared datatype
+    NotARequest,     // a Rebirth metric whose value is false, which asks nothing
+};
+
+const char* mq_sparkplugCommandOutcomeName(MqttSparkplugCommandOutcome outcome);
+
 struct MqttSparkplugCommand {
     // Empty for an NCMD, the device id for a DCMD.
     const char* device = nullptr;
@@ -75,6 +95,10 @@ struct MqttSparkplugCommand {
     // an alias [tck-id-payloads-alias-data-cmd-requirement], and the caller
     // wants the name they wrote in their own code. Resolved through the alias
     // table before the handler sees it.
+    //
+    // For a REFUSED command the name may be one this node never declared, as
+    // the host sent it - or null, when the host sent only an alias nothing
+    // here answers to, or a payload that would not decode.
     const char* name = nullptr;
 
     uint64_t alias = 0;
@@ -84,6 +108,11 @@ struct MqttSparkplugCommand {
     // internally before the handler runs - the node has already republished -
     // and surfaced so an application can log it.
     bool isRebirth = false;
+
+    // Always Applied in what onCommand() hands over; the reason otherwise, in
+    // what onCommandRefused() does.
+    MqttSparkplugCommandOutcome outcome = MqttSparkplugCommandOutcome::Applied;
+    bool applied() const { return outcome == MqttSparkplugCommandOutcome::Applied; }
 };
 
 typedef void (*MqttSparkplugCommandFn)(const MqttSparkplugCommand& command);
@@ -329,6 +358,15 @@ public:
     void onCommand(MqttSparkplugCommandFn handler);
     void onCommand(MqttSparkplugCommandContextFn handler, void* context);
 
+    // EVERY METRIC THAT WAS NOT APPLIED, one call each, with the reason in
+    // command.outcome. Separate from onCommand() rather than folded into it,
+    // so an application that acts on what its handler is given can never act
+    // on a write the node refused. Between the two, every metric of every
+    // NCMD and DCMD is seen exactly once - which is what a log, a test rig or
+    // an audit trail wants. commandsRefused() still counts them.
+    void onCommandRefused(MqttSparkplugCommandFn handler);
+    void onCommandRefused(MqttSparkplugCommandContextFn handler, void* context);
+
     // The pollable half. Generated IEC code cannot register a lambda.
     bool commandPending(const char* name) const;
     bool take(const char* name, MqttSparkplugValue& into);
@@ -408,6 +446,10 @@ private:
     void handleCommand(const MqttSparkplugTopicParts& parts,
                        const uint8_t* payload, size_t length);
     void handleState(const uint8_t* payload, size_t length);
+    void deliverCommand(MqttSparkplugCommand& command);
+    void refuseCommand(const char* device, const char* name, uint64_t alias,
+                       const MqttSparkplugValue& value,
+                       MqttSparkplugCommandOutcome outcome);
 
     int findPointIndex(const char* name, int16_t device) const;
     int findPointByAlias(uint64_t alias) const;
@@ -592,6 +634,9 @@ private:
     MqttSparkplugCommandFn _commandHandler = nullptr;
     MqttSparkplugCommandContextFn _commandContextHandler = nullptr;
     void* _commandContext = nullptr;
+    MqttSparkplugCommandFn _refusedHandler = nullptr;
+    MqttSparkplugCommandContextFn _refusedContextHandler = nullptr;
+    void* _refusedContext = nullptr;
 
     // The Will bytes have to survive from before the CONNECT until the server
     // uses them, so they are held here rather than built on the stack.

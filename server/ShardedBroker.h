@@ -32,6 +32,14 @@
 // handed to its owning shard after its handshake and CONNECT, exactly like a
 // plain one: the transport, with the decrypted bytes already read, moves.
 //
+// THE CERTIFICATE CAN BE CHANGED WHILE IT RUNS (replaceTls). The new context
+// is built on the caller's thread - so a certificate that will not load is
+// refused while the old one is still served - and handed to each shard,
+// which swaps it in on its own thread between two passes of its loop. Every
+// connection already up keeps the context it shook hands with; only new
+// handshakes see the new certificate. The port and the address are what the
+// sockets were bound to, and changing those still needs a restart.
+//
 // SHARED SUBSCRIPTIONS. "$share/<name>/<filter>" means one member of the
 // group receives each message - one in the whole server, not one per shard.
 // Every shard reports its members of every group to a registry; the shard a
@@ -106,6 +114,10 @@ struct ShardedTlsConfig {
     std::string certificateFile, keyFile;   // PEM files...
     std::string certificatePem, keyPem;     // ...or the PEM text itself
     std::string clientCaPem;                // set: mutual TLS, clients must present a certificate it signed
+    // With clientCaPem: a certificate is asked for and verified when offered,
+    // but a client that offers none is let through (to log in with a
+    // password). False: one is required.
+    bool clientCertificateOptional = false;
 };
 
 struct ShardedBrokerConfig {
@@ -157,6 +169,21 @@ public:
     // A snapshot, refreshed by each shard about ten times a second.
     ShardedBrokerStatus status() const;
 
+    // --- The TLS material, while running ---
+
+    // What the TLS listeners serve now: the configuration they were started
+    // with, as replaceTls() has since changed it. `enabled` is false when
+    // there is no TLS listener.
+    ShardedTlsConfig servedTls() const;
+
+    // Serve `tls`'s certificate, key, client CA and client-certificate mode
+    // to every connection accepted from now on, on every shard. Its address
+    // and port are ignored: they are what the sockets are bound to. False,
+    // with `error`, and nothing changed, if there is no TLS listener to
+    // change or the material will not load. Callable from any thread,
+    // including a shard's own.
+    bool replaceTls(const ShardedTlsConfig& tls, std::string& error);
+
     // Which shard owns this Client Identifier. Public for tests and tooling.
     static uint32_t ownerOf(const uint8_t* identifier, size_t length, size_t shards);
 
@@ -173,6 +200,8 @@ private:
     std::atomic<bool> _stopping{false};
     std::atomic<size_t> _ended{0};         // shards whose broker has ended
     std::atomic<int64_t> _inFlight{0};     // envelopes posted and not yet handled
+    mutable std::mutex _tlsLock;           // guards _tlsServed
+    ShardedTlsConfig _tlsServed;
     ShardExtension* _extension = nullptr;
     bool _running = false;
 

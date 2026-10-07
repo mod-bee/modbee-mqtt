@@ -3,19 +3,22 @@
 #
 #   1. Point a DNS name (mqtt.example.com) at this server. Open ports 80 and 8883.
 #   2. cp .env.example .env   and set DOMAIN, EMAIL and MQTT_PASSWORD.
-#   3. docker compose up -d
+#   3. docker compose up -d --build
+#
+# Until the image is published, --build builds it from this checkout (a few
+# minutes, once). That needs this file where it is, inside the repository.
 #
 # Devices connect to  mqtts://DOMAIN:8883, and every MQTT message lands in the
 # Kafka topic mqtt-messages. Where to reach Kafka from:
 #
 #   another service in this file, or in another compose project
-#     on the network "modbee"        kafka:9092
+#     on the network "modbee"        kafka:9092    (MODBEE_NETWORK renames it)
 #   this server (scripts, tools)      localhost:9094
 #   another machine on your network   set KAFKA_EXTERNAL_HOST and KAFKA_BIND in .env
 #   anywhere, with a password         DOMAIN:9093 over TLS - set KAFKA_PASSWORD in .env
 #
 # docs/docker.md, "Connecting to Kafka", has examples of each.
-name: modbee
+name: modbee-all-in-one
 
 services:
   # TLS, and the certificate. Port 80 answers Let's Encrypt's check; 8883 is
@@ -45,7 +48,10 @@ services:
     mem_limit: 256m
 
   modbee:
-    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    image: ${MODBEE_IMAGE:-ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}}
+    build:                                # used when the image cannot be pulled
+      context: ../..
+      dockerfile: docker/Dockerfile
     restart: unless-stopped
     depends_on:
       kafka-topics: {condition: service_completed_successfully}
@@ -123,10 +129,12 @@ services:
     mem_limit: 512m
 
 # Named, so another compose project can join it and reach kafka:9092 and
-# modbee:1883 by name (docs/docker.md shows the three lines it needs).
+# modbee:1883 by name (docs/docker.md shows the three lines it needs). The
+# name is fixed - not prefixed with the project's - so those lines stay the
+# same; MODBEE_NETWORK changes it, for a second all-in-one on one server.
 networks:
   default:
-    name: modbee
+    name: ${MODBEE_NETWORK:-modbee}
 
 # Traefik's routes, kept here so the stack is one file plus .env. Every MQTT
 # connection on 8883, and every Kafka connection on 9093, is decrypted with

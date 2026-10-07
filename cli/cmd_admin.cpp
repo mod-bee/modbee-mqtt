@@ -13,6 +13,8 @@
 // (Common.cpp); from anywhere else, -u and -P.
 
 #include "Common.h"
+#include <sstream>
+#include <fstream>
 #include "Json.h"
 #if defined(MODBEE_HAVE_SERVER)
 #include "AuthStore.h"
@@ -74,7 +76,17 @@ int ask(CliClient& cli, const std::string& clientId, json::Object request, json:
         return 1;
     }
     const std::string body = request.str();
-    cli.client.publish("$modbee/admin/request", (const uint8_t*)body.data(), body.size(), MQ_QOS_1, false);
+    const MqttResult sent =
+        cli.client.publish("$modbee/admin/request", (const uint8_t*)body.data(), body.size(), MQ_QOS_1, false);
+    if (!mq_accepted(sent)) {
+        // Said, rather than waited out as "no answer": a request the client
+        // could not even send never reaches anybody who could reply.
+        std::fprintf(stderr, "modbee: the request (%zu bytes) could not be sent: %s\n", body.size(),
+                     mq_resultName(sent));
+        cli.shutdown();
+        g_admin = nullptr;
+        return 1;
+    }
     cli.pollUntil([&] { return state.answered; }, 15000);
     cli.shutdown();
     g_admin = nullptr;
@@ -100,8 +112,16 @@ std::string joined(const json::Value& list) {
     return out.empty() ? "(any)" : out;
 }
 
+// An admin request can carry a whole settings document or a certificate chain
+// in PEM - far past the client's default 4 kB buffer, which would refuse it
+// before it left. The broker's own max-packet is still the limit that counts.
+void adminBuffers(CliClient& cli) {
+    cli.behaviour.transmitBufferSize = 256 * 1024;
+    cli.behaviour.receiveBufferSize = 256 * 1024;
+}
+
 const char* kUserUsage =
-    "modbee user <list|show|add|remove|enable|disable|approve|reset|password|permissions|admin> [name] [options]";
+    "modbee user <list|show|add|set|remove|enable|disable|approve|reset|password|permissions|admin> [name] [options]";
 const char* kKeyUsage = "modbee key <create|list|remove> [name] [options]";
 
 const std::vector<ArgSpec>& adminSpecs() {
@@ -111,6 +131,8 @@ const std::vector<ArgSpec>& adminSpecs() {
         {"secret", 0, true, "user add / password: a password you choose (default: generate one)"},
         {"admin", 0, false, "user add: an admin, who may manage logins"},
         {"no-admin", 0, false, "user admin: take admin away"},
+        {"fingerprint", 0, true, "user add / set: the SHA-256 of the one client certificate it may log in "
+                                 "with (certificate-login); \"\" clears it"},
         {"prefix", 0, true, "user list: only names starting with this"},
         {"approval", 0, true, "key create: auto (default) or manual - devices wait for approval"},
         {"uses", 0, true, "key create: how many devices it may create (default unlimited)"},
@@ -130,6 +152,7 @@ int prepare(int argc, char** argv, const char* usage, Args& args, CliClient& cli
         return -1;
     }
     std::string error;
+    adminBuffers(cli);
     if (!cli.configure(args, "modbee-admin", error)) {
         std::fprintf(stderr, "modbee: %s\n", error.c_str());
         return 2;
@@ -174,6 +197,7 @@ int cmdUser(int argc, char** argv) {
             page.add("command", "user.list").add("prefix", args.get("prefix")).add("after", after).add("limit", 500LL);
             CliClient pageCli;
             std::string error;
+            adminBuffers(pageCli);
             pageCli.configure(args, "modbee-admin", error);
             const int r = ask(pageCli, pageCli.connection.clientId, page, reply, text);
             if (r != 0) return r;
@@ -206,6 +230,16 @@ int cmdUser(int argc, char** argv) {
         request.add("command", "user.add").add("username", name);
         if (args.has("secret")) request.add("password", args.get("secret"));
         if (args.has("admin")) request.add("admin", true);
+        if (args.has("fingerprint")) request.add("fingerprint", args.get("fingerprint"));
+        rules(args, request);
+    } else if (action == "set") {
+        // Only what was given changes: --fingerprint, --publish/--subscribe,
+        // --admin/--no-admin, --secret.
+        request.add("command", "user.set").add("username", name);
+        if (args.has("fingerprint")) request.add("fingerprint", args.get("fingerprint"));
+        if (args.has("admin")) request.add("admin", true);
+        if (args.has("no-admin")) request.add("admin", false);
+        if (args.has("secret")) request.add("password", args.get("secret"));
         rules(args, request);
     } else if (action == "show") {
         request.add("command", "user.get").add("username", name);
@@ -237,19 +271,22 @@ int cmdUser(int argc, char** argv) {
     if (action == "show") {
         const json::Value& u = reply["user"];
         std::printf("%s\n  status:          %s\n  password:        %s (never shown again; `modbee user reset` issues a new one)\n"
-                    "  may publish:     %s\n  may subscribe:   %s\n  provisioned by:  %s\n  admin:           %s\n",
+                    "  may publish:     %s\n  may subscribe:   %s\n  provisioned by:  %s\n  admin:           %s\n"
+                    "  certificate:     %s\n",
                     u.str("username").c_str(),
                     !u.flag("enabled") ? "disabled" : u.flag("pending") ? "pending approval" : "enabled",
                     u.str("password").c_str(), joined(u["publish"]).c_str(), joined(u["subscribe"]).c_str(),
                     u.str("provisioned_by").empty() ? "-" : u.str("provisioned_by").c_str(),
-                    u.flag("admin") ? "yes" : "no");
+                    u.flag("admin") ? "yes" : "no",
+                    u.str("fingerprint").empty() ? "any whose CN is this name (certificate-login)"
+                                                 : u.str("fingerprint").c_str());
     } else if (reply.has("password")) {
         std::printf("%s %s\n  password: %s\n  (shown once - it cannot be read back; `modbee user reset %s` "
                     "issues a new one)\n",
                     action == "reset" ? "reset" : "added", name.c_str(), reply.str("password").c_str(),
                     name.c_str());
     } else {
-        const char* done = action == "add" ? "added" : action == "remove" ? "removed"
+        const char* done = action == "add" ? "added" : action == "set" ? "changed" : action == "remove" ? "removed"
                          : action == "enable" ? "enabled" : action == "disable" ? "disabled (and disconnected)"
                          : action == "approve" ? "approved" : action == "password" ? "new password set for"
                          : action == "permissions" ? "new permissions for (reconnecting)"
@@ -333,6 +370,7 @@ int cmdBackup(int argc, char** argv) {
     }
     CliClient cli;
     std::string error;
+    adminBuffers(cli);
     if (!cli.configure(args, "modbee-admin", error)) {
         std::fprintf(stderr, "modbee: %s\n", error.c_str());
         return 2;
@@ -345,6 +383,137 @@ int cmdBackup(int argc, char** argv) {
     if (r != 0) return r;
     if (cli.json) std::printf("%s\n", text.c_str());
     else std::printf("backed up to %s (on the broker's machine)\n", reply.str("file").c_str());
+    return 0;
+}
+
+// modbee config <get|set|apply|check|reset> - the server's settings, stored
+// beside its logins and changed over MQTT (docs/settings.md). Every change is
+// validated by the loader modbee.yaml goes through; refused with its problems.
+//
+//   modbee config get
+//   modbee config set broker.port=1884 broker.max-connections=50000 [--restart]
+//   modbee config set --remove broker.port
+//   modbee config apply --file new.yaml [--restart]
+//   modbee config check --file new.yaml     (or path=value ...)
+//   modbee config reset
+int cmdConfig(int argc, char** argv) {
+    const std::vector<ArgSpec> specs = withConnectionSpecs({
+        {"file", 0, true, "apply / check: a whole settings document (YAML, like modbee.yaml)"},
+        {"remove", 0, true, "set: drop a stored setting, back to the file's; repeat for more"},
+        {"restart", 0, false, "set / apply: restart the server once the change is stored"},
+    });
+    Args args;
+    if (!args.parse(argc, argv, 3, specs)) {
+        std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
+        return 2;
+    }
+    if (args.has("help") || argc < 3 || std::strcmp(argv[2], "--help") == 0 || std::strcmp(argv[2], "help") == 0) {
+        Args::printHelp("modbee config <get|set|apply|check|reset> [path=value ...] [options]", specs);
+        return argc < 3 ? 2 : 0;
+    }
+    const std::string action = argv[2];
+    if (action != "get" && action != "set" && action != "apply" && action != "check" && action != "reset") {
+        std::fprintf(stderr, "modbee config: get, set, apply, check or reset - not \"%s\"\n", action.c_str());
+        return 2;
+    }
+    CliClient cli;
+    std::string error;
+    adminBuffers(cli);
+    if (!cli.configure(args, "modbee-admin", error)) {
+        std::fprintf(stderr, "modbee: %s\n", error.c_str());
+        return 2;
+    }
+    json::Object request;
+    request.add("command", "config." + action);
+    json::Object set;
+    bool anySet = false;
+    for (const std::string& p : args.positional()) {
+        const size_t eq = p.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            std::fprintf(stderr, "modbee config: settings are path=value, like broker.port=1884 (not \"%s\")\n", p.c_str());
+            return 2;
+        }
+        const std::string path = p.substr(0, eq);
+        std::string value = p.substr(eq + 1);
+        // broker.tls.cert-pem=@server.crt: the PEM text from a file on THIS
+        // computer, because nobody types a certificate on a command line.
+        const bool pemPath = path.size() > 4 && path.compare(path.size() - 4, 4, "-pem") == 0;
+        if (pemPath && !value.empty() && value[0] == '@') {
+            std::ifstream in(value.substr(1), std::ios::binary);
+            if (!in) {
+                std::fprintf(stderr, "modbee config: cannot read %s\n", value.substr(1).c_str());
+                return 2;
+            }
+            std::ostringstream text;
+            text << in.rdbuf();
+            value = text.str();
+        }
+        set.add(path, value);
+        anySet = true;
+    }
+    if (anySet) request.raw("set", set.str());
+    if (args.has("remove")) request.raw("remove", json::array(args.all("remove")));
+    if (args.has("file")) {
+        std::ifstream in(args.get("file"), std::ios::binary);
+        if (!in) {
+            std::fprintf(stderr, "modbee config: cannot read %s\n", args.get("file").c_str());
+            return 2;
+        }
+        std::ostringstream text;
+        text << in.rdbuf();
+        request.add("document", text.str());
+    }
+    if (action == "apply" && !args.has("file")) {
+        std::fprintf(stderr, "modbee config apply needs --file\n");
+        return 2;
+    }
+    if (args.has("restart")) request.add("restart", true);
+
+    json::Value reply;
+    std::string text;
+    const int r = ask(cli, cli.connection.clientId, request, reply, text);
+    if (cli.json) std::printf("%s\n", text.c_str());
+    for (const json::Value& p : reply["problems"].items) {
+        std::fprintf(stderr, "  %s%s%s: %s\n", p.str("path").c_str(),
+                     p.integer("line") > 0 ? (" (line " + std::to_string(p.integer("line")) + ")").c_str() : "",
+                     p.flag("warning") ? " [warning]" : "", p.str("message").c_str());
+    }
+    if (r != 0 || cli.json) return r;
+    if (action == "get") {
+        std::printf("settings from: %s%s\n", reply.str("source").c_str(),
+                    reply.str("source") == "file" ? (" (" + reply.str("file") + ")").c_str() : " (a stored document)");
+        for (const auto& o : reply["overrides"].fields) {
+            // A certificate is a screenful; what it is comes under "tls:".
+            const bool pem = o.second.text.find("-----BEGIN") != std::string::npos;
+            std::printf("  %s = %s\n", o.first.c_str(),
+                        pem ? ("(PEM, " + std::to_string(o.second.text.size()) + " bytes)").c_str()
+                            : o.second.text.c_str());
+        }
+        for (const json::Value& p : reply["pinned"].items) std::printf("  pinned by the environment: %s\n", p.text.c_str());
+        const json::Value& tls = reply["tls"];
+        if (!tls.flag("serving")) {
+            std::printf("tls: not serving\n");
+        } else {
+            const json::Value& c = tls["certificate"];
+            std::printf("tls: serving on %lld (%s)\n  certificate: %s, until %s\n               sha256 %s\n",
+                        tls.integer("port"), tls.str("engine").c_str(), c.str("subject").c_str(),
+                        c.str("not_after").c_str(), c.str("fingerprint").c_str());
+            if (tls["client_ca"].type == json::Value::Object) {
+                std::printf("  client certificates: %s, from %s\n", tls.str("client_certificates").c_str(),
+                            tls["client_ca"].str("subject").c_str());
+            } else {
+                std::printf("  client certificates: none asked for\n");
+            }
+            std::printf("  certificate login: %s\n", tls.flag("certificate_login") ? "on" : "off");
+        }
+        if (reply.flag("restart_required")) std::printf("the running server is behind these settings - restart it to apply them\n");
+    } else if (action == "check") {
+        std::printf("these settings would load\n");
+    } else {
+        std::printf("stored%s\n", reply.flag("restarting") ? " - the server is restarting to apply them"
+                                   : reply.flag("restart_required") ? " - restart the server to apply them"
+                                   : reply.flag("tls_applied") ? " - and the TLS listener is serving it now" : "");
+    }
     return 0;
 }
 

@@ -42,11 +42,13 @@ Every MQTT message becomes one record in **`mqtt-messages`**:
 
 | Part of the record | What it holds | Example |
 | --- | --- | --- |
-| **key** | the MQTT topic | `plant/tank-01/level` |
+| **key** | which device published it: its MQTT client id (no key if an app sent it through Kafka) | `tank-01` |
 | **value** | the payload, byte for byte as the device sent it | `4.25` |
+| header `mqtt-topic` | the MQTT topic | `plant/tank-01/level` |
 | header `mqtt-qos` | the QoS it was published at | `1` |
 | header `mqtt-retain` | whether it was a retained message | `false` |
-| header `mqtt-clientid` | which device published it (none if an app sent it through Kafka) | `tank-01` |
+| header `mqtt-clientid` | the device again, as the key (absent if an app sent it through Kafka) | `tank-01` |
+| header `mqtt-username` | the login it connected with, as the broker checked it (absent without one) | `tank-01` |
 | headers `mqtt-content-type`, `mqtt-response-topic`, `mqtt-correlation-data`, `mqtt-message-expiry-interval`, `mqtt-payload-format-indicator` | MQTT 5 properties, when the device set them | `application/json` |
 | any other header | the device's MQTT 5 user properties, by name | `site` = `nz` |
 
@@ -55,8 +57,10 @@ send JSON (parse it in your app), and binary for Sparkplug B (decode it with a
 Sparkplug library, such as `sparkplug-payload` for Node.js or Eclipse Tahu for
 Python).
 
-**Order:** messages on one MQTT topic arrive in the order they were published,
-because they share a key. Messages on different topics may interleave.
+**Order:** each device's messages arrive in the order it sent them, because
+they share a key, and so a partition - whichever topics they were on. That is
+the order MQTT itself promises. Messages from different devices may
+interleave.
 
 ## Sending to your devices
 
@@ -73,8 +77,12 @@ subscribed to that topic receives it. Both rules - the key as the topic, QoS
 [kafka.md](kafka.md#kafka--mqtt) shows how to change them (a fixed topic, a
 different QoS, retained, properties).
 
+The key means something different in each direction: here it is the topic to
+publish on; on `mqtt-messages` it is the device that published. Each is its
+own mapping in `modbee.yaml`, and each is set the way that suits it.
+
 You will also see your own command come back on `mqtt-messages` - everything
-published on MQTT goes there, including what apps send. It has no
+published on MQTT goes there, including what apps send. It has no key and no
 `mqtt-clientid` header, which is how you tell it apart. It never loops: modbee
 does not write a message back to the Kafka topic it came from.
 
@@ -186,9 +194,9 @@ Reading an MQTT message:
 await consumer.subscribe({ topics: ["mqtt-messages"] });
 await consumer.run({
   eachMessage: async ({ message }) => {
-    const mqttTopic = message.key.toString();     // plant/tank-01/level
-    const payload = message.value.toString();     // 4.25
-    const device = message.headers["mqtt-clientid"]?.toString();
+    const mqttTopic = message.headers["mqtt-topic"]?.toString();   // plant/tank-01/level
+    const payload = message.value?.toString() ?? "";                // 4.25
+    const device = message.key?.toString();                         // tank-01, or none from an app
   },
 });
 ```
@@ -224,19 +232,22 @@ while True:
     record = consumer.poll(1.0)
     if record is None or record.error():
         continue
-    mqtt_topic = record.key().decode()     # the MQTT topic
-    payload = record.value()               # the MQTT payload, as bytes
     headers = {name: value.decode() for name, value in (record.headers() or [])}
+    mqtt_topic = headers.get("mqtt-topic")   # the MQTT topic
+    payload = record.value() or b""         # the MQTT payload, as bytes
+    device = record.key()                    # the publisher's client id; None from an app
     print(mqtt_topic, payload.decode(errors="replace"), headers.get("mqtt-qos"))
 
-    if mqtt_topic == "plant/tank-01/level" and float(payload) > 8:
+    # An empty payload clears a retained message; it is not a reading.
+    if mqtt_topic == "plant/tank-01/level" and payload.strip() and float(payload) > 8:
         producer.produce("mqtt-commands", key="plant/pump-2/cmd", value="stop")
         producer.flush()
 ```
 
 **Any other language** works the same way with any Kafka client: connect to
-the address above, read `mqtt-messages` under a group id of your choosing, and
-write records keyed by MQTT topic to `mqtt-commands`.
+the address above, read `mqtt-messages` under a group id of your choosing
+(the MQTT topic is the `mqtt-topic` header), and write records keyed by MQTT
+topic to `mqtt-commands`.
 
 ---
 

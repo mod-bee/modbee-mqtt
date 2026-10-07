@@ -54,11 +54,13 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee bench` | Load generator, Linux only: `conn`, `pub`, `sub` |
 | `modbee serve` | The broker, Linux only: one `MqttBroker` per core behind one port, with the Kafka pipe |
 | `modbee check` | Validate a `modbee.yaml` and report every problem with its line |
-| `modbee user` | Device logins on a broker: `list`, `show`, `add`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart ([logins.md](logins.md)) |
+| `modbee user` | Device logins on a broker: `list`, `show`, `add`, `set`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart. `add` and `set` take `--fingerprint`, binding a login to one client certificate ([logins.md](logins.md#logging-in-with-a-certificate)) |
 | `modbee key` | Provisioning keys, with which devices register themselves: `create`, `list`, `remove` |
 | `modbee provision` | Register a device with a key from a computer, and print the login it was given |
-| `modbee backup` | A copy of a broker's login database |
+| `modbee config` | A broker's settings, kept in its login database: `get`, `set`, `apply`, `check`, `reset` - applied at its next restart, which `--restart` asks for, except the TLS certificate, key and client CA, which apply at once (`broker.tls.cert-pem=@file`; [settings.md](settings.md)) |
+| `modbee backup` | A copy of a broker's login database, and the settings kept in it |
 | `modbee restore` | Put a backup of the login database back, with the broker stopped |
+| `modbee --version` | The version, and the TLS engine this build was compiled with: `modbee 0.1.0 (TLS: wolfSSL)` |
 
 **Exit codes, for scripts:**
 
@@ -158,6 +160,7 @@ modbee serve -C modbee.yaml                              # everything from the f
 modbee serve -c 200000                                   # plain MQTT on 1883, one shard per core
 modbee serve --tls-port 8883 --cert broker.pem --key broker.key
 modbee serve --no-plain --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem
+modbee serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem --client-certificates optional
 ```
 
 - **One broker per core, on one port.** Each shard is an `MqttBroker` on its
@@ -177,9 +180,17 @@ modbee serve --no-plain --tls-port 8883 --cert broker.pem --key broker.key --cli
   Kafka (with a `kafka:` section in the file). Memory only is the default.
   [docker.md](docker.md#where-messages-are-kept) compares the three.
 - **TLS** listens beside plain TCP on `--tls-port`, or alone with
-  `--no-plain`. The shards share one TLS context, so a session ticket from one
-  is honoured by all of them. `--client-ca` makes it mutual TLS: every client
-  must present a certificate that CA signed.
+  `--no-plain`. On OpenSSL the shards share one TLS context, so a session
+  ticket from one is honoured by all of them; on wolfSSL each shard has its
+  own ([security.md](security.md#the-broker-images-wolfssl)). `--client-ca` makes it mutual TLS: every client
+  must present a certificate that CA signed - or, with
+  `--client-certificates optional`, may, and logs in with a password if it
+  does not. The start-up line names the engine:
+  `tls 8883 (wolfSSL, client certificates required)`. With
+  `authentication: certificate-login: true` the certificate is the login
+  ([logins.md](logins.md#logging-in-with-a-certificate)), and the
+  certificate, key and client CA can be changed while it runs
+  ([settings.md](settings.md#the-tls-material-applied-while-it-runs)).
 - **Shared subscriptions work across shards.** Each message to
   `$share/<name>/<filter>` reaches one member of the group in the whole
   server. The shard it was published on chooses which shard delivers it,
@@ -189,7 +200,11 @@ modbee serve --no-plain --tls-port 8883 --cert broker.pem --key broker.key --cli
   [kafka.md](kafka.md). `modbee check -C modbee.yaml` validates a file
   without starting anything, and exits 0 only if it would load.
 - **`--metrics-port 9464`** (or a `metrics:` section) serves Prometheus
-  `/metrics` and `/healthz`.
+  `/metrics`, `/healthz` (the process answers) and `/readyz` (it is ready
+  for clients - [kafka.md](kafka.md#metrics)).
+- **Settings kept in the database.** With `authentication: database:`, what
+  `modbee config` has stored goes over the file, and under the environment
+  and these flags ([settings.md](settings.md#which-value-wins)).
 
 **What a connection costs**, measured on Linux with idle connections:
 

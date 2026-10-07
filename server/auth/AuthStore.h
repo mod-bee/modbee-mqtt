@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct AuthUser {
@@ -43,6 +44,10 @@ struct AuthUser {
     std::string provisionedBy;           // the key's name, or "" if added by an admin
     int64_t created = 0;                 // UTC seconds
     int64_t updated = 0;
+    // SHA-256 of the one client certificate this login may log in with
+    // (authentication.certificate-login): 64 lowercase hex, or "" for any
+    // certificate whose CN is this login's name.
+    std::string fingerprint;
 };
 
 struct AuthKey {
@@ -86,6 +91,13 @@ public:
     // One use of a key; false if it has none left.
     bool spendKey(const std::string& name);
 
+    // --- The server's own settings (ServerConfig.h, "Settings kept in the
+    // database"), beside the logins so one file backs up both ---
+    bool getSetting(const std::string& name, std::string& out);
+    AuthResult putSetting(const std::string& name, const std::string& value);
+    AuthResult removeSetting(const std::string& name);
+    bool listSettings(const std::string& prefix, std::vector<std::pair<std::string, std::string>>& out);
+
     // A consistent copy of the whole database, made while it is in use.
     bool backup(const std::string& toPath, std::string& error);
 
@@ -100,6 +112,8 @@ public:
 
 private:
     bool exec(const char* sql);
+    // Adds `column` to `table` if it is not there yet. True if it is now.
+    bool hasColumn(const char* table, const char* column, const char* declaration);
     void changed() { _generation.fetch_add(1, std::memory_order_acq_rel); }
 
     std::string _path;

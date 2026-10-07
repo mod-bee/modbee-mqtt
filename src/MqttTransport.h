@@ -158,4 +158,19 @@ public:
     // on. Defaulted to empty, so a medium that has no answer gives none and no
     // existing implementation has to change.
     virtual const char* peerName() const { return ""; }
+
+    // A certificate the far end presented AND the engine verified against the
+    // authority it was told to trust: the subject's Common Name, and SHA-256
+    // over the certificate's DER as 64 lowercase hexadecimal characters. Both
+    // empty when there was no such certificate - a plain medium, a TLS peer
+    // that offered none, or one nobody asked.
+    //
+    // For the same hook peerName() serves, and one step stronger: where a
+    // connection came from is a claim about the network, while a verified
+    // certificate is a claim the authority signed. A certificate that was
+    // offered and NOT verified never reaches here - the handshake failed and
+    // there is no connection to ask. Defaulted to empty for the same reason
+    // peerName() is.
+    virtual const char* peerCertificateName() const { return ""; }
+    virtual const char* peerCertificateFingerprint() const { return ""; }
 };

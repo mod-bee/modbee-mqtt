@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "AuthGate.h"
+#include "AdminReply.h"
 #include "AuthHash.h"
 #include "Json.h"
 
@@ -16,6 +17,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
+
+using admin_reply::failure;
+using admin_reply::reply;
 
 namespace {
 
@@ -53,6 +57,22 @@ bool safeName(const std::string& name, size_t maximum = 128) {
     if (name.empty() || name.size() > maximum || name[0] == '$') return false;
     for (unsigned char c : name) {
         if (c < 0x20 || c == 0x7F || c == '/' || c == '+' || c == '#') return false;
+    }
+    return true;
+}
+
+// A LOGIN NAME: anything MQTT allows in a user name, except a leading $ and
+// control characters. "/" IS allowed - a platform names its devices
+// "<namespace>/<device>" - and that is safe because a ${username} rule never
+// widens: expand() refuses to put a value with / + or # into a filter, so the
+// rule simply does not match for such a login (Mosquitto's answer to
+// CVE-2017-7650). Such a login gets its topics from explicit rules instead.
+// A name that BECOMES a topic - a device registering itself, a key's device -
+// keeps the strict safeName.
+bool loginNameOk(const std::string& name) {
+    if (name.empty() || name.size() > 256 || name[0] == '$') return false;
+    for (unsigned char c : name) {
+        if (c < 0x20 || c == 0x7F) return false;
     }
     return true;
 }
@@ -122,21 +142,28 @@ bool covers(const std::string& allowed, const std::string& requested) {
     return a.size() == r.size() || (a.size() == r.size() + 1 && a.back() == "#");
 }
 
-std::string reply(const json::Value& request, bool ok, json::Object body = json::Object()) {
-    if (request.has("id")) {
-        const json::Value& id = request["id"];
-        if (id.type == json::Value::String) body.add("id", id.text);
-        else if (id.type == json::Value::Number) body.add("id", (long long)id.number);
+// A certificate fingerprint as somebody pasted it - colons, spaces, upper
+// case, and openssl's own "sha256 Fingerprint=" in front - reduced to the 64
+// lowercase hexadecimal characters a verified certificate is compared by.
+// Empty stays empty: no certificate bound. False if what is left is not
+// SHA-256, because a fingerprint that can never match locks a device out
+// with no message saying why.
+bool certificateFingerprint(const std::string& typed, std::string& out) {
+    out.clear();
+    const size_t equals = typed.rfind('=');
+    const std::string value = equals == std::string::npos ? typed : typed.substr(equals + 1);
+    for (char c : value) {
+        if (c == ':' || c == ' ' || c == '-' || c == '\t' || c == '\n' || c == '\r') continue;
+        if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        out.push_back(c);
     }
-    body.add("ok", ok);
-    return body.str();
+    return out.empty() || out.size() == 64;
 }
 
-std::string failure(const json::Value& request, const std::string& error) {
-    json::Object body;
-    body.add("error", error);
-    return reply(request, false, body);
-}
+const char kFingerprintError[] =
+    "fingerprint is the SHA-256 of the device's certificate: 64 hexadecimal characters "
+    "(openssl x509 -noout -fingerprint -sha256 -in device.crt), or \"\" to clear it";
 
 std::string describeUser(const AuthUser& u) {
     json::Object o;
@@ -149,7 +176,8 @@ std::string describeUser(const AuthUser& u) {
         .raw("subscribe", json::array(u.subscribe))
         .add("provisioned_by", u.provisionedBy)
         .add("created", (long long)u.created)
-        .add("updated", (long long)u.updated);
+        .add("updated", (long long)u.updated)
+        .add("fingerprint", u.fingerprint);
     return o.str();
 }
 
@@ -196,6 +224,7 @@ AuthGate::~AuthGate() {
 
 bool AuthGate::begin(size_t shards, std::string& error) {
     if (!_store.open(_config.database, shards, error)) return false;
+    rememberRunningSettings();
     _shards.clear();
     for (size_t i = 0; i < shards; i++) {
         std::unique_ptr<Shard> shard(new Shard());
@@ -283,6 +312,10 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
     const std::string clientId = text(request.clientId);
 
     if (request.action == MqttBrokerAction::Connect) {
+        if (_config.certificateLogin && request.certificateName != nullptr &&
+            request.certificateName[0] != '\0') {
+            return certificateLogin(shard, request, reasonCode);
+        }
         reasonCode = MQ_REASON_BAD_USER_NAME_OR_PASSWORD;
         bool ok = false;
         if (username == kProvisionUser) {
@@ -349,6 +382,58 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
         if (publish ? mq_topicMatches(spanOf(filter), spanOf(topic)) : covers(filter, topic)) return true;
     }
     return false;
+}
+
+// A CONNECT whose client certificate the TLS handshake verified, on a server
+// with certificate-login: the certificate IS the credential (docs/logins.md).
+//
+//   the login        the certificate's CN - and if the CONNECT names a user,
+//                    it must be that one, or a device could present its own
+//                    certificate and ask to be somebody else
+//   the password     not asked: the handshake proved the private key
+//   the login record must exist, be enabled and approved; its permissions
+//                    apply exactly as for a password login
+//   a fingerprint    on the record binds it to ONE certificate: another one
+//                    the same CA issued with the same CN is refused
+//
+// Every refusal is counted with the rest and said on stderr, with the CN and
+// the fingerprint - the two things an operator needs to find the device and
+// the certificate, neither of them a secret.
+bool AuthGate::certificateLogin(Shard& shard, const MqttBrokerRequest& request, uint8_t& reasonCode) {
+    const std::string name = request.certificateName;
+    const std::string fingerprint = request.certificateFingerprint ? request.certificateFingerprint : "";
+    const std::string offered = text(request.userName);
+    const auto refuse = [&](uint8_t code, const char* why) {
+        reasonCode = code;
+        _refused.fetch_add(1, std::memory_order_relaxed);
+        _certificateRefused.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "modbee serve: certificate login refused for \"%s\" from %s (certificate %s): %s\n",
+                     name.c_str(), request.peerName ? request.peerName : "?", fingerprint.c_str(), why);
+        return false;
+    };
+    if (!offered.empty() && offered != name) {
+        return refuse(MQ_REASON_BAD_USER_NAME_OR_PASSWORD,
+                      "the CONNECT's user name is not the certificate's CN");
+    }
+    bool fixed = isFixedAdmin(name);
+    for (const auto& login : _config.logins) fixed = fixed || login.first == name;
+    if (!fixed) {
+        AuthUser user;
+        if (!_store.getUser(shard.index, name, user)) {
+            return refuse(MQ_REASON_BAD_USER_NAME_OR_PASSWORD, "no login has that name");
+        }
+        if (!user.enabled || user.pending) {
+            return refuse(MQ_REASON_NOT_AUTHORIZED, "the login is disabled or waiting for approval");
+        }
+        if (!user.fingerprint.empty() && user.fingerprint != fingerprint) {
+            return refuse(MQ_REASON_BAD_USER_NAME_OR_PASSWORD,
+                          "the login is bound to a different certificate (its fingerprint)");
+        }
+    }
+    if (request.login != nullptr) *request.login = name;
+    _accepted.fetch_add(1, std::memory_order_relaxed);
+    _certificateAccepted.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 // =============================================================================
@@ -428,6 +513,9 @@ void AuthGate::service(uint32_t shard, MqttBroker& broker) {
         out.retain = false;
         broker.publishMessage(out);
     }
+    // config.* with "restart": true - after the reply has been sent, so the
+    // asker hears that the change was stored before the server goes.
+    if (_restartAfterReply.exchange(false) && _config.restart) _config.restart(_config.restartContext);
 }
 
 void AuthGate::stop(uint32_t, MqttBroker&) {
@@ -521,7 +609,9 @@ std::string AuthGate::admin(const std::string& requestText) {
     };
 
     if (command == "user.add") {
-        if (!safeName(username)) return failure(request, "a user name may not be empty, start with $, or contain / + #");
+        if (!loginNameOk(username)) {
+            return failure(request, "a user name may not be empty, longer than 256, start with $, or hold control characters");
+        }
         if (isFixedAdmin(username)) return failure(request, "that name is the admin login");
         AuthUser u;
         u.username = username;
@@ -530,6 +620,9 @@ std::string AuthGate::admin(const std::string& requestText) {
             return failure(request, "publish and subscribe are lists of valid topic filters");
         }
         u.admin = request.flag("admin");
+        if (request.has("fingerprint") && !certificateFingerprint(request.str("fingerprint"), u.fingerprint)) {
+            return failure(request, kFingerprintError);
+        }
         const std::string chosen = request.str("password");
         const std::string secret = chosen.empty() ? auth::generateSecret(32) : chosen;
         u.generated = chosen.empty();
@@ -564,6 +657,62 @@ std::string AuthGate::admin(const std::string& requestText) {
         json::Object o;
         o.raw("users", items).add("total", (long long)_store.userCount());
         if ((long long)users.size() == limit) o.add("next", users.back().username);
+        return reply(request, true, o);
+    }
+    if (command == "user.set") {
+        // Several fields of one login at once - whichever the request names,
+        // and nothing else. For a platform that keeps its own view of a
+        // device and writes it back whole.
+        AuthUser u;
+        if (!needUser(u)) return failure(request, "no user " + username);
+        bool changed = false, kickAfter = false;
+        if (request.has("fingerprint")) {
+            std::string fingerprint;
+            if (!certificateFingerprint(request.str("fingerprint"), fingerprint)) {
+                return failure(request, kFingerprintError);
+            }
+            // A new binding cuts off whatever certificate is connected now; a
+            // cleared one takes nothing away.
+            kickAfter = kickAfter || (!fingerprint.empty() && fingerprint != u.fingerprint);
+            u.fingerprint = fingerprint;
+            changed = true;
+        }
+        if (request.has("publish") || request.has("subscribe")) {
+            std::vector<std::string> publish = u.publish, subscribe = u.subscribe;
+            if ((request.has("publish") && !request.strings("publish", publish)) ||
+                (request.has("subscribe") && !request.strings("subscribe", subscribe)) ||
+                !filtersOk(publish) || !filtersOk(subscribe)) {
+                return failure(request, "publish and subscribe are lists of valid topic filters");
+            }
+            u.publish = publish;
+            u.subscribe = subscribe;
+            kickAfter = changed = true;
+        }
+        if (request.has("admin")) {
+            u.admin = request.flag("admin");
+            kickAfter = kickAfter || !u.admin;
+            changed = true;
+        }
+        if (request.has("enabled")) {
+            u.enabled = request.flag("enabled", true);
+            kickAfter = kickAfter || !u.enabled;
+            changed = true;
+        }
+        if (request.has("password")) {
+            const std::string chosen = request.str("password");
+            if (chosen.empty()) return failure(request, "password may not be empty");
+            u.hash = auth::hashChosen(chosen);
+            u.generated = false;
+            kickAfter = changed = true;
+        }
+        if (!changed) {
+            return failure(request, "user.set changes fingerprint, publish, subscribe, admin, enabled "
+                                    "or password - the request named none of them");
+        }
+        if (_store.putUser(u, true) != AuthResult::Ok) return failure(request, "the login store could not be written");
+        if (kickAfter) kick(username);
+        json::Object o;
+        o.add("username", username).raw("user", describeUser(u));
         return reply(request, true, o);
     }
     if (command == "user.remove") {
@@ -663,6 +812,7 @@ std::string AuthGate::admin(const std::string& requestText) {
         o.add("file", path);
         return reply(request, true, o);
     }
+    if (command.compare(0, 7, "config.") == 0) return configCommand(command, request);
     if (command == "status") {
         const AuthGateStatus s = status();
         json::Object o;
@@ -670,6 +820,8 @@ std::string AuthGate::admin(const std::string& requestText) {
             .add("accepted", (long long)s.accepted)
             .add("refused", (long long)s.refused)
             .add("provisioned", (long long)s.provisioned)
+            .add("certificate_accepted", (long long)s.certificateAccepted)
+            .add("certificate_refused", (long long)s.certificateRefused)
             .add("database", _store.path())
             .add("last_backup", lastBackup());
         return reply(request, true, o);
@@ -728,5 +880,7 @@ AuthGateStatus AuthGate::status() const {
     s.refused = _refused.load();
     s.provisioned = _provisioned.load();
     s.kicked = _kicked.load();
+    s.certificateAccepted = _certificateAccepted.load();
+    s.certificateRefused = _certificateRefused.load();
     return s;
 }

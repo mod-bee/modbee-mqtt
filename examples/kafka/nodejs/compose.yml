@@ -4,7 +4,8 @@
 #   docker compose logs -f
 #
 # It joins the all-in-one stack's network, "modbee", so it reaches Kafka by
-# name at kafka:9092 - no ports to open.
+# name at kafka:9092 - no ports to open. If MODBEE_NETWORK renamed that
+# network, set the same MODBEE_NETWORK here.
 services:
   tank-rule:
     build: .
@@ -15,5 +16,5 @@ services:
 
 networks:
   default:
-    name: modbee
+    name: ${MODBEE_NETWORK:-modbee}
     external: true

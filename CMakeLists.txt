@@ -134,6 +134,7 @@ set(MQTT_SOURCES
     src/transport/MqttTcpTransport.cpp
     src/transport/MqttTlsTransport.cpp
     src/transport/MqttIdentity.cpp
+    src/transport/MqttCertificate.cpp
     src/codec/MqttCodecV5.cpp
     src/codec/MqttCodecV311.cpp
 )

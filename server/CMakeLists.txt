@@ -64,13 +64,20 @@ target_include_directories(modbee-server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(modbee-server PUBLIC cxx_std_17)
 
 # --- device logins, live: authentication: database: (server/auth/) ---
-add_library(modbee-auth STATIC auth/AuthHash.cpp auth/Json.cpp auth/AuthStore.cpp auth/AuthGate.cpp)
-target_link_libraries(modbee-auth PUBLIC modbee-server modbee-sqlite)
+add_library(modbee-auth STATIC auth/AuthHash.cpp auth/Json.cpp auth/AuthStore.cpp auth/AuthGate.cpp
+    auth/AuthGateSettings.cpp auth/TlsSettings.cpp)
+target_link_libraries(modbee-auth PUBLIC modbee-server modbee-sqlite modbee-config)
 target_include_directories(modbee-auth PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/auth)
 target_compile_features(modbee-auth PUBLIC cxx_std_17)
 if(NOT MSVC)
     target_compile_options(modbee-auth PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
 endif()
+
+# --- what clients do, as messages: events: (server/events/) ---
+add_library(modbee-events STATIC events/BrokerEvents.cpp)
+target_link_libraries(modbee-events PUBLIC modbee-server)
+target_include_directories(modbee-events PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/events)
+target_compile_features(modbee-events PUBLIC cxx_std_17)
 
 # --- retained messages that outlive a restart: retained: store: file ---
 add_library(modbee-retained STATIC retained/RetainedKeeper.cpp)

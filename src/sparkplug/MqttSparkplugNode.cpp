@@ -1356,13 +1356,55 @@ void MqttSparkplugNode::handleState(const uint8_t* payload, size_t length) {
     _client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
 }
 
+const char* mq_sparkplugCommandOutcomeName(MqttSparkplugCommandOutcome outcome) {
+    switch (outcome) {
+        case MqttSparkplugCommandOutcome::Applied:       return "applied";
+        case MqttSparkplugCommandOutcome::Undecodable:   return "undecodable";
+        case MqttSparkplugCommandOutcome::UnknownDevice: return "unknown device";
+        case MqttSparkplugCommandOutcome::UnknownMetric: return "unknown metric";
+        case MqttSparkplugCommandOutcome::ReadOnly:      return "read only";
+        case MqttSparkplugCommandOutcome::WrongType:     return "wrong type";
+        case MqttSparkplugCommandOutcome::NotARequest:   return "not a request";
+    }
+    return "?";
+}
+
+void MqttSparkplugNode::deliverCommand(MqttSparkplugCommand& command) {
+    if (_commandHandler) _commandHandler(command);
+    if (_commandContextHandler) {
+        _commandContextHandler(_commandContext, command);
+    }
+}
+
+void MqttSparkplugNode::refuseCommand(const char* device, const char* name,
+                                      uint64_t alias,
+                                      const MqttSparkplugValue& value,
+                                      MqttSparkplugCommandOutcome outcome) {
+    if (_refusedHandler == nullptr && _refusedContextHandler == nullptr) return;
+    MqttSparkplugCommand command;
+    command.device = device;
+    command.name = name;
+    command.alias = alias;
+    command.value = value;
+    command.outcome = outcome;
+    if (_refusedHandler) _refusedHandler(command);
+    if (_refusedContextHandler) _refusedContextHandler(_refusedContext, command);
+}
+
 void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
                                       const uint8_t* payload, size_t length) {
+    const char* const deviceId = parts.hasDevice ? parts.device : nullptr;
+
     const MqttSparkplugError error =
         mq_sparkplugDecode(payload, length, _inbound);
     if (error != MqttSparkplugError::None) {
         _lastPayloadError = error;
         _commandsRefused++;
+        // One report for the message: there are no metrics to report on, and
+        // a host sending something that is not Sparkplug at all is a fault
+        // worth seeing by itself.
+        refuseCommand(deviceId, nullptr, 0, MqttSparkplugValue(),
+                      MqttSparkplugCommandOutcome::Undecodable);
         return;
     }
 
@@ -1370,7 +1412,14 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
     if (parts.hasDevice) {
         const int index = findDeviceIndex(parts.device);
         if (index < 0) {
+            // Counted once for the message, as it always was; reported once
+            // per metric, so whoever is watching sees what was asked for.
             _commandsRefused++;
+            for (size_t m = 0; m < _inbound.metricCount; m++) {
+                const MqttSparkplugMetric& metric = _inbound.metrics[m];
+                refuseCommand(deviceId, metric.name, metric.alias, metric.value,
+                              MqttSparkplugCommandOutcome::UnknownDevice);
+            }
             return;
         }
         device = (int16_t)index;
@@ -1382,8 +1431,17 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
         // A command may carry only an alias
         // [tck-id-payloads-alias-data-cmd-requirement], so the alias table is
         // tried first and the name second.
+        //
+        // AND THE ALIAS MUST BELONG TO THE TOPIC'S DEVICE. Aliases are unique
+        // across the whole node [tck-id-payloads-alias-uniqueness], so an
+        // alias alone names exactly one point - but a DCMD for pump1 carrying
+        // the alias of a node-level setpoint is a host addressing the wrong
+        // thing, and applying it would write a metric the topic never named.
         int point = -1;
-        if (metric.hasAlias) point = findPointByAlias(metric.alias);
+        if (metric.hasAlias) {
+            point = findPointByAlias(metric.alias);
+            if (point >= 0 && _points[point].device != device) point = -1;
+        }
         if (point < 0 && metric.name != nullptr) {
             point = findPointIndex(metric.name, device);
         }
@@ -1408,6 +1466,13 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
               metric.alias == MQ_SP_ALIAS_DEVICE_REBIRTH));
 
         if (isRebirthRequest) {
+            // The name we know it by, not the name it arrived with - which,
+            // for a conformant host using aliases, is none.
+            const char* const rebirthName =
+                metric.name != nullptr ? metric.name
+                : metric.alias == MQ_SP_ALIAS_DEVICE_REBIRTH
+                    ? MQ_SP_METRIC_DEVICE_REBIRTH
+                    : MQ_SP_METRIC_NODE_REBIRTH;
             const bool asked = metric.value.type ==
                                        MqttSparkplugDataType::Boolean
                                    ? metric.value.as.boolean
@@ -1433,18 +1498,18 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
                 _commandsApplied++;
 
                 MqttSparkplugCommand command;
-                command.device = parts.hasDevice ? parts.device : nullptr;
-                // The name we know it by, not the name it arrived with -
-                // which, for a conformant host using aliases, is none.
-                command.name = metric.name != nullptr
-                                   ? metric.name
-                                   : MQ_SP_METRIC_NODE_REBIRTH;
+                command.device = deviceId;
+                command.name = rebirthName;
+                command.alias = metric.alias;
                 command.isRebirth = true;
                 command.value = metric.value;
-                if (_commandHandler) _commandHandler(command);
-                if (_commandContextHandler) {
-                    _commandContextHandler(_commandContext, command);
-                }
+                deliverCommand(command);
+            } else {
+                // Not counted either way, as before: false asks for nothing,
+                // and nothing was refused. Reported, because a host that
+                // sends it believes it asked for something.
+                refuseCommand(deviceId, rebirthName, metric.alias, metric.value,
+                              MqttSparkplugCommandOutcome::NotARequest);
             }
             continue;
         }
@@ -1454,6 +1519,8 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
             // a Host Application writing to the wrong name shows up here and
             // nowhere else.
             _commandsRefused++;
+            refuseCommand(deviceId, metric.name, metric.alias, metric.value,
+                          MqttSparkplugCommandOutcome::UnknownMetric);
             continue;
         }
         if (!_points[point].writable) {
@@ -1461,20 +1528,23 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
             // thinks it can write a sensor reading should find out, and
             // applying it would let a stale command overwrite a live reading.
             _commandsRefused++;
+            refuseCommand(deviceId, _points[point].name.c_str(),
+                          _points[point].alias, metric.value,
+                          MqttSparkplugCommandOutcome::ReadOnly);
             continue;
         }
         // [tck-id-payloads-metric-datatype-not-req] A command SHOULD NOT carry
         // a datatype; the one this node declared is applied, and a value that
         // cannot be that type is refused like a mismatch.
-        if (metric.datatypeAbsent &&
-            !mq_sparkplugApplyDatatype(metric, _points[point].type) &&
-            !metric.valueUnsupported) {
+        if ((metric.datatypeAbsent &&
+             !mq_sparkplugApplyDatatype(metric, _points[point].type) &&
+             !metric.valueUnsupported) ||
+            (metric.value.type != _points[point].type &&
+             !metric.value.isNull)) {
             _commandsRefused++;
-            continue;
-        }
-        if (metric.value.type != _points[point].type &&
-            !metric.value.isNull) {
-            _commandsRefused++;
+            refuseCommand(deviceId, _points[point].name.c_str(),
+                          _points[point].alias, metric.value,
+                          MqttSparkplugCommandOutcome::WrongType);
             continue;
         }
 
@@ -1483,17 +1553,14 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
         _commandsApplied++;
 
         MqttSparkplugCommand command;
-        command.device = parts.hasDevice ? parts.device : nullptr;
+        command.device = deviceId;
         // The name as WE declared it, not as it arrived - a command carrying
         // only an alias has no name at all, and the caller wants the one they
         // wrote in their own code.
         command.name = _points[point].name.c_str();
         command.alias = _points[point].alias;
         command.value = metric.value;
-        if (_commandHandler) _commandHandler(command);
-        if (_commandContextHandler) {
-            _commandContextHandler(_commandContext, command);
-        }
+        deliverCommand(command);
     }
 }
 
@@ -1505,6 +1572,16 @@ void MqttSparkplugNode::onCommand(MqttSparkplugCommandContextFn handler,
                                   void* context) {
     _commandContextHandler = handler;
     _commandContext = context;
+}
+
+void MqttSparkplugNode::onCommandRefused(MqttSparkplugCommandFn handler) {
+    _refusedHandler = handler;
+}
+
+void MqttSparkplugNode::onCommandRefused(MqttSparkplugCommandContextFn handler,
+                                         void* context) {
+    _refusedContextHandler = handler;
+    _refusedContext = context;
 }
 
 bool MqttSparkplugNode::commandPending(const char* name) const {

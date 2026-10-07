@@ -1065,8 +1065,10 @@ the older `available()` plus one-byte `read()`, which the base class loops for
 you. A transport written against the byte-wise pair compiles and runs untouched;
 `test/test_link.cpp` keeps one around as a standing check that it still does.
 
-Four further methods are defaulted and can be ignored: `waitHandle()`,
-`hasBufferedInput()`, `peerClosed()` and `peerName()`. The first two are how a
+Six further methods are defaulted and can be ignored: `waitHandle()`,
+`hasBufferedInput()`, `peerClosed()`, `peerName()`, and
+`peerCertificateName()` / `peerCertificateFingerprint()` - the CN and SHA-256
+of a client certificate a TLS listener verified, empty otherwise. The first two are how a
 host broker asks the kernel which connections have something to say instead of
 asking every connection in turn; a board overrides neither and polls exactly as
 it always did. See [extending.md](extending.md) for why that pair exists and
@@ -1159,11 +1161,58 @@ if (!secure.begin()) {
 broker.addListener(secure);
 ```
 
+`requestClientCertificate(caPem)` in place of `requireClientCertificate`
+asks for a client certificate without demanding one: one that is offered must
+verify, and a client that offers none is let through. Either way an accepted
+connection's `peerCertificateName()` and `peerCertificateFingerprint()` are the
+verified certificate's CN and SHA-256.
+
+**Changing the certificate of a running listener.** The new context is made
+first, away from the socket, so a pair that will not load is refused while the
+old one is still served; then it is swapped in on the thread that calls
+`accept()`. Connections already accepted keep the context they shook hands
+with.
+
+```cpp
+MqttTlsListener maker;                               // never begun: it only builds
+maker.useCertificate(newCertPem, newKeyPem);
+maker.requireClientCertificate(caPem);
+void* context = maker.makeContext();                 // null, with maker.lastError(), if it will not load
+if (context) secure.useContext(context);             // on the accept() thread; secure owns it now
+```
+
+`shareContext()` gives another reference to the same context where the engine
+shares one across threads (OpenSSL) and null where it does not (wolfSSL);
+`dropContext()` frees one nobody took.
+
 `boundPort()` reports what was actually bound, which differs from what was
 asked for whenever port 0 was requested — how a test gets a free port without
 racing. `active()` and `capacityRemaining()` say how many slots are in use; the
 broker reads `capacityRemaining()` to decide whether an arriving connection gets
 a session or a `0x89 Server Busy`.
+
+### What a certificate says
+
+`transport/MqttCertificate.h` reads a certificate the same way on both
+engines - the engine supplies the DER, one parser reads it:
+
+```cpp
+MqttCertificateFacts facts;
+std::string why;
+if (mqttReadCertificate(pem, facts, why)) {
+    // facts.fingerprint  SHA-256 of the DER, 64 lowercase hex
+    // facts.commonName   "" unless the subject has exactly one CN
+    // facts.subject      "O=Plant, CN=plc-01", in the certificate's order
+    // facts.notAfter     "2036-10-04T09:33:00Z", and notAfterSeconds
+    // facts.names        "DNS:plc-01", "IP:10.0.0.10"
+}
+mqttCertificateMatchesKey(certPem, keyPem, why);     // the key is this certificate's own
+mqttCountCertificates(bundlePem);                    // a CA bundle's size
+```
+
+This fingerprint is of the whole certificate, where `MqttIdentity`'s is of the
+key: a login bound to a certificate should not survive its reissue, a pin
+should.
 
 ### Listening from a board
 

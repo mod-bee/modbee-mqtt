@@ -150,6 +150,23 @@ The written value is the metric's value from then on, and the next
 `publishChanged()` reports it back, so the SCADA system sees the write take
 effect.
 
+A write the node refuses is not given to `onCommand()` - so an application
+that acts on what its handler is given never acts on one - but it can be seen,
+with the reason, through `onCommandRefused()`:
+
+```cpp
+void onRefused(const MqttSparkplugCommand& command) {
+    // command.outcome: UnknownDevice, UnknownMetric, ReadOnly, WrongType,
+    // Undecodable or NotARequest - mq_sparkplugCommandOutcomeName() names it
+    log(command.name, mq_sparkplugCommandOutcomeName(command.outcome));
+}
+
+node.onCommandRefused(&onRefused);
+```
+
+Between the two handlers every metric of every NCMD and DCMD is reported
+exactly once; `command.applied()` says which side it came from.
+
 ### Devices
 
 A node can speak for devices behind it, each with its own metrics, its own

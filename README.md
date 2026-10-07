@@ -161,6 +161,10 @@ ready-to-run compose files:
 Each needs, at most, a domain name, an email address and a password for your
 devices, all in one `.env` file. You never handle a certificate file.
 
+Until the image is published, `docker compose up -d --build` builds it from
+this checkout, and `docker build -t ghcr.io/mod-bee/modbee-mqtt -f docker/Dockerfile .`
+builds it for the `docker run` commands ([docker.md](docs/docker.md)).
+
 ### From a terminal
 
 The `modbee` command is in the Docker image:
@@ -315,6 +319,8 @@ message from Kafka and sends a pump command back
 | [docker.md](docs/docker.md) | **Running the server**: one command, a stack with a certificate, or that stack with Kafka |
 | [kafka.md](docs/kafka.md) | `modbee.yaml` and the Kafka pipe |
 | [logins.md](docs/logins.md) | **Device logins**: a login per device, devices that register themselves, permissions, backups |
+| [settings.md](docs/settings.md) | The server's settings, changed over MQTT and applied at a restart |
+| [events.md](docs/events.md) | What clients do - connect, go, subscribe - as messages, and in Kafka |
 | [kafka-apps.md](docs/kafka-apps.md) | **Your own app on Kafka** - reading device data and sending commands, from Node.js, Python or anything else |
 | [cli.md](docs/cli.md) | The `modbee` command |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The five layers, and why |

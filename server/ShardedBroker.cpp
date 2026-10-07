@@ -207,6 +207,25 @@ struct ShardedBroker::Shard {
     int wakeFd = -1;
     std::thread thread;
 
+    // A TLS context waiting to be swapped in (ShardedBroker::replaceTls), and
+    // whether there is one - so the loop's check is one atomic load.
+    std::mutex tlsSwapLock;
+    void* tlsPending = nullptr;
+    std::atomic<bool> tlsSwap{false};
+    void takeTlsContext() {
+        if (!tlsSwap.load(std::memory_order_acquire)) return;
+        void* context = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(tlsSwapLock);
+            context = tlsPending;
+            tlsPending = nullptr;
+            tlsSwap.store(false, std::memory_order_release);
+        }
+#if MQTT_TLS_SOCKETS
+        if (context != nullptr) tlsListener.useContext(context);
+#endif
+    }
+
     // inbox[from]: the ring shard `from` writes and this shard reads.
     std::vector<std::unique_ptr<SpscRing<Envelope>>> inbox;
     // proxies[origin]: where this shard's adopted connections are released,
@@ -697,6 +716,9 @@ void ShardedBroker::run(Shard& shard) {
 #endif
 
     while (!_stopping.load(std::memory_order_acquire)) {
+        // Before accepting anything this pass, so a connection that arrives
+        // after replaceTls() returned is served the new certificate.
+        shard.takeTlsContext();
         shard.broker.poll();
         shard.drain(false);
         if (_extension) _extension->service(shard.index, shard.broker);
@@ -849,7 +871,11 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
                     s.tlsListener.useCertificate(tls.certificatePem.c_str(), tls.keyPem.c_str());
                 }
                 if (!tls.clientCaPem.empty()) {
-                    s.tlsListener.requireClientCertificate(tls.clientCaPem.c_str());
+                    if (tls.clientCertificateOptional) {
+                        s.tlsListener.requestClientCertificate(tls.clientCaPem.c_str());
+                    } else {
+                        s.tlsListener.requireClientCertificate(tls.clientCaPem.c_str());
+                    }
                 }
             } else {
                 s.tlsListener.shareContextWith(_shards[0]->tlsListener);
@@ -887,6 +913,11 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
     }
     _port = config.plain ? port : 0;
     _tlsPort = config.tls.enabled ? tlsPort : 0;
+    {
+        std::lock_guard<std::mutex> guard(_tlsLock);
+        _tlsServed = config.tls;
+        _tlsServed.port = _tlsPort;
+    }
 
     for (std::unique_ptr<Shard>& shard : _shards) {
         Shard* s = shard.get();
@@ -922,7 +953,82 @@ void ShardedBroker::stop() {
         shard->wakeFd = -1;
     }
 #endif
+#if MQTT_TLS_SOCKETS
+    // A context replaceTls() delivered after the last pass took one.
+    for (std::unique_ptr<Shard>& shard : _shards) {
+        std::lock_guard<std::mutex> guard(shard->tlsSwapLock);
+        MqttTlsListener::dropContext(shard->tlsPending);
+        shard->tlsPending = nullptr;
+    }
+#endif
     _running = false;
+}
+
+ShardedTlsConfig ShardedBroker::servedTls() const {
+    std::lock_guard<std::mutex> guard(_tlsLock);
+    return _tlsServed;
+}
+
+bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) {
+#if !MQTT_TLS_SOCKETS
+    (void)tls;
+    error = "this build has no TLS engine";
+    return false;
+#else
+    if (!_running || _tlsPort == 0) {
+        error = "there is no TLS listener running to change - TLS starts with the server";
+        return false;
+    }
+    // Built here, on the caller's thread, from a listener that never opens a
+    // socket: it exists to turn settings into contexts. One context per
+    // shard on an engine that cannot share one between threads, one shared
+    // by every shard on an engine that can - the same arrangement start()
+    // makes.
+    MqttTlsListener maker;
+    if (!tls.certificateFile.empty()) {
+        maker.useCertificateFile(tls.certificateFile.c_str(), tls.keyFile.c_str());
+    } else {
+        maker.useCertificate(tls.certificatePem.c_str(), tls.keyPem.c_str());
+    }
+    if (!tls.clientCaPem.empty()) {
+        if (tls.clientCertificateOptional) maker.requestClientCertificate(tls.clientCaPem.c_str());
+        else maker.requireClientCertificate(tls.clientCaPem.c_str());
+    }
+    std::vector<void*> contexts;
+    for (size_t i = 0; i < _shards.size(); i++) {
+        void* context = i == 0 ? nullptr : MqttTlsListener::shareContext(contexts[0]);
+        if (context == nullptr) context = maker.makeContext();
+        if (context == nullptr) {
+            error = maker.lastError();
+            for (void* made : contexts) MqttTlsListener::dropContext(made);
+            return false;
+        }
+        contexts.push_back(context);
+    }
+    // Delivered, and each shard woken so an idle one swaps now rather than at
+    // its next timeout. A context still waiting from an earlier call was
+    // never served and is dropped.
+    for (size_t i = 0; i < _shards.size(); i++) {
+        Shard& shard = *_shards[i];
+        {
+            std::lock_guard<std::mutex> guard(shard.tlsSwapLock);
+            MqttTlsListener::dropContext(shard.tlsPending);
+            shard.tlsPending = contexts[i];
+            shard.tlsSwap.store(true, std::memory_order_release);
+        }
+        const uint64_t one = 1;
+        const ssize_t ignored = ::write(shard.wakeFd, &one, sizeof one);
+        (void)ignored;
+    }
+    std::lock_guard<std::mutex> guard(_tlsLock);
+    const std::string address = _tlsServed.address;
+    const uint16_t port = _tlsServed.port;
+    _tlsServed = tls;
+    _tlsServed.enabled = true;
+    _tlsServed.address = address;
+    _tlsServed.port = port;
+    return true;
+#endif
 }
 
 ShardedBrokerStatus ShardedBroker::status() const {

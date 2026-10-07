@@ -31,12 +31,21 @@ kafka:
       bootstrap-servers: kafka:9092    # the Kafka in this compose file
 
   mqtt-to-kafka:
-    # Every MQTT message, to one Kafka topic. The record's key is the MQTT
-    # topic, its value the payload untouched, and its headers carry the topic,
-    # QoS and properties. Narrow the filters, or add mappings, to split it up.
+    # Every MQTT message, to one Kafka topic. The record's value is the payload
+    # untouched, and its headers carry the MQTT topic (mqtt-topic), QoS and
+    # properties. Narrow the filters, or add mappings, to split it up.
+    #
+    # The record's KEY is the publisher's client id, not the topic. Kafka keeps
+    # order only within a partition, and the key picks the partition: keyed by
+    # topic, one device's messages on different topics land on different
+    # partitions and are read out of order (a Sparkplug node's NBIRTH after its
+    # NDATA). Keyed by publisher, each device's messages share a partition, in
+    # the order it sent them - MQTT's own ordering promise. Messages that came
+    # from Kafka apps have no publisher, and are written without a key.
     - id: all
       mqtt-topic-filters: ["#"]
       kafka-topic: mqtt-messages
+      key: clientid
       headers: all
 
   kafka-to-mqtt:

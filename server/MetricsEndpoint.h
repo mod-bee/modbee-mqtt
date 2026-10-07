@@ -23,6 +23,8 @@
 class MetricsEndpoint {
 public:
     typedef void (*RenderFn)(void* context, std::string& out);
+    // Readiness: true when the server should be given clients; false with why.
+    typedef bool (*ReadyFn)(void* context, std::string& why);
 
     MetricsEndpoint() = default;
     ~MetricsEndpoint() { stop(); }
@@ -34,6 +36,8 @@ public:
     bool start(const std::string& address, uint16_t port, RenderFn render, void* context,
                std::string& error);
     void stop();
+    // /readyz answers 200 "ready" or 503 with the reason; without this, "ready".
+    void setReadiness(ReadyFn ready, void* context) { _ready = ready; _readyContext = context; }
     uint16_t port() const { return _port; }
 
 private:
@@ -41,6 +45,8 @@ private:
     int _wake = -1;
     uint16_t _port = 0;
     RenderFn _render = nullptr;
+    ReadyFn _ready = nullptr;
+    void* _readyContext = nullptr;
     void* _context = nullptr;
     std::atomic<bool> _stopping{false};
     std::thread _thread;

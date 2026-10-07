@@ -15,6 +15,10 @@
 //   CONNECT    an admin login (from the config), a device login (from the
 //              SQLite store, AuthStore.h), or `$provision` with a
 //              provisioning key. Nothing else: anonymous is refused.
+//              With certificate-login, a client certificate the TLS
+//              handshake verified is a login of its own: its CN names the
+//              login, no password is asked, and a login bound to one
+//              certificate (its `fingerprint`) accepts that one only.
 //   PUBLISH,   a device: only the topic filters in its record, with
 //   SUBSCRIBE  ${username} and ${clientid} expanded - and never a `$` topic.
 //              An admin: anything. `$provision`: its own request and reply
@@ -36,6 +40,8 @@
 
 #include "ShardedBroker.h"
 #include "AuthStore.h"
+#include "ServerConfig.h"
+#include "Json.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -54,6 +60,20 @@ struct AuthGateConfig {
     std::string backupDirectory;                                // "" = <database's folder>/backups
     int backupsKept = 7;
     int backupEveryHours = 24;                                  // 0 = only on request
+    // The server's settings (config.* on $modbee/admin): the file they start
+    // from, and how to restart so a change takes effect. No restart function:
+    // a change is stored and applies at the next start.
+    std::string configFile;
+    void (*restart)(void* context) = nullptr;
+    void* restartContext = nullptr;
+    // authentication.certificate-login: a verified client certificate's CN is
+    // the login, without a password.
+    bool certificateLogin = false;
+    // The running server, for what its TLS listeners serve and to change
+    // their certificate live (config.*). Not owned; may be set after the gate
+    // is made, before the server starts. Null: TLS is reported as not served
+    // and a change to it waits for the restart.
+    ShardedBroker* server = nullptr;
 };
 
 struct AuthGateStatus {
@@ -61,6 +81,9 @@ struct AuthGateStatus {
     uint64_t refused = 0;
     uint64_t provisioned = 0;
     uint64_t kicked = 0;
+    // Of accepted and refused: the logins a client certificate made.
+    uint64_t certificateAccepted = 0;
+    uint64_t certificateRefused = 0;
 };
 
 class AuthGate : public ShardExtension {
@@ -85,6 +108,8 @@ public:
 
     AuthStore& store() { return _store; }
     AuthGateStatus status() const;
+    // The running server, when it was not known as the gate was made.
+    void attach(ShardedBroker* server) { _config.server = server; }
     std::string lastBackup() const;
 
 private:
@@ -117,12 +142,24 @@ private:
                     const MqttSpan& user, const MqttSpan& password) const;
     bool isFixedAdmin(const std::string& username) const;
     bool checkKey(const std::string& offered, const std::string& clientId, std::string& keyName);
+    bool certificateLogin(Shard& shard, const MqttBrokerRequest& request, uint8_t& reasonCode);
 
     // Closes every live connection of a login, on every shard.
     void kick(const std::string& username);
     void queue(uint32_t shard, const Request& request);
 
     bool backupNow(std::string& path, std::string& error);
+
+    // --- config.* (AuthGateSettings.cpp) ---
+    std::string configCommand(const std::string& command, const json::Value& request);
+    StoredSettings storedSettings();
+    void rememberRunningSettings();
+    std::string fileText() const;
+    ShardedTlsConfig servedTls() const;
+    bool behind(const StoredSettings& stored, const ServerConfig& effective) const;
+    bool applyTlsLive(const ServerConfig& effective, std::vector<ConfigProblem>& problems);
+    std::atomic<bool> _restartAfterReply{false};
+    StoredSettings _running;                    // what the server started with
     void backupLoop();
 
     AuthGateConfig _config;
@@ -135,6 +172,7 @@ private:
     std::unordered_map<std::string, std::string> _provisioning;
 
     std::atomic<uint64_t> _accepted{0}, _refused{0}, _provisioned{0}, _kicked{0};
+    std::atomic<uint64_t> _certificateAccepted{0}, _certificateRefused{0};
 
     std::thread _backups;
     std::mutex _backupMutex;

@@ -100,6 +100,17 @@ public:
 
     const char* peerName() const override { return _peerName.c_str(); }
 
+    // The client certificate the handshake verified, if there was one - see
+    // MqttTransport::peerCertificateName(). Read off the engine the moment the
+    // handshake completes, which on this end is usually inside the read that
+    // brings the first record of application data: the CONNECT is decrypted
+    // by the same call that finishes the handshake, so anything that waited
+    // for a write to notice would answer an authorisation hook with nothing.
+    const char* peerCertificateName() const override { return _peerCertificateName.c_str(); }
+    const char* peerCertificateFingerprint() const override {
+        return _peerCertificateFingerprint.c_str();
+    }
+
     bool inUse() const { return _socket >= 0; }
 
     // Whether the TLS handshake has completed. Diagnostics and tests - the
@@ -118,6 +129,8 @@ private:
     bool _peerClosed = false;
     std::string _peerName;
     std::string _lastError;
+    std::string _peerCertificateName;
+    std::string _peerCertificateFingerprint;
 
     // See MQTT_SOCKET_READ_SIZE in MqttSocketSupport.h - one definition
     // for all four transports, which is why this is not a number.
@@ -134,6 +147,7 @@ private:
     void closeAll();
     void fail(const std::string& what);
     bool finishHandshake();
+    void secured();            // the handshake is done: note it, and who the peer proved to be
     bool fill();
     // One SSL_read into `into`; the outcome is recorded exactly as fill()
     // records it. 0 means nothing now, or the connection is gone.
@@ -166,6 +180,42 @@ public:
     // arrangement, where a client proves itself with a user name and password
     // over a channel it has already verified.
     void requireClientCertificate(const char* caPem);
+
+    // Ask for a client certificate and verify it against this CA when one is
+    // offered - WITHOUT demanding one. A certificate that is offered and does
+    // not verify still fails the handshake; a client that offers none is let
+    // through to log in with a user name and password, and its transport
+    // reports no peer certificate. For a broker where some devices carry a
+    // certificate and some never will.
+    void requestClientCertificate(const char* caPem);
+
+    // --- Changing what a RUNNING listener serves ---
+    //
+    // A certificate is renewed, a client CA is rotated - and a broker serving
+    // a plant is not restarted for either. The context is built first, away
+    // from the socket, so a certificate that will not load is refused while
+    // the old one is still being served; then it is swapped in, for the
+    // connections accepted from then on. Connections already accepted keep
+    // the context they were made with: every engine's SSL object holds a
+    // reference of its own, so nothing they use is freed under them.
+
+    // A context from this listener's current certificate settings
+    // (useCertificate*, require/requestClientCertificate), without touching
+    // the socket. Null, with lastError(), if they do not load. The caller owns
+    // the handle until it gives it to useContext() or dropContext().
+    void* makeContext();
+
+    // Serve every connection accepted from now on with `context`, a handle
+    // from makeContext() whose ownership passes here. Call it on the thread
+    // that calls accept(): the swap is a pointer, and the only reader is that
+    // thread.
+    void useContext(void* context);
+
+    // Another reference to `context` for another listener, where the engine
+    // shares one safely across threads (OpenSSL); null where it does not
+    // (wolfSSL), and the caller makes another with makeContext().
+    static void* shareContext(void* context);
+    static void dropContext(void* context);
 
     // Several listeners on the same port, one per broker of a multi-core
     // server - see MqttTcpListener::setReusePort(). Set before begin().
@@ -206,7 +256,8 @@ private:
     std::string _certFile, _keyFile;
     std::string _certPem,  _keyPem;
     std::string _clientCaPem;
-    bool _requireClientCert = false;
+    bool _requireClientCert = false;      // a client CA is set: verify what is offered
+    bool _peerCertificateOptional = false;   // ...and let a peer that offers none through
 
     void* _context = nullptr;   // SSL_CTX* / WOLFSSL_CTX*
 
@@ -222,6 +273,7 @@ private:
 
     void releaseContext();
     bool buildContext();
+    void* createContext();
     void fail(const std::string& what);
 };
 

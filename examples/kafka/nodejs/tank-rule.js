@@ -49,23 +49,28 @@ async function publishToMqtt(mqttTopic, payload) {
 let pumpRunning = null;   // not known until we have decided once
 
 async function onMqttMessage({ message }) {
-  // The KEY is the MQTT topic and the VALUE is the payload, byte for byte as
-  // the device sent it - text here, but it could be JSON, or binary
-  // (Sparkplug B is protobuf).
-  const mqttTopic = message.key.toString();
-  const payload = message.value.toString();
-
-  // The headers carry the rest of the MQTT message (headers: all).
+  // The VALUE is the payload, byte for byte as the device sent it - text
+  // here, but it could be JSON, or binary (Sparkplug B is protobuf). The
+  // headers carry the rest of the MQTT message (headers: all), the topic
+  // among them.
+  const mqttTopic = message.headers["mqtt-topic"]?.toString();
+  const payload = message.value ? message.value.toString() : "";
   const qos = message.headers["mqtt-qos"]?.toString();
-  // mqtt-clientid is the device that published it. A message with none came
-  // from Kafka - our own commands come back this way too, because EVERY MQTT
+
+  // The KEY is the device that published it: its MQTT client id, which is
+  // also the mqtt-clientid header. Keying by device keeps each device's
+  // messages in the order it sent them. A message with no key came from
+  // Kafka - our own commands come back this way too, because EVERY MQTT
   // message goes to mqtt-messages, including the ones apps send.
-  const from = message.headers["mqtt-clientid"]?.toString() || "a Kafka app";
+  const from = message.key?.toString() || "a Kafka app";
   console.log(`<- MQTT ${mqttTopic}: ${payload}  (QoS ${qos}, from ${from})`);
 
   if (mqttTopic === "plant/tank-01/level") {
+    // An empty payload is a retained message being cleared, not a reading:
+    // Number("") is 0, which would read as an empty tank and start the pump.
+    if (payload.trim() === "") return;
     const level = Number(payload);
-    if (Number.isNaN(level)) return;                 // not a number: ignore it
+    if (!Number.isFinite(level)) return;             // not a number: ignore it
     if (level > 8 && pumpRunning !== false) {
       await publishToMqtt("plant/pump-2/cmd", "stop");
       pumpRunning = false;

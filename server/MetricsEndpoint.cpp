@@ -77,11 +77,20 @@ void MetricsEndpoint::serve() {
                 _render(_context, body);
             } else if (std::strncmp(request, "GET / ", 6) == 0 ||
                        std::strncmp(request, "GET /healthz", 12) == 0) {
+                // LIVENESS: the process answers. Restart it only if this fails.
                 body = "ok\n";
+                type = "text/plain";
+            } else if (std::strncmp(request, "GET /readyz", 11) == 0) {
+                // READINESS: give it clients. Not ready while Kafka, which
+                // holds publishers' acknowledgements, cannot be reached.
+                std::string why;
+                const bool ready = _ready == nullptr || _ready(_readyContext, why);
+                if (!ready) status = "503 Service Unavailable";
+                body = ready ? "ready\n" : "not ready: " + why + "\n";
                 type = "text/plain";
             } else {
                 status = "404 Not Found";
-                body = "only /metrics and /healthz here\n";
+                body = "only /metrics, /healthz and /readyz here\n";
                 type = "text/plain";
             }
         }

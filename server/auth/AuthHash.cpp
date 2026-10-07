@@ -157,6 +157,13 @@ void hmacSha256(const uint8_t* key, size_t keyLength, const uint8_t* data, size_
 // RFC 8018 section 5.2.
 void pbkdf2Sha256(const uint8_t* password, size_t passwordLength, const uint8_t* salt,
                   size_t saltLength, uint32_t iterations, uint8_t* out, size_t outLength) {
+    // A salt is 16 bytes. The bound is here because GCC's release build
+    // cannot see that saltLength + 4 never wraps, warns that the copy below
+    // could be 2^64 bytes, and -Werror makes that warning a failed build.
+    if (saltLength > 4096) {
+        std::memset(out, 0, outLength);
+        return;
+    }
     std::vector<uint8_t> first(saltLength + 4);
     std::memcpy(first.data(), salt, saltLength);
     for (uint32_t block = 1; outLength > 0; block++) {

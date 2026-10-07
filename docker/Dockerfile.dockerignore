@@ -1,0 +1,19 @@
+# docker/Dockerfile only (BuildKit reads <Dockerfile>.dockerignore beside it,
+# in place of the root .dockerignore): the product image is built from the
+# source tree only - never from build output, captures, tests or the
+# development tree.
+build/
+build-*/
+build2/
+.git/
+.vscode/
+.idea/
+docker/testing/
+
+**/*.o
+**/*.a
+**/*.log
+internal/
+test/
+**/.env
+**/node_modules/

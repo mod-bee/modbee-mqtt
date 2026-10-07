@@ -152,9 +152,35 @@ struct KafkaPipe::Shard {
     std::vector<std::pair<size_t, rd_kafka_t*>> consumers;
 
     static void onDelivery(rd_kafka_t*, const rd_kafka_message_t* message, void* opaque);
+    static void onError(rd_kafka_t*, int error, const char* reason, void* opaque);
+    static int onStatistics(rd_kafka_t*, char* json, size_t length, void* opaque);
     void consume(size_t mapping, rd_kafka_t* consumer);
     void publishRecord(FromKafka& mapping, const rd_kafka_message_t* record);
 };
+
+// librdkafka's own errors. Only "every broker is unreachable" changes what the
+// pipe reports (/readyz): the rest it retries by itself.
+void KafkaPipe::Shard::onError(rd_kafka_t*, int error, const char* reason, void* opaque) {
+    Shard& shard = *static_cast<Shard*>(opaque);
+    if (error == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
+        if (!shard.pipe->_brokersDown.exchange(true)) {
+            std::fprintf(stderr, "kafka: every broker is unreachable (%s) - publishers' acknowledgements wait\n",
+                         reason ? reason : "");
+        }
+    }
+}
+
+// librdkafka's statistics, every few seconds: a broker in state "UP" means
+// Kafka can be reached. This is what turns /readyz back to ready after an
+// outage on a server with no traffic (a delivery would also, but there may be
+// none). A substring test, not a parse: the document is librdkafka's own.
+int KafkaPipe::Shard::onStatistics(rd_kafka_t*, char* json, size_t length, void* opaque) {
+    Shard& shard = *static_cast<Shard*>(opaque);
+    const std::string stats(json, length);
+    const bool up = stats.find("\"state\":\"UP\"") != std::string::npos;
+    shard.pipe->_brokersDown.store(!up, std::memory_order_relaxed);
+    return 0;   // librdkafka frees the document
+}
 
 // Runs inside rd_kafka_poll(), on the shard's own thread.
 void KafkaPipe::Shard::onDelivery(rd_kafka_t*, const rd_kafka_message_t* message, void* opaque) {
@@ -163,6 +189,7 @@ void KafkaPipe::Shard::onDelivery(rd_kafka_t*, const rd_kafka_message_t* message
     ToKafka& to = *shard.pipe->_toKafka[mapping];
     const uint64_t deferral = (uint64_t)(uintptr_t)message->_private;
     if (message->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+        shard.pipe->_brokersDown.store(false, std::memory_order_relaxed);
         to.counters.success.fetch_add(1, std::memory_order_relaxed);
         const int64_t latency = rd_kafka_message_latency(message);
         if (latency > 0) to.counters.latencyMicros.fetch_add((uint64_t)latency, std::memory_order_relaxed);
@@ -260,6 +287,8 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
                 // 60 s). Thirty seconds rides out a broker restart and still
                 // answers inside the client's patience. The file can change it.
                 kafkaSet(conf, "message.timeout.ms", "30000", error) &&
+                // Broker state for /readyz (onStatistics). The file can change it.
+                kafkaSet(conf, "statistics.interval.ms", "5000", error) &&
                 kafkaPassThrough(conf, cluster, error);
             if (!ok) {
                 rd_kafka_conf_destroy(conf);
@@ -267,6 +296,8 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
                 return false;
             }
             rd_kafka_conf_set_dr_msg_cb(conf, &Shard::onDelivery);
+            rd_kafka_conf_set_error_cb(conf, &Shard::onError);
+            rd_kafka_conf_set_stats_cb(conf, &Shard::onStatistics);
             rd_kafka_conf_set_opaque(conf, shard.get());
             char reason[512];
             rd_kafka_t* producer = rd_kafka_new(RD_KAFKA_PRODUCER, conf, reason, sizeof reason);
@@ -428,6 +459,11 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
             if (headerWanted(mapping, "mqtt-retain")) addText("mqtt-retain", message.retain ? "true" : "false");
             if (headerWanted(mapping, "mqtt-clientid") && message.clientId.length > 0) {
                 add("mqtt-clientid", message.clientId.data, message.clientId.length);
+            }
+            // Who published it - the login the broker checked, so a reader knows whose message this is
+            // without trusting anything in the payload or the topic. A Will carries its session's.
+            if (headerWanted(mapping, "mqtt-username") && message.userName.length > 0) {
+                add("mqtt-username", message.userName.data, message.userName.length);
             }
             if (p != nullptr) {
                 if (headerWanted(mapping, "mqtt-content-type") && p->has(MQ_PROP_CONTENT_TYPE)) {
@@ -596,7 +632,15 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
             from.counters.invalid.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        broker->publishMessage(message);
+        // Committed either way (at-least-once is about reaching the broker, and a
+        // refusal would refuse again on a re-read), but a refusal is COUNTED: a
+        // subscriber's queue or the retained store was full. A record no session
+        // subscribes to reaches nobody and is not counted here - with several
+        // shards, this one cannot know whether another has a subscriber.
+        if (!broker->publishMessage(message)) {
+            from.counters.refused.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         from.counters.published.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -661,6 +705,7 @@ void KafkaPipe::stop(uint32_t shardIndex, MqttBroker& broker) {
 
 KafkaPipeStatus KafkaPipe::status() const {
     KafkaPipeStatus out;
+    out.kafkaReachable = !_brokersDown.load(std::memory_order_relaxed);
     for (const std::unique_ptr<ToKafka>& to : _toKafka) {
         KafkaPipeStatus::Mapping m;
         m.id = to->config.id;
@@ -679,6 +724,7 @@ KafkaPipeStatus KafkaPipe::status() const {
         m.polled = from->counters.polled.load();
         m.published = from->counters.published.load();
         m.invalid = from->counters.invalid.load();
+        m.refused = from->counters.refused.load();
         out.mappings.push_back(m);
     }
     for (const std::unique_ptr<Shard>& shard : _shards) out.heldAcknowledgements += shard->held.load();
@@ -731,6 +777,9 @@ void renderKafkaMetrics(const KafkaPipeStatus& status, std::string& out) {
            "MQTT messages published from Kafka records.", status, false, &M::published);
     series(out, "modbee_kafka_kafka_to_mqtt_invalid_total", "counter",
            "Records that made no valid MQTT message.", status, false, &M::invalid);
+    series(out, "modbee_kafka_kafka_to_mqtt_refused_total", "counter",
+           "Records the broker could not take: a subscriber's queue or the retained store was full.",
+           status, false, &M::refused);
     out += "# HELP modbee_kafka_held_acknowledgements PUBACK/PUBRECs waiting on Kafka now.\n"
            "# TYPE modbee_kafka_held_acknowledgements gauge\n"
            "modbee_kafka_held_acknowledgements " + std::to_string(status.heldAcknowledgements) + "\n";

@@ -4,12 +4,15 @@
 #
 #   1. Point a DNS name (mqtt.example.com) at this server. Open ports 80 and 8883.
 #   2. cp .env.example .env   and set DOMAIN, EMAIL and MQTT_PASSWORD.
-#   3. docker compose up -d
+#   3. docker compose up -d --build
 #
 # Devices connect to  mqtts://DOMAIN:8883. The certificate is fetched and
 # renewed by Traefik; nobody handles a certificate file. docs/docker.md has
 # the rest, including using a Nginx Proxy Manager you already run instead.
-name: modbee
+#
+# Until the image is published, --build builds it from this checkout (a few
+# minutes, once). That needs this file where it is, inside the repository.
+name: modbee-stack
 
 services:
   # TLS, and the certificate. Port 80 answers Let's Encrypt's check; 8883 is
@@ -37,7 +40,10 @@ services:
     mem_limit: 256m
 
   modbee:
-    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    image: ${MODBEE_IMAGE:-ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}}
+    build:                                # used when the image cannot be pulled
+      context: ../..
+      dockerfile: docker/Dockerfile
     restart: unless-stopped
     environment:
       # The admin login (.env). Devices have their own: docs/logins.md.

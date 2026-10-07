@@ -12,7 +12,7 @@
 #
 # exec, so the broker is PID 1 and receives docker stop's SIGTERM itself.
 case "$1" in
-    pub|sub|req|bench|check|serve|user|key|provision|backup|restore|help|--help) exec modbee "$@" ;;
+    pub|sub|req|bench|check|serve|user|key|config|provision|backup|restore|help|--help|version|--version) exec modbee "$@" ;;
     modbee) shift; exec modbee "$@" ;;
 esac
 exec modbee serve -C /etc/modbee/modbee.yaml "$@"

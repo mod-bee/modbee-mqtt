@@ -300,7 +300,34 @@ self-signed default. Both are first-class; neither is a workaround.
 
 ```cpp
 secure.requireClientCertificate(caPem);   // and the handshake demands one
+secure.requestClientCertificate(caPem);   // or asks, verifies one if offered, and lets none through
 ```
+
+A certificate that is offered and does not verify fails the handshake either
+way. One that does verify reaches the authorisation hook as its CN and
+fingerprint (`MqttBrokerRequest::certificateName`, [broker.md](broker.md)),
+which is how `modbee serve` lets a certificate be a login
+([logins.md](logins.md#logging-in-with-a-certificate)).
+
+**With a client CA, wolfSSL makes every connection a full handshake.** A
+resumed session skips the certificate exchange, and what wolfSSL reports as
+the peer's certificate afterwards depends on how it was built - so a device
+that resumed could arrive with no verified identity. Resumption is turned off
+for a listener that verifies clients on that engine. OpenSSL keeps the peer's
+certificate in the session, and resumes as usual.
+
+### The broker image's wolfSSL
+
+`docker/Dockerfile` builds wolfSSL from a pinned release (`WOLFSSL_VERSION`
+and `WOLFSSL_SHA256`, changed together) with exactly what this library asks of
+it, and says why beside each option: `opensslall` and `opensslextra` (the
+OpenSSL-named API the transports are written against), `certgen`, `certext`
+and `keygen` (`MqttIdentity`), `tls13`, `session-ticket`, `sni`,
+`curve25519` (the key exchange today's clients offer first), and the
+assembly paths. One difference from OpenSSL remains: across the shards of
+`modbee serve` OpenSSL shares one context and so one session-ticket key,
+while each wolfSSL shard has its own - a device that reconnects to another
+shard makes a full handshake rather than resuming.
 
 ---
 

@@ -21,6 +21,8 @@ add_executable(modbee
 )
 target_link_libraries(modbee PRIVATE modbee-mqtt Threads::Threads)
 target_include_directories(modbee PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../server/auth)
+# What `modbee --version` says it is.
+target_compile_definitions(modbee PRIVATE MODBEE_VERSION="${PROJECT_VERSION}")
 
 if(NOT MSVC)
     target_compile_options(modbee PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
@@ -28,7 +30,7 @@ endif()
 
 # `modbee serve` needs the server tier, which exists only where it builds.
 if(TARGET modbee-server)
-    target_link_libraries(modbee PRIVATE modbee-server modbee-config modbee-retained modbee-auth)
+    target_link_libraries(modbee PRIVATE modbee-server modbee-config modbee-retained modbee-auth modbee-events)
     target_compile_definitions(modbee PRIVATE MODBEE_HAVE_SERVER=1)
 endif()
 

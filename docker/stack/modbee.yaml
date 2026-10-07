@@ -37,4 +37,5 @@ retained:
 #     - id: all
 #       mqtt-topic-filters: ["#"]
 #       kafka-topic: mqtt-messages
+#       key: clientid        # each device's messages in one partition, in order
 #       headers: all

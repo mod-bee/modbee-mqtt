@@ -230,6 +230,51 @@ inline std::string keyFingerprint(X509* certificate) {
     return out;
 }
 
+/** SHA-256 of `length` bytes as 64 lowercase hexadecimal characters, or ""
+ *  if the engine would not compute it. */
+inline std::string sha256Hex(const uint8_t* data, size_t length) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+#if MQTT_TLS_ENGINE_WOLFSSL
+    if (wc_Sha256Hash(data, (word32)length, digest) != 0) return std::string();
+#else
+    if (SHA256(data, length, digest) == nullptr) return std::string();
+#endif
+    static const char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(SHA256_DIGEST_LENGTH * 2);
+    for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        out.push_back(kHex[digest[i] >> 4]);
+        out.push_back(kHex[digest[i] & 0x0F]);
+    }
+    return out;
+}
+
+/** A certificate's DER bytes, as the engine holds them - the ONE thing each
+ *  engine is asked for, so that everything read from a certificate after it
+ *  is read the same way on both (MqttCertificate.h says why).
+ *
+ *  wolfSSL keeps the DER it was handed and gives it back natively; OpenSSL
+ *  re-encodes through i2d_X509, which for a certificate it decoded is the same
+ *  bytes - a certificate's signature covers its encoding, so a DER that
+ *  changed on the way through would no longer verify. */
+inline bool certificateDer(X509* certificate, std::vector<uint8_t>& out) {
+    out.clear();
+    if (certificate == nullptr) return false;
+#if MQTT_TLS_ENGINE_WOLFSSL
+    int length = 0;
+    const unsigned char* der = wolfSSL_X509_get_der(certificate, &length);
+    if (der == nullptr || length <= 0) return false;
+    out.assign(der, der + length);
+#else
+    unsigned char* der = nullptr;
+    const int length = i2d_X509(certificate, &der);
+    if (length <= 0 || der == nullptr) return false;
+    out.assign(der, der + length);
+    OPENSSL_free(der);
+#endif
+    return true;
+}
+
 /** Whether a private key is the one this certificate was issued for.
  *
  *  NOT X509_check_private_key, which is the obvious call and is WRONG on one

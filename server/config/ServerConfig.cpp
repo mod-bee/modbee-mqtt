@@ -6,8 +6,11 @@
 #include "ServerConfig.h"
 
 #include "MqttTopic.h"
+#include "transport/MqttCertificate.h"
 
 #include <yaml.h>
+
+#include <ctime>
 
 #include <algorithm>
 #include <cerrno>
@@ -21,6 +24,7 @@ const char* const kMqttHeaderPlaceholders[] = {
     "mqtt-qos",
     "mqtt-retain",
     "mqtt-clientid",
+    "mqtt-username",
     "mqtt-content-type",
     "mqtt-correlation-data",
     "mqtt-payload-format-indicator",
@@ -457,26 +461,79 @@ void Section::finish() {
 
 // --- The schema --------------------------------------------------------------
 
+// The PEM text is checked here, where every other value is - so config.check
+// and config.set refuse a certificate that will not load, or a key that is
+// not its key, while the old one is still being served, rather than the
+// server discovering it at the next start.
+void checkTlsText(Loader& loader, Section& tls, const BrokerSection& out) {
+    if (out.certificatePem.empty() != out.keyPem.empty()) {
+        const char* missing = out.certificatePem.empty() ? "cert-pem" : "key-pem";
+        loader.problem(nullptr, tls.pathOf(missing),
+                       "cert-pem and key-pem go together: a certificate cannot be served "
+                       "without its key, and a key is nothing without its certificate");
+    }
+#if MQTT_TLS_AVAILABLE
+    if (!out.certificatePem.empty() && !out.keyPem.empty()) {
+        std::string why;
+        if (!mqttCertificateMatchesKey(out.certificatePem.c_str(), out.keyPem.c_str(), why)) {
+            loader.problem(nullptr, tls.pathOf("cert-pem"), why);
+        } else {
+            MqttCertificateFacts facts;
+            if (mqttReadCertificate(out.certificatePem.c_str(), facts, why) &&
+                facts.notAfterSeconds < (int64_t)std::time(nullptr)) {
+                loader.problem(nullptr, tls.pathOf("cert-pem"),
+                               "the certificate expired at " + facts.notAfter +
+                               ": clients that check will refuse it", true);
+            }
+        }
+    }
+    if (!out.clientCaPem.empty() && mqttCountCertificates(out.clientCaPem.c_str()) == 0) {
+        loader.problem(nullptr, tls.pathOf("client-ca-pem"),
+                       "the client CA would not parse: it must be one or more PEM certificates");
+    }
+#else
+    if (!out.certificatePem.empty() || !out.clientCaPem.empty()) {
+        loader.problem(nullptr, tls.pathOf("cert-pem"),
+                       "this build has no TLS engine, so it cannot serve a certificate");
+    }
+#endif
+}
+
 void readBroker(Loader& loader, Section broker, BrokerSection& out) {
     long long n = 0;
     broker.text("address", out.address);
     broker.flag("plain", out.plain);
     if (broker.integer("port", n, 0, 65535)) out.port = (uint16_t)n;
+    // TLS. Read whether or not the section is there, as events: is: a
+    // certificate and its key given as PEM text - stored with config.set, or
+    // in the environment - turn the listener on by themselves, so a server
+    // whose file never mentioned TLS can be given it over MQTT.
     Section tls = broker.child("tls");
+    if (tls.integer("port", n, 0, 65535)) out.tlsPort = (uint16_t)n;
+    tls.text("cert-pem", out.certificatePem);
+    tls.text("key-pem", out.keyPem);
+    tls.text("client-ca-pem", out.clientCaPem);
+    static const char* const kClientCertificates[] = {"required", "optional", nullptr};
+    tls.choice("client-certificates", out.clientCertificates, kClientCertificates);
+    const bool pemPair = !out.certificatePem.empty() && !out.keyPem.empty();
     if (tls.present()) {
         out.tls = true;
-        if (tls.integer("port", n, 0, 65535)) out.tlsPort = (uint16_t)n;
-        tls.text("cert", out.certificateFile, true);
-        tls.text("key", out.keyFile, true);
+        // A path is required only when there is no text to serve instead.
+        tls.text("cert", out.certificateFile, !pemPair);
+        tls.text("key", out.keyFile, !pemPair);
         tls.text("client-ca", out.clientCaFile);
         tls.finish();
+    } else if (pemPair) {
+        out.tls = true;
     }
+    checkTlsText(loader, tls, out);
     if (broker.integer("shards", n, 0, 1024)) out.shards = (size_t)n;
     broker.integer("max-connections", out.maxConnections, 1, 100000000);
     broker.integer("max-sessions", out.maxSessions, 0, 100000000);
     if (broker.integer("max-packet", n, 64, 268435455)) out.maxPacket = (uint32_t)n;
     if (broker.integer("queue", n, 1, 1000000)) out.queue = (size_t)n;
     if (broker.integer("subscriptions", n, 1, 100000)) out.subscriptions = (size_t)n;
+    broker.integer("max-session-expiry", out.maxSessionExpiry, 0, 4294967295LL);
     if (broker.integer("max-retained", n, 0, 10000000)) out.maxRetained = (size_t)n;
     broker.flag("pin-threads", out.pinThreads);
     broker.integer("status-every", out.statusEvery, 0, 86400);
@@ -757,6 +814,25 @@ void crossCheck(Loader& loader, ServerConfig& config) {
                        "a login database needs an admin to manage it: set authentication.username "
                        "and password (MQTT_USERNAME / MQTT_PASSWORD in .env)");
     }
+    const BrokerSection& b = config.broker;
+    const bool clientCa = !b.clientCaFile.empty() || !b.clientCaPem.empty();
+    if (config.authentication.certificateLogin && config.authentication.database.empty()) {
+        loader.problem(nullptr, "authentication.certificate-login",
+                       "certificate-login takes the login from a certificate and looks it up in "
+                       "the login database - it needs authentication.database");
+    }
+    if (config.authentication.certificateLogin && (!b.tls || !clientCa)) {
+        loader.problem(nullptr, "authentication.certificate-login",
+                       "no client certificate can be verified without TLS and a client CA "
+                       "(broker.tls.client-ca or client-ca-pem), so nobody can log in this way",
+                       true);
+    }
+    if (b.clientCertificates == "optional" && !clientCa) {
+        loader.problem(nullptr, "broker.tls.client-certificates",
+                       "optional client certificates need a client CA to verify them against "
+                       "(broker.tls.client-ca or client-ca-pem); without one none is asked for",
+                       true);
+    }
     RetainedSection& retained = config.retained;
     if (retained.store == RetainedStore::File && retained.file.empty()) {
         loader.problem(nullptr, "retained.file", "store: file needs a file to keep them in");
@@ -903,6 +979,12 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
         if (metrics.integer("port", port, 0, 65535)) out.metrics.port = (uint16_t)port;
         metrics.finish();
     }
+    // Read whether or not the section is there, so MODBEE_EVENTS_ENABLED alone
+    // turns it on.
+    Section events = top.child("events");
+    if (events.present()) out.events.enabled = true;
+    events.flag("enabled", out.events.enabled);
+    if (events.present()) events.finish();
     // Who may connect. One login for every device -
     //   authentication: {username: devices, password: ...}
     // - or a list, one per device. Read whether or not the section is there,
@@ -925,6 +1007,7 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
             }
         }
         auth.text("database", out.authentication.database);
+        auth.flag("certificate-login", out.authentication.certificateLogin);
         const size_t users = auth.count("users");
         for (size_t i = 0; i < users; i++) {
             Section user = auth.item("users", i);
@@ -1017,6 +1100,63 @@ bool loadServerConfigFile(const std::string& path, ServerConfig& out,
     ConfigSource source;
     source.name = path;
     return loadServerConfig(text.str(), source, out, problems);
+}
+
+std::string configEnvironmentName(const std::string& path) { return environmentName(path); }
+
+namespace {
+
+struct EffectiveEnvironment {
+    std::vector<std::pair<std::string, std::string>> overrides;   // MODBEE_ name -> value
+    std::vector<std::string> asked;                               // every name the loader asked for
+    std::vector<std::string> pinned;
+};
+
+const char* effectiveEnvironment(void* context, const char* name) {
+    EffectiveEnvironment& env = *static_cast<EffectiveEnvironment*>(context);
+    env.asked.push_back(name);
+    if (const char* value = std::getenv(name)) {
+        env.pinned.push_back(name);
+        return value;
+    }
+    for (const auto& o : env.overrides) if (o.first == name) return o.second.c_str();
+    return nullptr;
+}
+
+} // namespace
+
+bool loadEffectiveConfig(const std::string& fileText, const std::string& fileName,
+                         const StoredSettings& stored, ServerConfig& out,
+                         std::vector<ConfigProblem>& problems, EffectiveConfigInfo* info) {
+    EffectiveEnvironment env;
+    for (const auto& o : stored.overrides) env.overrides.emplace_back(environmentName(o.first), o.second);
+    ConfigSource source;
+    source.name = stored.hasDocument ? std::string("the stored settings") : fileName;
+    source.env = &effectiveEnvironment;
+    source.envContext = &env;
+    bool ok = loadServerConfig(stored.hasDocument ? stored.document : fileText, source, out, problems);
+    // An override the loader never asked about names no setting: refused, as a
+    // misspelt key in the file is, because a setting silently not set is the
+    // worse failure.
+    for (const auto& o : stored.overrides) {
+        const std::string name = environmentName(o.first);
+        bool asked = false;
+        for (const std::string& a : env.asked) if (a == name) { asked = true; break; }
+        if (!asked) {
+            ConfigProblem p;
+            p.path = o.first;
+            p.message = "no setting is called \"" + o.first + "\"";
+            problems.push_back(p);
+            ok = false;
+        }
+    }
+    if (info) {
+        info->pinned.clear();
+        for (const std::string& p : env.pinned) {
+            if (std::find(info->pinned.begin(), info->pinned.end(), p) == info->pinned.end()) info->pinned.push_back(p);
+        }
+    }
+    return ok;
 }
 
 std::string describe(const ConfigProblem& problem, const std::string& fileName) {
