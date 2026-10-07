@@ -1,0 +1,13 @@
+{
+  "name": "modbee-kafka-tank-rule",
+  "version": "1.0.0",
+  "description": "A Node.js app on the modbee Kafka pipe: reads MQTT messages from Kafka, sends commands back to MQTT devices",
+  "main": "tank-rule.js",
+  "private": true,
+  "scripts": {
+    "start": "node tank-rule.js"
+  },
+  "dependencies": {
+    "@confluentinc/kafka-javascript": "^1.10.1"
+  }
+}

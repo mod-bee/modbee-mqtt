@@ -1,0 +1,83 @@
+# modbee on the internet: MQTT over TLS with a free Let's Encrypt certificate.
+# No Kafka here - point modbee.yaml at the Kafka you already run, or leave the
+# pipe off. For Kafka in the same file, use docker/all-in-one/ instead.
+#
+#   1. Point a DNS name (mqtt.example.com) at this server. Open ports 80 and 8883.
+#   2. cp .env.example .env   and set DOMAIN, EMAIL and MQTT_PASSWORD.
+#   3. docker compose up -d
+#
+# Devices connect to  mqtts://DOMAIN:8883. The certificate is fetched and
+# renewed by Traefik; nobody handles a certificate file. docs/docker.md has
+# the rest, including using a Nginx Proxy Manager you already run instead.
+name: modbee
+
+services:
+  # TLS, and the certificate. Port 80 answers Let's Encrypt's check; 8883 is
+  # MQTT over TLS, passed to modbee as plain MQTT on the private network.
+  traefik:
+    image: traefik:v3.7
+    restart: unless-stopped
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.mqtts.address=:8883
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --certificatesresolvers.letsencrypt.acme.email=${EMAIL:?set EMAIL in .env}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.letsencrypt.acme.caserver=${ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      - --log.level=INFO
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${MQTTS_PORT:-8883}:8883"
+    configs:
+      - source: traefik-routes
+        target: /etc/traefik/dynamic.yml
+    volumes:
+      - letsencrypt:/letsencrypt
+    mem_limit: 256m
+
+  modbee:
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      # The admin login (.env). Devices have their own: docs/logins.md.
+      MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
+      MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+    volumes:
+      - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
+      - modbee-data:/var/lib/modbee        # device logins; retained messages with store: file
+    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
+    mem_limit: 2g
+    # Plain MQTT for devices on this LAN as well - uncomment to open it:
+    # ports: ["1883:1883"]
+
+# Traefik's routes, kept here so the stack is one file plus .env. Every MQTT
+# connection on 8883 is decrypted with the Let's Encrypt certificate for
+# DOMAIN - served even to a client that connects by IP address - and passed
+# to modbee.
+configs:
+  traefik-routes:
+    content: |
+      tcp:
+        routers:
+          mqtt:
+            entryPoints: [mqtts]
+            rule: "HostSNI(`*`)"
+            service: modbee
+            tls: {}
+        services:
+          modbee:
+            loadBalancer:
+              servers:
+                - address: "modbee:1883"
+      tls:
+        stores:
+          default:
+            defaultGeneratedCert:
+              resolver: letsencrypt
+              domain:
+                main: "${DOMAIN:?set DOMAIN in .env}"
+
+volumes:
+  letsencrypt:
+  modbee-data:

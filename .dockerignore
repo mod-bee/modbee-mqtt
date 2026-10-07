@@ -1,0 +1,17 @@
+# The image is built from the source tree only - never from build output,
+# captures or the development tree.
+build/
+build-*/
+build2/
+.git/
+.vscode/
+.idea/
+docker/testing/
+
+**/*.o
+**/*.a
+**/*.log
+internal/
+test/
+**/.env
+**/node_modules/

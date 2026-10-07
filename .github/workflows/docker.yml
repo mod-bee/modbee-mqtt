@@ -1,0 +1,126 @@
+# The modbee-mqtt image: built from docker/Dockerfile, tested, and published
+# to the GitHub Container Registry as ghcr.io/mod-bee/modbee-mqtt.
+#
+#   push to main       -> :main and :latest (latest follows main until the first release)
+#   tag v1.2.3         -> :1.2.3, :1.2, and :latest
+#   pull request       -> built and tested, never pushed
+#
+# amd64 and arm64 (a Raspberry Pi, an ARM cloud server). The image is tested
+# BEFORE anything is pushed: a container is started and a QoS 1 message is
+# published through it, so a tag never points at an image that does not run.
+#
+# Nothing to configure for GHCR - the workflow's own GITHUB_TOKEN publishes.
+# The first push creates the package as private; make it public once under
+# the repository's Packages settings.
+
+name: docker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "docker/Dockerfile"
+      - ".dockerignore"
+      - "CMakeLists.txt"
+      - "src/**"
+      - "server/**"
+      - "cli/**"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,format=short
+
+      # Build for this runner first and load it, so it can be tested.
+      - name: Build (amd64, for the test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: modbee-under-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test the image
+        run: |
+          set -euo pipefail
+          # A configuration file validates inside the image - and a command
+          # given to the image runs that command, not the broker.
+          docker run --rm modbee-under-test check -C /etc/modbee/modbee.yaml
+          # The broker starts, and a QoS 1 publish through it is acknowledged.
+          docker run -d --name under-test modbee-under-test --metrics-port 9464
+          for _ in $(seq 1 30); do
+            docker run --rm --network container:under-test modbee-under-test \
+              pub -h 127.0.0.1 -t ci/check -m ok -q 1 && break
+            sleep 1
+          done
+          docker run --rm --network container:under-test modbee-under-test \
+            pub -h 127.0.0.1 -t ci/check -m ok -q 1
+          # Every command reaches modbee, not the broker: an unknown one would
+          # start a second broker instead of answering.
+          for command in user key provision backup restore; do
+            docker run --rm modbee-under-test "$command" --help > /dev/null
+          done
+          # And it reports itself.
+          docker run --rm --network container:under-test --entrypoint bash modbee-under-test \
+            -c 'exec 3<>/dev/tcp/127.0.0.1/9464 && printf "GET /metrics HTTP/1.0\r\n\r\n" >&3 && grep -q modbee_connections <&3'
+          # And it stops cleanly on SIGTERM, as docker stop sends.
+          docker stop under-test
+          test "$(docker inspect -f '{{.State.ExitCode}}' under-test)" = 0
+          docker logs under-test | tail -3
+          docker rm under-test
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

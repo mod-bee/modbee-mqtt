@@ -1,0 +1,145 @@
+// ModBee MQTT.
+//
+// Licensed under the GNU Affero General Public License, Version 3, WITH
+// ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
+
+// modbee req - MQTT 5 request/response from the command line.
+//
+// Subscribes to a response topic, publishes the request carrying that topic
+// and a correlation value [V5:4.10], and prints the first reply whose
+// Correlation Data matches. A reply to somebody else's request on a shared
+// response topic is ignored rather than printed, because matching on
+// correlation is the whole point of the mechanism.
+
+#include "Common.h"
+
+#include <cstdio>
+#include <cstring>
+
+namespace {
+
+struct ReqState {
+    std::string correlation;
+    bool answered = false;
+    bool json = false;
+    bool subscribed = false;
+    MqttResult subscribeResult = MqttResult::Queued;
+};
+
+ReqState* g_req = nullptr;
+
+void onSubscribed(void*, MqttResult result, uint16_t) {
+    if (g_req == nullptr) return;
+    g_req->subscribed = true;
+    g_req->subscribeResult = result;
+}
+
+void onMessage(void*, const MqttMessage& message) {
+    if (g_req == nullptr || g_req->answered) return;
+    const MqttProperties* p = message.properties;
+    if (p == nullptr || !p->has(MQ_PROP_CORRELATION_DATA)) return;
+    if (p->correlationData.length != g_req->correlation.size() ||
+        std::memcmp(p->correlationData.data, g_req->correlation.data(),
+                    g_req->correlation.size()) != 0) {
+        return;
+    }
+    g_req->answered = true;
+    if (g_req->json) {
+        std::printf("%s\n", messageJson(message).c_str());
+    } else if (isPrintableText(message.payload.data, message.payload.length)) {
+        std::printf("%.*s\n", (int)message.payload.length, (const char*)message.payload.data);
+    } else {
+        std::printf("<%u bytes binary, base64 %s>\n", (unsigned)message.payload.length,
+                    base64(message.payload.data, message.payload.length).c_str());
+    }
+}
+
+const std::vector<ArgSpec>& reqSpecs() {
+    static const std::vector<ArgSpec> specs = withConnectionSpecs({
+        {"topic", 't', true, "request topic (required)"},
+        {"message", 'm', true, "request payload text (default empty)"},
+        {"response-topic", 'e', true, "where the reply should go (default modbee/reply/<id>)"},
+        {"qos", 'q', true, "QoS for request and reply: 0, 1 or 2 (default 1)"},
+        {"wait", 'W', true, "seconds to wait for the reply (default 10)"},
+    });
+    return specs;
+}
+
+} // namespace
+
+int cmdReq(int argc, char** argv) {
+    const std::vector<ArgSpec>& specs = reqSpecs();
+    Args args;
+    if (!args.parse(argc, argv, 2, specs)) {
+        std::fprintf(stderr, "modbee req: %s\n", args.error().c_str());
+        return 2;
+    }
+    if (args.has("help")) {
+        Args::printHelp("modbee req -t <topic> [-m <text>] [options]", specs);
+        return 0;
+    }
+    if (!args.has("topic")) {
+        std::fprintf(stderr, "modbee req: --topic is required\n");
+        return 2;
+    }
+    long long qos = 1, wait = 10;
+    if (!args.getInt("qos", 1, 0, 2, qos) || !args.getInt("wait", 10, 1, 86400, wait)) {
+        std::fprintf(stderr, "modbee req: %s\n", args.error().c_str());
+        return 2;
+    }
+
+    cliInstallSignalHandlers();
+    CliClient cli;
+    std::string error;
+    if (!cli.configure(args, "modbee-req", error)) {
+        std::fprintf(stderr, "modbee req: %s\n", error.c_str());
+        return 2;
+    }
+    if (cli.connection.version != MqttVersion::V5) {
+        // 3.1.1 has no Response Topic or Correlation Data property at all.
+        std::fprintf(stderr, "modbee req: request/response needs MQTT 5\n");
+        return 2;
+    }
+
+    ReqState state;
+    state.json = cli.json;
+    state.correlation = cli.connection.clientId + "-" + std::to_string((unsigned long)mq_millis());
+    g_req = &state;
+    cli.client.onMessage(&onMessage, nullptr);
+
+    const std::string responseTopic = args.get("response-topic",
+        ("modbee/reply/" + cli.connection.clientId).c_str());
+    cli.client.subscribe(responseTopic.c_str(), (uint8_t)qos, &onSubscribed, nullptr);
+
+    if (!cli.connectAndWait((mq_time_t)wait * 1000)) return 3;
+
+    // The reply cannot be caught before the subscription is in place, so the
+    // request waits for the SUBACK rather than racing it.
+    cli.pollUntil([&] { return state.subscribed; }, (mq_time_t)wait * 1000);
+    if (!state.subscribed || state.subscribeResult != MqttResult::Ok) {
+        std::fprintf(stderr, "modbee req: could not subscribe to %s: %s\n",
+                     responseTopic.c_str(),
+                     state.subscribed ? mq_resultName(state.subscribeResult) : "no answer");
+        cli.shutdown();
+        return 3;
+    }
+
+    MqttOwnedProperties properties;
+    properties.setResponseTopic(responseTopic.c_str());
+    properties.setCorrelationData((const uint8_t*)state.correlation.data(), state.correlation.size());
+    const std::string payload = args.get("message");
+    const MqttResult queued = cli.client.publish(args.get("topic").c_str(),
+                                                 (const uint8_t*)payload.data(), payload.size(),
+                                                 (uint8_t)qos, false, properties);
+    if (queued != MqttResult::Queued) {
+        std::fprintf(stderr, "modbee req: request refused: %s\n", mq_resultName(queued));
+        cli.shutdown();
+        return 1;
+    }
+
+    const bool answered = cli.pollUntil([&] { return state.answered; }, (mq_time_t)wait * 1000);
+    if (!answered) std::fprintf(stderr, "modbee req: no reply within %llds\n", wait);
+    cli.shutdown();
+    g_req = nullptr;
+    return answered ? 0 : 1;
+}

@@ -1,0 +1,180 @@
+// ModBee MQTT.
+//
+// Licensed under the GNU Affero General Public License, Version 3, WITH
+// ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
+
+#pragma once
+
+// One MqttBroker per core, on one port, behaving as one broker.
+//
+// THE SHAPE (internal/CLOUD-PLAN.md, section 5). N shards, each a thread with
+// its own MqttBroker, its own listener on the shared port (SO_REUSEPORT, so
+// the kernel spreads arrivals) and its own epoll set. The brokers never share
+// memory; they talk through one bounded ring for each ordered pair of shards,
+// woken by an eventfd. Nothing inside MqttBroker learns that threads exist.
+//
+// WHERE A SESSION LIVES. On the shard that OWNS its Client Identifier:
+// hash(identifier) mod N, or for an identifier this server assigned, the
+// shard named in it. A connection that arrives elsewhere is handed to the
+// owner at its CONNECT, with the bytes already read, so a session never moves
+// and takeover, Wills and in-flight QoS stay single-threaded.
+//
+// HOW A MESSAGE TRAVELS. The shard it was published on routes it to its own
+// sessions, then sends one shared copy to every other shard, each of which
+// routes it to its sessions - retained messages are stored on every shard as
+// they pass. At QoS 1 and 2 the PUBACK waits until every shard has reported,
+// so "no matching subscribers" and "quota exceeded" are true of the whole
+// server. A ring that is full counts as that shard refusing the message.
+//
+// TLS. Every shard can run a TLS listener beside the plain one, on a port of
+// its own shared the same way. The shards share one TLS context, so a session
+// ticket issued by one shard is honoured by all of them. A TLS connection is
+// handed to its owning shard after its handshake and CONNECT, exactly like a
+// plain one: the transport, with the decrypted bytes already read, moves.
+//
+// SHARED SUBSCRIPTIONS. "$share/<name>/<filter>" means one member of the
+// group receives each message - one in the whole server, not one per shard.
+// Every shard reports its members of every group to a registry; the shard a
+// message is published on chooses, once, which shard delivers each matching
+// group's copy (rotating over all members, so a shard with three members gets
+// three turns in four against a shard with one), and that choice travels with
+// the forwarded message. The chosen shard then picks among its own members.
+//
+// Linux only: SO_REUSEPORT, epoll, eventfd.
+
+#include <ModBeeMqtt.h>
+
+#include "broker/MqttBroker.h"
+#include "transport/MqttPollSet.h"
+#include "transport/MqttTcpListener.h"
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+// Something that runs INSIDE every shard alongside its broker - the Kafka pipe
+// is one. Every call is made on the shard's own thread with that shard's
+// broker, so an extension keeps per-shard state and needs no locks for it.
+// Virtual calls only; no RTTI.
+class ShardExtension {
+public:
+    virtual ~ShardExtension() {}
+
+    // Before any thread starts, on the caller's thread. False with `error`
+    // refuses to start the server.
+    virtual bool begin(size_t shards, std::string& error) = 0;
+
+    // Each shard's broker, once it is begun and before its thread starts or
+    // any client is accepted, on the caller's thread. Where a store kept
+    // elsewhere is put back (MqttBroker::restoreRetained).
+    virtual void prepare(uint32_t shard, MqttBroker& broker) { (void)shard; (void)broker; }
+
+    // A descriptor that becomes readable when the extension has work for this
+    // shard - it is added to the shard's epoll set, so a shard asleep in its
+    // wait wakes for it. -1 for none.
+    virtual int waitHandle(uint32_t shard) = 0;
+
+    // Every message that ORIGINATED on this shard (a client's PUBLISH, a
+    // Will, publishMessage()), after local routing and cross-shard
+    // forwarding. `deferral` as for MqttBrokerEgressFn: return how many
+    // parties will report through broker.concludeDeferred(deferral, ...).
+    virtual uint32_t offer(uint32_t shard, MqttBroker& broker,
+                           const MqttBrokerRouted& message, uint64_t deferral) = 0;
+
+    // Once per pass of the shard's loop. Never blocks.
+    virtual void service(uint32_t shard, MqttBroker& broker) = 0;
+
+    // Whether the shard must not sleep: something to do that no descriptor
+    // will announce.
+    virtual bool hasPendingWork(uint32_t shard) = 0;
+
+    // Shutting down, while the broker still has its clients: finish what can
+    // be finished, within a bound.
+    virtual void stop(uint32_t shard, MqttBroker& broker) = 0;
+};
+
+// A TLS listener on every shard. Needs a build with a TLS engine (OpenSSL);
+// without one, start() fails and says so.
+struct ShardedTlsConfig {
+    bool enabled = false;
+    std::string address;                    // empty: the plain listener's address
+    uint16_t port = 8883;                   // 0: an ephemeral port, shared by every shard
+    std::string certificateFile, keyFile;   // PEM files...
+    std::string certificatePem, keyPem;     // ...or the PEM text itself
+    std::string clientCaPem;                // set: mutual TLS, clients must present a certificate it signed
+};
+
+struct ShardedBrokerConfig {
+    MqttBrokerConfig broker;           // per shard; maxConnections and maxSessions are per shard too
+    std::string address = "0.0.0.0";
+    bool plain = true;                 // the plain-TCP listener; false for TLS only
+    uint16_t port = 1883;              // 0: an ephemeral port, shared by every shard
+    ShardedTlsConfig tls;
+    size_t shards = 0;                 // 0: one per core
+    // Messages waiting in one shard's inbox, from all the other shards
+    // together - each sender's ring gets an equal share, a power of two, at
+    // least 1024. A budget per shard, not per pair: rings per pair of this
+    // size would cost N^2 (24 shards: 2.6 GB before a single client).
+    size_t mailboxCapacity = 65536;
+    bool pinThreads = false;           // one shard per core, pinned
+    ShardExtension* extension = nullptr;   // not owned; must outlive stop()
+};
+
+struct ShardedBrokerStatus {
+    MqttBrokerStatus total;            // summed across shards
+    size_t shards = 0;
+    uint64_t mailboxFull = 0;          // messages a full ring made a shard refuse
+    uint64_t skipped = 0;              // sends avoided: nobody on that shard could want it
+    std::vector<size_t> connectionsPerShard;
+};
+
+class ShardedBroker {
+public:
+    ShardedBroker();
+    ~ShardedBroker();
+
+    ShardedBroker(const ShardedBroker&) = delete;
+    ShardedBroker& operator=(const ShardedBroker&) = delete;
+
+    // Binds every shard's listener and starts the threads. False, with
+    // lastError(), if any listener could not be opened.
+    bool start(const ShardedBrokerConfig& config);
+
+    // Every client is told 0x8B Server shutting down, every transport is
+    // handed back to the shard whose listener it came from, and the threads
+    // end. Safe to call twice.
+    void stop();
+
+    uint16_t port() const { return _port; }        // 0 if there is no plain listener
+    uint16_t tlsPort() const { return _tlsPort; }  // 0 if there is no TLS listener
+    size_t shardCount() const { return _shards.size(); }
+    const std::string& lastError() const { return _lastError; }
+
+    // A snapshot, refreshed by each shard about ten times a second.
+    ShardedBrokerStatus status() const;
+
+    // Which shard owns this Client Identifier. Public for tests and tooling.
+    static uint32_t ownerOf(const uint8_t* identifier, size_t length, size_t shards);
+
+    struct Shard;
+    struct ShareRegistry;
+
+private:
+    friend struct Shard;
+    std::unique_ptr<ShareRegistry> _shares;
+    std::vector<std::unique_ptr<Shard>> _shards;
+    uint16_t _port = 0;
+    uint16_t _tlsPort = 0;
+    std::string _lastError;
+    std::atomic<bool> _stopping{false};
+    std::atomic<size_t> _ended{0};         // shards whose broker has ended
+    std::atomic<int64_t> _inFlight{0};     // envelopes posted and not yet handled
+    ShardExtension* _extension = nullptr;
+    bool _running = false;
+
+    void run(Shard& shard);
+};

@@ -1,0 +1,50 @@
+# modbee and Kafka on one machine, to try the Kafka pipe.
+#
+#   docker compose -f docker/compose.yml up -d
+#   modbee pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
+#
+# Plain MQTT on 1883 and metrics on 9464. For a server on the internet with a
+# certificate, use docker/stack/ instead (docs/docker.md).
+#
+# One Kafka node with no replication: for trying it out, not for production.
+# Every service has a memory limit - without one a JVM sizes itself from the
+# whole host.
+name: modbee-quickstart
+
+services:
+  modbee:
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    build:                                # used when the image cannot be pulled
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      kafka: {condition: service_healthy}
+    mem_limit: 2g
+    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
+    # Host ports. MODBEE_MQTT_PORT / MODBEE_METRICS_PORT move them when 1883 is taken.
+    ports: ["${MODBEE_MQTT_PORT:-1883}:1883", "${MODBEE_METRICS_PORT:-9464}:9464"]
+    volumes:
+      - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
+
+  kafka:
+    image: apache/kafka-native:4.3.1      # Apache's lightweight image, made for development
+    restart: unless-stopped
+    mem_limit: 1g
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 30

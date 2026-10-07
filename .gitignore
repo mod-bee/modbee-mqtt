@@ -1,0 +1,54 @@
+build/
+build-*/
+build2/
+.vscode/
+.idea/
+*.o
+*.a
+*.log
+
+# A compose stack's .env holds someone's domain, email and settings. Only the
+# .env.example beside it is published.
+.env
+
+# =============================================================================
+# THE DEVELOPMENT TREE, WHICH IS NOT PUBLISHED
+# =============================================================================
+#
+# These three directories are how the library is built, proven and documented
+# to ourselves. They are not part of what a user of the library consumes, and
+# they are not published.
+#
+#   internal/   the plan, the conformance matrix, the interoperability
+#               evidence and the working notes
+#   test/       the test suite and the loopback peer
+#   docker/testing/  the interoperability rig and every load test: five
+#               brokers, the TLS matrix, the third-party client harnesses,
+#               the Kafka and TBMQ comparisons, the board builds.
+#               docker/ itself IS published: the image and the example stacks.
+#   scripts/    the checks that hold the documentation and the layering to
+#               account, the footprint measurement, and the Arduino shim the
+#               first two compile against
+#
+# WHAT THIS COSTS, so it is a decision rather than a surprise:
+#
+#   - a clone of the published repository cannot run `ctest`, the fuzzer, the
+#     soak, the interoperability rig, or any of the four scripted checks.
+#     CMake already guards `add_subdirectory(test)` with an EXISTS check, so
+#     it configures and builds the library and the examples cleanly without
+#     any of them
+#   - the CI jobs that need a private directory skip themselves, visibly,
+#     rather than failing. What is left still genuinely CAN fail: it builds
+#     the published tree three ways, including -Werror and the
+#     -fno-exceptions build a microcontroller gets
+#   - docs/ names these checks but no longer links into them
+#
+# Everything a user needs - src/, examples/, docs/, CMakeLists.txt,
+# library.properties - is published.
+internal/
+test/
+docker/testing/
+scripts/
+
+# An example app's installed packages (npm install).
+node_modules/

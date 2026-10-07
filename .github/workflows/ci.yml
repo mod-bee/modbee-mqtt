@@ -1,0 +1,328 @@
+# What runs on every push.
+#
+# The point of this file is that the claims in the documentation stay true.
+# Every job below corresponds to something README.md or docs/ says out loud,
+# and a job going red means a claim has stopped being one.
+#
+# What is NOT here: the Docker interoperability matrix. It needs four broker
+# images and the better part of an hour, so it runs nightly and before a
+# release, not on every push. docs/testing.md says how.
+#
+# THE TLS MATRIX IS HERE, and used not to be. It was grouped with the interop
+# matrix and skipped for the same stated reason - four images, an hour - which
+# was never true of it: it needs ONE image and finishes in seconds. The result
+# was that TLS was verified by whoever last remembered to type the commands in
+# internal/TESTING.md by hand, which is how "TLS is tested" quietly became
+# "TLS compiles".
+#
+# THE DEVELOPMENT TREE IS NOT PUBLISHED. internal/, test/, docker/testing/ and
+# scripts/ are .gitignore'd, so a job that needs one of them cannot run on a
+# published clone. Each such job checks for its directory and SKIPS ITSELF
+# VISIBLY rather than failing - a red X on a public repository for a file that
+# was never meant to be there tells nobody anything.
+#
+# WHICH LEAVES A TRAP THIS FILE MUST NOT FALL INTO. If every job skipped, the
+# public repository would show a green tick that proves nothing - and "a suite
+# that cannot fail is not a suite" is this project's own rule.
+#
+# So the FIRST job below needs nothing private and genuinely can fail: it
+# builds the published tree three ways, including -Werror and the
+# -fno-exceptions build a microcontroller gets, and it builds every C++
+# example. A header that stops compiling, a source missing from
+# CMakeLists.txt, an example that rots - all of those turn it red, on any
+# clone.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # THE ONE JOB THAT NEEDS NOTHING PRIVATE, and the only signal a published
+  # clone has. Three builds, because each catches something the others do not:
+  #
+  #   default        what `cmake -S . -B build` gives somebody who just cloned
+  #   -Werror        no warnings, which is how the MCU toolchains are run
+  #   MCU            -fno-exceptions -fno-rtti, which is what a board and a
+  #                  generated wrapper give you
+  #
+  # There was a fourth, "every optional role together", passing the
+  # MQTT_WITH_* flags. Those were deleted, so it built exactly the same
+  # library as the default and burned a runner proving it twice.
+  #
+  # Plus every C++ example, which is what stops an example rotting quietly.
+  published-tree:
+    name: the published tree builds
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Default build, as a user would get it
+        run: |
+          cmake -S . -B build-default -DMQTT_BUILD_TESTS=OFF
+          cmake --build build-default -j
+      - name: No warnings anywhere
+        run: |
+          cmake -S . -B build-werror -DMQTT_BUILD_TESTS=OFF \
+                -DCMAKE_CXX_FLAGS="-Werror"
+          cmake --build build-werror -j
+      - name: The build a microcontroller gets
+        run: |
+          cmake -S . -B build-client -DMQTT_BUILD_TESTS=OFF \
+                -DMQTT_NO_EXCEPTIONS=ON -DCMAKE_CXX_FLAGS="-Werror"
+          cmake --build build-client -j
+
+  # Everything, under the address and undefined-behaviour sanitizers.
+  #
+  # This library parses bytes it did not produce, and MQTT hands a decoder four
+  # independently declared lengths to get wrong. An out-of-bounds read is the
+  # failure mode that matters most and the one least likely to surface as a
+  # wrong answer, so the ordinary build IS the sanitized one.
+  tests:
+    name: tests (${{ matrix.os }}, sanitized)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          [ -d test ] || { echo "::notice::skipped - the test suite is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build -DMQTT_SANITIZE=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # A host runtime may drive one client from two threads: an OpenPLC task
+  # servicing the link while application code publishes from a slower one. The
+  # address sanitizer says nothing about that race; only this does.
+  thread-sanitizer:
+    name: thread sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build -DMQTT_SANITIZE_THREAD=ON
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # Generated IEC 61131 function-block code, and several MCU toolchains, build
+  # with exceptions and RTTI off. Proving it compiles that way is cheaper than
+  # discovering it does not once a wrapper exists.
+  no-exceptions:
+    name: -fno-exceptions -fno-rtti, -Werror
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build -DMQTT_NO_EXCEPTIONS=ON \
+                -DCMAKE_CXX_FLAGS="-Werror"
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # THE TESTS, WITH WARNINGS AS ERRORS.
+  #
+  # This job was called "client only" and its comment said a client build must
+  # contain no broker, no bridge and no typed layer. That was true when the
+  # MQTT_WITH_* flags existed; they were deleted, every role is compiled every
+  # time, and what keeps an unused one out of a program is the linker. So the
+  # job kept its name and stopped testing what the name said - which is worse
+  # than not having it, because a green tick claimed something nobody was
+  # checking. scripts/measure-footprint.sh is what measures that claim now, and
+  # it fails if a program that never names MqttDevice links any of it.
+  tests-werror:
+    name: tests, warnings as errors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build -DCMAKE_CXX_FLAGS="-Werror"
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # R1: no layer below L3 knows what role it is playing. A broker is a
+  # different L3 over the same L0-L2, and that only stays true if this fails
+  # the day a role assumption is written rather than the day somebody tries to
+  # build on it.
+  #
+  # R9: no layer above the platform layer knows which platform it is on. It
+  # exists because one did - MqttTransport's read side was Arduino's Stream
+  # idiom in the interface every host socket also had to implement - and it
+  # caught a leak within an hour of being written.
+  layering:
+    name: layering (R1, R9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d scripts ] || { echo "::notice::skipped - scripts/ is in the unpublished development tree"; exit 0; }
+          python3 scripts/check-layering.py
+
+  # The conformance table, without needing the PDFs.
+  #
+  # verify-coverage.py is the one that matters: it RUNS every test binary and
+  # fails if the table cites an assertion that does not exist. A table of
+  # unchecked claims is worse than an empty one, because the gap looks closed.
+  conformance:
+    name: conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d internal ] || { echo "::notice::skipped - internal/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build
+          cmake --build build -j
+          python3 internal/check-conformance.py
+          python3 internal/verify-coverage.py
+
+  # Longer than ctest runs it, with several seeds, so a defect that needs a
+  # million rounds is found here rather than in a plant.
+  fuzz:
+    name: fuzz (extended)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build -DMQTT_SANITIZE=ON
+          cmake --build build -j
+          for seed in 1 2 3; do
+            ./build/test/test_packet_fuzz "$seed" 400000
+          done
+          ./build/test/test_broker_fuzz 7 2000
+
+          # Hostile bytes at a LIVE CLIENT, which neither of the above covers:
+          # one fuzzes the codecs, the other a whole broker. A client parses
+          # whatever its broker sends, and port 1883 is not encrypted.
+          for seed in 1 0xC0FFEE 0xDEADBEEF; do
+            ./build/test/test_memory_safety "$seed" 600
+          done
+
+  # Resident memory over a long run. Built WITHOUT sanitizers, because ASan
+  # holds freed memory in quarantine on purpose and asserting on its resident
+  # set would fail for a reason that is not a fault.
+  soak:
+    name: soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          ./build/test/test_soak 1000000
+
+  # Every self-contained C++ example in the documentation compiles.
+  #
+  # Written after the root README was found to show a facade that was never
+  # built - an example nobody could have run, at the top of the repository.
+  # Documentation that does not compile is worse than none.
+  docs:
+    name: documentation examples compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d scripts ] || { echo "::notice::skipped - scripts/ is in the unpublished development tree"; exit 0; }
+          python3 scripts/check-docs.py
+
+  # TLS, end to end, against a real broker with real certificates.
+  #
+  # Every row must behave correctly INCLUDING THE REFUSALS: a valid chain
+  # connects, an untrusted CA is refused, an expired certificate is refused, a
+  # wrong hostname is refused, and a required client certificate is enforced
+  # both ways. A TLS suite that only proves the happy path proves nothing -
+  # the whole value of certificate validation is what it declines.
+  tls:
+    name: TLS matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d docker/testing ] || { echo "::notice::skipped - docker/testing/ is in the unpublished development tree"; exit 0; }
+          docker/testing/run.sh --phase tls
+
+  # The Arduino examples still build, against a shim core. The board itself
+  # cannot run here, and the documentation records that honestly rather than
+  # claiming otherwise.
+  arduino:
+    name: Arduino examples compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d scripts ] || { echo "::notice::skipped - scripts/ is in the unpublished development tree"; exit 0; }
+          ./scripts/compile-sketches.sh
+
+  # Boundaries, leaks and undefined behaviour, under a stricter sanitizer set
+  # than the ordinary test job uses.
+  #
+  # -fno-sanitize-recover=all makes any finding fatal rather than a printed
+  # line somebody scrolls past. vptr is OFF because it needs RTTI and one
+  # target here is deliberately built without it - leaving it on reports the
+  # missing type information as an invalid vptr, which looks alarming and
+  # means nothing.
+  memory-safety:
+    name: memory safety (strict sanitizers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build \
+                -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,bounds-strict,pointer-overflow,float-divide-by-zero,float-cast-overflow -fno-sanitize=vptr -fno-sanitize-recover=all -fno-omit-frame-pointer -g -O1" \
+                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build -j
+          ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \
+            ctest --test-dir build --output-on-failure
+
+  # The same sources with _FORTIFY_SOURCE and a stack protector, which catch a
+  # different class again - and at -O2, where the optimiser can expose what a
+  # debug build hides.
+  fortified:
+    name: fortified build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d test ] || { echo "::notice::skipped - test/ is in the unpublished development tree"; exit 0; }
+          cmake -S . -B build \
+                -DCMAKE_CXX_FLAGS="-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -Wall -Wextra -Werror"
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  # The library compiles as C++14.
+  #
+  # The mbed-based Arduino cores compile at -std=gnu++14, and so does OpenPLC's
+  # STruC++. A library that needed C++17 would not build there, and one
+  # `if constexpr` written on a host is enough to break them silently.
+  cxx14:
+    name: C++14 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d scripts ] || { echo "::notice::skipped - scripts/ is in the unpublished development tree"; exit 0; }
+          ./scripts/check-cxx14.sh
+
+  # What each option costs, in bytes. The script fails if a broker build is not
+  # larger than a client build - which would mean the broker is not being
+  # compiled and the measurement means nothing.
+  footprint:
+    name: footprint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          [ -d scripts ] || { echo "::notice::skipped - scripts/ is in the unpublished development tree"; exit 0; }
+          ./scripts/measure-footprint.sh

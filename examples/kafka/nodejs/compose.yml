@@ -1,0 +1,19 @@
+# The tank rule, running next to docker/all-in-one on the same server.
+#
+#   docker compose up -d --build        (start docker/all-in-one first)
+#   docker compose logs -f
+#
+# It joins the all-in-one stack's network, "modbee", so it reaches Kafka by
+# name at kafka:9092 - no ports to open.
+services:
+  tank-rule:
+    build: .
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: kafka:9092
+    mem_limit: 256m
+
+networks:
+  default:
+    name: modbee
+    external: true
