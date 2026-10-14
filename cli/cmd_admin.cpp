@@ -147,7 +147,12 @@ int prepare(int argc, char** argv, const char* usage, Args& args, CliClient& cli
         std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
         return 2;
     }
-    if (args.has("help") || argc < 3) {
+    // `modbee user --help`: the action's place holds the help request, as for
+    // `modbee config --help`.
+    const bool helpAsked = argc >= 3 && (std::strcmp(argv[2], "--help") == 0 ||
+                                         std::strcmp(argv[2], "-h") == 0 ||
+                                         std::strcmp(argv[2], "help") == 0);
+    if (args.has("help") || argc < 3 || helpAsked) {
         Args::printHelp(usage, adminSpecs());
         return -1;
     }
