@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "../MqttNoExcept.h"
 
 const char* mq_valueTypeName(MqttValueType type) {
     switch (type) {

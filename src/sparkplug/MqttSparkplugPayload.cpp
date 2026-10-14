@@ -5,7 +5,11 @@
 
 #include "MqttSparkplugPayload.h"
 
+#include "../MqttPlatform.h"
+
+#include <new>
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 // =============================================================================
 // PROTOBUF PRIMITIVES
@@ -981,6 +985,22 @@ MqttSparkplugProperty mq_spDescription(const char* text) {
     return out;
 }
 
+static MqttSparkplugProperty mq_spDoubleProperty(const char* key, double value) {
+    MqttSparkplugProperty out;
+    out.key = key;
+    out.type = MqttSparkplugDataType::Double;
+    out.as.float64 = value;
+    return out;
+}
+
+MqttSparkplugProperty mq_spEngLow(double low) {
+    return mq_spDoubleProperty("engLow", low);
+}
+
+MqttSparkplugProperty mq_spEngHigh(double high) {
+    return mq_spDoubleProperty("engHigh", high);
+}
+
 const MqttSparkplugProperty*
 MqttSparkplugMetric::findProperty(const char* key) const {
     if (key == nullptr) return nullptr;
@@ -1016,7 +1036,7 @@ const char* MqttSparkplugPayload::intern(const uint8_t* bytes, size_t length) {
     // +1 for the terminator. A name that does not fit returns null and the
     // decode fails by name: truncating it would create a second tag at the far
     // end that looks almost like the right one.
-    if (length + 1 > sizeof names - namesUsed) return nullptr;
+    if (names == nullptr || length + 1 > _nameCapacity - namesUsed) return nullptr;
     char* at = names + namesUsed;
     if (length > 0 && bytes != nullptr) memcpy(at, bytes, length);
     at[length] = '\0';
@@ -1030,12 +1050,108 @@ const char* MqttSparkplugPayload::rebase(const MqttSparkplugPayload& other,
     // Only what lives in the source's arena moves. Anything else - a string
     // literal a caller passed, a span into a receive buffer - is left exactly
     // as it was, because rebasing it would point at nothing.
+    if (other.names == nullptr) return pointer;
     if (pointer < other.names) return pointer;
-    if (pointer >= other.names + sizeof other.names) return pointer;
+    if (pointer >= other.names + other._nameCapacity) return pointer;
     return names + (pointer - other.names);
 }
 
+MqttSparkplugPayload::MqttSparkplugPayload(size_t metricCapacity,
+                                           size_t nameBytes) {
+    allocate(metricCapacity, nameBytes);
+}
+
+MqttSparkplugPayload::~MqttSparkplugPayload() {
+    release();
+}
+
+void MqttSparkplugPayload::release() {
+    if (metrics != nullptr) {
+        for (size_t index = 0; index < _metricCapacity; index++) {
+            metrics[index].~MqttSparkplugMetric();
+        }
+        mq_freeLarge(metrics);
+    }
+    mq_freeLarge(names);
+    metrics = nullptr;
+    names = nullptr;
+    _metricCapacity = 0;
+    _nameCapacity = 0;
+    metricCount = 0;
+    namesUsed = 0;
+}
+
+bool MqttSparkplugPayload::allocate(size_t metricCapacity, size_t nameBytes) {
+    release();
+    if (metricCapacity > 0) {
+        void* raw = mq_allocLarge(metricCapacity * sizeof(MqttSparkplugMetric));
+        if (raw == nullptr) return false;
+        metrics = static_cast<MqttSparkplugMetric*>(raw);
+        for (size_t index = 0; index < metricCapacity; index++) {
+            new (&metrics[index]) MqttSparkplugMetric();
+        }
+        _metricCapacity = metricCapacity;
+    }
+    if (nameBytes > 0) {
+        names = static_cast<char*>(mq_allocLarge(nameBytes));
+        if (names == nullptr) {
+            release();
+            return false;
+        }
+        _nameCapacity = nameBytes;
+    }
+    return true;
+}
+
+bool MqttSparkplugPayload::reserve(size_t metricCapacity, size_t nameBytes) {
+    if (metricCapacity <= _metricCapacity && nameBytes <= _nameCapacity) {
+        return true;
+    }
+    // Never smaller than it was in either dimension.
+    if (metricCapacity < _metricCapacity) metricCapacity = _metricCapacity;
+    if (nameBytes < _nameCapacity) nameBytes = _nameCapacity;
+
+    // The new storage first, so a failure leaves the payload as it was.
+    MqttSparkplugPayload grown(metricCapacity, nameBytes);
+    if (grown._metricCapacity < metricCapacity || grown._nameCapacity < nameBytes) {
+        return false;
+    }
+    release();
+    metrics = grown.metrics;
+    names = grown.names;
+    _metricCapacity = grown._metricCapacity;
+    _nameCapacity = grown._nameCapacity;
+    grown.metrics = nullptr;
+    grown.names = nullptr;
+    grown._metricCapacity = 0;
+    grown._nameCapacity = 0;
+    clear();
+    return true;
+}
+
 void MqttSparkplugPayload::copyFrom(const MqttSparkplugPayload& other) {
+    // Room for what the source holds - its CONTENT, not its capacity, so a
+    // copy of a decoded command does not inherit a birth certificate's size.
+    if (_metricCapacity < other.metricCount || _nameCapacity < other.namesUsed) {
+        const size_t wantMetrics = other.metricCount > _metricCapacity
+                                       ? other.metricCount : _metricCapacity;
+        const size_t wantNames = other.namesUsed > _nameCapacity
+                                     ? other.namesUsed : _nameCapacity;
+        if (!allocate(wantMetrics, wantNames)) {
+            // Out of memory. An empty payload rather than a half-copied one.
+            timestamp = 0;
+            hasTimestamp = false;
+            seq = 0;
+            hasSeq = false;
+            uuid = nullptr;
+            body = nullptr;
+            bodyLength = 0;
+            return;
+        }
+    } else {
+        clear();
+    }
+
     timestamp = other.timestamp;
     hasTimestamp = other.hasTimestamp;
     seq = other.seq;
@@ -1044,7 +1160,7 @@ void MqttSparkplugPayload::copyFrom(const MqttSparkplugPayload& other) {
     bodyLength = other.bodyLength;
 
     namesUsed = other.namesUsed;
-    if (namesUsed > 0) memcpy(names, other.names, namesUsed);
+    if (namesUsed > 0 && names != nullptr) memcpy(names, other.names, namesUsed);
 
     uuid = rebase(other, other.uuid);
 
@@ -1093,7 +1209,7 @@ size_t mq_sparkplugSize(const MqttSparkplugPayload& payload,
                         MqttSparkplugError& error) {
     error = MqttSparkplugError::None;
 
-    if (payload.metricCount > MQ_SP_MAX_METRICS) {
+    if (payload.metricCount > payload.capacity()) {
         error = MqttSparkplugError::TooManyMetrics;
         return 0;
     }
@@ -1192,8 +1308,8 @@ size_t mq_sparkplugEncode(uint8_t* out, size_t capacity,
 //
 // Kept as a static thread-local-free single instance would break R5, so it is
 // not. Instead the arena lives inside the payload the caller already owns: see
-// the `names` member below, which is why MqttSparkplugPayload is 6 kB rather
-// than 3 and why it is passed by reference everywhere.
+// the `names` member, sized by whoever constructed the payload, which is why it
+// is passed by reference everywhere.
 namespace {
 
 bool decodeMetric(const uint8_t* body, size_t bodyLength,
@@ -1568,7 +1684,7 @@ MqttSparkplugError mq_sparkplugDecode(const uint8_t* in, size_t length,
                 const uint8_t* body = nullptr;
                 size_t bodyLength = 0;
                 if (!reader.lengthDelimited(body, bodyLength)) break;
-                if (out.metricCount >= MQ_SP_MAX_METRICS) {
+                if (out.metricCount >= out.capacity()) {
                     reader.fail(MqttSparkplugError::TooManyMetrics);
                     break;
                 }

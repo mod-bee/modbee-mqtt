@@ -169,9 +169,13 @@
 // pure cryptography, it is exactly what a board needs to mint its own
 // certificate, and it works anywhere the engine does.
 //
-// On a board TLS reaches the network the way it always has, through
-// MqttStreamTransport over a secure Arduino Client - and what wolfSSL adds
-// there is an identity and a fingerprint to pin against, not a socket layer.
+// On a board, DIALLING TLS is MqttChannelTlsTransport over a plain Arduino
+// Client, with the core's mbedTLS (MQTT_CHANNEL_TLS, below) - and what wolfSSL
+// adds there is the SERVING side: an identity, a certificate, and
+// MqttStreamTlsListener. A sketch may still hand MqttStreamTransport a secure
+// Client of its own (WiFiClientSecure, SSLClient); the library no longer
+// needs one.
+//
 // BUFFERS THAT START SMALL AND GROW (MqttLink) are a host feature: a broker
 // holding a million mostly-idle connections needs them, and nothing on a
 // board does - a board allocates its buffers once, at begin(), and never
@@ -201,6 +205,38 @@
     #endif
 #endif
 
+// THE BOARD BUILD'S LEAN CHOICES - one switch for the memory-saving changes
+// that a board needs and a host must not get. The host build (the broker, the
+// Kafka pipe, the Docker image, the CLI and its bench) is tuned for speed and
+// compiles exactly as it did before any of them: with the switch off, not one
+// preprocessed line of it changes, which test/wire/host_same.sh proves.
+//
+// What it turns on, each where it is used:
+//   - no exception tables or unwind code for the library's own functions
+//     (MqttNoExcept.h): about 5 kB of flash. The library throws and catches
+//     nothing, so nothing changes but the size.
+//   - one property set per packet instead of one per packet kind
+//     (MqttPacket.h, MQ_PROPERTIES): a packet is 1 kB on the stack instead of
+//     3 kB, and about 2.7 kB less code.
+//
+// The tests define it on a host to run a board's code there. Define
+// MQTT_LEAN yourself to override either way.
+#ifndef MQTT_LEAN
+    #if defined(MQTT_PLATFORM_HOST)
+        #define MQTT_LEAN 0
+    #else
+        #define MQTT_LEAN 1
+    #endif
+#endif
+
+// A board's constructors are noexcept: MqttNoExcept.h's pragma does not reach
+// them, and they would keep their unwind tables. Nothing on a host.
+#if MQTT_LEAN
+    #define MQ_NOEXCEPT noexcept
+#else
+    #define MQ_NOEXCEPT
+#endif
+
 // SPARKPLUG'S PER-MESSAGE LIMITS on a host. A board's are sized for a board -
 // 34 metrics a message (MqttSparkplugTypes.h) - because every payload object
 // holds that many. A host application watching real plant nodes meets births
@@ -220,6 +256,61 @@
     #define MQTT_TLS_SOCKETS 1
 #else
     #define MQTT_TLS_SOCKETS 0
+#endif
+
+// --- TLS OVER A BOARD'S OWN CHANNEL, by the core's mbedTLS ---
+//
+// A board dials TLS through MqttChannelTlsTransport (transport/), which runs
+// the handshake on the controller over ANY Arduino channel - WiFiClient,
+// EthernetClient, a modem's plain socket - and checks the broker the same way
+// on all three. It is a separate question from MQTT_TLS_AVAILABLE above:
+// that is wolfSSL or OpenSSL, for host sockets and for SERVING TLS; this is
+// the engine the ESP32 Arduino core already links for its own Wi-Fi, so
+// dialling costs the board no second TLS library.
+//
+// DETECTED, never configured, like everything else here: every ESP32 Arduino
+// core ships mbedTLS, so ARDUINO_ARCH_ESP32 is the whole answer. Another
+// board has no mbedTLS to reuse and gets 0 - MqttChannelTls.cpp then compiles
+// to nothing.
+//
+// On a host it is 0 unless asked for, and only the test suite asks: the host
+// has the socket transports, and the test builds this one against an mbedTLS
+// shaped like the ESP32 core's (scripts/host-mbedtls.sh) to prove it off the
+// board. The same header-and-link-line rule as OpenSSL applies: define it,
+// put mbedTLS on the include path AND the link line, or do neither.
+#if !defined(MQTT_CHANNEL_TLS)
+    #if defined(ARDUINO_ARCH_ESP32) && defined(__has_include)
+        #if __has_include(<mbedtls/ssl.h>)
+            #define MQTT_CHANNEL_TLS 1
+        #endif
+    #endif
+#endif
+#if !defined(MQTT_CHANNEL_TLS)
+    #define MQTT_CHANNEL_TLS 0
+#endif
+
+// --- A BOARD'S CONNECT, OUTSIDE THE SCAN ---
+//
+// Arduino's Client::connect() is synchronous - seconds when the broker cannot
+// be reached - and a TLS handshake is heavy arithmetic for a controller.
+// MqttConnectTask (transport/) runs both on a short-lived task of their own, so
+// the PLC task that polls the client never waits for either. It needs threads:
+// every ESP32 core runs FreeRTOS, so ARDUINO_ARCH_ESP32 is again the whole
+// answer. A board without threads gets 0 and connects as it always has: inside
+// begin(), which stalls its caller for as long as the medium takes.
+//
+// It needs MQTT_LEAN too, for MqttTransport::openFailed(), which carries an
+// open that failed back to the client and exists only there. The test suite
+// turns it on for a host (std::thread) to prove it off the board.
+#if !defined(MQTT_CONNECT_TASK)
+    #if defined(ARDUINO_ARCH_ESP32) && MQTT_LEAN
+        #define MQTT_CONNECT_TASK 1
+    #else
+        #define MQTT_CONNECT_TASK 0
+    #endif
+#endif
+#if MQTT_CONNECT_TASK && !MQTT_LEAN
+    #error "MQTT_CONNECT_TASK needs MQTT_LEAN (MqttTransport::openFailed)"
 #endif
 
 // The name for a log line or a status pin. One place, so a runtime and a board

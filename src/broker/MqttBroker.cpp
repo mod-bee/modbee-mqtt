@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include "../MqttNoExcept.h"
 
 namespace {
 
@@ -59,6 +60,23 @@ MqttSpan asSpan(const std::vector<uint8_t>& bytes) {
     span.length = (uint32_t)bytes.size();
     return span;
 }
+
+#if MQTT_LEAN
+// A board's fixed fields (MqttFixed.h).
+MqttSpan asSpan(const MqttText& text) {
+    MqttSpan span;
+    span.data = (const uint8_t*)text.data();
+    span.length = (uint32_t)text.size();
+    return span;
+}
+
+MqttSpan asSpan(const MqttBytes& bytes) {
+    MqttSpan span;
+    span.data = bytes.data();
+    span.length = (uint32_t)bytes.size();
+    return span;
+}
+#endif
 
 // Puts a stored property set back on the wire.
 //
@@ -1460,7 +1478,7 @@ bool MqttBroker::sendConnAck(MqttBrokerConnection& connection, uint8_t reasonCod
     packet.connack.version = connection.version;
 
     if (connection.version == MqttVersion::V5) {
-        MqttProperties& properties = packet.connack.properties;
+        MqttProperties& properties = MQ_PROPERTIES(packet, packet.connack);
 
         // EVERYTHING WE ADVERTISE HERE IS ENFORCED BELOW. That pairing is the
         // point: a limit stated and not kept teaches every client a lie, and a
@@ -1819,7 +1837,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // No enhanced authentication mechanism ships, so every method is
     // unsupported. Saying so is the whole point: a client that asked for
     // SCRAM-SHA-1 and was answered 0x00 would believe it had authenticated.
-    if (isV5 && request.properties.has(MQ_PROP_AUTHENTICATION_METHOD)) {
+    if (isV5 && MQ_PROPERTIES(packet, request).has(MQ_PROP_AUTHENTICATION_METHOD)) {
         sendConnAck(connection, MQ_REASON_BAD_AUTHENTICATION_METHOD, false, nullptr);
         _status.refused++;
         closeConnection(connection, (uint8_t)(MQ_REASON_BAD_AUTHENTICATION_METHOD), false, false);
@@ -1828,11 +1846,11 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
 
     // --- What the client told us about itself ---
     if (isV5) {
-        connection.peerReceiveMaximum = request.properties.receiveMaximum;
-        connection.peerMaximumPacketSize = request.properties.maximumPacketSize;
-        connection.peerTopicAliasMaximum = request.properties.topicAliasMaximum;
+        connection.peerReceiveMaximum = MQ_PROPERTIES(packet, request).receiveMaximum;
+        connection.peerMaximumPacketSize = MQ_PROPERTIES(packet, request).maximumPacketSize;
+        connection.peerTopicAliasMaximum = MQ_PROPERTIES(packet, request).topicAliasMaximum;
         connection.peerWantsProblemInformation =
-            request.properties.requestProblemInformation != 0;
+            MQ_PROPERTIES(packet, request).requestProblemInformation != 0;
     } else {
         // 3.1.1 states none of this, so the defaults are its fixed answers -
         // no flow control, no packet limit, no aliases.
@@ -2040,8 +2058,8 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
 
     // --- Session expiry ---
     if (isV5) {
-        const uint32_t asked = request.properties.has(MQ_PROP_SESSION_EXPIRY_INTERVAL)
-                                 ? request.properties.sessionExpiryInterval : 0;
+        const uint32_t asked = MQ_PROPERTIES(packet, request).has(MQ_PROP_SESSION_EXPIRY_INTERVAL)
+                                 ? MQ_PROPERTIES(packet, request).sessionExpiryInterval : 0;
         uint32_t requested = asked;
         if (requested > _config.maximumSessionExpiry &&
             _config.maximumSessionExpiry != 0xFFFFFFFFu) {
@@ -2612,14 +2630,14 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         packet.publish.dup = next->packetId != MQ_PACKET_ID_NONE && next->sent;
 
         if (isV5) {
-            restoreProperties(next->properties, packet.publish.properties);
+            restoreProperties(next->properties, MQ_PROPERTIES(packet, packet.publish));
 
             if (next->properties.hasExpiry) {
                 const uint32_t waited =
                     (uint32_t)(mq_elapsed(next->queuedAt, now) / 1000u);
-                packet.publish.properties.messageExpiryInterval =
+                MQ_PROPERTIES(packet, packet.publish).messageExpiryInterval =
                     next->properties.expiryInterval - waited;
-                packet.publish.properties.markPresent(MQ_PROP_MESSAGE_EXPIRY_INTERVAL);
+                MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_MESSAGE_EXPIRY_INTERVAL);
             }
 
             // [V5:3.3.4] The identifiers of every matching subscription travel
@@ -2628,12 +2646,12 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
             if (_config.subscriptionIdentifiersAvailable) {
                 for (uint8_t index = 0; index < next->subscriptionIdCount &&
                                         index < MQTT_MAX_SUBSCRIPTION_IDS; index++) {
-                    packet.publish.properties.subscriptionIds[index] =
+                    MQ_PROPERTIES(packet, packet.publish).subscriptionIds[index] =
                         next->subscriptionIds[index];
-                    packet.publish.properties.subscriptionIdCount = (uint8_t)(index + 1);
+                    MQ_PROPERTIES(packet, packet.publish).subscriptionIdCount = (uint8_t)(index + 1);
                 }
                 if (next->subscriptionIdCount > 0) {
-                    packet.publish.properties.markPresent(MQ_PROP_SUBSCRIPTION_IDENTIFIER);
+                    MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_SUBSCRIPTION_IDENTIFIER);
                 }
             }
 
@@ -2646,16 +2664,16 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
                     // may be sent zero-length. The alias is only ever used
                     // AFTER the full topic has gone once on this connection.
                     packet.publish.topic.length = 0;
-                    packet.publish.properties.topicAlias = alias;
-                    packet.publish.properties.markPresent(MQ_PROP_TOPIC_ALIAS);
+                    MQ_PROPERTIES(packet, packet.publish).topicAlias = alias;
+                    MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_TOPIC_ALIAS);
                 } else {
                     // false: lookupOutbound() has just missed on this exact
                     // topic, so searching again would be the same walk twice.
                     alias = connection.aliases.assignOutbound(
                         topicSpan.data, (uint16_t)topicSpan.length, false);
                     if (alias != 0) {
-                        packet.publish.properties.topicAlias = alias;
-                        packet.publish.properties.markPresent(MQ_PROP_TOPIC_ALIAS);
+                        MQ_PROPERTIES(packet, packet.publish).topicAlias = alias;
+                        MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_TOPIC_ALIAS);
                     }
                 }
             }
@@ -2815,8 +2833,8 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
     MqttSpan topic = message.topic;
 
     // --- Topic aliases, inbound [V5:3.3.2.3.4] ---
-    if (isV5 && message.properties.has(MQ_PROP_TOPIC_ALIAS)) {
-        const uint16_t alias = message.properties.topicAlias;
+    if (isV5 && MQ_PROPERTIES(packet, message).has(MQ_PROP_TOPIC_ALIAS)) {
+        const uint16_t alias = MQ_PROPERTIES(packet, message).topicAlias;
 
         // "A sender MUST NOT send a PUBLISH packet with a Topic Alias greater
         // than the Topic Alias Maximum value returned by the receiver"
@@ -2887,8 +2905,8 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
     // or PUBREC with Reason Code 0x99." It does validate: a payload that
     // claims to be text and is not will be read as text by something
     // downstream, and that something is usually a dashboard.
-    if (isV5 && message.properties.has(MQ_PROP_PAYLOAD_FORMAT_INDICATOR) &&
-        message.properties.payloadFormatIndicator == 1) {
+    if (isV5 && MQ_PROPERTIES(packet, message).has(MQ_PROP_PAYLOAD_FORMAT_INDICATOR) &&
+        MQ_PROPERTIES(packet, message).payloadFormatIndicator == 1) {
         if (mq_validateUtf8(message.payload.data, message.payload.length)
                 != MqttError::None) {
             if (message.qos == MQ_QOS_0) {
@@ -2967,12 +2985,12 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
             // slots answered 0x00 and the publisher believed its setpoint had
             // been kept for the next subscriber to arrive. It had not.
             retainedStoreFull = !_retained.store(topic, message.payload,
-                                                 message.qos, message.properties,
+                                                 message.qos, MQ_PROPERTIES(packet, message),
                                                  mq_millis());
         }
 
         matched = route(topic, message.payload, message.qos, message.retain,
-                        message.properties, session, &refusedByQueue);
+                        MQ_PROPERTIES(packet, message), session, &refusedByQueue);
 
         if (_onTap) {
             _onTap(_tapContext, asSpan(session->clientId()), topic,
@@ -2991,7 +3009,7 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
                     : 0;
             const uint32_t parties =
                 egress(topic, message.payload, message.qos, message.retain,
-                       message.properties, asSpan(session->clientId()), matched,
+                       MQ_PROPERTIES(packet, message), asSpan(session->clientId()), matched,
                        refusedByQueue, deferral, nullptr, asSpan(session->userName));
             if (deferral != 0) {
                 if (parties == 0) {
@@ -3261,7 +3279,7 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
     }
 
     uint32_t subscriptionId = 0;
-    if (isV5 && request.properties.has(MQ_PROP_SUBSCRIPTION_IDENTIFIER)) {
+    if (isV5 && MQ_PROPERTIES(packet, request).has(MQ_PROP_SUBSCRIPTION_IDENTIFIER)) {
         if (!_config.subscriptionIdentifiersAvailable) {
             // [V5:MQTT-3.2.2-12] A client that sends one to a server that said
             // they are unavailable gets a DISCONNECT, not a refused filter:
@@ -3271,7 +3289,7 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
                             true, true);
             return;
         }
-        subscriptionId = request.properties.subscriptionIds[0];
+        subscriptionId = MQ_PROPERTIES(packet, request).subscriptionIds[0];
     }
 
     MqttPacket response;
@@ -3440,8 +3458,8 @@ void MqttBroker::handleDisconnect(MqttBrokerConnection& connection,
         isV5 && packet.disconnect.reasonCode == MQ_REASON_DISCONNECT_WITH_WILL;
 
     if (isV5 && session != nullptr &&
-        packet.disconnect.properties.has(MQ_PROP_SESSION_EXPIRY_INTERVAL)) {
-        const uint32_t requested = packet.disconnect.properties.sessionExpiryInterval;
+        MQ_PROPERTIES(packet, packet.disconnect).has(MQ_PROP_SESSION_EXPIRY_INTERVAL)) {
+        const uint32_t requested = MQ_PROPERTIES(packet, packet.disconnect).sessionExpiryInterval;
 
         // [V5:MQTT-3.14.4-2] "If the Session Expiry Interval in the CONNECT
         // packet was zero, then it is a Protocol Error to set a non-zero

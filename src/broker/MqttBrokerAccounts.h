@@ -13,9 +13,12 @@
 //     is right. Both comparisons here run over the whole stored value whatever
 //     the offered one contains.
 //
-// FIXED SIZE, ALLOCATED NOWHERE. A broker on a board is configured once and
-// runs for months, and an account table that could grow is a heap that could
-// fragment. MQ_BROKER_MAX_ACCOUNTS raises the limit for a build that needs it.
+// AS MANY ACCOUNTS AS ARE DECLARED, on a host or a board: the table grows
+// with set() - once, as the PLC program's MQTT_BROKER_USER blocks start or a
+// server loads its logins - and only memory ends it (set() is then false).
+// Nothing is allocated after that, so a broker that runs for months does not
+// fragment its heap. (It was MQ_BROKER_MAX_ACCOUNTS, 16, which a PLC program
+// could not raise.)
 //
 // WHEN ACCOUNTS ARE REQUIRED. Declaring any account makes them required for
 // every CONNECT - including declaring one that is disabled. The alternative,
@@ -36,10 +39,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifndef MQ_BROKER_MAX_ACCOUNTS
-#define MQ_BROKER_MAX_ACCOUNTS 16
-#endif
-
 // 64, because that is what an OpenPLC STRING pin can carry and what a user
 // name or password typed into a PLC program realistically is. Longer is refused
 // at set() rather than truncated: a truncated password is a different password.
@@ -51,7 +50,7 @@ class MqttBrokerAccounts {
 public:
     // Add an account, or replace the password and enabled flag of one that
     // already exists. False if the name is empty, either field is too long, or
-    // the table is full.
+    // the memory for one more account is not there.
     //
     // A disabled account still makes accounts REQUIRED - see the header
     // comment - and simply cannot log in.
@@ -96,12 +95,15 @@ private:
         uint8_t password[MQ_BROKER_ACCOUNT_FIELD_BYTES];
         uint32_t logins = 0;
         uint32_t refusals = 0;
+        // The table moves when it grows, and the copy left behind held a
+        // password: wiped before it is freed.
+        ~Account();
     };
 
     int find(const char* userName) const;
     static void wipe(Account& account);
 
-    Account _accounts[MQ_BROKER_MAX_ACCOUNTS];
+    MqttGrowList<Account> _accounts;
     size_t _count = 0;
 
     uint32_t _accepted = 0;

@@ -6,6 +6,7 @@
 #include "MqttSparkplugValue.h"
 
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 namespace {
 

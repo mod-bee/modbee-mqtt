@@ -36,8 +36,10 @@ Nothing is behind a build flag. A part your program never uses is code nothing
 references, and the linker drops it; [footprint.md](docs/footprint.md) measures
 that.
 
-TLS uses whatever is there: wolfSSL or OpenSSL on a host, and
-`WiFiClientSecure` or `SSLClient` on a board.
+TLS uses whatever is there: wolfSSL or OpenSSL on a host; on an ESP32 the
+core's own mbedTLS over any channel (`MqttChannelTlsTransport` - the same checks
+on Wi-Fi, Ethernet and a modem, with key pinning); and `WiFiClientSecure` or
+`SSLClient` on other boards.
 
 ### The server: the broker at scale
 
@@ -104,7 +106,9 @@ Only the network lines differ between links:
 WiFiClient net;             MqttDevice mqtt(net);   // WiFi
 EthernetClient net;         MqttDevice mqtt(net);   // wired
 TinyGsmClient net(modem);   MqttDevice mqtt(net);   // cellular
-WiFiClientSecure net;       MqttDevice mqtt(net);   // TLS, ESP32
+MqttChannelTlsTransport<EthernetClient> tls(net, "broker", 8883);
+                            MqttDevice mqtt(tls);   // TLS on any channel, ESP32
+WiFiClientSecure net;       MqttDevice mqtt(net);   // TLS, ESP8266
 SSLClient net(wired, TAs, TAs_NUM, A5);             // TLS where the chip has none
 ```
 

@@ -57,6 +57,16 @@ transport.setCaFile("/etc/ssl/certs/plant-ca.crt");
 ```
 
 ```cpp
+// An ESP32, over ANY channel - Wi-Fi, Ethernet or a modem's plain socket. The
+// TLS is done on the controller by the mbedTLS the core already links, with
+// the same checks as MqttTlsTransport: validate, pin one key, or neither.
+WiFiClient plain;
+MqttChannelTlsTransport<WiFiClient> tls(plain, "broker.example.com", 8883);
+tls.setCaCertificate(ROOT_CA);
+MqttDevice mqtt(tls);
+```
+
+```cpp
 // Arduino, on a board with native TLS (ESP32, ESP8266). A secure channel is an
 // ordinary Arduino network channel, so the same template covers it and TLS
 // costs no extra code at all.
@@ -153,10 +163,20 @@ deliberately rather than have a library quietly agree to it.
 
 ## A note on Arduino
 
-**ESP32's `WiFiClientSecure` is documented not to check certificate validity
-dates.** So "it connected" is weaker evidence there than a developer expects —
-an expired certificate that this library refuses on a host may be accepted on a
-board.
+**An ESP32 does not judge certificate dates** - not through `WiFiClientSecure`
+and not through `MqttChannelTlsTransport`, because the core's mbedTLS is built
+without a calendar. So "it connected" is weaker evidence there than a developer
+expects: an expired certificate that this library refuses on a host may be
+accepted on a board. It is deliberate rather than an oversight - a controller
+that booted believing it is 1970 must still connect - and it is the reason
+`MQTT_TLS_PINNED` skips dates on a host too.
+
+**`MqttChannelTlsTransport` is tested off the board** (`test/test_channel_tls`)
+against an mbedTLS configured as the core's is, built by
+`scripts/host-mbedtls.sh`: every check and every refusal, RSA, P-256 and P-384
+chains, mutual TLS and a whole MQTT session over one-byte reads. What that
+cannot prove is the core's own build of the engine, so the board build and a
+bench connection remain part of a release.
 
 **`SSLClient` needs real entropy.** Its last constructor argument is an analog
 pin, and that pin must be **unconnected**. Wired to anything with a steady
@@ -173,6 +193,56 @@ and they are stated here rather than left to be discovered. The Arduino side is 
 covered by the automated TLS matrix for the same reason it is not covered by the
 broker rig: it cannot run in a container. That is said here rather than left as
 implied coverage.
+
+---
+
+## Why a board refused: `MqttTlsError`
+
+`MqttChannelTlsTransport` reports a refusal as a value, not as mbedTLS's own
+sentences: `mbedtls_strerror()` and its text for every code in every module
+cost about 11.7 kB of a board's flash and say no more than this list does.
+
+```cpp
+tls.lastErrorCode();    // MqttTlsError, below
+tls.lastEngineCode();   // the mbedTLS code (negative), or 0 when it is not the engine's
+tls.lastError();        // both as one line for a status pin, at most 38 characters:
+                        //   "TLS: broker refused us -0x7780"
+mq_tlsErrorText(MqttTlsError::WrongHost);   // the line alone
+```
+
+The numbers are fixed; a value may be added at the end, never moved. The line
+is at most 30 characters, and is followed by ` -0x` and the engine's code in
+hexadecimal when there is one.
+
+| # | `MqttTlsError` | Line | What it means, and what to do |
+| ---: | --- | --- | --- |
+| 0 | `None` | | nothing has failed |
+| 1 | `NoHost` | no host or port configured | the transport was begun with no host or port |
+| 2 | `Unreachable` | cannot connect to the broker | the plain channel would not open: nothing listening, no network, the modem not registered |
+| 3 | `NoMemory` | TLS: out of memory | the heap could not hold the session (about 40 kB; in PSRAM where the board has it) |
+| 4 | `NoCa` | TLS: no CA certificate given | validating with no CA: give one, or pin the broker's key |
+| 5 | `BadCa` | TLS: CA certificate unreadable | the CA is not PEM, or not a certificate; the code says where it stopped |
+| 6 | `BadClientCertificate` | TLS: client cert/key unusable | a certificate without its key, or either will not parse |
+| 7 | `EngineSetup` | TLS: engine would not start | the random generator or the session would not initialise - a fault, not a configuration |
+| 8 | `Untrusted` | TLS: certificate not trusted | the broker's chain does not lead to the CA given - a different CA, or a server that omits its intermediate |
+| 9 | `WrongHost` | TLS: wrong host name | the certificate is for another name: use the name it was issued to, not the address |
+| 10 | `BadCertificate` | TLS: bad certificate | the certificate failed another check (key usage, signature), or its message would not parse |
+| 11 | `NoPeerCertificate` | TLS: broker sent no cert | pinned, and the broker presented no certificate to compare |
+| 12 | `PinMismatch` | TLS: not the pinned key | the broker was replaced, or the address is wrong; `peerKeyFingerprint()` is what it showed |
+| 13 | `Refused` | TLS: broker refused us | the broker ended the handshake with an alert - most often it wants a client certificate, or refuses the one given |
+| 14 | `NoCommonProtocol` | TLS: no common version/cipher | no TLS 1.2 or no cipher suite in common: a broker set to TLS 1.3 only, or to suites the board does not offer |
+| 15 | `Handshake` | TLS handshake failed | any other handshake failure; the code says which |
+| 16 | `Timeout` | TLS handshake timed out | the handshake was given up before it finished - the client's connect timeout on a slow or lossy link |
+| 17 | `Closed` | broker closed the connection | the broker said goodbye (close_notify, or end of stream) |
+| 18 | `Dropped` | TLS: connection dropped | the connection went in the middle of a record |
+| 19 | `ReadFailed` | TLS read failed | any other failure reading; the code says which |
+| 20 | `WriteFailed` | TLS write failed | any other failure writing; the code says which |
+
+The engine code is mbedTLS's own number, so it can be looked up in mbedTLS's
+headers (`include/mbedtls/ssl.h`, `x509.h`, ...) or with its
+`programs/util/strerror` on a host. `mq_tlsErrorFromEngine()` is the mapping,
+and `test/test_channel_tls` holds it to this table. A host's `MqttTlsTransport`
+keeps OpenSSL's or wolfSSL's own words, which cost a host nothing.
 
 ---
 
@@ -251,8 +321,10 @@ const std::string key = transport.peerKeyFingerprint();   // store this
 `peerKeyFingerprint()` is filled in whether or not anything is pinned, so an
 application can always report what it was actually shown rather than what it
 hoped for. A mismatch afterwards fails with **both** fingerprints in
-`lastError()` — because the useful question is always which one moved, a broker
-that was reinstalled or an address that is wrong.
+`lastError()` on a host — because the useful question is always which one
+moved, a broker that was reinstalled or an address that is wrong. On a board
+it fails with `MqttTlsError::PinMismatch`, and `peerKeyFingerprint()` still
+holds the key that was presented, to set beside the one that was pinned.
 
 ---
 

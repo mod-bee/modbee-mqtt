@@ -156,6 +156,7 @@ it.** It does a DNS lookup and a TCP handshake and returns when they are done.
 | `EthernetClient`, DNS name | one DNS round trip, plus the handshake |
 | `WiFiClientSecure` / `SSLClient` | the above, plus a TLS handshake — the slow part on a small board |
 | `TinyGsmClient` | **seconds** — it is a sequence of AT commands |
+| `MqttChannelTlsTransport` over any of these | only the plain channel's `connect()`; the TLS handshake runs a step per `poll()` and never waits for the network, though a step's arithmetic is the poll's |
 
 ### Where it can happen
 
@@ -196,6 +197,31 @@ void loop() {
 `examples/arduino/Remote_Site_Cellular` does exactly this, including bringing
 the bearer back up.
 
+### On an ESP32: put the connect on a task of its own
+
+Every ESP32 runs FreeRTOS, so there the stall can be moved off your loop
+altogether. `MqttConnectTask` wraps the transport that opens the medium; its
+`begin()` starts a short task that calls the medium's `begin()` - and, for
+`MqttChannelTlsTransport`, drives the whole handshake - then hands the medium
+back. Meanwhile the client is `Connecting`, `poll()` returns at once, and the
+connect timeout and the reconnect backoff are the client's as always. An open
+that fails is answered exactly as a `begin()` that returned false.
+
+```cpp
+WiFiClient wifi;
+MqttStreamTransport<WiFiClient> stream(wifi, "broker.local", 1883);
+MqttConnectTask task;                 // MQTT_CONNECT_STACK bytes, internal RAM
+task.wrap(stream);
+client.begin(task, connection);       // auto-reconnect stays on
+```
+
+While an attempt runs the task owns the medium: the wrapper answers "nothing
+yet" for it, and an `end()` asked for meanwhile is done by the task when the
+medium's connect returns. Never free the medium while `busy()`: hand it to
+`retire()`, which frees it after the attempt. The task exists only while an
+attempt runs. `MQTT_CLIENT`, the OpenPLC block, does all of this on an ESP32.
+A board without threads (`MQTT_CONNECT_TASK` 0) keeps the stall where it was.
+
 On a **host** none of this applies: `MqttTcpTransport` and `MqttTlsTransport`
 are non-blocking throughout, connect included. The limitation is Arduino's
 `Client` interface, not the design.
@@ -206,6 +232,58 @@ are non-blocking throughout, connect included. The limitation is Arduino's
 
 TLS is a transport, not a feature. Which means on Arduino it usually costs no
 extra code at all — a secure channel *is* a channel.
+
+### An ESP32, over any channel — Wi-Fi, Ethernet or a modem
+
+**This is the one to use on an ESP32.** `MqttChannelTlsTransport` takes a
+*plain* channel and does the TLS itself, with the mbedTLS the ESP32 core
+already links for its own Wi-Fi — so it adds no TLS library, about 4 kB of
+code, and it checks the broker the same way whatever the medium:
+
+```cpp
+WiFiClient plain;                        // or EthernetClient, or a modem's client
+MqttChannelTlsTransport<WiFiClient> tls(plain, "broker.example.com", 8883);
+tls.setCaCertificate(ROOT_CA);           // or setPinnedKeyFingerprint(), see below
+MqttDevice mqtt(tls);
+mqtt.connect("broker.example.com", 8883, "tank-01");
+```
+
+What it gives that a medium's own secure client does not:
+
+| | `WiFiClientSecure` | `SSLClient` | a modem's own TLS | `MqttChannelTlsTransport` |
+| --- | --- | --- | --- | --- |
+| Verifies by CA, and the host name | yes | yes | **no** | yes |
+| Pins one key (`setPinnedKeyFingerprint`) | no | no | no | yes |
+| Reports the broker's key (`peerKeyFingerprint`) | no | no | no | yes |
+| Mutual TLS (`setClientCertificate`) | yes | yes | varies | yes |
+| Ethernet and cellular too | no | yes | cellular only | yes |
+| Handshake blocks the loop | yes | yes | yes | **no** — a step per `poll()` |
+| Extra flash on an ESP32 | 0 | 40–50 kB | 0 | about 4 kB |
+
+The checks are `MqttTlsTransport`'s, the host's TLS transport: validate by
+default and refuse without a CA, pinning replaces chain and name checking, and
+`setInsecureNoCertificateValidation()` checks nothing. A refusal is reported
+as a value, `lastErrorCode()`, with a short line in `lastError()` — the list is
+in [security.md](security.md#why-a-board-refused-mqtttlserror). Certificate dates are
+never judged: the core's mbedTLS is built without a calendar, because a
+controller that booted thinking it is 1970 must still connect.
+
+**Memory.** A session holds about 40 kB while it is up — two 16 kB record
+buffers the core compiles in — and nothing while it is down. On a board with
+PSRAM, the first session moves mbedTLS's larger allocations there
+(`mq_channelTlsUseExternalRam()`). That is global: mbedTLS has one allocator,
+so Wi-Fi's own cryptography moves too, exactly as ESP-IDF's
+`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` would do it. Define
+`MQTT_CHANNEL_TLS_INTERNAL_RAM` to keep everything in internal RAM.
+
+**Bytes on the wire.** The cipher suites offered are the ECDHE-AES-GCM and
+ECDHE-AES-CBC-SHA256/384 families plus RSA-AES-GCM — what brokers choose —
+rather than everything the core compiled, which keeps the first message about
+150 bytes on a metered link. RSA, P-256 and P-384 certificate chains all
+verify; the suite list does not affect that.
+
+ESP32 only (`MQTT_CHANNEL_TLS` in `MqttFeatures.h`): no other core ships an
+mbedTLS to reuse. Elsewhere, use one of the two below.
 
 ### A board with native TLS (ESP32, ESP8266)
 

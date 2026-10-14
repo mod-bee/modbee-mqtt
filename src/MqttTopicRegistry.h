@@ -38,12 +38,14 @@
 
 #include "MqttResult.h"
 #include "MqttTopic.h"
+#include "MqttFixed.h"   // MqttGrowList
 
-// How many topics may be registered. Fixed, because a device with no spare
-// heap must know its ceiling before it starts rather than discover it.
-#ifndef MQTT_MAX_TOPIC_HANDLES
-#define MQTT_MAX_TOPIC_HANDLES 16
-#endif
+// HOW MANY TOPICS MAY BE REGISTERED: no fixed number, on a host or a board.
+// The table grows with what the program registers, each entry allocated once
+// (in PSRAM where a board has some), and only memory ends it - add() then
+// refuses and outOfMemory() says why - or the 32767 handles an int16_t
+// MqttTopicHandle can number. (It was MQTT_MAX_TOPIC_HANDLES, 16, shared by
+// every block on a client.)
 
 // The largest inbound payload a handle keeps for polling.
 //
@@ -70,9 +72,6 @@
 // flag; both would look like the library losing messages.
 //
 // Caught here, at compile time, rather than by whoever chose the number.
-static_assert(MQTT_MAX_TOPIC_HANDLES <= 32767,
-              "MQTT_MAX_TOPIC_HANDLES must fit the int16_t MqttTopicHandle, "
-              "which also has to hold -1 for 'no handle'");
 static_assert(MQTT_HANDLE_TOPIC_MAX <= 256,
               "MQTT_HANDLE_TOPIC_MAX must fit the uint8_t that stores a "
               "topic's length - raise the field before raising the bound");
@@ -101,7 +100,8 @@ struct MqttTopicState {
 class MqttTopicRegistry {
 public:
     // Registers a topic or filter and returns its handle, or
-    // MQTT_TOPIC_HANDLE_NONE when the table is full or the text will not fit.
+    // MQTT_TOPIC_HANDLE_NONE when memory for one more is not there (or all
+    // 32767 handles are taken) or the text will not fit.
     //
     // Registering the same text twice returns the SAME handle rather than
     // consuming a second slot: a function block that registers in its own
@@ -136,6 +136,10 @@ public:
     size_t count() const;
     void clear();
 
+    // The table ran out of memory: a registration was refused for want of
+    // RAM rather than for anything about the topic. Cleared by clear().
+    bool outOfMemory() const { return _outOfMemory; }
+
     // The completion handler the client installs for a handle-based publish
     // or subscribe. The context is the MqttTopicState, so there is no
     // allocation, no capture, and nothing for a generated wrapper to express.
@@ -149,14 +153,27 @@ private:
         bool pending = false;       // a message is waiting to be taken
         MqttTopicState state;
     };
-    Entry _entries[MQTT_MAX_TOPIC_HANDLES];
+    // The entries, one allocation each, so an entry never moves: its
+    // MqttTopicState is the context of a publish still in flight. Indexed as
+    // an array is.
+    struct Entries {
+        MqttGrowList<Entry*> slots;
+        size_t count = 0;
+        Entries() noexcept = default;
+        Entries(const Entries&) = delete;
+        Entries& operator=(const Entries&) = delete;
+        ~Entries() noexcept;
+        Entry& operator[](size_t index) const noexcept { return *slots[index]; }
+    };
+    Entries _entries;
+    bool _outOfMemory = false;
 
     // Returned for a handle that does not exist, so stateOf() never returns
     // null and a polled reader needs no special case.
     MqttTopicState _noSuchHandle;
 
     bool valid(MqttTopicHandle handle) const {
-        return handle >= 0 && handle < MQTT_MAX_TOPIC_HANDLES &&
+        return handle >= 0 && (size_t)handle < _entries.count &&
                _entries[handle].inUse;
     }
 };

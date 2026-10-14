@@ -1,6 +1,15 @@
 #include "MqttBrokerAccounts.h"
 
 #include <string.h>
+#include "../MqttNoExcept.h"
+
+// The table: as many slots as it has grown to.
+#define MQ_ACCOUNT_SLOTS _accounts.capacity()
+
+MqttBrokerAccounts::Account::~Account() {
+    memset(name, 0, sizeof name);
+    memset(password, 0, sizeof password);
+}
 
 namespace {
 
@@ -34,12 +43,14 @@ bool MqttBrokerAccounts::set(const char* userName, const uint8_t* password,
 
     int slot = find(userName);
     if (slot < 0) {
-        for (size_t index = 0; index < MQ_BROKER_MAX_ACCOUNTS; index++) {
+        for (size_t index = 0; index < MQ_ACCOUNT_SLOTS; index++) {
             if (!_accounts[index].inUse) {
                 slot = (int)index;
                 break;
             }
         }
+        // Every slot taken: one more, as far as memory goes.
+        if (slot < 0 && _accounts.reserve(_count + 1)) slot = (int)_count;
         if (slot < 0) return false;
         Account& fresh = _accounts[slot];
         fresh = Account();
@@ -75,7 +86,7 @@ bool MqttBrokerAccounts::remove(const char* userName) {
 }
 
 void MqttBrokerAccounts::clear() {
-    for (size_t index = 0; index < MQ_BROKER_MAX_ACCOUNTS; index++) {
+    for (size_t index = 0; index < MQ_ACCOUNT_SLOTS; index++) {
         wipe(_accounts[index]);
     }
     _count = 0;
@@ -94,7 +105,7 @@ void MqttBrokerAccounts::wipe(Account& account) {
 int MqttBrokerAccounts::find(const char* userName) const {
     if (userName == nullptr) return -1;
     const size_t length = strlen(userName);
-    for (size_t index = 0; index < MQ_BROKER_MAX_ACCOUNTS; index++) {
+    for (size_t index = 0; index < MQ_ACCOUNT_SLOTS; index++) {
         const Account& account = _accounts[index];
         if (!account.inUse || account.nameLength != length) continue;
         if (memcmp(account.name, userName, length) == 0) return (int)index;
@@ -123,7 +134,7 @@ bool MqttBrokerAccounts::authorise(const MqttBrokerRequest& request,
     // returned on: a scan that stopped at the right name would answer sooner
     // for names that exist, which tells a guesser which ones do.
     int match = -1;
-    for (size_t index = 0; index < MQ_BROKER_MAX_ACCOUNTS; index++) {
+    for (size_t index = 0; index < MQ_ACCOUNT_SLOTS; index++) {
         const Account& account = _accounts[index];
         if (!account.inUse) continue;
         const bool same = sameBytes((const uint8_t*)account.name,

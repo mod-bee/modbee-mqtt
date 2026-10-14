@@ -6,6 +6,7 @@
 #include "MqttSparkplugTopic.h"
 
 #include "../MqttWire.h"
+#include "../MqttNoExcept.h"
 
 namespace {
 

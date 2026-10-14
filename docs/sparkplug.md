@@ -101,8 +101,35 @@ to `mq_spUInt64`, `mq_spFloat`, `mq_spDouble`, `mq_spString`, `mq_spText`,
 ### Sending
 
 - **`publishChanged()`** sends one NDATA with the metrics whose value moved
-  since they were last sent. Call it on a timer (once a second in the
-  examples) or every loop; with nothing changed it sends nothing.
+  since they were last sent, and one DDATA for each online device that has
+  some. Call it on a timer (once a second in the examples) or every loop;
+  with nothing changed it sends nothing. It looks only at the metrics that
+  were marked - by `set()`/`setAt()` changing a value, a host's write, or
+  `reportAt()` - and a metric stays marked while it differs from what was
+  last sent (inside its deadband, or held), so a call costs what moved, not
+  what is declared. A text value rewritten in place in the same buffer is
+  seen when it is `set()` again, as the OpenPLC blocks do every scan.
+- **`publishAtPoll()`** asks for one `publishChanged()` at the next `poll()`.
+  For a program that sets values in many places - the OpenPLC blocks: each
+  asks, and the node sends one NDATA (and one DDATA a device) per poll for
+  all of them. `pollPublishes()` counts those made and `pollPublishSent()`
+  says whether the last one went; a caller keeps the count from when it
+  asked to know its message has been made.
+- **A deadband** decides what "moved" means for a noisy number:
+
+  ```cpp
+  node.deadband("Tank/Level", 0.01);          // ignore moves of 10 mm or less
+  node.deadband("Line/Pressure", 0, 2.0);     // ignore moves of 2 % or less
+  node.deadbandFor("Pump-2", "Speed", 5.0);   // a device's metric
+  ```
+
+  A move is measured from the value **last published**, not the last one set,
+  so a slow drift still adds up and goes. A value a host **wrote** is always
+  reported back, deadband or not - the host watches for that echo to know the
+  write took. With both numbers set, a move must
+  clear both. Only numeric metrics take one (a Boolean is refused - a
+  deadband would freeze the bit), and a birth or `publishAll()` always
+  carries every value as it is.
 - **`publishAll()`** sends every metric, changed or not.
 - **`rebirth()`** publishes the birth again. A host asks for this with a
   rebirth command, and the node does it by itself.
@@ -110,18 +137,75 @@ to `mq_spUInt64`, `mq_spFloat`, `mq_spDouble`, `mq_spString`, `mq_spText`,
 ### The clock
 
 Every Sparkplug message carries a UTC timestamp, and the specification
-requires it. On a host the system clock is used and nothing needs doing. On a
-board, which may only know how long it has been running, give the node the
-time once, in milliseconds since 1970, from NTP or an RTC:
+requires it. On a host the system clock is used and nothing needs doing.
+
+On an ESP32, ESP8266 or RP2040 the board's own system clock is used as soon as
+something has set it - so starting SNTP is enough, and the node needs no call:
 
 ```cpp
 configTime(0, 0, "pool.ntp.org");                // ESP32 and ESP8266
-while (time(nullptr) < 1700000000) delay(250);
-node.epochNow((uint64_t)time(nullptr) * 1000);
 ```
 
-The node adds its own uptime from then on. Without it, `node.clockIsSet()` is
-false and its timestamps count from boot, which a strict host will reject.
+A modem's network time, or an RTC read at start-up, sets it the same way:
+`mq_setEpochMillis(ms)` (or `settimeofday()`). Until the clock reads a date
+after 2024 it is treated as not set.
+
+On any other board, give the node the time once, in milliseconds since 1970:
+
+```cpp
+node.epochNow(rtcMillisSince1970);
+```
+
+The node adds its own uptime from then on. Without a clock,
+`node.clockIsSet()` is false and the timestamps count from boot - a date in
+January 1970, which a host should read as "not synced" and replace with the
+time it received the message.
+
+### Units and ranges
+
+The birth can say what a number means: `engUnit`, and the `engLow`/`engHigh`
+range a SCADA gauge or trend should show (the property names Eclipse Tahu and
+Ignition use).
+
+```cpp
+node.declare("Tank/Level", MqttSparkplugDataType::Float, "m");   // units at declaration
+const int level = node.indexOf(nullptr, "Tank/Level");
+node.unitsAt(level, "m");
+node.rangeAt(level, 0.0, 4.5);
+```
+
+They travel only in the birth, so a change shows at the next one.
+
+### Many metrics from one block
+
+A wrapper binding a whole structure looks each metric up once and keeps its
+index - `indexOf(device, name)` - then works by index every scan: `setAt()`,
+`valueAt()`, `changePendingAt()`, `commandPendingAt()`, `takeAt()`,
+`deadbandAt()`. The
+index is stable for the life of the node; every call refuses one past
+`pointCount()`. `setAt()` answers whether the value changed (false for the
+same value again, and for a refusal). Names are found through a hash index
+built as metrics are declared, so declaring a thousand costs a thousand
+lookups, not half a million compares.
+
+Two more by index, for a set sent on its own clock:
+
+```cpp
+node.holdAt(elapsed, true);       // only when asked: not with every other report
+node.reportAt(elapsed);           // ask: it goes in the next publishChanged()
+```
+
+A **held** metric is left out of `publishChanged()` unless `reportAt()` marked
+it - for a set sent on its own clock, every period or on request. Births and
+`publishAll()` carry it as it is. `isHeldAt()` says whether one is held.
+
+**What a metric is, and what it holds.** `pointAt(index)` (and `findPoint()`)
+answer a metric's `MqttSparkplugPoint`: its name, type, alias, device, units,
+range, deadband and write queue. Its value is not there - read it with
+`valueAt(index)`. The value, the one last sent and the marks that decide
+whether it goes are a separate table of 32 bytes a metric, one cache line on
+an ESP32, so a scan that sets a thousand values reads a thousand lines and
+not five thousand.
 
 ### Writes from SCADA
 
@@ -144,11 +228,29 @@ or by polling, which suits a PLC scan:
 ```cpp
 MqttSparkplugValue value;
 if (node.take("Tank/Setpoint", value)) setpoint = (float)value.asNumber();
+
+// A device's metric (a DCMD) - a name is only unique within its device:
+if (node.takeFor("Pump-2", "Enable", value)) enable = value.as.boolean;
 ```
 
 The written value is the metric's value from then on, and the next
 `publishChanged()` reports it back, so the SCADA system sees the write take
 effect.
+
+By default a write replaces the one before it, so a host writing 1 and then 0
+faster than the application polls is seen to write 0 only. A PLC wants every
+write, in order:
+
+```cpp
+node.queueWrites(4);            // before the first write; 1..16 per metric
+// each take() / takeAt() now hands over the OLDEST write, one at a time;
+// peekAt() looks at it without taking it
+```
+
+Full, a metric's queue drops its oldest write and keeps the newest, and
+counts the drop (`writesLost()`, `writesLostAt(index)`). A queued write
+becomes the metric's value when it is taken, and is reported back then. Text
+is copied, so a queued STRING survives the packets that follow it.
 
 A write the node refuses is not given to `onCommand()` - so an application
 that acts on what its handler is given never acts on one - but it can be seen,
@@ -182,6 +284,34 @@ node.setFor("Pump-2", "Speed", mq_spFloat(1450.0f));
 node.deviceOffline("Pump-2");                    // DDEATH, when the device stops answering
 ```
 
+### On a connection you already have
+
+A device rarely has only Sparkplug to say: its own topics and its firmware
+updates want the same broker session. Give the node the client instead of a
+network, and it becomes a layer on that connection (see "Layers sharing one
+client" in api.md):
+
+```cpp
+MqttSparkplugNode node(client);    // client: begun, connected and polled by its owner
+node.group("Plant1");
+node.node("pump-01");
+node.declare("level", MqttSparkplugDataType::Float);
+node.connect();                    // starts the node on the shared session
+
+// every pass, after client.poll():
+node.poll();
+```
+
+The owner keeps the connection: `server()`, `credentials()`, `keepAlive()`,
+`only()` and the TLS calls do nothing here, and `node.poll()` does not poll the
+client. What Sparkplug needs of the session the node takes on every CONNECT:
+the Will (its NDEATH - claimed, and refused while another layer owns it),
+Clean Start, no session expiry, and a transmit buffer that holds the birth
+certificate. Started on a session that is already up, it restarts the client
+once so the next CONNECT carries the NDEATH; a primary host going offline
+restarts it too. `disconnect()` publishes the NDEATH and leaves the connection
+to everything else on it. `MqttSparkplugHost` takes a client the same way.
+
 ### A primary host, and more than one broker
 
 ```cpp
@@ -193,7 +323,10 @@ node.addServer("broker-b.plant");                // up to four
 With a primary host set, the node connects but does not birth until host
 `scada-1` says it is online. If that host goes offline, the node disconnects
 and connects to the **next** broker in the list, as the specification
-requires. Without a primary host, the node births as soon as it connects,
+requires. If the host is replaced and the node sees the new session's online
+(a newer timestamp) without the old one's offline, it treats the missed
+offline as valid: NDEATH, reconnect to the same broker, and a new NBIRTH for
+the new host. Without a primary host, the node births as soon as it connects,
 which is what a single-broker site wants.
 
 `node.waitingFor()` says, in words, why a connected node has not birthed yet:
@@ -228,6 +361,41 @@ broker.
 | `sequence()`, `birthDeathSequence()` | The current `seq` and `bdSeq` |
 | `commandsApplied()`, `commandsRefused()` | Writes taken, and writes refused |
 | `client()` | The `MqttClient` underneath, for anything else |
+
+### Changing settings while running
+
+`server()`, `credentials()` / `clearCredentials()`, `group()`, `node()`,
+`primaryHost()`, `only()` and `keepAlive()` may be called again after a
+`disconnect()`; the next `connect()` uses them and births with the next bdSeq.
+`rebind(MqttTransport&)` moves the node to another transport you built - the
+declarations, aliases, devices and write queues stay. With 5.0 the
+`disconnect()` before it makes the broker publish the NDEATH.
+
+### Records with their own time, and store-and-forward
+
+```cpp
+struct MqttSparkplugRecord { size_t index; MqttSparkplugValue value; uint64_t timestamp; };
+bool publishRecords(const MqttSparkplugRecord* records, size_t count, bool historical);
+uint64_t timestamp() const;   // the stamp the node would use now
+```
+
+`publishRecords()` sends values outside report by exception, each metric with
+its own timestamp, in one NDATA (or DDATA: all records belong to one device or
+all to the node). With `historical` every metric carries `is_historical` - the
+specification's store-and-forward flag: "it may be desirable to send metrics
+after they were acquired ... for batching, store and forward, or sending local
+backup data during network communication losses" - so the host files them at
+their own time and does not update the live tags. Without it each value
+becomes the metric's live value and its last published one, so report by
+exception does not send it twice. QoS 0 like every data message: keep what
+must not be lost until you have seen the node stay born afterwards.
+
+`MqttSparkplugHistory` is the bounded ring that goes with it: `begin(depth)`
+allocates `depth` events of 24 bytes with `mq_allocLarge()` (PSRAM first),
+`add()` drops the oldest when full and counts it in `lost()`, `peek()` /
+`drop()` take them oldest first, and `placeOnClock(utcNow, uptimeNow)` moves
+events recorded before the clock was set onto UTC. The OpenPLC block
+`SPARKPLUG_HISTORY` is built on the two.
 
 ---
 
@@ -319,24 +487,38 @@ accept messages without it: the host applies the type from the node's birth,
 and the node the type it declared. A value that arrives in a field that
 cannot hold that type is NULL rather than guessed.
 
-**Limits**, fixed at build time so nothing is allocated while running:
+**Limits.** A node's tables grow with what it declares, and its payloads and
+send buffer are sized to its own birth certificate when it first connects -
+so nothing is allocated in the steady state, and a node with five metrics pays
+for five. On an ESP32 with PSRAM all of it is in PSRAM.
+
+**No fixed number of metrics or devices**, on a host or a board: a node
+declares as many metrics, under as many devices, as memory holds, and a
+declaration memory cannot take is refused and `node.outOfMemory()` says so.
+`node.metricLimit(n)` sets a limit of your own. A host likewise tracks as many
+nodes, and metrics per node, as memory holds, and its decode payload grows to
+the largest birth it meets (`host.outOfMemory()` when it could not).
 
 | Macro | Default | What it bounds |
 | --- | --- | --- |
-| `MQ_SP_MAX_METRICS` | 34 on a board, 256 on a host | Metrics per node (all its devices included), and per message. A message with more cannot be read, so a host - which may watch nodes with hundreds of metrics - has the larger default |
-| `MQ_SP_MAX_DEVICES` | 8 | Devices under one node |
+| `MQ_SP_MAX_METRICS` | 34 on a board, 256 on a host | The size of a payload nobody sized, and where a host's decode payload starts before it grows |
 | `MQ_SP_MAX_SERVERS` | 4 | Brokers a node can fail over through |
 | `MQ_SP_MAX_PROPERTIES` | 4 | Properties per metric |
-| `MQ_SP_MAX_TRACKED_NODES` | 16 | Nodes one host keeps track of, each with up to `MQ_SP_MAX_METRICS` metrics |
 
 To change one, set it for the **whole build**, not with a `#define` in the
 sketch: the library's own files are compiled separately and would not see it.
 That means `-DMQ_SP_MAX_METRICS=64` in CMake, PlatformIO's `build_flags`, or
-the Arduino IDE's `compiler.cpp.extra_flags` in `platform.local.txt`.
+the Arduino IDE's `compiler.cpp.extra_flags` in `platform.local.txt`. An
+OpenPLC project has no build flags of its own: there a define comes from the
+board package.
 
-**What it costs on an ESP32:** the `Sparkplug_Edge_Node` example is about
-30 KB of flash and 21 KB of RAM larger than `First_Sketch`. The RAM is the
-node's fixed tables: its metrics, two payload buffers and a 4 KB send buffer.
+**What it costs on an ESP32:** the node's tables are allocated as metrics are
+declared, so its static RAM is a few hundred bytes. At run time a metric costs
+320 bytes in the registry (288 for what it is, 32 for its value and state), a
+text metric 280 more for the text it owns, and a writable one 80 for its write
+queue (624 for a text metric) - all allocated with `mq_allocLarge()`, so in
+PSRAM where the board has it. The outbound payload, the encode buffer and the
+client's send buffer are sized to the birth certificate on top.
 
 ---
 

@@ -10,12 +10,17 @@
 #include "MqttSession.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
+
+// The subscription table: as many slots as it has grown to.
+#define MQ_SUBSCRIPTION_SLOTS ((int)_subscriptions.capacity())
 
 void MqttSession::clear() {
     resetProtocolState();
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         _subscriptions[i] = MqttStoredSubscription();
     }
+    _outOfMemory = false;
     for (size_t i = 0; i < kMaxControlIds; i++) {
         _controlIds[i] = MQ_PACKET_ID_NONE;
     }
@@ -132,6 +137,12 @@ bool MqttSession::storeOutbound(uint16_t packetId, uint8_t qos,
         _outbound[i].awaitingPubcomp = false;
         _outbound[i].sent = false;
         _outbound[i].encoded.assign(encoded, encoded + length);
+#if MQTT_LEAN
+        if (_outbound[i].encoded.failed()) {   // the byte area is full
+            _outbound[i] = MqttStoredPublish();
+            return false;
+        }
+#endif
         return true;
     }
     return false;
@@ -226,7 +237,7 @@ void MqttSession::forgetInbound(uint16_t packetId) {
 
 int MqttSession::indexOfSubscription(const uint8_t* filter, uint16_t length) const {
     if (!filter || length == 0) return -1;
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         const MqttStoredSubscription& entry = _subscriptions[i];
         if (entry.filter.size() == length &&
             memcmp(entry.filter.data(), filter, length) == 0) {
@@ -256,9 +267,21 @@ bool MqttSession::addSubscription(const uint8_t* filter, uint16_t length,
         return true;
     }
 
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    // Every slot taken: one more, as far as memory goes.
+    if (subscriptionCount() == _subscriptions.capacity() &&
+        !_subscriptions.reserve(_subscriptions.capacity() + 1)) {
+        _outOfMemory = true;
+        return false;
+    }
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         if (_subscriptions[i].inUse()) continue;
         _subscriptions[i].filter.assign(filter, filter + length);
+#if MQTT_LEAN
+        if (_subscriptions[i].filter.failed()) {   // no memory for the filter
+            _outOfMemory = true;
+            return false;
+        }
+#endif
         _subscriptions[i].options = options;
         _subscriptions[i].established = false;
         _subscriptions[i].issued = false;
@@ -285,20 +308,20 @@ void MqttSession::markSubscriptionIssued(const uint8_t* filter, uint16_t length)
 }
 
 void MqttSession::clearSubscriptionsIssued() {
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         _subscriptions[i].issued = false;
     }
 }
 
 void MqttSession::markAllSubscriptionsUnestablished() {
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         _subscriptions[i].established = false;
     }
 }
 
 size_t MqttSession::subscriptionCount() const {
     size_t count = 0;
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         if (_subscriptions[i].inUse()) count++;
     }
     return count;
@@ -306,7 +329,7 @@ size_t MqttSession::subscriptionCount() const {
 
 const MqttStoredSubscription* MqttSession::subscriptionAt(size_t index) const {
     size_t seen = 0;
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         if (!_subscriptions[i].inUse()) continue;
         if (seen == index) return &_subscriptions[i];
         seen++;
@@ -319,8 +342,14 @@ uint32_t MqttSession::storedBytes() const {
     for (int i = 0; i < MQTT_SESSION_MAX_INFLIGHT; i++) {
         bytes += (uint32_t)_outbound[i].encoded.size();
     }
-    for (int i = 0; i < MQTT_SESSION_MAX_SUBSCRIPTIONS; i++) {
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
         bytes += (uint32_t)_subscriptions[i].filter.size();
     }
     return bytes;
 }
+
+#if MQTT_LEAN
+void MqttSession::bind(MqttByteArea& area) {
+    for (int i = 0; i < MQTT_SESSION_MAX_INFLIGHT; i++) _outbound[i].encoded.bind(area);
+}
+#endif

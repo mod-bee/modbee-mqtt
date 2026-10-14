@@ -94,6 +94,65 @@ typedef void (*MqttSessionFn)(void* context, bool sessionPresent);
 
 typedef void (*MqttStateFn)(void* context, MqttState state, MqttResult reason);
 
+class MqttClient;
+
+// =============================================================================
+// A LAYER THAT SHARES A CLIENT
+// =============================================================================
+//
+// ONE CONNECTION, SEVERAL PROTOCOLS ON TOP OF IT. A Sparkplug node, a firmware
+// updater and an application's own topics all want the same broker session,
+// and a device has one radio and one login to spend. The three handler slots
+// further down are the application's; a layer that took one took it from
+// everybody else.
+//
+// So a layer attaches instead. Any number may, each sees every event, in the
+// order they attached, and the application's own handlers run after them.
+//
+//   prepareConnect      before EVERY CONNECT is encoded - the first, each
+//                       automatic reconnect, a 3.1.1 fallback - with the
+//                       config it is built from. Where a layer whose Will
+//                       changes per connection (Sparkplug's bdSeq) writes it,
+//                       because the client reconnects without asking anybody.
+//   sessionEstablished  as MqttSessionFn: before anything queued is sent, and
+//                       what is queued inside it goes first.
+//   stateChanged        as MqttStateFn.
+//   message             every inbound message, after the topic registry has
+//                       it. True when it was this layer's: later layers and the
+//                       application handler do not see it.
+//
+// NOTHING ATTACHED COSTS ONE NULL CHECK per event, which is the whole of what
+// this adds to a client that does not use it.
+//
+// Callbacks run inside poll(), on whatever thread polls. A layer is attached
+// to at most one client and is detached (or the client ended) before it is
+// destroyed; attach() and detach() are never called from inside a callback.
+// How long restart() leaves between the goodbye and the next CONNECT: long
+// enough for a broker to have handled the one before the same client
+// identifier returns, short enough that nobody waits for it.
+#ifndef MQ_RESTART_SETTLE_MS
+#define MQ_RESTART_SETTLE_MS 250
+#endif
+
+class MqttClientHook {
+public:
+    // Out of line, in MqttClient.cpp: one vtable in the program, not one per
+    // file that names a layer.
+    virtual ~MqttClientHook();
+
+    virtual void prepareConnect(MqttConnectionConfig& connection);
+    virtual void sessionEstablished(bool sessionPresent);
+    virtual void stateChanged(MqttState state, MqttResult reason);
+    virtual bool message(const MqttMessage& message);
+    // The client this layer is attached to, or null.
+    MqttClient* attachedTo() const { return _attachedTo; }
+
+private:
+    friend class MqttClient;
+    MqttClientHook* _nextHook = nullptr;
+    MqttClient* _attachedTo = nullptr;
+};
+
 // Everything a caller can poll instead of registering a handler.
 //
 // Counters are RUNNING TOTALS that wrap, never flags. A caller compares one
@@ -141,7 +200,7 @@ struct MqttStatus {
 
 class MqttClient {
 public:
-    MqttClient();
+    MqttClient() MQ_NOEXCEPT;
 
     // The transport is the caller's and must outlive this object. The library
     // does not own the network stack and cannot decide when it starts.
@@ -183,6 +242,24 @@ public:
     // MqttDevice::connect() for the pattern where the caller owns both.
     MqttResult reconfigure(const MqttConnectionConfig& connection);
 
+    // MOVES THE CLIENT TO ANOTHER TRANSPORT, KEEPING EVERYTHING ELSE.
+    //
+    // For a settings change that needs a different medium, not just a
+    // different host: plain to TLS, Wi-Fi to cellular, a new pinned key. The
+    // topic registry, the subscriptions, the handles every other block holds,
+    // the status counters and the operation queue all stay - begin() would
+    // reset the counters and re-cap the queue without concluding it.
+    //
+    // Whatever the old transport held is closed first, without a DISCONNECT
+    // (send one with disconnect() and let it go out before this if the peer
+    // should see a graceful goodbye). The client is left Idle and down until
+    // connect(), with the session's unsent work concluded exactly as a
+    // dropped connection concludes it. The old transport is the caller's to
+    // delete afterwards; this object never refers to it again.
+    //
+    // Refused before begin(), because there is nothing to move.
+    MqttResult rebind(MqttTransport& transport);
+
     // The connection configuration in force - what begin() or the last
     // reconfigure() gave. Read it, change a field, hand it back to
     // reconfigure(): how a caller that did not keep its own copy (an OpenPLC
@@ -201,7 +278,53 @@ public:
 
     // Sends a DISCONNECT and closes. V5:3.14.4 - after sending one we MUST
     // close the connection and MUST NOT send anything further on it.
+    //
+    // MQ_REASON_DISCONNECT_WITH_WILL has the broker publish the Will anyway:
+    // what a layer whose Will is a death certificate needs on a deliberate
+    // goodbye (see willOwner()). At 3.1.1, which has no such reason, the Will
+    // is published by the client itself, just ahead of the DISCONNECT.
     MqttResult disconnect(uint8_t reasonCode = MQ_REASON_NORMAL_DISCONNECTION);
+
+    // ENDS THIS CONNECTION AND STARTS THE NEXT ONE AT ONCE.
+    //
+    // For a layer that shares the client and needs a fresh CONNECT without
+    // owning the decision to be connected: a Sparkplug node whose Will has to
+    // be on the CONNECT, or whose primary host went offline. disconnect()
+    // would leave the client down until its owner noticed; this sends the
+    // DISCONNECT (reasonCode as disconnect() takes it), closes, and connects
+    // again MQ_RESTART_SETTLE_MS later - no backoff, autoReconnect or not.
+    //
+    // Refused with NotConnected while the owner keeps the client down - never
+    // connected, or disconnect() in force: that is its decision, not a
+    // layer's. A client between connections stops waiting out its backoff.
+    MqttResult restart(uint8_t reasonCode = MQ_REASON_NORMAL_DISCONNECTION);
+
+    // --- Layers sharing this client: see MqttClientHook ---
+    //
+    // attach() appends. False if the hook is attached to another client;
+    // true, and nothing changes, if it is already attached to this one.
+    bool attach(MqttClientHook& hook);
+    void detach(MqttClientHook& hook);
+
+    // THE WILL HAS ONE OWNER. A CONNECT carries one Will, and two layers each
+    // writing theirs in prepareConnect would leave whichever ran last - so a
+    // layer that needs it claims it, and a second claimant is refused rather
+    // than silently overwritten. Releasing clears the Will from the next
+    // CONNECT; detaching releases it.
+    bool claimWill(MqttClientHook& hook);
+    void releaseWill(MqttClientHook& hook);
+    const MqttClientHook* willOwner() const { return _willOwner; }
+
+    // A TRANSMIT BUFFER AT LEAST THIS BIG, for a layer whose largest packet is
+    // its own business - a Sparkplug birth certificate grows with what is
+    // declared. The buffers never grow under a live connection (see
+    // MqttLink), so this is applied while the link is down: at once if it is,
+    // otherwise before the next CONNECT. True when the buffer already holds
+    // `bytes`; false means it will after the next connection starts (a
+    // restart() brings that forward), or that memory could not be found -
+    // transmitCapacity() says which.
+    bool reserveTransmit(size_t bytes);
+    size_t transmitCapacity() const { return _link.transmitCapacity(); }
 
     // --- Operations ---
     MqttResult publish(const char* topic, const uint8_t* payload, size_t length,
@@ -322,6 +445,23 @@ public:
     MqttTopicRegistry& topics() { return _topics; }
     const MqttTopicRegistry& topics() const { return _topics; }
 
+    // The topic and subscription tables grow with the program - on a host and
+    // a board alike, nothing caps them but memory - and this says one of them
+    // could not: a registration or a subscription was refused for want of
+    // memory, not for anything about the topic.
+    bool outOfMemory() const { return _topics.outOfMemory() || _session.outOfMemory(); }
+
+    // The send queue could not be given the size begin() asked for
+    // (MqttClientConfig::queueCapacity - a PLC's MAX_PENDING): its slots or,
+    // on a board, the bytes its messages are kept in. It keeps the size it
+    // had, and operations().capacity() says what that is.
+    bool queueOutOfMemory() const {
+#if MQTT_LEAN
+        if (_areaOutOfMemory) return true;
+#endif
+        return _operations.outOfMemory();
+    }
+
     // --- Polled state ---
     const MqttStatus& status() const { return _status; }
     MqttState state() const { return _status.state; }
@@ -351,6 +491,18 @@ private:
     MqttStatus _status;
     MqttCapabilities _capabilities;
     MqttFlow _flow;
+#if MQTT_LEAN
+    // A board's queued topics, payloads, properties, resend copies and
+    // filters (MqttFixed.h), sized in begin(). Declared first so it outlives
+    // what it holds.
+    MqttLargeBytes _areaBytes;
+    MqttByteArea _area;
+    bool _areaOutOfMemory = false;
+#endif
+    // Subscriptions the queue could not take when the session came up, still
+    // to go: a program may hold more subscriptions than the queue holds
+    // operations, so they go as it drains.
+    bool _reissueOwed = false;
     MqttSession _session;
     MqttOperations _operations;
     MqttKeepAlive _keepAlive;
@@ -384,6 +536,30 @@ private:
     MqttStateFn _onState = nullptr;
     void* _stateContext = nullptr;
 
+    // Layers, in attach order, and the one that writes the Will.
+    MqttClientHook* _hooks = nullptr;
+    MqttClientHook* _willOwner = nullptr;
+
+    // reserveTransmit()'s request, applied while the link is down.
+    size_t _transmitWanted = 0;
+    void applyTransmitReservation();
+#if MQTT_LEAN
+    // The board's byte area and queue slots, from _behaviour: begin(), and a
+    // reservation that grew the transmit buffer.
+    void sizeArea();
+#endif
+    // restart() is under way: the close it causes reconnects at once.
+    bool _restarting = false;
+#if MQTT_LEAN
+    // The reason an open that failed on a connect task is answered with
+    // (MqttTransport::openFailed()): the one connect() gives a false begin(),
+    // and none after serviceReconnect(), which keeps the one the link was
+    // lost with.
+    MqttResult _openFailure = MqttResult::Ok;
+#endif
+
+    // disconnect()/restart() with MQ_REASON_DISCONNECT_WITH_WILL at 3.1.1.
+    void sendWillAt311(uint8_t reasonCode);
     // Topics by number, and the state a polled reader watches. Its own type
     // since the API review: a registry of topics with counters attached is a
     // self-contained idea, and MqttClient had enough to do.

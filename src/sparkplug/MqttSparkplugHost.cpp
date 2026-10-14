@@ -6,6 +6,7 @@
 #include "MqttSparkplugHost.h"
 
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 
 namespace {
@@ -23,32 +24,40 @@ uint64_t hostUtcNow() {
 
 }  // namespace
 
-MqttSparkplugHost::MqttSparkplugHost() {
+MqttSparkplugHost::MqttSparkplugHost() MQ_NOEXCEPT : _client(_ownClient) {
     memset(_scratch, 0, sizeof _scratch);
     _topic[0] = '\0';
 }
 
-MqttSparkplugHost::MqttSparkplugHost(MqttTransport& transport) {
+MqttSparkplugHost::MqttSparkplugHost(MqttTransport& transport) MQ_NOEXCEPT
+    : _client(_ownClient) {
     memset(_scratch, 0, sizeof _scratch);
     _topic[0] = '\0';
     _net.borrow(transport);
 }
 
+MqttSparkplugHost::MqttSparkplugHost(MqttClient& shared) MQ_NOEXCEPT
+    : _client(shared), _shared(true) {
+    memset(_scratch, 0, sizeof _scratch);
+    _topic[0] = '\0';
+}
+
 MqttSparkplugHost::~MqttSparkplugHost() {
-    if (_begun) _client.end();
+    if (_begun && !_shared) _client.end();
+    _client.detach(*this);
 }
 
 #if MQTT_TLS_SOCKETS
 bool MqttSparkplugHost::useTls(bool enabled) {
-    return !_begun && _net.useTls(enabled);
+    return !_shared && !_begun && _net.useTls(enabled);
 }
 
 bool MqttSparkplugHost::trustFile(const char* path) {
-    return !_begun && _net.trustFile(path);
+    return !_shared && !_begun && _net.trustFile(path);
 }
 
 bool MqttSparkplugHost::pinnedKey(const char* fingerprint) {
-    return !_begun && _net.pin(fingerprint);
+    return !_shared && !_begun && _net.pin(fingerprint);
 }
 #endif
 
@@ -109,12 +118,17 @@ void MqttSparkplugHost::applyConnectionConfig() {
     _net.target(_host.c_str(), _connection.port);
 
     if (_connection.clientId.empty()) _connection.clientId = _hostId;
+}
+
+// EVERY CONNECT, the host's own client's or a shared one's, whoever starts it.
+void MqttSparkplugHost::prepareConnect(MqttConnectionConfig& connection) {
+    _willArmed = false;
+    if (!_active) return;
 
     // [tck-id-message-flow-phid-sparkplug-clean-session-311] and -50: a Host
     // Application is as stateless as an edge node.
-    _connection.cleanStart = true;
-    _connection.sessionExpiryInterval = 0;
-
+    connection.cleanStart = true;
+    connection.sessionExpiryInterval = 0;
     // --- The Will: this host's own death certificate ---
     //
     // THE TIMESTAMP IS CHOSEN HERE AND REUSED IN THE BIRTH.
@@ -144,9 +158,10 @@ void MqttSparkplugHost::applyConnectionConfig() {
     // mechanism [tck-id-operational-behavior-edge-node-birth-sequence-wait]
     // depends on - whereas a node's death certificate must not linger on the
     // broker after the node is back.
-    _connection.will.set(_topic, _willBytes.data(), _willBytes.size(),
-                         MQ_QOS_1, true);
-    _connection.will.delayInterval = 0;
+    connection.will.set(_topic, _willBytes.data(), _willBytes.size(),
+                        MQ_QOS_1, true);
+    connection.will.delayInterval = 0;
+    _willArmed = true;
 }
 
 void MqttSparkplugHost::beginClient() {
@@ -154,17 +169,35 @@ void MqttSparkplugHost::beginClient() {
     _behaviour.autoReconnect = true;
     applyConnectionConfig();
     _client.begin(*_net.get(), _connection, _behaviour);
-    _client.onMessage(&messageTrampoline, this);
-    _client.onSessionEstablished(&sessionTrampoline, this);
+    _client.attach(*this);
+    _client.claimWill(*this);
     _begun = true;
 }
 
 bool MqttSparkplugHost::connect() {
     if (_hostId.empty()) return false;
+    if (_shared) {
+        if (!_client.attach(*this) || !_client.claimWill(*this)) {
+            _willRefused = true;
+            return false;
+        }
+        _willRefused = false;
+        _begun = true;
+        _active = true;
+        _born = false;
+        // A session already up, or a CONNECT already sent, went without the
+        // offline STATE: the next one carries it.
+        if (_client.state() != MqttState::Idle &&
+            _client.state() != MqttState::Reconnecting) {
+            _client.restart();
+        }
+        return true;
+    }
     if (_net.get() == nullptr) return false;
     if (_host.empty()) return false;
 
     _born = false;
+    _active = true;
     if (!_begun) {
         beginClient();
     } else {
@@ -179,7 +212,17 @@ bool MqttSparkplugHost::connect() {
 
 void MqttSparkplugHost::disconnect() {
     if (!_begun) return;
-
+    _active = false;
+    _restartOwed = false;
+    if (_shared) {
+        // The connection stays up for everybody else, so the offline STATE
+        // goes by hand and the next CONNECT goes without it.
+        _disconnectAfterDeath = false;
+        if (_willArmed && _client.isConnected()) publishDeath();
+        _client.releaseWill(*this);
+        _born = false;
+        return;
+    }
     // [tck-id-host-topic-phid-death-payload-disconnect-clean] If a Host
     // Application is disconnecting cleanly using MQTT DISCONNECT packet, the
     // Host Application MUST publish a Death Certificate payload BEFORE sending
@@ -221,8 +264,14 @@ void MqttSparkplugHost::deathTrampoline(void* context, MqttResult result,
 
 void MqttSparkplugHost::poll() {
     if (!_begun) return;
-    _client.poll();
+    if (!_shared) _client.poll();   // a shared client's owner polls it
     serviceReorder();
+
+    // A shared client restarts from here, never from inside its own poll.
+    if (_restartOwed) {
+        _restartOwed = false;
+        if (_active) _client.restart();
+    }
 
     // The bound on the deferred disconnect above. Without it a server that
     // never acknowledges the death certificate would leave the host neither
@@ -235,18 +284,20 @@ void MqttSparkplugHost::poll() {
     }
 }
 
-void MqttSparkplugHost::sessionTrampoline(void* context, bool sessionPresent) {
-    static_cast<MqttSparkplugHost*>(context)->sessionEstablished(sessionPresent);
-}
-
-void MqttSparkplugHost::messageTrampoline(void* context,
-                                          const MqttMessage& message) {
-    static_cast<MqttSparkplugHost*>(context)->handleMessage(message);
+bool MqttSparkplugHost::message(const MqttMessage& message) {
+    // Never taken: a node on the same client may watch the same namespace.
+    handleMessage(message);
+    return false;
 }
 
 void MqttSparkplugHost::sessionEstablished(bool sessionPresent) {
     (void)sessionPresent;
-
+    if (!_active) return;   // a shared client's session; this host stood down
+    if (_shared && !_willArmed) {
+        // Opened before this host was there, so without its offline STATE.
+        _restartOwed = true;
+        return;
+    }
     // [tck-id-payloads-state-subscribe] After establishing an MQTT connection,
     // the Sparkplug Host Application MUST subscribe on it's own
     // spBv1.0/STATE/[sparkplug_host_id] topic.
@@ -364,7 +415,10 @@ int MqttSparkplugHost::trackNode(const char* group, const char* node) {
             return (int)index;
         }
     }
-    if (_nodeCount >= MQ_SP_MAX_TRACKED_NODES) return -1;
+    if (!_nodes.reserve(_nodeCount + 1)) {
+        _outOfMemory = true;
+        return -1;
+    }
     _nodes[_nodeCount].group = group;
     _nodes[_nodeCount].node = node;
     _nodeCount++;
@@ -467,12 +521,16 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
             }
         }
 
-        // FULL IS FULL, and quietly. The table is a convenience for reading
-        // data; refusing the birth over it would lose the node entirely, and
-        // an unresolved alias already has an honest answer - metricName()
-        // returns nullptr and the caller sees a number it cannot name.
+        // OUT OF MEMORY is said (outOfMemory()), not fatal. The table is a
+        // convenience for reading data; refusing the birth over it would lose
+        // the node entirely, and an unresolved alias already has an honest
+        // answer - metricName() returns nullptr and the caller sees a number
+        // it cannot name.
         if (slot == tracked.metricCount) {
-            if (tracked.metricCount >= MQ_SP_MAX_TRACKED_METRICS) return;
+            if (!tracked.metrics.reserve(tracked.metricCount + 1)) {
+                _outOfMemory = true;
+                return;
+            }
             tracked.metricCount++;
         }
 
@@ -599,9 +657,31 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
     // would be acting on its own traffic.
     if (mq_sparkplugIsCommand(parts.type)) return;
 
-    const MqttSparkplugError error =
+    MqttSparkplugError error =
         mq_sparkplugDecode(message.payload.data, message.payload.length,
                            _inbound);
+    // The decode payload starts at the default size and grows to the
+    // largest message seen: one with more metrics, or longer names, than it
+    // holds is decoded again in a larger one, as far as memory goes. Never
+    // past what the message itself could carry.
+    while (error == MqttSparkplugError::TooManyMetrics) {
+        const size_t bytes = message.payload.length;
+        size_t metrics = _inbound.capacity();
+        size_t names = _inbound.nameCapacity();
+        if (_inbound.metricCount >= metrics && metrics < bytes) {
+            metrics = metrics ? metrics * 2 : MQ_SP_MAX_METRICS;
+        } else if (names <= bytes) {
+            names = names ? names * 2 : MQ_SP_NAME_BYTES;
+        } else {
+            break;   // too many properties on one metric: not a size we grow
+        }
+        if (!_inbound.reserve(metrics, names)) {
+            _outOfMemory = true;
+            break;
+        }
+        error = mq_sparkplugDecode(message.payload.data, message.payload.length,
+                                   _inbound);
+    }
     if (error != MqttSparkplugError::None) {
         _lastPayloadError = error;
         _decodeFailures++;

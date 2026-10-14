@@ -30,7 +30,29 @@
 // There is no role in this file. A CONNECT is a CONNECT whichever end builds
 // it, which is what lets a broker be a different L3 over this same code.
 
+#include "MqttFeatures.h"
 #include "MqttProperties.h"
+
+// --- Where a packet's properties are ---
+//
+// On a host every packet kind below carries its own property set. On a board
+// (MQTT_LEAN, MqttFeatures.h) the packet carries ONE, shared by whichever kind
+// it is: eleven sets were 3 kB of every packet on the stack, and the code that
+// initialised them was repeated wherever a packet was built. A Will keeps its
+// own, because it travels inside a CONNECT that has properties of its own.
+//
+// Code reaches a kind's set through MQ_PROPERTIES(packet, kind), where `kind`
+// is that packet's member or a reference to it:
+//
+//     const MqttPublish& publish = packet.publish;
+//     mq_encodeProperties(writer, MQ_PROPERTIES(packet, publish), MQ_PKT_PUBLISH);
+//
+// On a host it is `publish.properties`, the very same tokens as before.
+#if MQTT_LEAN
+    #define MQ_PROPERTIES(packet, kind) (packet).properties
+#else
+    #define MQ_PROPERTIES(packet, kind) kind.properties
+#endif
 
 // Topic filters carried in one SUBSCRIBE or UNSUBSCRIBE, and reason codes in
 // one SUBACK or UNSUBACK.
@@ -136,7 +158,9 @@ struct MqttConnect {
     bool hasPassword = false;
     MqttSpan password;
 
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
 };
 
 // --- CONNACK ---
@@ -156,7 +180,9 @@ struct MqttConnAck {
     // finds out.
     MqttVersion version = MqttVersion::V5;
 
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
 };
 
 // --- PUBLISH ---
@@ -171,7 +197,9 @@ struct MqttPublish {
     // when QoS > 0.
     uint16_t packetId = MQ_PACKET_ID_NONE;
 
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
 
     // Whatever the Remaining Length leaves over. May legitimately be empty:
     // a zero-length payload to a retained topic is how a retained message is
@@ -220,14 +248,18 @@ static_assert(MQTT_MAX_FILTERS_PER_PACKET <= 255,
 
 struct MqttSubscribe {
     uint16_t packetId = MQ_PACKET_ID_NONE;
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
     MqttSubscription filters[MQTT_MAX_FILTERS_PER_PACKET];
     uint8_t count = 0;
 };
 
 struct MqttUnsubscribe {
     uint16_t packetId = MQ_PACKET_ID_NONE;
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
     MqttSpan filters[MQTT_MAX_FILTERS_PER_PACKET];
     uint8_t count = 0;
 };
@@ -239,7 +271,9 @@ struct MqttUnsubscribe {
 // return codes; in 5.0 they are reason codes from Table 2-6.
 struct MqttSubAck {
     uint16_t packetId = MQ_PACKET_ID_NONE;
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
     uint8_t reasons[MQTT_MAX_FILTERS_PER_PACKET] = {0};
     uint8_t count = 0;
 };
@@ -258,7 +292,9 @@ struct MqttPubAck {
     // produced by real brokers, so both are decoded and the shorter is what we
     // emit when we can.
     uint8_t reasonCode = MQ_REASON_SUCCESS;
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
 };
 
 // --- DISCONNECT and AUTH ---
@@ -266,12 +302,16 @@ struct MqttDisconnect {
     // V5:3.14.2.1 - may be omitted, meaning Normal disconnection. 3.1.1 has no
     // variable header at all, so there is nothing here to encode for it.
     uint8_t reasonCode = MQ_REASON_NORMAL_DISCONNECTION;
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
 };
 
 struct MqttAuth {
     uint8_t reasonCode = MQ_REASON_SUCCESS;
+#if !MQTT_LEAN
     MqttProperties properties;
+#endif
 };
 
 // --- One packet, whatever it is ---
@@ -295,6 +335,10 @@ struct MqttPacket {
     MqttUnsubscribe unsubscribe;
     MqttDisconnect disconnect;
     MqttAuth auth;
+
+#if MQTT_LEAN
+    MqttProperties properties;   // whichever kind it is (see MQ_PROPERTIES)
+#endif
 
     uint8_t type() const { return header.type; }
     void clear() { *this = MqttPacket(); }

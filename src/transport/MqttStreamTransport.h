@@ -74,6 +74,10 @@ public:
     //
     //     mqtt.autoReconnect(false);      // and call connect() yourself
     //
+    // On an ESP32 there is a better answer: wrap this transport in an
+    // MqttConnectTask (MqttConnectTask.h), and this call runs on a short task
+    // of its own while the client polls on. MQTT_CLIENT does.
+    //
     // docs/transports.md gives the measured shape of this per transport.
     bool begin() override {
         if (_channel.connected()) return true;

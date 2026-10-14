@@ -47,8 +47,33 @@
 #include "../MqttFeatures.h"
 #include "../MqttOwnedTransport.h"
 
+#include <memory>
 #include <string>
 #include <type_traits>
+#include <vector>
+#include "../MqttFixed.h"
+
+// A board's text fields (MQTT_LEAN, MqttFixed.h). Ids are already at most
+// MQ_SP_MAX_ID everywhere. A metric name longer than its field is refused at
+// declare(); units and text values are cut to theirs - a text value comes from
+// a PLC STRING, 126 characters unless declared longer.
+#if MQTT_LEAN
+    #ifndef MQ_SP_POINT_NAME
+    #define MQ_SP_POINT_NAME 96
+    #endif
+    #ifndef MQ_SP_POINT_UNITS
+    #define MQ_SP_POINT_UNITS 16
+    #endif
+    #ifndef MQ_SP_POINT_DESCRIPTION
+    #define MQ_SP_POINT_DESCRIPTION 64
+    #endif
+    #ifndef MQ_SP_POINT_TEXT
+    #define MQ_SP_POINT_TEXT 126
+    #endif
+    #ifndef MQ_SP_WILL_BYTES
+    #define MQ_SP_WILL_BYTES 64       // the NDEATH: one bdSeq metric
+    #endif
+#endif
 
 // How many servers a node can fail over through.
 //
@@ -60,10 +85,9 @@
 #define MQ_SP_MAX_SERVERS 4
 #endif
 
-// Devices under one node.
-#ifndef MQ_SP_MAX_DEVICES
-#define MQ_SP_MAX_DEVICES 8
-#endif
+// Devices under one node: no fixed number, on a host or a board. The device
+// table grows with addDevice() until memory runs out (outOfMemory()), or the
+// 32767 an int16_t can number. (It was MQ_SP_MAX_DEVICES, 8.)
 
 // --- What a command looks like when it arrives ---
 
@@ -119,10 +143,73 @@ typedef void (*MqttSparkplugCommandFn)(const MqttSparkplugCommand& command);
 typedef void (*MqttSparkplugCommandContextFn)(void* context,
                                               const MqttSparkplugCommand& command);
 
+// --- Writes waiting to be taken ---
+//
+// The writes to one metric that the application has not taken, oldest first:
+// a ring of queueWrites() slots, made the first time the metric is written (on
+// a board, when the node connects) - a metric nobody writes pays a null
+// pointer.
+//
+// ONE BLOCK, in PSRAM where the board has some (mq_allocLarge): the values,
+// and beside them, for a TEXT metric only, the text each one owns - a decoded
+// STRING or BYTES value is a span into the receive buffer, which the next
+// packet overwrites, so a value kept past the message it came in cannot be
+// one. A number's slots carry no text. They each carried 127 characters, four
+// to every writable metric whatever its type, and as four small allocations
+// they went to a board's internal RAM first (MQX-027).
+struct MqttSparkplugWriteQueue {
+    MqttSparkplugValue* values = nullptr;          // `depth` of them
+    MQ_STRING(MQ_SP_POINT_TEXT)* texts = nullptr;  // a text metric's; else null
+    uint8_t depth = 0;
+    uint8_t head = 0;
+    uint8_t count = 0;
+};
+
+// --- What a text metric owns ---
+//
+// A STRING, TEXT, UUID, BYTES or FILE metric, and only one of those: made when
+// it is declared, in PSRAM where the board has some. A number used to carry
+// these two 127-character buffers too, empty, for ever (MQX-027).
+struct MqttSparkplugPointText {
+    // The value: a span, as MqttSparkplugValue's - into the application's
+    // buffer (a PLC STRING), or into `command`.
+    const uint8_t* data = nullptr;
+    uint32_t length = 0;
+
+    // Owns the text of what was last published. A text value is a span into
+    // the application's buffer, and a span kept as "what was last published"
+    // moved with that buffer: the comparison was the buffer with itself, and
+    // a change that kept the length was never reported.
+    MQ_STRING(MQ_SP_POINT_TEXT) published;
+
+    // Owns the text of the value last written (or taken), so the value never
+    // points into a receive buffer that has since been reused.
+    MQ_STRING(MQ_SP_POINT_TEXT) command;
+};
+
 // --- One declared metric ---
 
+// One value for publishRecords(): a declared metric (by index, as indexOf()
+// answers), the value in its declared type, and the moment it belongs to.
+struct MqttSparkplugRecord {
+    size_t index = 0;
+    MqttSparkplugValue value;
+    uint64_t timestamp = 0;   // UTC milliseconds
+};
+
+// WHAT A METRIC IS - its name, its alias, what its birth says about it - and
+// what is read only now and then: a deadband once a value has moved, a write
+// queue when a host writes. Allocated with the others in PSRAM where the board
+// has some.
+//
+// ITS VALUE IS NOT HERE. What a scan reads and writes - the value, the one
+// last published, and the marks that decide whether it goes - is in the node's
+// small state table, a cache line a metric (see MqttSparkplugNode, "TWO
+// TABLES"). Read it with valueAt(), changePendingAt(), commandPendingAt() and
+// isHeldAt(). (It was all one record, 608 bytes on a board, and a scan touched
+// five of its cache lines to set one value - MQX-027.)
 struct MqttSparkplugPoint {
-    std::string name;
+    MQ_STRING(MQ_SP_POINT_NAME) name;
     MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
 
     uint64_t alias = 0;
@@ -131,32 +218,52 @@ struct MqttSparkplugPoint {
     // rather than a name so the hot path is an integer compare.
     int16_t device = -1;
 
-    MqttSparkplugValue value;
-
-    // What was last actually published, so publishChanged() can tell. Separate
-    // from `value` because a value written and not yet published is still
-    // pending - comparing against the last scan instead would let a slow drift
-    // accumulate and never go.
-    MqttSparkplugValue published;
-    bool everPublished = false;
-
     // Whether a DCMD or NCMD may write it. A command for a read-only metric is
     // refused and counted rather than applied: a Host Application that thinks
     // it can write a sensor reading should find out.
     bool writable = false;
 
-    // Set when a command has written this point and the application has not
-    // taken it yet. The pollable half of R4.
-    bool commandPending = false;
+    // The display range, engLow and engHigh in the birth. Only when hasRange.
+    bool hasRange = false;
+    double engLow = 0.0;
+    double engHigh = 0.0;
 
-    std::string units;
+    // REPORT BY EXCEPTION, AND WHAT COUNTS AS AN EXCEPTION. A numeric metric
+    // whose value has moved from the one last PUBLISHED by no more than
+    // `deadband` (in its own units) or no more than `deadbandPercent` of that
+    // published value is not "changed" for publishChanged(). Both zero - the
+    // default - means any change at all, as the specification's
+    // [tck-id-principles-rbe-recommended] has it; set both and a change must
+    // clear both. Measured against what was last published, never against the
+    // last scan, so a slow drift still adds up and goes. Not applied to
+    // Boolean or text metrics, and not to a birth or publishAll(): those carry
+    // every value as it is.
+    double deadband = 0.0;
+    double deadbandPercent = 0.0;
+
+    // The text it owns - a text metric's only; null for a number.
+    MqttSparkplugPointText* text = nullptr;
+
+    // The writes not taken yet, when queueWrites() is on; see there.
+    MqttSparkplugWriteQueue* queue = nullptr;
+
+    // Writes dropped because the queue was full: the oldest goes, the newest
+    // is kept, and each one dropped is counted here and in writesLost().
+    uint32_t writesLost = 0;
+
+    // Writes taken so far. A program that looks at the oldest write before
+    // taking it (peekAt) compares this to know another caller took the one it
+    // looked at, and that what it sees now is the next write.
+    uint32_t writesTaken = 0;
+
     int32_t quality = MQ_SP_QUALITY_GOOD;
-    std::string description;
+    MQ_STRING(MQ_SP_POINT_UNITS) units;
+    MQ_STRING(MQ_SP_POINT_DESCRIPTION) description;
 };
 
 // --- The node ---
 
-class MqttSparkplugNode {
+class MqttSparkplugNode : private MqttClientHook {
 public:
     // --- Construction: the network, three ways, as MqttDevice takes it ---
 
@@ -172,13 +279,33 @@ public:
 
     // On a host: nothing to supply. Plain TCP, or TLS after useTls(). (On a
     // board this has no network, and connect() returns false.)
-    MqttSparkplugNode();
+    MqttSparkplugNode() MQ_NOEXCEPT;
 
     // A transport you built and configured yourself. Never reconfigured here -
     // so it stays pointed where you pointed it, and a server LIST cannot walk
     // it. Use one of the constructors above to fail over between servers.
-    explicit MqttSparkplugNode(MqttTransport& transport);
+    explicit MqttSparkplugNode(MqttTransport& transport) MQ_NOEXCEPT;
 
+    // ON A CLIENT SOMEBODY ELSE OWNS - the connection a device already has,
+    // shared with its own topics and its firmware updates. One radio, one
+    // login, one session.
+    //
+    // The client's owner keeps everything about the connection: where, how,
+    // as whom, and whether to be connected at all. server(), credentials(),
+    // keepAlive(), only() and the TLS calls do nothing here, and poll() does
+    // not poll the client - its owner does. What Sparkplug needs of the
+    // session it takes for itself, on every CONNECT: the Will (the NDEATH,
+    // claimed with MqttClient::claimWill - refused if another layer owns it),
+    // Clean Start, no session expiry, and a transmit buffer that holds the
+    // birth certificate.
+    //
+    // connect() starts the node: when the session in progress was opened
+    // without its Will, it restarts the client once so the next CONNECT
+    // carries it. disconnect() publishes the NDEATH and stands the node down,
+    // leaving the connection to everybody else. A primary host going offline
+    // restarts the connection, as Sparkplug requires; a server list is the
+    // owner's business.
+    explicit MqttSparkplugNode(MqttClient& shared) MQ_NOEXCEPT;
     ~MqttSparkplugNode();
 
     MqttSparkplugNode(const MqttSparkplugNode&) = delete;
@@ -192,6 +319,8 @@ public:
     bool node(const char* edgeNodeId);
 
     void credentials(const char* user, const char* password);
+    // No user name and no password on the next CONNECT.
+    void clearCredentials();
     void keepAlive(uint16_t seconds);
 
     // Which protocol version to ask for. Both are legal for Sparkplug 3.0 -
@@ -298,6 +427,114 @@ public:
     size_t pointCount() const { return _pointCount; }
     const MqttSparkplugPoint* pointAt(size_t index) const;
     const MqttSparkplugPoint* findPoint(const char* name) const;
+    const MqttSparkplugPoint* findPointFor(const char* deviceId,
+                                           const char* name) const;
+
+    // HOW MANY METRICS THIS NODE MAY DECLARE, node and devices together.
+    //
+    // No limit but memory, on a host or a board - as many as the program
+    // declares, in PSRAM where a board has some; a declaration memory cannot
+    // take is refused (0) and outOfMemory() says so. (It was 1024 on a host
+    // and on a board with PSRAM, MQ_SP_MAX_METRICS_LARGE.) Nothing is
+    // reserved up front: the tables grow with the declarations, and the
+    // payloads and encode buffer are sized to the birth certificate when the
+    // node first connects.
+    size_t metricLimit() const;
+    // Override it - for a board whose application knows better. Before the
+    // declarations; it never refuses a metric already declared.
+    void metricLimit(size_t limit) { _metricLimit = limit; }
+
+    // The tables (metrics, devices, the birth's buffers) grow with the
+    // program, and this says one of them could not: something was refused
+    // for want of memory. For SPARKPLUG_NODE's LAST_ERROR.
+    bool outOfMemory() const { return _outOfMemory; }
+
+    // A DEADBAND on a numeric metric: see MqttSparkplugPoint::deadband. False
+    // when the metric is not declared, is not numeric, or a value is negative.
+    bool deadband(const char* name, double absolute, double percent = 0.0);
+    bool deadbandFor(const char* deviceId, const char* name, double absolute,
+                     double percent = 0.0);
+
+    // Whether this metric would go in the next publishChanged() - it has
+    // moved past its deadband since it was last published. A null or empty
+    // device means a node metric. False for an undeclared one.
+    bool changePending(const char* deviceId, const char* name) const;
+
+    // --- By index, for a block that binds many metrics ---
+    //
+    // A STRUCT of a hundred members looked every one up by name, every scan:
+    // ten thousand string compares to say what had changed. The index is
+    // stable for the life of the node - metrics are never removed - so a
+    // block looks each one up once, at declaration, and keeps the number.
+    // Every call refuses an index past pointCount() rather than trusting it.
+    //
+    // A null or empty device means a node metric. -1 when not declared.
+    //
+    // setAt() answers whether the value CHANGED: false for the same value
+    // again, and false when refused - an index past pointCount(), or a value
+    // of another type (lastPayloadError() then says ValueTypeMismatch).
+    int indexOf(const char* deviceId, const char* name) const;
+    bool setAt(size_t index, const MqttSparkplugValue& value);
+    bool changePendingAt(size_t index) const;
+    bool commandPendingAt(size_t index) const;
+    bool takeAt(size_t index, MqttSparkplugValue& into);
+
+    // THE VALUE a metric holds now - what the next message would carry. A
+    // text value is a span: into the application's buffer, or one the node
+    // owns, good until the metric is next written. An index past pointCount()
+    // answers a value of type Unknown.
+    MqttSparkplugValue valueAt(size_t index) const;
+
+    // --- Every write, in order: the write queue ---
+    //
+    // OFF (depth 0) BY DEFAULT, and then a write replaces the one before it:
+    // the metric holds the latest value, and a host that writes 1 and then 0
+    // faster than the application takes them is seen to write 0 only - the
+    // command in the 1 is lost. That is what the onCommand() callback, which
+    // sees every write as it arrives, needs nothing more than.
+    //
+    // ON, every write to a metric waits in a queue of `depth` until taken,
+    // and each take() hands over the OLDEST - so a program that takes one per
+    // scan sees each written value, in order, for a scan each. What a PLC
+    // block wants, and the OpenPLC blocks turn it on. When the queue is full
+    // the oldest write is dropped, the newest kept, and the drop counted
+    // (writesLost(), writesLostAt()) - never silently. A write's value is the
+    // metric's value from when it is TAKEN, and it is reported back then.
+    //
+    // Depth 1..16. Set it before the first write; a metric's queue keeps the
+    // depth it was made with.
+    void queueWrites(size_t depth);
+    size_t writeQueueDepth() const { return _writeDepth; }
+
+    // The oldest write waiting, without taking it - for a program that looks
+    // before it decides. Its text stays valid until it is taken.
+    bool peekAt(size_t index, MqttSparkplugValue& into) const;
+    uint32_t writesLostAt(size_t index) const;
+    uint32_t writesTakenAt(size_t index) const;
+    uint32_t writesLost() const { return _writesLost; }
+    // A numeric metric's deadband. A non-numeric one takes only 0, 0.
+    bool deadbandAt(size_t index, double absolute, double percent);
+
+    // HELD, or not: a held metric goes only when reportAt() asks for it, in a
+    // birth, or with publishAll() - never with publishChanged() just because
+    // it moved. For a set published on its own clock (every PERIOD, on
+    // request), whose values would otherwise ride along in every other
+    // metric's report-by-exception message.
+    bool holdAt(size_t index, bool held);
+    bool isHeldAt(size_t index) const;
+
+    // Puts this metric in the next publishChanged(), changed or not, held or
+    // not. A set published on its own clock marks its members and publishes:
+    // one message with them and whatever else moved, and nothing of anyone
+    // else's that did not.
+    bool reportAt(size_t index);
+
+    // What the birth says about a metric beside its value: engUnit (null or
+    // "" for none), and the engLow/engHigh display range (low >= high for
+    // none). Kept, and sent with the next birth - a host only reads them
+    // there, so a change made after the birth shows at the next one.
+    bool unitsAt(size_t index, const char* units);
+    bool rangeAt(size_t index, double low, double high);
 
     // --- Devices ---
 
@@ -326,6 +563,17 @@ public:
 
     bool connect();
 
+    // MOVES THE NODE TO ANOTHER TRANSPORT - a settings change that needs a
+    // different medium (plain to TLS, Wi-Fi to cellular, a new broker on a
+    // board link). Every declaration, alias, device and the write queues stay;
+    // the client keeps its counters. Whatever the old transport held is closed
+    // without a death certificate of its own, so call disconnect() and let it
+    // go first when the old broker should see one (with 5.0 the broker sends
+    // the NDEATH Will on that DISCONNECT). The node is down until connect(),
+    // which births again with the next bdSeq. The transport is the caller's,
+    // as with the MqttTransport constructor: it is never re-pointed here.
+    bool rebind(MqttTransport& transport);
+
     // Intentional. At 3.1.1 an NDEATH is published first
     // [tck-id-payloads-ndeath-will-message-publisher-disconnect-mqtt311];
     // at 5.0 the DISCONNECT carries reason 0x04 and the SERVER publishes it
@@ -343,10 +591,56 @@ public:
     // One NDATA per node and one DDATA per device carrying only what moved.
     // [tck-id-principles-rbe-recommended] is the report-by-exception
     // recommendation, and this is it.
+    //
+    // IT LOOKS ONLY AT WHAT WAS MARKED. A metric is marked when its value
+    // changes (set(), setAt()), when a host's write is applied, and by
+    // reportAt(); it stays marked while it differs from what was last
+    // published - a move inside its deadband, a held metric - and leaves the
+    // mark when it goes. So a call walks the metrics that moved, not all of
+    // them: it walked every metric of the node once, and again for every
+    // online device, on every call (MQX-026).
     bool publishChanged();
+
+    // ONE MESSAGE A POLL, for a program that sets its values in many places.
+    // Owes one publishChanged() to the next poll(): every part of the program
+    // with something to say asks, and the node then sends ONE NDATA, and one
+    // DDATA per online device, carrying everything that moved - where each
+    // asking part used to send its own (MQX-026). Asking twice before the poll
+    // is asking once.
+    //
+    // pollPublishes() counts the ones poll() has made, and pollPublishSent()
+    // says whether the last of them went (publishChanged()'s answer). A caller
+    // that asked keeps the count from when it asked; once the count has moved,
+    // its message has been made and pollPublishSent() is its result.
+    void publishAtPoll() { _publishOwed = true; }
+    uint32_t pollPublishes() const { return _pollPublishes; }
+    bool pollPublishSent() const { return _pollPublishSent; }
 
     // Every metric, changed or not. What a recipe download wants.
     bool publishAll();
+
+    // VALUES OUTSIDE REPORT BY EXCEPTION, EACH WITH ITS OWN TIMESTAMP.
+    //
+    // For what must reach the host even when its value repeats - an event,
+    // a day's total - and for store-and-forward. All the records belong to one
+    // device, or all to the node; that is what the first one says.
+    //
+    // `historical` sets is_historical on every metric, and that is the
+    // specification's store-and-forward: the host files each value at its
+    // own timestamp and does NOT update the live tag. Not historical, each
+    // value becomes the metric's live value and its last published one, as if
+    // publishChanged() had sent it.
+    //
+    // False when not born, while a rebirth is pending, for a record naming a
+    // metric of another device or a value of the wrong type, or when nothing
+    // could be queued. Published at QoS 0 like every NDATA/DDATA, so delivery
+    // is the broker's best effort: a caller that must not lose a record keeps
+    // it until it has seen the node stay born afterwards.
+    bool publishRecords(const MqttSparkplugRecord* records, size_t count, bool historical);
+
+    // The timestamp this node stamps a message with now: UTC milliseconds, or
+    // uptime while no clock is set (see clockIsSet()).
+    uint64_t timestamp() const { return utcNow(); }
 
     // Republish the whole birth sequence: NBIRTH at seq 0, then every online
     // device's DBIRTH. What a Node Control/Rebirth NCMD triggers, and callable
@@ -368,8 +662,17 @@ public:
     void onCommandRefused(MqttSparkplugCommandContextFn handler, void* context);
 
     // The pollable half. Generated IEC code cannot register a lambda.
+    //
+    // A NODE metric. A command for a metric under a DEVICE (a DCMD) is held on
+    // that device's metric and is reached with the ...For() pair - a name is
+    // only unique within its device, so asking for it without one cannot be
+    // answered. Before these existed a DCMD was applied, counted, and then
+    // never handed to anyone.
     bool commandPending(const char* name) const;
     bool take(const char* name, MqttSparkplugValue& into);
+    bool commandPendingFor(const char* deviceId, const char* name) const;
+    bool takeFor(const char* deviceId, const char* name,
+                 MqttSparkplugValue& into);
 
     // --- Knowing what is going on ---
 
@@ -408,35 +711,109 @@ public:
     // The whole library, when this is not enough.
     MqttClient& client() { return _client; }
 
+    // Built on a client somebody else owns.
+    bool sharesClient() const { return _shared; }
 private:
     struct Server {
-        std::string host;
+        MQ_STRING(MQTT_CONFIG_HOST) host;
         uint16_t port = 0;
     };
 
+    // --- TWO TABLES ---
+    //
+    // A metric is two records. MqttSparkplugPoint is what it IS - its name,
+    // alias, units, range, deadband, write queue - read when it is declared,
+    // when it births, when a host writes it, and when a moved value is
+    // checked against its deadband. PointState is what a scan reads and
+    // writes: the value, the one last published, and the marks that decide
+    // whether it goes. 32 bytes, one cache line on an ESP32, where the old
+    // single record spread those over five lines of 608 bytes in PSRAM.
+    //
+    // A text metric's value is in its MqttSparkplugPointText (kText): the
+    // span does not fit in 8 bytes on a 64-bit host, and a text value is read
+    // with its text anyway.
+    struct PointState {
+        // A number's or a Boolean's value as the bits differsFrom() compares
+        // - a Float's four, a Boolean as 0 or 1, the rest all eight - so a
+        // change is two integers that differ. 0 while null, and for a text
+        // metric.
+        uint64_t value = 0;
+        uint64_t published = 0;
+        // The next metric on its slot's change list, as index + 1; 0 ends it.
+        uint32_t nextChanged = 0;
+        int16_t device = -1;
+        uint8_t type = 0;          // MqttSparkplugDataType
+        uint8_t spare = 0;
+        uint16_t flags = 0;
+    };
+    static constexpr uint16_t kValueNull = 1u << 0;
+    static constexpr uint16_t kPublishedNull = 1u << 1;
+    // What was last actually published is known, so publishChanged() can
+    // tell. Not before the first birth.
+    static constexpr uint16_t kEverPublished = 1u << 2;
+    // A COMMANDED VALUE IS ALWAYS REPORTED BACK, deadband or not. Set when an
+    // NCMD or DCMD writes the point (or reportAt() asks), cleared when it is
+    // published. Without it a setpoint written 0.3 away from the last report,
+    // under a 0.5 deadband, was never echoed - and the host, which watches for
+    // the echo, decided the write had failed.
+    static constexpr uint16_t kReportNext = 1u << 3;
+    // HELD: reported only when asked (reportAt), in a birth, or by
+    // publishAll() - never by publishChanged() just for having moved. See
+    // holdAt().
+    static constexpr uint16_t kHeld = 1u << 4;
+    // A command has written it and the application has not taken it yet. The
+    // pollable half of R4.
+    static constexpr uint16_t kCommandPending = 1u << 5;
+    // On its slot's change list.
+    static constexpr uint16_t kListed = 1u << 6;
+    // A deadband is set: only then is the cold record read for it.
+    static constexpr uint16_t kDeadband = 1u << 7;
+    // A text metric: its value is in its MqttSparkplugPointText.
+    static constexpr uint16_t kText = 1u << 8;
+
+    // THE METRICS THAT MAY HAVE TO GO, one list a slot - the node's own, and
+    // each device's - threaded through PointState::nextChanged. A metric is
+    // put on when its value changes, a host writes it or reportAt() asks, and
+    // stays on while it differs from what was last published (a move inside
+    // its deadband, a held metric), so publishChanged() looks at those and
+    // nothing else. In order of index unless `sorted` says otherwise.
+    struct ChangeList {
+        uint32_t head = 0;   // index + 1; 0 for an empty list
+        uint32_t tail = 0;
+        bool sorted = true;
+    };
+
     struct Device {
-        std::string id;
+        MQ_STRING(MQ_SP_MAX_ID) id;
         bool online = false;
         // Whether a DBIRTH is owed once the node births. deviceOnline() before
         // the node is born sets this rather than failing.
         bool wantsBirth = false;
+        ChangeList changes;
     };
 
     // --- Session wiring ---
     void beginClient();
+#if MQTT_LEAN
+    void prepareWriteQueues();
+#endif
     void applyConnectionConfig();
     bool publishBirth();
     bool publishDeviceBirth(Device& device);
+    void deviceBirthRefused(bool refused);
     bool publishData(int16_t device, bool onlyChanged);
     bool publishNodeDeath();
     bool subscribeCommands();
 
     void advanceServer();
     void nextSequence();
+    void endBirth();
 
     // --- Payload assembly ---
     bool buildPayload(MqttSparkplugPayload& payload, MqttSparkplugType type,
                       int16_t device, bool onlyChanged, bool includeBirthExtras);
+    bool addPointMetric(MqttSparkplugPayload& payload, size_t index,
+                        bool isBirth);
     bool sendPayload(MqttSparkplugType type, const char* deviceId,
                      const MqttSparkplugPayload& payload, uint8_t qos,
                      bool retain, bool asWill);
@@ -452,6 +829,7 @@ private:
                        MqttSparkplugCommandOutcome outcome);
 
     int findPointIndex(const char* name, int16_t device) const;
+    void indexPoint(size_t index);
     int findPointByAlias(uint64_t alias) const;
     int findDeviceIndex(const char* deviceId) const;
 
@@ -459,33 +837,102 @@ private:
                              int16_t device, bool writable,
                              const char* units, int32_t quality);
 
-    static void messageTrampoline(void* context, const MqttMessage& message);
+    // The registry grows as metrics are declared - see metricLimit().
+    bool growPoints(size_t wanted);
+
+    // Whether a point is "changed" for report by exception: its value differs
+    // from the one last published by more than its deadband.
+    bool pointChanged(size_t index) const;
+    // Whether it must stay on its change list: never published, a report
+    // owed, or a value other than the one last published.
+    bool pointOwed(size_t index) const;
+
+    // --- The two tables (see TWO TABLES) ---
+    MqttSparkplugValue stateValue(size_t index) const;
+    MqttSparkplugValue publishedValue(size_t index) const;
+    // A value into the state table as it is: a text value's span kept.
+    void storeValue(size_t index, const MqttSparkplugValue& value);
+    // A host's value: its text copied into the metric's own storage first.
+    void storeCommand(size_t index, const MqttSparkplugValue& value);
+    // The value becomes what was last published; the report owed is paid.
+    void markPublished(size_t index);
+    // The declared type wins; whether the value changed, in `changed`.
+    bool putValue(size_t index, const MqttSparkplugValue& value, bool& changed);
+
+    ChangeList& changesOf(int16_t device);
+    void markChanged(size_t index);
+    void sortChanges(ChangeList& list);
+    // After a message (`published`: the changed ones went) or a look that
+    // found nothing to send: what still differs stays, the rest leaves.
+    void settleChanges(ChangeList& list, bool published);
+    // A birth carried them all: the list is empty.
+    void forgetChanges(ChangeList& list);
+
+    bool makeQueue(size_t index);
+    static void freeQueue(MqttSparkplugWriteQueue* queue);
+    static void freeText(MqttSparkplugPointText* text);
+
+    // publishAtPoll(), paid.
+    void publishOwed();
+
+    // The payloads, the encode buffer and the client's transmit buffer, sized
+    // to this node's birth certificate. Called by connect(), before the client
+    // exists the first time, and before every birth.
+    bool sizeBuffers();
+    bool ensureScratch(size_t bytes);
+
+    // A host's write to a point: the latest value, or one more in its queue.
+    void acceptWrite(size_t index, const MqttSparkplugValue& value);
+
     static void deathTrampoline(void* context, MqttResult result,
                                 uint16_t packetId);
-    static void sessionTrampoline(void* context, bool sessionPresent);
     static void stateSubscribed(void* context, MqttResult result, uint16_t packetId);
     static void commandSubscribed(void* context, MqttResult result, uint16_t packetId);
-    static void stateTrampoline(void* context, MqttState state,
-                                MqttResult reason);
+    // --- The client's events, as a layer on it (MqttClientHook) ---
+    void prepareConnect(MqttConnectionConfig& connection) override;
+    void sessionEstablished(bool sessionPresent) override;
+    void stateChanged(MqttState state, MqttResult reason) override;
+    bool message(const MqttMessage& message) override;
 
-    void sessionEstablished(bool sessionPresent);
-    void stateChanged(MqttState state, MqttResult reason);
+    // The numbers a new session starts with: bdSeq onwards, seq from zero.
+    void nextSession();
+    // Ends this session so the next one births afresh: the NDEATH, then a new
+    // CONNECT - the node's own, or a restart of a shared client.
+    void cycleSession();
+    bool startShared();
+    void restartShared(uint8_t reasonCode);
+    // The client: the node's own, or a shared one (see the constructor).
+    MqttClient _ownClient;
+    MqttClient& _client;
+    bool _shared = false;
 
-    MqttClient _client;
+    // The node wants to be online: connect() until disconnect().
+    bool _active = false;
+    // The CONNECT that opened this session carried the node's Will.
+    bool _willArmed = false;
+    // A shared client must restart, from poll(): the session came up without
+    // the Will, or the birth certificate outgrew the transmit buffer.
+    bool _restartOwed = false;
+    // Another layer owns the shared client's Will.
+    bool _willRefused = false;
+    // A shared session to end from poll(): the primary host went offline, or
+    // came back as a new session (cycleSession); the 3.1.1 NDEATH concluded.
+    bool _cycleOwed = false;
+    bool _restartAfterDeath = false;
     MqttOwnedTransport _net;
     bool _begun = false;
 
     MqttConnectionConfig _connection;
     MqttClientConfig _behaviour;
 
-    std::string _group;
-    std::string _node;
+    MQ_STRING(MQ_SP_MAX_ID) _group;
+    MQ_STRING(MQ_SP_MAX_ID) _node;
 
     Server _servers[MQ_SP_MAX_SERVERS];
     size_t _serverCount = 0;
     size_t _serverIndex = 0;
 
-    std::string _primaryHostId;
+    MQ_STRING(MQ_SP_MAX_TOPIC) _primaryHostId;
     bool _primaryHostOnline = false;
 
     // The last online=true timestamp seen from the primary host.
@@ -518,11 +965,32 @@ private:
     uint64_t _lastStateAt = 0;
     bool _sawState = false;
 
-    MqttSparkplugPoint _points[MQ_SP_MAX_METRICS];
+    // Allocated (mq_allocLarge, so in PSRAM where there is some) and grown as
+    // metrics are declared. A node with five metrics pays for five. Two
+    // tables, one entry each a metric: see TWO TABLES. The state table starts
+    // on a 32-byte boundary, so each entry is one cache line on an ESP32;
+    // _stateBlock is the allocation it is in.
+    MqttSparkplugPoint* _points = nullptr;
+    PointState* _state = nullptr;
+    void* _stateBlock = nullptr;
+    ChangeList _nodeChanges;
     size_t _pointCount = 0;
+    size_t _pointCapacity = 0;
+    // NAME TO INDEX, for findPointIndex(): open addressing on the name and
+    // device, each slot a point's index + 1 (0 empty), at most half full, and
+    // grown with the points. Declaring used to search every metric declared
+    // before it, so a thousand-metric program made half a million name
+    // compares in its first scan. Null (0 slots) when it could not be had, and
+    // then the search is the plain one.
+    uint32_t* _pointIndex = nullptr;
+    size_t _pointSlots = 0;
+    size_t _metricLimit = 0;   // 0: the platform's default, metricLimit()
+    size_t _writeDepth = 0;    // queueWrites(); 0 = the latest write wins
+    uint32_t _writesLost = 0;
     uint64_t _nextAlias = 1;
 
-    Device _devices[MQ_SP_MAX_DEVICES];
+    MqttGrowList<Device> _devices;
+    bool _outOfMemory = false;
     size_t _deviceCount = 0;
 
     // [tck-id-topics-nbirth-bdseq-increment] The bdSeq number MUST start at
@@ -536,6 +1004,11 @@ private:
     bool _born = false;
     bool _aliasesEnabled = true;
 
+    // publishAtPoll(): owed, how many poll() has made, and the last answer.
+    bool _publishOwed = false;
+    bool _pollPublishSent = false;
+    uint32_t _pollPublishes = 0;
+
     // OWED, AND RETRIED - not attempted once and forgotten.
     //
     // A birth that failed (queue full, a payload too large) or a subscription
@@ -547,6 +1020,13 @@ private:
     bool _birthOwed = false;
     bool _subscriptionsOwed = false;
     mq_time_t _owedTriedAt = 0;
+
+    // AN OWED DBIRTH WAITS between tries. A DBIRTH refused for want of queue
+    // room was rebuilt - every metric of the device - and refused again on
+    // every poll, which is every PLC scan, for as long as the queue stayed
+    // full. Now, like the owed NBIRTH, no more than once a second.
+    bool _deviceBirthWaiting = false;
+    mq_time_t _deviceBirthTriedAt = 0;
 
     // A SUBACK refusal is the broker's answer, not ours, and retrying it would
     // only be refused again - so it is recorded for waitingFor() to report.
@@ -640,20 +1120,23 @@ private:
 
     // The Will bytes have to survive from before the CONNECT until the server
     // uses them, so they are held here rather than built on the stack.
-    std::vector<uint8_t> _willBytes;
+    MQ_BYTES(MQ_SP_WILL_BYTES) _willBytes;
 
-    // One scratch buffer for outbound payloads. Sized for a full NBIRTH with
-    // properties on every metric - about 120 bytes each, so 4 kB at a
-    // board's 34 metrics; anything larger is refused by name.
-    static const size_t kScratch = MQ_SP_MAX_METRICS * 120 > 4096 ? MQ_SP_MAX_METRICS * 120 : 4096;
-    uint8_t _scratch[kScratch];
+    // One scratch buffer for outbound payloads, grown to the largest message
+    // this node has had to encode - which is its birth certificate, sized
+    // exactly by sizeBuffers() before the first one goes. It was a fixed
+    // 120 bytes a metric inside the node, which is a guess, and a guess that
+    // was 4 kB of internal RAM on every board.
+    uint8_t* _scratch = nullptr;
+    size_t _scratchSize = 0;
 
-    // One decode payload, reused. A member rather than a stack local because it
-    // carries its own name arena and is several kilobytes.
-    MqttSparkplugPayload _inbound;
+    // One decode payload, reused, sized for a command that writes every
+    // writable metric at once. A member rather than a stack local because it
+    // carries its own name arena.
+    MqttSparkplugPayload _inbound{(size_t)0, (size_t)0};
 
-    // Assembled outbound payload, same reasoning.
-    MqttSparkplugPayload _outbound;
+    // Assembled outbound payload, sized to the birth certificate.
+    MqttSparkplugPayload _outbound{(size_t)0, (size_t)0};
 
     char _topic[MQ_SP_MAX_TOPIC];
 };

@@ -13,6 +13,7 @@
 #include "../MqttTopic.h"
 
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 namespace {
 

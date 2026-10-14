@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttCapabilities.h"
+#include "MqttNoExcept.h"
 
 void MqttCapabilities::applyV311Defaults() {
     version = MqttVersion::V311;

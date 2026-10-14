@@ -38,6 +38,30 @@
 #include <string>
 #include <vector>
 
+// The text fields on a board (MQTT_LEAN, MqttFixed.h): fixed, at least as long
+// as the PLC blocks' pins (BROKER and topics STRING(128), USER and PASSWORD
+// STRING(64); a Sparkplug client id is group:node, up to 97).
+#if MQTT_LEAN
+    #ifndef MQTT_CONFIG_HOST
+    #define MQTT_CONFIG_HOST 128
+    #endif
+    #ifndef MQTT_CONFIG_CLIENT_ID
+    #define MQTT_CONFIG_CLIENT_ID 128
+    #endif
+    #ifndef MQTT_CONFIG_USER
+    #define MQTT_CONFIG_USER 64
+    #endif
+    #ifndef MQTT_CONFIG_PASSWORD
+    #define MQTT_CONFIG_PASSWORD 64
+    #endif
+    #ifndef MQTT_CONFIG_WILL_TOPIC
+    #define MQTT_CONFIG_WILL_TOPIC 128
+    #endif
+    #ifndef MQTT_CONFIG_WILL_PAYLOAD
+    #define MQTT_CONFIG_WILL_PAYLOAD 128
+    #endif
+#endif
+
 // A Will, as the application states it.
 //
 // The payload is BYTES, not text. A Sparkplug death certificate is protobuf,
@@ -45,8 +69,8 @@
 // that is not valid UTF-8.
 struct MqttWillConfig {
     bool enabled = false;
-    std::string topic;
-    std::vector<uint8_t> payload;
+    MQ_STRING(MQTT_CONFIG_WILL_TOPIC) topic;
+    MQ_BYTES(MQTT_CONFIG_WILL_PAYLOAD) payload;
     uint8_t qos = MQ_QOS_0;
     bool retain = false;
 
@@ -91,15 +115,15 @@ struct MqttWillConfig {
 
 // --- What we send, and the peer may revise ---
 struct MqttConnectionConfig {
-    std::string host;
+    MQ_STRING(MQTT_CONFIG_HOST) host;
     uint16_t port = MQ_PORT_TCP;
 
     // V5:3.1.3.1 - may be empty, in which case a 5.0 peer assigns one and
     // returns it as the Assigned Client Identifier. A 3.1.1 peer may refuse.
-    std::string clientId;
+    MQ_STRING(MQTT_CONFIG_CLIENT_ID) clientId;
 
-    std::string userName;
-    std::vector<uint8_t> password;   // Binary Data at both versions
+    MQ_STRING(MQTT_CONFIG_USER) userName;
+    MQ_BYTES(MQTT_CONFIG_PASSWORD) password;   // Binary Data at both versions
     bool hasUserName = false;
     bool hasPassword = false;
 
@@ -140,7 +164,8 @@ struct MqttConnectionConfig {
 // --- What is ours alone ---
 struct MqttClientConfig {
     // Operations held before a publish is refused with QueueFull. Never a
-    // silent drop.
+    // silent drop. Any number: the queue is sized to it at begin(), and only
+    // memory refuses it (MqttClient::queueOutOfMemory()).
     size_t queueCapacity = MQTT_QUEUE_CAPACITY;
 
     // The largest packet we will assemble on receive, and the buffer we encode

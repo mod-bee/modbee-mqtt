@@ -10,6 +10,7 @@
 #include "MqttWire.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
 
 // =============================================================================
 // ERRORS

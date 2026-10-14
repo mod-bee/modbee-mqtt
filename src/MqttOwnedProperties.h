@@ -38,10 +38,34 @@
 // holder is the fix that keeps it fixed.
 
 #include "MqttProperties.h"
+#include "MqttFixed.h"
 
 #include <memory>
 #include <string>
 #include <vector>
+
+// The fields on a board (MQTT_LEAN): fixed, sized for what the PLC blocks pass
+// (a REPLY_TOPIC pin is STRING(128)). Longer text is cut to the field.
+#if MQTT_LEAN
+    #ifndef MQTT_OWNED_CONTENT_TYPE
+    #define MQTT_OWNED_CONTENT_TYPE 32
+    #endif
+    #ifndef MQTT_OWNED_RESPONSE_TOPIC
+    #define MQTT_OWNED_RESPONSE_TOPIC 128
+    #endif
+    #ifndef MQTT_OWNED_CORRELATION
+    #define MQTT_OWNED_CORRELATION 32
+    #endif
+    #ifndef MQTT_OWNED_USER_PROPERTIES
+    #define MQTT_OWNED_USER_PROPERTIES 2
+    #endif
+    #ifndef MQTT_OWNED_USER_KEY
+    #define MQTT_OWNED_USER_KEY 24
+    #endif
+    #ifndef MQTT_OWNED_USER_VALUE
+    #define MQTT_OWNED_USER_VALUE 48
+    #endif
+#endif
 
 struct MqttOwnedProperties {
     bool hasPayloadFormat = false;
@@ -51,20 +75,20 @@ struct MqttOwnedProperties {
     uint32_t expiryInterval = 0;
 
     bool hasContentType = false;
-    std::string contentType;
+    MQ_STRING(MQTT_OWNED_CONTENT_TYPE) contentType;
 
     bool hasResponseTopic = false;
-    std::string responseTopic;
+    MQ_STRING(MQTT_OWNED_RESPONSE_TOPIC) responseTopic;
 
     bool hasCorrelationData = false;
-    std::vector<uint8_t> correlationData;
+    MQ_BYTES(MQTT_OWNED_CORRELATION) correlationData;
 
     // [V5:MQTT-3.3.2-17] "The Server MUST send all User Properties unaltered
     // in a PUBLISH packet when forwarding the Application Message to a
     // Client." Unaltered means every one of them, in the order they were sent,
     // so this is a list rather than a map - and two entries may share a key.
-    struct UserProperty { std::string key; std::string value; };
-    std::vector<UserProperty> user;
+    struct UserProperty { MQ_STRING(MQTT_OWNED_USER_KEY) key; MQ_STRING(MQTT_OWNED_USER_VALUE) value; };
+    MQ_LIST(UserProperty, MQTT_OWNED_USER_PROPERTIES) user;
 
     // EMPTIED, NOT REBUILT.
     //
@@ -185,11 +209,12 @@ struct MqttOwnedProperties {
 // PROPERTIES ON A QUEUED OPERATION, WITHOUT PAYING FOR THEM
 // =============================================================================
 //
-// The send queue is a FIXED ARRAY, sized MQTT_QUEUE_CAPACITY at compile time so
-// a device with no spare heap never grows one. An MqttOwnedProperties member
-// inside each slot would therefore cost its full size on every client, used or
-// not: 144 bytes x 32 slots = 4,608 bytes of RAM, measured, on a board that
-// may have 320 kB in total and has already spent 8 kB on buffers.
+// The send queue is an ARRAY OF SLOTS, sized once when the client is begun
+// (MQTT_QUEUE_CAPACITY, 32, by default) so nothing grows while it runs. An
+// MqttOwnedProperties member inside each slot would therefore cost its full
+// size on every client, used or not: 144 bytes x 32 slots = 4,608 bytes of
+// RAM, measured, on a board that may have 320 kB in total and has already
+// spent 8 kB on buffers.
 //
 // Almost no message carries properties. So the slot holds a POINTER - eight
 // bytes, null for the ordinary case - and the storage is allocated only when
@@ -201,10 +226,69 @@ struct MqttOwnedProperties {
 // operation - which is a silent bug the first time somebody adds a field and
 // forgets it. This wrapper copies itself correctly and the operation keeps the
 // compiler's own copy.
+#if MQTT_LEAN
+// ON A BOARD a queued publish keeps its properties ENCODED, in the client's
+// byte area beside its topic and payload (MqttFixed.h): only as many bytes as
+// the properties need, and nothing allocated. Same value semantics: a slot
+// bound to an area holds its own copy; an operation being built on the stack
+// (not bound) refers to the caller's MqttOwnedProperties until the queue
+// copies it in.
+#ifndef MQTT_QUEUED_PROPERTY_BYTES
+#define MQTT_QUEUED_PROPERTY_BYTES 256   // the largest encoded set a publish may queue
+#endif
+
+class MqttOptionalProperties {
+public:
+    MqttOptionalProperties() noexcept = default;
+    MqttOptionalProperties(const MqttOptionalProperties& other) noexcept
+        : _source(other._source), _encoded(other._encoded), _failed(other._failed) {}
+    // Moved with its slot when the queue grows: the encoded set goes with it.
+    MqttOptionalProperties(MqttOptionalProperties&& other) noexcept
+        : _source(other._source), _encoded(static_cast<MqttAreaBytes&&>(other._encoded)),
+          _failed(other._failed) {}
+    MqttOptionalProperties& operator=(const MqttOptionalProperties& other);
+
+    void bind(MqttByteArea& area) { _encoded.bind(area); }
+    bool failed() const { return _failed || _encoded.failed(); }
+
+    bool empty() const { return _source ? _source->empty() : _encoded.empty(); }
+    void set(const MqttOwnedProperties& properties);
+    void clear() {
+        _source = nullptr;
+        _encoded.clear();
+        _failed = false;
+    }
+
+    // Read through get()->describeTo(), as on a host.
+    const MqttOptionalProperties* get() const { return empty() ? nullptr : this; }
+    void describeTo(MqttProperties& into) const;
+
+    // The bytes it takes, or will take, in an area; 0 for none and SIZE_MAX
+    // for a set larger than MQTT_QUEUED_PROPERTY_BYTES.
+    size_t encodedSize() const;
+
+    bool operator==(const MqttOptionalProperties& other) const;
+    bool operator!=(const MqttOptionalProperties& other) const {
+        return !(*this == other);
+    }
+
+private:
+    // The encoded set into `out`, or 0 when it does not fit.
+    size_t encode(uint8_t* out, size_t capacity) const;
+    void store();
+
+    const MqttOwnedProperties* _source = nullptr;   // not bound: the caller's
+    MqttAreaBytes _encoded;                          // bound: the encoded set
+    bool _failed = false;
+};
+#else
 class MqttOptionalProperties {
 public:
     MqttOptionalProperties() = default;
     MqttOptionalProperties(const MqttOptionalProperties& other) { *this = other; }
+    // Moved with its slot when the queue grows.
+    MqttOptionalProperties(MqttOptionalProperties&& other) noexcept
+        : _held(std::move(other._held)) {}
     MqttOptionalProperties& operator=(const MqttOptionalProperties& other) {
         if (this == &other) return *this;
         if (other._held) _held.reset(new MqttOwnedProperties(*other._held));
@@ -238,3 +322,4 @@ public:
 private:
     std::unique_ptr<MqttOwnedProperties> _held;
 };
+#endif

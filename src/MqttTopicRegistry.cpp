@@ -10,6 +10,7 @@
 #include "MqttTopicRegistry.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
 
 MqttTopicHandle MqttTopicRegistry::add(const char* topic) {
     if (topic == nullptr) return MQTT_TOPIC_HANDLE_NONE;
@@ -19,27 +20,62 @@ MqttTopicHandle MqttTopicRegistry::add(const char* topic) {
         return MQTT_TOPIC_HANDLE_NONE;
     }
 
-    // The same text twice is the same handle.
-    for (int index = 0; index < MQTT_MAX_TOPIC_HANDLES; index++) {
+    // The same text twice is the same handle, a free slot is
+    // reused, and otherwise one more entry is allocated - limited by memory
+    // and by what a handle can number, nothing else.
+    size_t free = _entries.count;
+    for (size_t index = 0; index < _entries.count; index++) {
         const Entry& entry = _entries[index];
-        if (entry.inUse && entry.length == length &&
-            memcmp(entry.topic, topic, length) == 0) {
+        if (!entry.inUse) {
+            if (free == _entries.count) free = index;
+            continue;
+        }
+        if (entry.length == length && memcmp(entry.topic, topic, length) == 0) {
             return (MqttTopicHandle)index;
         }
     }
-
-    for (int index = 0; index < MQTT_MAX_TOPIC_HANDLES; index++) {
-        Entry& entry = _entries[index];
-        if (entry.inUse) continue;
-        memcpy(entry.topic, topic, length);
-        entry.topic[length] = '\0';
-        entry.length = (uint8_t)length;
-        entry.inUse = true;
-        entry.pending = false;
-        entry.state = MqttTopicState();
-        return (MqttTopicHandle)index;
+    if (free == _entries.count) {
+        if (free >= 32767 || !_entries.slots.reserve(free + 1)) {
+            _outOfMemory = free < 32767;
+            return MQTT_TOPIC_HANDLE_NONE;
+        }
+        void* raw = mq_allocLarge(sizeof(Entry));
+        if (raw == nullptr) {
+            _outOfMemory = true;
+            return MQTT_TOPIC_HANDLE_NONE;
+        }
+        _entries.slots[free] = new (raw) Entry();
+        _entries.count++;
     }
-    return MQTT_TOPIC_HANDLE_NONE;
+    Entry& entry = _entries[free];
+    memcpy(entry.topic, topic, length);
+    entry.topic[length] = '\0';
+    entry.length = (uint8_t)length;
+    entry.inUse = true;
+    entry.pending = false;
+    entry.state = MqttTopicState();
+    return (MqttTopicHandle)free;
+}
+
+MqttTopicRegistry::Entries::~Entries() noexcept {
+    for (size_t index = 0; index < count; index++) {
+        slots[index]->~Entry();
+        mq_freeLarge(slots[index]);
+    }
+}
+
+size_t MqttTopicRegistry::count() const {
+    size_t used = 0;
+    for (size_t index = 0; index < _entries.count; index++) {
+        if (_entries[index].inUse) used++;
+    }
+    return used;
+}
+
+// The entries stay allocated for the next registrations.
+void MqttTopicRegistry::clear() {
+    for (size_t index = 0; index < _entries.count; index++) _entries[index] = Entry();
+    _outOfMemory = false;
 }
 
 const char* MqttTopicRegistry::topicOf(MqttTopicHandle handle) const {
@@ -54,17 +90,6 @@ MqttTopicState* MqttTopicRegistry::mutableStateOf(MqttTopicHandle handle) {
     return valid(handle) ? &_entries[handle].state : nullptr;
 }
 
-size_t MqttTopicRegistry::count() const {
-    size_t used = 0;
-    for (const Entry& entry : _entries) {
-        if (entry.inUse) used++;
-    }
-    return used;
-}
-
-void MqttTopicRegistry::clear() {
-    for (Entry& entry : _entries) entry = Entry();
-}
 
 void MqttTopicRegistry::noteOutcome(void* context, MqttResult result, uint16_t) {
     MqttTopicState* state = (MqttTopicState*)context;
@@ -83,7 +108,8 @@ void MqttTopicRegistry::noteOutcome(void* context, MqttResult result, uint16_t) 
 }
 
 void MqttTopicRegistry::noteMessage(const MqttSpan& topic, const MqttSpan& payload) {
-    for (Entry& entry : _entries) {
+    for (size_t index = 0; index < _entries.count; index++) {
+        Entry& entry = _entries[index];
         if (!entry.inUse) continue;
 
         MqttSpan filter;

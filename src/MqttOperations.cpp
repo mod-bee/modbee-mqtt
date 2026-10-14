@@ -10,22 +10,45 @@
 #include "MqttOperations.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
 
 MqttOperations::MqttOperations() {
     // Reserved once so a conclusion reached inside a handler never allocates
     // on the poll path. The bound below is what keeps it from growing past it.
     _deferred.reserve(kMaxDrainPerDispatch);
+    // The default slots, so a queue nobody sizes works as it always has.
+    _outOfMemory = !_ops.reserveExactly(MQTT_QUEUE_CAPACITY);
 }
 
-void MqttOperations::setCapacity(size_t capacity) {
+bool MqttOperations::setCapacity(size_t capacity) {
     if (capacity == 0) capacity = 1;
-    if (capacity > MQTT_QUEUE_CAPACITY) capacity = MQTT_QUEUE_CAPACITY;
+    // Taken here, when the client is begun, never while it runs. The slots
+    // move, what is queued with them (a held entry in a board's area moves
+    // with its slot); a board's new slots are bound to its area.
+    const size_t had = _ops.capacity();
+    if (!_ops.reserveExactly(capacity)) {
+        _outOfMemory = true;
+        return false;
+    }
+#if MQTT_LEAN
+    if (_area) {
+        for (size_t i = had; i < _ops.capacity(); i++) {
+            _ops[i].topic.bind(*_area);
+            _ops[i].payload.bind(*_area);
+            _ops[i].properties.bind(*_area);
+        }
+    }
+#else
+    (void)had;
+#endif
     _capacity = capacity;
+    _outOfMemory = false;
+    return true;
 }
 
 int MqttOperations::indexOfOpId(uint32_t opId) const {
     if (opId == 0) return -1;
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (_ops[i].opId == opId) return i;
     }
     return -1;
@@ -33,7 +56,7 @@ int MqttOperations::indexOfOpId(uint32_t opId) const {
 
 int MqttOperations::indexOfPacketId(uint16_t packetId) const {
     if (packetId == MQ_PACKET_ID_NONE) return -1;
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (_ops[i].inUse() && _ops[i].packetId == packetId) return i;
     }
     return -1;
@@ -41,7 +64,7 @@ int MqttOperations::indexOfPacketId(uint16_t packetId) const {
 
 size_t MqttOperations::pending() const {
     size_t count = 0;
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (_ops[i].inUse()) count++;
     }
     return count;
@@ -49,7 +72,7 @@ size_t MqttOperations::pending() const {
 
 size_t MqttOperations::sentCount() const {
     size_t count = 0;
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (_ops[i].inUse() && _ops[i].sent) count++;
     }
     return count;
@@ -71,13 +94,20 @@ MqttResult MqttOperations::add(const MqttOperation& operation) {
         _refused++;
         return MqttResult::QueueFull;
     }
+#if MQTT_LEAN
+    // A board's queue is full when its byte area is, too.
+    if (_area && !roomFor(operation)) {
+        _refused++;
+        return MqttResult::QueueFull;
+    }
+#endif
 
     // --- Supersede ---
     //
     // Only a publish, only to the same topic, only while both are willing, and
     // only before either has been sent.
     if (operation.kind == MqttOpKind::Publish && operation.supersedable) {
-        for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+        for (int i = 0; i < (int)slots(); i++) {
             MqttOperation& existing = _ops[i];
             if (!existing.inUse()) continue;
             if (existing.kind != MqttOpKind::Publish) continue;
@@ -111,7 +141,13 @@ MqttResult MqttOperations::add(const MqttOperation& operation) {
             // completion handler belongs to the caller that asked for it, so a
             // publish replacing another must not inherit the old one's terms.
             const uint32_t keptId = existing.opId;
+#if MQTT_LEAN
+            unreserve(existing);
+#endif
             existing = operation;
+#if MQTT_LEAN
+            holdResendRoom(existing);
+#endif
             existing.opId = keptId;
             existing.sent = false;
             existing.packetId = MQ_PACKET_ID_NONE;
@@ -125,9 +161,12 @@ MqttResult MqttOperations::add(const MqttOperation& operation) {
         }
     }
 
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (_ops[i].inUse()) continue;
         _ops[i] = operation;
+#if MQTT_LEAN
+        holdResendRoom(_ops[i]);
+#endif
         _ops[i].priority = operation.priority || _priorityMode;
         _ops[i].opId = _nextOpId++;
         if (_nextOpId == 0) _nextOpId = 1;   // never zero: zero means unused
@@ -158,7 +197,7 @@ MqttOperation* MqttOperations::nextUnsent() {
     int found = -1;
     bool foundPriority = false;
 
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (!_ops[i].inUse() || _ops[i].sent) continue;
 
         const bool isPriority = _ops[i].priority;
@@ -185,7 +224,7 @@ void MqttOperations::markAllUnsent() {
     // The deadline is NOT cleared here. These are about to be offered again,
     // and markSent() restamps each one as it goes - so a session resumed after
     // an outage does not inherit a deadline that expired during it.
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
+    for (int i = 0; i < (int)slots(); i++) {
         if (_ops[i].inUse()) _ops[i].sent = false;
     }
 }
@@ -195,7 +234,7 @@ void MqttOperations::markAllUnsent() {
 // =============================================================================
 
 void MqttOperations::retireAt(int index, MqttResult result) {
-    if (index < 0 || index >= (int)MQTT_QUEUE_CAPACITY) return;
+    if (index < 0 || index >= (int)slots()) return;
     if (!_ops[index].inUse()) return;
 
     // EVERYTHING NEEDED FROM THE RECORD IS TAKEN BEFORE IT IS ERASED, AND
@@ -204,23 +243,25 @@ void MqttOperations::retireAt(int index, MqttResult result) {
     void* context = _ops[index].context;
     const uint16_t packetId = _ops[index].packetId;
 
+#if MQTT_LEAN
+    unreserve(_ops[index]);
+#endif
     _ops[index] = MqttOperation();
     _concluded++;
 
     dispatch(handler, context, result, packetId);
 }
 
-size_t MqttOperations::withdraw(const std::vector<uint8_t>& topic,
+size_t MqttOperations::withdraw(const MQ_AREA_BYTES& topic,
                                 MqttResult result) {
-    // The live mask is taken first, exactly as concludeOverdue does: retiring
+    // The mark is taken first, exactly as concludeOverdue does: retiring
     // a record dispatches a completion handler, and a handler may queue
     // something new. Without the snapshot this could withdraw a publish the
     // handler had just made, which is not what the caller asked for.
-    uint32_t live = liveMask();
+    const uint32_t live = mark();
     size_t taken = 0;
-    for (int index = 0; index < (int)MQTT_QUEUE_CAPACITY; index++) {
-        if ((live & (1u << index)) == 0) continue;
-        if (!_ops[index].inUse()) continue;
+    for (int index = 0; index < (int)slots(); index++) {
+        if (!queuedBefore(_ops[index], live)) continue;
         if (_ops[index].kind != MqttOpKind::Publish) continue;
         if (_ops[index].sent) continue;
         if (_ops[index].topic != topic) continue;
@@ -238,12 +279,11 @@ size_t MqttOperations::concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
     // retireAt() runs the handler synchronously and that handler may add(),
     // filling a slot this loop has not reached yet. Walking live state would
     // retire an operation that was never attempted.
-    uint32_t live = liveMask();
+    const uint32_t live = mark();
     size_t concluded = 0;
 
-    for (int index = 0; index < (int)MQTT_QUEUE_CAPACITY; index++) {
-        if ((live & (1u << index)) == 0) continue;
-        if (!_ops[index].inUse()) continue;
+    for (int index = 0; index < (int)slots(); index++) {
+        if (!queuedBefore(_ops[index], live)) continue;
         if (!_ops[index].sent) continue;
         // QoS 0 has nothing to wait for: it concludes when it is written.
         if (_ops[index].packetId == MQ_PACKET_ID_NONE) continue;
@@ -263,7 +303,7 @@ void MqttOperations::concludeByOpId(uint32_t opId, MqttResult result) {
     retireAt(indexOfOpId(opId), result);
 }
 
-// WHICH SLOTS ARE LIVE RIGHT NOW, as a bitmask.
+// WHICH OPERATIONS WERE LIVE WHEN A WALK STARTED: those queued before mark().
 //
 // A COUNT was not enough, and the difference is a real defect. retireAt() runs
 // the handler synchronously, and that handler may add() - which fills the
@@ -274,42 +314,33 @@ void MqttOperations::concludeByOpId(uint32_t opId, MqttResult result) {
 // in use with its completion handler never called - exactly the "outstanding
 // for ever" outcome the snapshot was there to prevent.
 //
-// A mask names the slots rather than counting them, so a slot filled during
-// the walk is not one of them. MQTT_QUEUE_CAPACITY is 32 by default and the
-// static_assert keeps that honest.
-uint32_t MqttOperations::liveMask() const {
-    static_assert(MQTT_QUEUE_CAPACITY <= 32,
-                  "the live-slot snapshot is a uint32_t bitmask over the queue");
-    uint32_t live = 0;
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
-        if (_ops[i].inUse()) live |= (1u << i);
-    }
-    return live;
-}
+// The mark names the operations rather than counting them: every operation
+// gets the next id when it is queued, so one queued during the walk - in any
+// slot, even one a handler freed and refilled - is at or past the mark and is
+// not one of them. It was a 32-bit mask over the slots, which held the queue
+// to 32; the queue is any size now, and the mark costs nothing per slot.
 
 void MqttOperations::concludeAll(MqttResult result) {
-    const uint32_t live = liveMask();
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
-        if ((live & (1u << i)) == 0) continue;
-        if (!_ops[i].inUse()) continue;   // a handler may have retired it already
+    const uint32_t live = mark();
+    for (int i = 0; i < (int)slots(); i++) {
+        // A handler may have retired it already, or queued a new one there.
+        if (!queuedBefore(_ops[i], live)) continue;
         retireAt(i, result);
     }
 }
 
 void MqttOperations::concludeSent(MqttResult result) {
-    const uint32_t live = liveMask();
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
-        if ((live & (1u << i)) == 0) continue;
-        if (!_ops[i].inUse() || !_ops[i].sent) continue;
+    const uint32_t live = mark();
+    for (int i = 0; i < (int)slots(); i++) {
+        if (!queuedBefore(_ops[i], live) || !_ops[i].sent) continue;
         retireAt(i, result);
     }
 }
 
 void MqttOperations::concludeUnsent(MqttResult result) {
-    const uint32_t live = liveMask();
-    for (int i = 0; i < (int)MQTT_QUEUE_CAPACITY; i++) {
-        if ((live & (1u << i)) == 0) continue;
-        if (!_ops[i].inUse() || _ops[i].sent) continue;
+    const uint32_t live = mark();
+    for (int i = 0; i < (int)slots(); i++) {
+        if (!queuedBefore(_ops[i], live) || _ops[i].sent) continue;
         retireAt(i, result);
     }
 }
@@ -380,7 +411,7 @@ void MqttOperations::drainDeferred() {
 
     // Swapped out before any handler runs, for the same reason as everywhere
     // else here: a handler may queue work, which pushes onto this vector.
-    std::vector<Deferred> owed;
+    MQ_LIST(Deferred, MQTT_DEFERRED_COMPLETIONS) owed;
     owed.swap(_deferred);
 
     // Guarded for the same reason as dispatch(): a handler that throws must
@@ -397,3 +428,65 @@ void MqttOperations::drainDeferred() {
         }
     }
 }
+
+#if MQTT_LEAN
+// --- The byte area, on a board ---
+
+void MqttOperations::bind(MqttByteArea& area) {
+    _area = &area;
+    for (int i = 0; i < (int)slots(); i++) {
+        _ops[i].topic.bind(area);
+        _ops[i].payload.bind(area);
+        _ops[i].properties.bind(area);
+    }
+}
+
+// The most a publish's resend copy can take: its encoding with the largest
+// fixed header (5), the topic's length (2), a packet identifier (2) and the
+// largest property-length prefix (4).
+size_t MqttOperations::resendRoom(const MqttOperation& operation) {
+    if (operation.kind != MqttOpKind::Publish || operation.qos == MQ_QOS_0) return 0;
+    return operation.topic.size() + operation.payload.size() +
+           operation.properties.encodedSize() + 13;
+}
+
+bool MqttOperations::roomFor(const MqttOperation& operation) const {
+    const size_t properties = operation.properties.encodedSize();
+    if (properties == (size_t)-1) return false;
+    const size_t needed = operation.topic.size() + operation.payload.size() +
+                          properties + resendRoom(operation);
+
+    // A newer value for a topic still waiting to go replaces the older one
+    // (add()), and the older one's room comes back first.
+    size_t freed = 0;
+    if (operation.kind == MqttOpKind::Publish && operation.supersedable) {
+        for (int i = 0; i < (int)slots(); i++) {
+            const MqttOperation& existing = _ops[i];
+            if (!existing.inUse() || existing.kind != MqttOpKind::Publish) continue;
+            if (!existing.supersedable || existing.sent) continue;
+            if (existing.topic != operation.topic) continue;
+            freed = existing.topic.size() + existing.payload.size() +
+                    existing.properties.encodedSize() + existing.reserved;
+            break;
+        }
+    }
+    return needed <= _area->available() + freed;
+}
+
+void MqttOperations::holdResendRoom(MqttOperation& operation) {
+    if (!_area) return;
+    const size_t room = resendRoom(operation);
+    operation.reserved = _area->reserve(room) ? (uint16_t)room : 0;
+}
+
+void MqttOperations::unreserve(MqttOperation& operation) {
+    if (_area && operation.reserved) _area->unreserve(operation.reserved);
+    operation.reserved = 0;
+}
+
+bool MqttOperations::makeRoomToStore(MqttOperation& operation, size_t length) {
+    if (!_area) return true;
+    unreserve(operation);
+    return length <= _area->available();
+}
+#endif

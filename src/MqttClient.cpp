@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "MqttNoExcept.h"
 
 namespace {
 
@@ -55,6 +56,25 @@ MqttSpan spanOf(const std::vector<uint8_t>& bytes) {
     return span;
 }
 
+#if MQTT_LEAN
+// A board's fixed fields (MqttFixed.h).
+MqttSpan spanOf(const MqttText& text) {
+    MqttSpan span;
+    if (text.empty()) return span;
+    span.data = (const uint8_t*)text.data();
+    span.length = (uint32_t)text.size();
+    return span;
+}
+
+MqttSpan spanOf(const MqttBytes& bytes) {
+    MqttSpan span;
+    if (bytes.empty()) return span;
+    span.data = bytes.data();
+    span.length = (uint32_t)bytes.size();
+    return span;
+}
+#endif
+
 // Deterministic jitter. A device has no entropy at start-up, and all that is
 // needed is that forty PLCs restarting together land on different numbers -
 // otherwise they present the broker with forty simultaneous connects, back off
@@ -84,7 +104,7 @@ mq_time_t spread(uint32_t seed, mq_time_t span) {
 // nothing unique of its own to hash at the moment it first needs a delay, so
 // it falls back to its own address - different per instance in one process,
 // and on a board at least not the same constant for every device.
-uint32_t deviceSeed(const std::string& clientId, const void* self) {
+uint32_t deviceSeed(const MQ_STRING_REF& clientId, const void* self) {
     if (clientId.empty()) {
         const uintptr_t address = (uintptr_t)self;
         return (uint32_t)(address ^ (address >> 16) ^ ((uint64_t)address >> 32));
@@ -112,8 +132,12 @@ const char* mq_stateName(MqttState state) {
     return "?";
 }
 
-MqttClient::MqttClient() {
+MqttClient::MqttClient() MQ_NOEXCEPT {
     _status.state = MqttState::Idle;
+#if MQTT_LEAN
+    _session.bind(_area);
+    _operations.bind(_area);
+#endif
 }
 
 const MqttCodec& MqttClient::codecFor(MqttVersion version) const {
@@ -127,21 +151,65 @@ void MqttClient::begin(MqttTransport& transport,
     _transport = &transport;
     _connection = connection;
     _behaviour = behaviour;
+    if (_transmitWanted > _behaviour.transmitBufferSize) {
+        _behaviour.transmitBufferSize = _transmitWanted;
+    }
 
     _activeVersion = connection.version;
     _fallbackTried = false;
+    _restarting = false;
 
-    _link.begin(transport, behaviour.receiveBufferSize, behaviour.transmitBufferSize);
-
+    _link.begin(transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize);
+#if MQTT_LEAN
+    sizeArea();
+#else
     _operations.setCapacity(behaviour.queueCapacity);
+#endif
     _reconnectDelay = behaviour.reconnectInitialMs;
-
     _status = MqttStatus();
     _stayDown = false;
     _status.version = _activeVersion;
     enterState(MqttState::Idle);
 }
 
+#if MQTT_LEAN
+void MqttClient::sizeArea() {
+    const MqttClientConfig& behaviour = _behaviour;
+    // A board's byte area, set aside once: room for the queue it is given -
+    // MQTT_QUEUE_BYTES and MQTT_AREA_ENTRIES for the default queue, in
+    // proportion for a larger one - or for any message the link can send,
+    // whichever is more, twice over: queued, and its resend copy. It grows
+    // only if a later begin() asks for more, keeping what it holds. When the
+    // memory is not there the queue keeps the size it had, and
+    // queueOutOfMemory() says so.
+    const size_t operations = behaviour.queueCapacity ? behaviour.queueCapacity : 1;
+    const size_t perOperation = MQTT_QUEUE_BYTES / MQTT_QUEUE_CAPACITY;
+    size_t largest = MQTT_QUEUE_BYTES;
+    size_t entries = MQTT_AREA_ENTRIES;
+    if (operations > MQTT_QUEUE_CAPACITY) {
+        largest = operations <= (size_t)-1 / 4 / perOperation
+                      ? operations * perOperation : (size_t)-1 / 4;
+        entries = operations <= MqttByteArea::kMaxEntries
+                      ? operations * MQTT_AREA_ENTRIES / MQTT_QUEUE_CAPACITY
+                      : MqttByteArea::kMaxEntries + 1;
+    }
+    if (behaviour.transmitBufferSize > largest) largest = behaviour.transmitBufferSize;
+    const size_t areaSize = largest <= (size_t)-1 / 4 ? 2 * largest : 0;
+    _areaOutOfMemory = false;
+    if (areaSize == 0) {
+        _areaOutOfMemory = true;
+    } else if (areaSize > _area.capacity()) {
+        if (_areaBytes.replace(areaSize)) {
+            _area.move(_areaBytes.data(), areaSize);
+            _areaBytes.releaseOld();
+        } else {
+            _areaOutOfMemory = true;
+        }
+    }
+    if (!_area.entries(entries)) _areaOutOfMemory = true;
+    if (!_areaOutOfMemory) _operations.setCapacity(behaviour.queueCapacity);
+}
+#endif
 MqttResult MqttClient::reconfigure(const MqttConnectionConfig& connection) {
     // Nothing to reconfigure before begin() has been given a transport, and
     // accepting it would leave a config that the next begin() silently
@@ -171,6 +239,27 @@ MqttResult MqttClient::reconfigure(const MqttConnectionConfig& connection) {
     return MqttResult::Ok;
 }
 
+MqttResult MqttClient::rebind(MqttTransport& transport) {
+    if (_transport == nullptr) return MqttResult::NotConnected;
+    if (_transport == &transport) return MqttResult::Ok;
+
+    // Down until connect() - and first, so closing does not schedule a
+    // reconnect on the transport that is going away.
+    _stayDown = true;
+    if (_status.state != MqttState::Idle) {
+        // Concluded as a dropped connection is: what was sent stays in the
+        // session (a clean start discards it anyway), what was not concludes.
+        closeConnection(MqttResult::Cancelled);
+    } else {
+        _transport->end();
+    }
+    enterState(MqttState::Idle);
+
+    _transport = &transport;
+    _link.rebind(transport);
+    return MqttResult::Ok;
+}
+
 void MqttClient::end() {
     if (_transport) _transport->end();
 
@@ -190,9 +279,13 @@ void MqttClient::enterState(MqttState state, MqttResult reason) {
     _status.connected = (state == MqttState::Connected);
     _stateSince = mq_millis();
     if (reason != MqttResult::Ok) _status.lastError = reason;
+    for (MqttClientHook* hook = _hooks; hook != nullptr;) {
+        MqttClientHook* next = hook->_nextHook;
+        hook->stateChanged(state, reason);
+        hook = next;
+    }
     if (_onState) _onState(_stateContext, state, reason);
 }
-
 void MqttClient::onMessage(MqttMessageFn handler, void* context) {
     _onMessage = handler;
     _messageContext = context;
@@ -255,11 +348,18 @@ MqttResult MqttClient::connect() {
         return MqttResult::NotConnected;
     }
 
+#if MQTT_LEAN
+    _openFailure = MqttResult::ConnectionLost;
+#endif
     enterState(MqttState::Connecting);
     return MqttResult::Queued;
 }
 
 void MqttClient::sendConnect() {
+    for (MqttClientHook* hook = _hooks; hook != nullptr; hook = hook->_nextHook) {
+        hook->prepareConnect(_connection);
+    }
+
     MqttPacket packet;
     packet.header.type = MQ_PKT_CONNECT;
 
@@ -297,20 +397,20 @@ void MqttClient::sendConnect() {
 
     if (_activeVersion == MqttVersion::V5) {
         if (_connection.hasSessionExpiry) {
-            connect.properties.sessionExpiryInterval = _connection.sessionExpiryInterval;
-            connect.properties.markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
+            MQ_PROPERTIES(packet, connect).sessionExpiryInterval = _connection.sessionExpiryInterval;
+            MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
         }
         if (_connection.receiveMaximum != 0) {
-            connect.properties.receiveMaximum = _connection.receiveMaximum;
-            connect.properties.markPresent(MQ_PROP_RECEIVE_MAXIMUM);
+            MQ_PROPERTIES(packet, connect).receiveMaximum = _connection.receiveMaximum;
+            MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_RECEIVE_MAXIMUM);
         }
         if (_connection.topicAliasMaximum != 0) {
-            connect.properties.topicAliasMaximum = _connection.topicAliasMaximum;
-            connect.properties.markPresent(MQ_PROP_TOPIC_ALIAS_MAXIMUM);
+            MQ_PROPERTIES(packet, connect).topicAliasMaximum = _connection.topicAliasMaximum;
+            MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_TOPIC_ALIAS_MAXIMUM);
         }
         if (_connection.maximumPacketSize != 0) {
-            connect.properties.maximumPacketSize = _connection.maximumPacketSize;
-            connect.properties.markPresent(MQ_PROP_MAXIMUM_PACKET_SIZE);
+            MQ_PROPERTIES(packet, connect).maximumPacketSize = _connection.maximumPacketSize;
+            MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_MAXIMUM_PACKET_SIZE);
         }
     }
 
@@ -373,6 +473,16 @@ void MqttClient::poll() {
 
     case MqttState::Connecting:
         if (!_transport->isConnected()) {
+#if MQTT_LEAN
+            // An open that ran on a connect task and failed is answered as a
+            // false begin() always was - by connect() or serviceReconnect(),
+            // whichever started it: the backoff, and nothing concluded.
+            if (_transport->openFailed()) {
+                enterState(MqttState::Reconnecting, _openFailure);
+                scheduleReconnect();
+                return;
+            }
+#endif
             // Still handshaking. A TCP connect takes as long as it takes and
             // nothing here waits for it - but an attempt the transport has
             // already given up on is not waited out either.
@@ -411,6 +521,10 @@ void MqttClient::poll() {
         // used on the same poll rather than the next one.
         serviceAcknowledgements();
         if (_status.state != MqttState::Connected) return;
+        if (_reissueOwed) {
+            _reissueOwed = false;
+            reissueSubscriptions();
+        }
         serviceQueue();
         return;
 
@@ -431,6 +545,10 @@ void MqttClient::poll() {
 
 bool MqttClient::sendPacket(const MqttPacket& packet) {
     if (!_transport) return false;
+    // V5:3.14.4 - after a DISCONNECT nothing more goes on the connection.
+    // Reachable when a handler disconnects inside poll(): the PUBACK for the
+    // message it was handed would otherwise follow the goodbye.
+    if (_status.state == MqttState::Disconnecting) return false;
     if (!_link.send(codec(), packet)) return false;
 
     // Any packet at all resets the keepalive timer. [V5:3.1.2.10] measures the
@@ -685,7 +803,7 @@ void MqttClient::handleConnAck(const MqttPacket& packet) {
     _status.version = _activeVersion;
 
     if (_activeVersion == MqttVersion::V5) {
-        _capabilities.applyV5(connack.properties);
+        _capabilities.applyV5(MQ_PROPERTIES(packet, connack));
     } else {
         _capabilities.applyV311Defaults();
     }
@@ -761,12 +879,16 @@ void MqttClient::establishSession(bool sessionPresent) {
     // So operations queued inside the hook are marked priority. The window is
     // exactly the hook's own execution - nothing else in the library ever sets
     // it, and the application has no way to.
-    if (_onSession) {
+    if (_onSession || _hooks) {
         _operations.setPriorityMode(true);
-        _onSession(_sessionContext, sessionPresent);
+        for (MqttClientHook* hook = _hooks; hook != nullptr;) {
+            MqttClientHook* next = hook->_nextHook;
+            hook->sessionEstablished(sessionPresent);
+            hook = next;
+        }
+        if (_onSession) _onSession(_sessionContext, sessionPresent);
         _operations.setPriorityMode(false);
     }
-
     reissueSubscriptions();
 }
 
@@ -799,9 +921,15 @@ void MqttClient::reissueSubscriptions() {
         // which on a round-trip test looks like a lost message and on a plant
         // looks like a device that stopped reporting.
         op.priority = true;
-        if (mq_accepted(_operations.add(op))) {
+        const MqttResult queued = _operations.add(op);
+        if (mq_accepted(queued)) {
             _session.markSubscriptionIssued(held->filter.data(),
                                             (uint16_t)held->filter.size());
+        } else if (queued == MqttResult::QueueFull) {
+            // A program may hold more subscriptions than the queue holds
+            // operations: the rest go as the queue drains (poll).
+            _reissueOwed = true;
+            break;
         }
     }
 }
@@ -817,8 +945,8 @@ void MqttClient::handlePublish(const MqttPacket& packet) {
 
     // --- Topic aliases, V5:3.3.2.3.4 ---
     if (_activeVersion == MqttVersion::V5 &&
-        publish.properties.has(MQ_PROP_TOPIC_ALIAS)) {
-        const uint16_t alias = publish.properties.topicAlias;
+        MQ_PROPERTIES(packet, publish).has(MQ_PROP_TOPIC_ALIAS)) {
+        const uint16_t alias = MQ_PROPERTIES(packet, publish).topicAlias;
 
         if (!_aliases.inboundAllowed(alias)) {
             // Outside what we offered. We cannot receive an alias we never
@@ -872,7 +1000,7 @@ void MqttClient::handlePublish(const MqttPacket& packet) {
         message.dup = publish.dup;
         message.packetId = publish.packetId;
         message.properties = _activeVersion == MqttVersion::V5
-                                 ? &publish.properties : nullptr;
+                                 ? &MQ_PROPERTIES(packet, publish) : nullptr;
         _status.received++;
 
         // Handles first, then the callback. A caller that polls and a caller
@@ -880,7 +1008,12 @@ void MqttClient::handlePublish(const MqttPacket& packet) {
         // copy has to be in place before application code runs - a handler
         // that reads its own handle would otherwise see the previous message.
         _topics.noteMessage(message.topic, message.payload);
-        if (_onMessage) _onMessage(_messageContext, message);
+        bool taken = false;
+        for (MqttClientHook* hook = _hooks; hook != nullptr && !taken;
+             hook = hook->_nextHook) {
+            taken = hook->message(message);
+        }
+        if (!taken && _onMessage) _onMessage(_messageContext, message);
     }
 
     // --- Acknowledge ---
@@ -1129,7 +1262,7 @@ void MqttClient::serviceQueue() {
             // reason the queue owns its properties rather than borrowing the
             // caller's.
             if (!op->properties.empty()) {
-                op->properties.get()->describeTo(packet.publish.properties);
+                op->properties.get()->describeTo(MQ_PROPERTIES(packet, packet.publish));
             }
 
         } else if (op->kind == MqttOpKind::Subscribe) {
@@ -1180,6 +1313,16 @@ void MqttClient::serviceQueue() {
             _operations.concludeByOpId(op->opId, MqttResult::PacketTooLarge);
             continue;
         }
+#if MQTT_LEAN
+        // On a board the resend copy goes in the byte area, into the room the
+        // publish reserved when it was queued. One going out again after a
+        // reconnect has none reserved, and waits for room.
+        if (op->kind == MqttOpKind::Publish && op->qos > MQ_QOS_0 &&
+            !_operations.makeRoomToStore(*op, needed)) {
+            _session.releasePacketId(packetId);
+            break;
+        }
+#endif
 
         // The bytes go out and are kept in one pass.
         //
@@ -1306,7 +1449,7 @@ void MqttClient::closeConnection(MqttResult reason) {
 
     _link.reset();
     _keepAlive.stop();
-
+    applyTransmitReservation();
     // Not session state, so neither survives. V5:4.9 and V5:3.3.2.3.4.
     _aliases.reset(0, 0);
 
@@ -1366,7 +1509,20 @@ void MqttClient::closeConnection(MqttResult reason) {
           (_status.connectReasonCode == MQ_RETURN_BAD_CREDENTIALS ||
            _status.connectReasonCode == MQ_RETURN_NOT_AUTHORIZED)));
 
-    if (_behaviour.autoReconnect && !_stayDown &&
+    const bool restarting = _restarting;
+    _restarting = false;
+
+    if (restarting && !_stayDown) {
+        // restart(): the owner wants to be connected and a layer wants a new
+        // CONNECT - no backoff, whatever autoReconnect says. But not this
+        // instant: the same client identifier back before the broker has
+        // handled the goodbye is a session takeover, and a takeover may drop
+        // the very Will the goodbye asked it to publish. Mosquitto did, one
+        // run in three.
+        _reconnectDelay = _behaviour.reconnectInitialMs;
+        _reconnectAt = mq_millis() + MQ_RESTART_SETTLE_MS;
+        enterState(MqttState::Reconnecting, reason);
+    } else if (_behaviour.autoReconnect && !_stayDown &&
         reason != MqttResult::Cancelled && !credentialRejected) {
         scheduleReconnect();
         enterState(MqttState::Reconnecting, reason);
@@ -1415,6 +1571,9 @@ void MqttClient::serviceReconnect() {
         scheduleReconnect();
         return;
     }
+#if MQTT_LEAN
+    _openFailure = MqttResult::Ok;
+#endif
     enterState(MqttState::Connecting);
 }
 
@@ -1443,7 +1602,7 @@ MqttResult MqttClient::publish(const char* topic, const uint8_t* payload, size_t
 size_t MqttClient::withdraw(const char* topic) {
     if (topic == nullptr || *topic == '\0') return 0;
     const size_t length = strlen(topic);
-    std::vector<uint8_t> key(topic, topic + length);
+    MQ_AREA_BYTES key(topic, topic + length);
     return _operations.withdraw(key, MqttResult::Superseded);
 }
 
@@ -1621,6 +1780,130 @@ MqttResult MqttClient::unsubscribe(const char* filter,
     return _operations.add(op);
 }
 
+// DISCONNECT WITH WILL MESSAGE AT 3.1.1, which has no such reason code: the
+// Will goes as an ordinary PUBLISH, written ahead of the DISCONNECT on the
+// same link, so the broker has it before it learns the goodbye was deliberate
+// - the same order [tck-id-payloads-ndeath-will-message-publisher-disconnect-
+// mqtt311] asks of a Sparkplug node. QoS 0: nothing may follow the DISCONNECT,
+// an acknowledgement included. At 5.0 the reason code does it and this is
+// nothing.
+void MqttClient::sendWillAt311(uint8_t reasonCode) {
+    if (reasonCode != MQ_REASON_DISCONNECT_WITH_WILL ||
+        _activeVersion != MqttVersion::V311 || !_connection.will.enabled) {
+        return;
+    }
+    MqttPacket will;
+    will.header.type = MQ_PKT_PUBLISH;
+    will.publish.qos = MQ_QOS_0;
+    will.publish.retain = _connection.will.retain;
+    will.publish.topic = spanOf(_connection.will.topic);
+    will.publish.payload = spanOf(_connection.will.payload);
+    sendPacket(will);
+}
+
+MqttResult MqttClient::restart(uint8_t reasonCode) {
+    if (!_transport) return MqttResult::NotInitialised;
+    if (_stayDown || _status.state == MqttState::Idle) return MqttResult::NotConnected;
+
+    if (_status.state == MqttState::Reconnecting) {
+        _reconnectAt = mq_millis();
+        return MqttResult::Ok;
+    }
+    _restarting = true;
+    if (_status.state == MqttState::Disconnecting) return MqttResult::Queued;
+    if (!isConnected()) {
+        // Connecting or mid-handshake: nothing to say goodbye on.
+        closeConnection(MqttResult::Cancelled);
+        return MqttResult::Ok;
+    }
+
+    sendWillAt311(reasonCode);
+    MqttPacket packet;
+    packet.header.type = MQ_PKT_DISCONNECT;
+    packet.disconnect.reasonCode = reasonCode;
+    if (_activeVersion == MqttVersion::V311 &&
+        reasonCode != MQ_REASON_NORMAL_DISCONNECTION) {
+        packet.disconnect.reasonCode = MQ_REASON_NORMAL_DISCONNECTION;
+    }
+    if (!sendPacket(packet)) {
+        closeConnection(MqttResult::Cancelled);
+        return MqttResult::Ok;
+    }
+    enterState(MqttState::Disconnecting);
+    return MqttResult::Queued;
+}
+
+// =============================================================================
+// LAYERS
+// =============================================================================
+
+MqttClientHook::~MqttClientHook() = default;
+void MqttClientHook::prepareConnect(MqttConnectionConfig& connection) { (void)connection; }
+void MqttClientHook::sessionEstablished(bool sessionPresent) { (void)sessionPresent; }
+void MqttClientHook::stateChanged(MqttState state, MqttResult reason) {
+    (void)state;
+    (void)reason;
+}
+bool MqttClientHook::message(const MqttMessage& message) {
+    (void)message;
+    return false;
+}
+bool MqttClient::attach(MqttClientHook& hook) {
+    if (hook._attachedTo == this) return true;
+    if (hook._attachedTo != nullptr) return false;
+    MqttClientHook** tail = &_hooks;
+    while (*tail != nullptr) tail = &(*tail)->_nextHook;
+    hook._nextHook = nullptr;
+    hook._attachedTo = this;
+    *tail = &hook;
+    return true;
+}
+
+void MqttClient::detach(MqttClientHook& hook) {
+    if (hook._attachedTo != this) return;
+    releaseWill(hook);
+    for (MqttClientHook** link = &_hooks; *link != nullptr; link = &(*link)->_nextHook) {
+        if (*link == &hook) {
+            *link = hook._nextHook;
+            break;
+        }
+    }
+    hook._nextHook = nullptr;
+    hook._attachedTo = nullptr;
+}
+
+bool MqttClient::claimWill(MqttClientHook& hook) {
+    if (hook._attachedTo != this) return false;
+    if (_willOwner != nullptr && _willOwner != &hook) return false;
+    _willOwner = &hook;
+    return true;
+}
+
+void MqttClient::releaseWill(MqttClientHook& hook) {
+    if (_willOwner != &hook) return;
+    _willOwner = nullptr;
+    _connection.will = MqttWillConfig();
+}
+
+bool MqttClient::reserveTransmit(size_t bytes) {
+    if (bytes > _transmitWanted) _transmitWanted = bytes;
+    if (_status.state == MqttState::Idle || _status.state == MqttState::Reconnecting) {
+        applyTransmitReservation();
+    }
+    return _link.transmitCapacity() >= bytes;
+}
+
+void MqttClient::applyTransmitReservation() {
+    // Only on a link that is down: nothing is half-written into the buffer
+    // being replaced.
+    if (_transport == nullptr || _transmitWanted <= _behaviour.transmitBufferSize) return;
+    _behaviour.transmitBufferSize = _transmitWanted;
+    _link.begin(*_transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize);
+#if MQTT_LEAN
+    sizeArea();
+#endif
+}
+
 MqttResult MqttClient::disconnect(uint8_t reasonCode) {
     if (!_transport) return MqttResult::NotInitialised;
     if (!isConnected()) {
@@ -1628,6 +1911,7 @@ MqttResult MqttClient::disconnect(uint8_t reasonCode) {
         return MqttResult::Ok;
     }
 
+    sendWillAt311(reasonCode);
     MqttPacket packet;
     packet.header.type = MQ_PKT_DISCONNECT;
     packet.disconnect.reasonCode = reasonCode;

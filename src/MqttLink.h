@@ -37,6 +37,7 @@
 #include "MqttCodec.h"
 
 #include <vector>
+#include "MqttFixed.h"   // MQ_HEAP_BYTES: a board allocates its buffers once
 
 
 // What the receive side found. Deliberately not an error enum: three of these
@@ -69,6 +70,14 @@ public:
     // transport - the link does not own it and does not know whether the
     // caller means to reuse it.
     void end();
+
+    // Points the link at another transport, keeping its buffers and their
+    // capacities, and empties them: nothing half-read from the old medium may
+    // be taken as the start of a packet on the new one.
+    void rebind(MqttTransport& transport) {
+        _transport = &transport;
+        reset();
+    }
 
     // Empties both buffers but keeps the transport and its capacities.
     //
@@ -186,7 +195,7 @@ private:
     void shrinkTransmitIfIdle();
     void compactTransmit();
 
-    std::vector<uint8_t> _receive;
+    MQ_HEAP_BYTES _receive;
 
     // A READ CURSOR, NOT A COMPACTED BUFFER.
     //
@@ -218,7 +227,7 @@ private:
     // silently dropped acknowledgements: a PUBREC arriving mid-PUBLISH could
     // not raise its PUBREL, and the QoS 2 exchange stalled while the peer
     // retried for ever. A live broker found it in the first minute.
-    std::vector<uint8_t> _transmit;
+    MQ_HEAP_BYTES _transmit;
     size_t _transmitLength = 0;
     size_t _transmitCursor = 0;
 

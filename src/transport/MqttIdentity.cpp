@@ -26,6 +26,7 @@
 #if !defined(_WIN32)
 #include <sys/stat.h>
 #endif
+#include "../MqttNoExcept.h"
 
 namespace {
 

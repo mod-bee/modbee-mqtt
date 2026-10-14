@@ -6,6 +6,7 @@
 #include "MqttSparkplugTypes.h"
 
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 // The wire spellings, indexed by the enum. A table rather than a switch so the
 // two directions - name from type, type from name - cannot disagree.

@@ -80,6 +80,8 @@
 #include "transport/MqttStreamListener.h"      // a board serving plain MQTT
 #include "transport/MqttStreamTlsListener.h"   // a board serving TLS
 #include "transport/MqttStreamTransport.h"
+#include "transport/MqttChannelTlsTransport.h"  // a board dialling TLS: ESP32, any channel
+#include "transport/MqttConnectTask.h"          // a board's connect, outside the scan: ESP32
 
 // An identity of the device's own: an EC key, a self-signed certificate and
 // the fingerprint to pin it by. Unlike the two above it needs no sockets, so
@@ -117,4 +119,5 @@
 #include "sparkplug/MqttSparkplugPayload.h"
 #include "sparkplug/MqttSparkplugTopic.h"
 #include "sparkplug/MqttSparkplugNode.h"
+#include "sparkplug/MqttSparkplugHistory.h"
 #include "sparkplug/MqttSparkplugHost.h"

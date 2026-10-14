@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "MqttNoExcept.h"
 
 namespace {
 
@@ -295,7 +296,11 @@ void MqttDevice::startProvisioning() {
 }
 
 void MqttDevice::provisionSession() {
+#if MQTT_LEAN
+    const std::string base = std::string("$modbee/provision/") + _connection.clientId.c_str();
+#else
     const std::string base = "$modbee/provision/" + _connection.clientId;
+#endif
     _client.subscribe((base + "/reply").c_str(), MQ_QOS_1);
     _client.publish((base + "/request").c_str(), "{}", MQ_QOS_1, false);
     _provisionAskedAt = mq_millis();
@@ -430,12 +435,12 @@ void MqttDevice::willDelay(uint32_t seconds) {
 }
 
 size_t MqttDevice::queueSize(size_t operations) {
-    // Clamped HERE and reported, rather than clamped silently inside the queue
-    // where a caller would never find out. A remote site told it could hold an
-    // hour of readings, and holding twenty minutes, loses forty minutes of
-    // data and no warning.
+    // Nothing caps it but memory: the queue is sized to it when the client is
+    // begun, and if the memory is not there it keeps the size it had and
+    // queueOutOfMemory() says so - never a quietly smaller queue. A remote
+    // site told it could hold an hour of readings, and holding twenty
+    // minutes, loses forty minutes of data and no warning.
     if (operations == 0) operations = 1;
-    if (operations > MQTT_QUEUE_CAPACITY) operations = MQTT_QUEUE_CAPACITY;
     _behaviour.queueCapacity = operations;
     return operations;
 }

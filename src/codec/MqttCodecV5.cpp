@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttCodecV5.h"
+#include "../MqttNoExcept.h"
 
 namespace {
 
@@ -123,7 +124,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (!reader.ok()) return reader.error();
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_CONNECT, connect.properties);
+            mq_decodeProperties(reader, MQ_PKT_CONNECT, MQ_PROPERTIES(out, connect));
         if (propertyError != MqttError::None) return propertyError;
 
         connect.clientId = reader.utf8();
@@ -167,7 +168,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (reasonError != MqttError::None) return reasonError;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_CONNACK, connack.properties);
+            mq_decodeProperties(reader, MQ_PKT_CONNACK, MQ_PROPERTIES(out, connack));
         if (propertyError != MqttError::None) return propertyError;
         break;
     }
@@ -200,7 +201,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         }
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_PUBLISH, publish.properties);
+            mq_decodeProperties(reader, MQ_PKT_PUBLISH, MQ_PROPERTIES(out, publish));
         if (propertyError != MqttError::None) return propertyError;
 
         // Whatever is left. The payload's length is not a field - it is what
@@ -238,7 +239,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (header.remainingLength < 4) break;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, header.type, ack.properties);
+            mq_decodeProperties(reader, header.type, MQ_PROPERTIES(out, ack));
         if (propertyError != MqttError::None) return propertyError;
         break;
     }
@@ -250,7 +251,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (subscribe.packetId == MQ_PACKET_ID_NONE) return MqttError::PropertyValueInvalid;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_SUBSCRIBE, subscribe.properties);
+            mq_decodeProperties(reader, MQ_PKT_SUBSCRIBE, MQ_PROPERTIES(out, subscribe));
         if (propertyError != MqttError::None) return propertyError;
 
         while (!reader.atEnd()) {
@@ -287,7 +288,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (suback.packetId == MQ_PACKET_ID_NONE) return MqttError::PropertyValueInvalid;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, header.type, suback.properties);
+            mq_decodeProperties(reader, header.type, MQ_PROPERTIES(out, suback));
         if (propertyError != MqttError::None) return propertyError;
 
         while (!reader.atEnd()) {
@@ -311,7 +312,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (unsubscribe.packetId == MQ_PACKET_ID_NONE) return MqttError::PropertyValueInvalid;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_UNSUBSCRIBE, unsubscribe.properties);
+            mq_decodeProperties(reader, MQ_PKT_UNSUBSCRIBE, MQ_PROPERTIES(out, unsubscribe));
         if (propertyError != MqttError::None) return propertyError;
 
         while (!reader.atEnd()) {
@@ -352,7 +353,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (header.remainingLength < 2) break;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_DISCONNECT, disconnect.properties);
+            mq_decodeProperties(reader, MQ_PKT_DISCONNECT, MQ_PROPERTIES(out, disconnect));
         if (propertyError != MqttError::None) return propertyError;
         break;
     }
@@ -375,7 +376,7 @@ MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
         if (header.remainingLength < 2) break;
 
         const MqttError propertyError =
-            mq_decodeProperties(reader, MQ_PKT_AUTH, auth.properties);
+            mq_decodeProperties(reader, MQ_PKT_AUTH, MQ_PROPERTIES(out, auth));
         if (propertyError != MqttError::None) return propertyError;
         break;
     }
@@ -416,7 +417,7 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
                     + 1                                  // Protocol Version
                     + 1                                  // Connect Flags
                     + 2;                                 // Keep Alive
-        size += mq_propertiesSize(c.properties, MQ_PKT_CONNECT);
+        size += mq_propertiesSize(MQ_PROPERTIES(packet, c), MQ_PKT_CONNECT);
         size += mq_utf8Size(c.clientId.length);
         if (c.hasWill) {
             size += mq_propertiesSize(c.will.properties, MQ_PROP_SCOPE_WILL);
@@ -429,13 +430,13 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
     }
 
     case MQ_PKT_CONNACK:
-        return 1 + 1 + mq_propertiesSize(packet.connack.properties, MQ_PKT_CONNACK);
+        return 1 + 1 + mq_propertiesSize(MQ_PROPERTIES(packet, packet.connack), MQ_PKT_CONNACK);
 
     case MQ_PKT_PUBLISH: {
         const MqttPublish& p = packet.publish;
         size_t size = mq_utf8Size(p.topic.length);
         if (p.qos > MQ_QOS_0) size += 2;
-        size += mq_propertiesSize(p.properties, MQ_PKT_PUBLISH);
+        size += mq_propertiesSize(MQ_PROPERTIES(packet, p), MQ_PKT_PUBLISH);
         size += p.payload.length;
         return size;
     }
@@ -445,7 +446,7 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
     case MQ_PKT_PUBREL:
     case MQ_PKT_PUBCOMP: {
         const MqttPubAck& a = packet.ack;
-        const size_t properties = mq_propertiesSize(a.properties, type);
+        const size_t properties = mq_propertiesSize(MQ_PROPERTIES(packet, a), type);
 
         // V5:3.4.2.1 lets both the Reason Code and the Property Length be
         // omitted when the reason is Success and there are no properties. Two
@@ -457,7 +458,7 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
 
     case MQ_PKT_SUBSCRIBE: {
         const MqttSubscribe& s = packet.subscribe;
-        size_t size = 2 + mq_propertiesSize(s.properties, MQ_PKT_SUBSCRIBE);
+        size_t size = 2 + mq_propertiesSize(MQ_PROPERTIES(packet, s), MQ_PKT_SUBSCRIBE);
         for (uint8_t i = 0; i < s.count; i++) {
             size += mq_utf8Size(s.filters[i].filter.length) + 1;
         }
@@ -466,12 +467,12 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
 
     case MQ_PKT_SUBACK:
     case MQ_PKT_UNSUBACK:
-        return 2 + mq_propertiesSize(packet.suback.properties, type)
+        return 2 + mq_propertiesSize(MQ_PROPERTIES(packet, packet.suback), type)
                  + packet.suback.count;
 
     case MQ_PKT_UNSUBSCRIBE: {
         const MqttUnsubscribe& u = packet.unsubscribe;
-        size_t size = 2 + mq_propertiesSize(u.properties, MQ_PKT_UNSUBSCRIBE);
+        size_t size = 2 + mq_propertiesSize(MQ_PROPERTIES(packet, u), MQ_PKT_UNSUBSCRIBE);
         for (uint8_t i = 0; i < u.count; i++) {
             size += mq_utf8Size(u.filters[i].length);
         }
@@ -484,7 +485,7 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
 
     case MQ_PKT_DISCONNECT: {
         const MqttDisconnect& d = packet.disconnect;
-        const size_t properties = mq_propertiesSize(d.properties, MQ_PKT_DISCONNECT);
+        const size_t properties = mq_propertiesSize(MQ_PROPERTIES(packet, d), MQ_PKT_DISCONNECT);
         // V5:3.14.2.1 - a clean close with nothing to add is two bytes total.
         if (d.reasonCode == MQ_REASON_NORMAL_DISCONNECTION && properties == 1) return 0;
         return 1 + properties;
@@ -492,7 +493,7 @@ size_t bodySizeV5(const MqttPacket& packet, bool& encodable) {
 
     case MQ_PKT_AUTH: {
         const MqttAuth& a = packet.auth;
-        const size_t properties = mq_propertiesSize(a.properties, MQ_PKT_AUTH);
+        const size_t properties = mq_propertiesSize(MQ_PROPERTIES(packet, a), MQ_PKT_AUTH);
         if (a.reasonCode == MQ_REASON_SUCCESS && properties == 1) return 0;
         return 1 + properties;
     }
@@ -574,7 +575,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
         writer.u8(flags);
 
         writer.u16(c.keepAlive);
-        mq_encodeProperties(writer, c.properties, MQ_PKT_CONNECT);
+        mq_encodeProperties(writer, MQ_PROPERTIES(packet, c), MQ_PKT_CONNECT);
 
         writer.utf8(c.clientId.data, c.clientId.length);
         if (c.hasWill) {
@@ -591,7 +592,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
         const MqttConnAck& a = packet.connack;
         writer.u8(a.sessionPresent ? CONNACK_SESSION_PRESENT : 0u);
         writer.u8(a.reasonCode);
-        mq_encodeProperties(writer, a.properties, MQ_PKT_CONNACK);
+        mq_encodeProperties(writer, MQ_PROPERTIES(packet, a), MQ_PKT_CONNACK);
         break;
     }
 
@@ -599,7 +600,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
         const MqttPublish& p = packet.publish;
         writer.utf8(p.topic.data, p.topic.length);
         if (p.qos > MQ_QOS_0) writer.u16(p.packetId);
-        mq_encodeProperties(writer, p.properties, MQ_PKT_PUBLISH);
+        mq_encodeProperties(writer, MQ_PROPERTIES(packet, p), MQ_PKT_PUBLISH);
         writer.raw(p.payload.data, p.payload.length);
         break;
     }
@@ -612,7 +613,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
         writer.u16(a.packetId);
         if (body > 2) {
             writer.u8(a.reasonCode);
-            mq_encodeProperties(writer, a.properties, type);
+            mq_encodeProperties(writer, MQ_PROPERTIES(packet, a), type);
         }
         break;
     }
@@ -620,7 +621,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
     case MQ_PKT_SUBSCRIBE: {
         const MqttSubscribe& s = packet.subscribe;
         writer.u16(s.packetId);
-        mq_encodeProperties(writer, s.properties, MQ_PKT_SUBSCRIBE);
+        mq_encodeProperties(writer, MQ_PROPERTIES(packet, s), MQ_PKT_SUBSCRIBE);
         for (uint8_t i = 0; i < s.count; i++) {
             writer.utf8(s.filters[i].filter.data, s.filters[i].filter.length);
             writer.u8(s.filters[i].options);
@@ -632,7 +633,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
     case MQ_PKT_UNSUBACK: {
         const MqttSubAck& s = packet.suback;
         writer.u16(s.packetId);
-        mq_encodeProperties(writer, s.properties, type);
+        mq_encodeProperties(writer, MQ_PROPERTIES(packet, s), type);
         for (uint8_t i = 0; i < s.count; i++) writer.u8(s.reasons[i]);
         break;
     }
@@ -640,7 +641,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
     case MQ_PKT_UNSUBSCRIBE: {
         const MqttUnsubscribe& u = packet.unsubscribe;
         writer.u16(u.packetId);
-        mq_encodeProperties(writer, u.properties, MQ_PKT_UNSUBSCRIBE);
+        mq_encodeProperties(writer, MQ_PROPERTIES(packet, u), MQ_PKT_UNSUBSCRIBE);
         for (uint8_t i = 0; i < u.count; i++) {
             writer.utf8(u.filters[i].data, u.filters[i].length);
         }
@@ -654,7 +655,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
     case MQ_PKT_DISCONNECT: {
         if (body > 0) {
             writer.u8(packet.disconnect.reasonCode);
-            mq_encodeProperties(writer, packet.disconnect.properties, MQ_PKT_DISCONNECT);
+            mq_encodeProperties(writer, MQ_PROPERTIES(packet, packet.disconnect), MQ_PKT_DISCONNECT);
         }
         break;
     }
@@ -662,7 +663,7 @@ MqttError MqttCodecV5::encode(uint8_t* out, size_t capacity,
     case MQ_PKT_AUTH: {
         if (body > 0) {
             writer.u8(packet.auth.reasonCode);
-            mq_encodeProperties(writer, packet.auth.properties, MQ_PKT_AUTH);
+            mq_encodeProperties(writer, MQ_PROPERTIES(packet, packet.auth), MQ_PKT_AUTH);
         }
         break;
     }

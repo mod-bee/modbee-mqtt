@@ -131,10 +131,18 @@ set(MQTT_SOURCES
     src/MqttPacket.cpp
     src/MqttTopic.cpp
     src/MqttTimerWheel.cpp
+    src/MqttFixed.cpp
     src/transport/MqttTcpTransport.cpp
     src/transport/MqttTlsTransport.cpp
     src/transport/MqttIdentity.cpp
     src/transport/MqttCertificate.cpp
+    # A board's TLS over its own channel, by the ESP32 core's mbedTLS. Empty
+    # on a host (MQTT_CHANNEL_TLS is 0 there); the test suite builds it
+    # against an ESP32-shaped mbedTLS - see test/CMakeLists.txt.
+    src/transport/MqttChannelTls.cpp
+    # A board's connect on a task of its own (ESP32). Empty on a host unless a
+    # test asks for it: test/wire/connect_task.sh.
+    src/transport/MqttConnectTask.cpp
     src/codec/MqttCodecV5.cpp
     src/codec/MqttCodecV311.cpp
 )
@@ -148,6 +156,7 @@ list(APPEND MQTT_SOURCES
     src/sparkplug/MqttSparkplugPayload.cpp
     src/sparkplug/MqttSparkplugTopic.cpp
     src/sparkplug/MqttSparkplugNode.cpp
+    src/sparkplug/MqttSparkplugHistory.cpp
     src/sparkplug/MqttSparkplugHost.cpp
     src/broker/MqttBroker.cpp
     src/broker/MqttBrokerAccounts.cpp

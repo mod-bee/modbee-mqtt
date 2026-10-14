@@ -10,6 +10,7 @@
 #include "MqttTopic.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
 
 MqttSpan mq_topicSpan(const char* text) {
     MqttSpan span;

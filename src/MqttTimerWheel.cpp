@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttTimerWheel.h"
+#include "MqttNoExcept.h"
 
 namespace {
 const uint32_t kTickMask = 0x0FFFFFFFu;   // 2^32 ms / 16 ms per tick = 2^28 ticks

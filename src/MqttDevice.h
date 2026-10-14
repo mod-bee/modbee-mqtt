@@ -727,7 +727,13 @@ public:
     bool willRetainRefused() const { return _willRetainRefused; }
 
     size_t queued() const { return _client.operations().pending(); }
-    size_t queueCapacity() const { return _behaviour.queueCapacity; }
+    // What is in force: what queueSize() asked for, or - when the memory for
+    // it was not there (queueOutOfMemory()) - the size the queue kept.
+    size_t queueCapacity() const {
+        return _client.queueOutOfMemory() ? _client.operations().capacity()
+                                          : _behaviour.queueCapacity;
+    }
+    bool queueOutOfMemory() const { return _client.queueOutOfMemory(); }
 
     // How many filters are subscribed, and the state of each: how many
     // messages it has taken, when the last one came, and whether the broker
@@ -742,15 +748,17 @@ public:
     // How many messages may be held while the link is down. Past this, a
     // publish is refused - never silently dropped.
     //
-    // RETURNS WHAT IS ACTUALLY IN FORCE, which may be less than you asked for.
-    // The queue is a fixed array of MQTT_QUEUE_CAPACITY slots (32 by default,
-    // a build flag) because a device with no spare heap cannot grow one, so
-    // that is a hard ceiling. Asking for more and being quietly given less is
-    // exactly the kind of silence this library exists not to do:
+    // Any size: nothing caps it but memory (MQTT_QUEUE_CAPACITY, 32, is only
+    // the default). The slots - and on a board the bytes their messages are
+    // kept in, in proportion - are taken when the device connects, once, so
+    // nothing grows while it runs. If the memory is not there the queue keeps
+    // the size it had, and that is said rather than quietly given:
     //
-    //     if (mqtt.queueSize(64) < 64) {
-    //         // rebuild with -DMQTT_QUEUE_CAPACITY=64, or plan for 32
-    //     }
+    //     mqtt.queueSize(500);
+    //     mqtt.connect(...);
+    //     if (mqtt.queueOutOfMemory()) { /* queueCapacity() is what it kept */ }
+    //
+    // Returns what was asked for (0 is taken as 1).
     size_t queueSize(size_t operations);
 
     // The largest message that can be received or sent, in bytes. A message

@@ -39,8 +39,8 @@ public:
                 if (!table->set(account.first.c_str(), account.second.c_str())) {
                     error = "the MQTT login \"" + account.first + "\" could not be added: a user name "
                             "and password are each at most " +
-                            std::to_string(MQ_BROKER_ACCOUNT_FIELD_BYTES - 1) + " characters, and there "
-                            "are at most " + std::to_string(MQ_BROKER_MAX_ACCOUNTS) + " logins";
+                            std::to_string(MQ_BROKER_ACCOUNT_FIELD_BYTES - 1) + " characters (or "
+                            "the memory for one more login is not there)";
                     return false;
                 }
             }

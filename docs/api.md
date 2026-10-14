@@ -93,7 +93,7 @@ The channel must outlive the device. It is **not started here**: `WiFi.begin()`,
 | `statusTopic(topic, online, offline)` | the availability pair — see below |
 | `will(topic, bytes, length, qos, retain)` | a Will of your own, for a payload that is not text |
 | `willDelay(seconds)` | 5.0 only. A reconnect inside the window publishes no Will at all |
-| `queueSize(operations)` | how much may be held while the link is down. Past this a publish is refused, never dropped. Default 32, and **it returns what is actually in force** — `MQTT_QUEUE_CAPACITY` is a hard compile-time ceiling, so asking for more gives you less and says so |
+| `queueSize(operations)` | how much may be held while the link is down. Past this a publish is refused, never dropped. Default 32 (`MQTT_QUEUE_CAPACITY`), and **any size**: the queue is taken when the device connects, and only memory refuses it - then it keeps the size it had, `queueOutOfMemory()` is true and `queueCapacity()` says what it kept |
 | `bufferSize(bytes)` | the largest message in or out. Default 4096 — see **What a large payload costs** below |
 | `autoReconnect(bool)` | on by default. See [transports.md](transports.md) |
 
@@ -545,8 +545,11 @@ void insecureNoCertificateValidation();
 ```
 
 Built whenever `<openssl/ssl.h>` is present. On Arduino there is nothing here to call:
-a secure channel *is* an Arduino channel, so you hand `WiFiClientSecure` or
-`SSLClient` to the constructor instead. See [transports.md](transports.md).
+on an ESP32 hand the constructor a
+[`MqttChannelTlsTransport`](#tls-over-any-channel-on-an-esp32) over a plain
+channel; elsewhere a secure channel *is* an Arduino channel, so you hand
+`WiFiClientSecure` or `SSLClient` to it instead. See
+[transports.md](transports.md).
 
 ### The whole library, when you outgrow this
 
@@ -650,6 +653,26 @@ void poll();
 ```
 
 Call it often. It never waits for anything.
+
+### Changing settings while running
+
+```cpp
+MqttResult reconfigure(const MqttConnectionConfig& connection);
+MqttResult rebind(MqttTransport& transport);
+```
+
+`reconfigure()` replaces what the **next** CONNECT says - host, port, client
+identifier, credentials, Will - and touches nothing else: not the counters, not
+the queue, not the session. `rebind()` moves the client to **another
+transport** (plain to TLS, Wi-Fi to cellular, a new broker on a board link): it
+closes whatever the old one holds, without a DISCONNECT, leaves the client Idle
+and down until `connect()`, and keeps the topic registry, the subscriptions,
+every handle and the counters. Send `disconnect()` first and let it leave for a
+graceful goodbye. The old transport is yours to delete afterwards.
+
+The pattern for a settings page: `disconnect()`, poll until it is no longer
+`Disconnecting` (a second at most), then `rebind()` if the medium changed,
+`reconfigure()`, `connect()`.
 
 ### Connecting
 
@@ -988,6 +1011,63 @@ publishes goes out **first**. That is the hook a Sparkplug layer hangs its
 birth certificate on: an NBIRTH has to precede the data it introduces, and a
 hook that ran after the queue drained would put it in the middle.
 
+### Layers sharing one client
+
+One connection, several protocols on it: a Sparkplug node, a firmware updater
+and the application's own topics all want the same broker session, and a device
+has one radio and one login to spend. The three handlers above are the
+application's. A **layer** attaches instead, and any number may:
+
+```cpp
+class MqttClientHook {
+public:
+    virtual void prepareConnect(MqttConnectionConfig& connection);
+    virtual void sessionEstablished(bool sessionPresent);
+    virtual void stateChanged(MqttState state, MqttResult reason);
+    virtual bool message(const MqttMessage& message);   // true: it was mine
+};
+
+bool attach(MqttClientHook& hook);
+void detach(MqttClientHook& hook);
+```
+
+Layers see every event in the order they attached, and the application's
+handlers run after them. `prepareConnect()` runs before **every** CONNECT is
+encoded - the first, each automatic reconnect, a 3.1.1 fallback - with the
+config it is built from: where a layer whose Will changes per connection
+writes it. A layer that returns true from `message()` takes that message;
+later layers and the application handler do not see it.
+
+With nothing attached, each event costs one null check.
+
+```cpp
+bool claimWill(MqttClientHook& hook);
+void releaseWill(MqttClientHook& hook);
+const MqttClientHook* willOwner() const;
+```
+
+**A CONNECT carries one Will**, so a layer that needs it claims it, and a
+second claimant is refused rather than silently overwritten. Releasing clears
+the Will from the next CONNECT; detaching releases it.
+
+```cpp
+MqttResult restart(uint8_t reasonCode = MQ_REASON_NORMAL_DISCONNECTION);
+bool reserveTransmit(size_t bytes);
+size_t transmitCapacity() const;
+```
+
+`restart()` ends the connection and starts the next one at once, with no
+backoff, for a layer that needs a fresh CONNECT without owning the decision to
+be connected. It is refused while the owner keeps the client down.
+`reserveTransmit()` asks for a transmit buffer at least that big; the buffers
+never grow under a live connection, so it is applied while the link is down -
+at once if it is, otherwise before the next CONNECT.
+
+`disconnect(MQ_REASON_DISCONNECT_WITH_WILL)` has the broker publish the Will
+anyway - what a layer whose Will is a death certificate needs on a deliberate
+goodbye. At 3.1.1, which has no such reason, the client publishes the Will
+itself, just ahead of the DISCONNECT.
+
 ### MqttStatus
 
 ```cpp
@@ -1127,6 +1207,36 @@ MqttStreamTransport<SSLClient> ethernetTls(wrapped, "broker", 8883);
 
 Or hand the channel to [`MqttDevice`](#mqttdevice) and skip the transport
 entirely.
+
+#### TLS over any channel, on an ESP32
+
+`MqttChannelTlsTransport<ChannelType>` takes the same plain channels and does
+the TLS itself, with the mbedTLS the ESP32 core already links - the same
+checks over Wi-Fi, Ethernet and a modem, and a handshake that advances a step
+per `poll()` instead of stalling the loop. Its setters are
+[`MqttTlsTransport`](#host-tls)'s:
+
+```cpp
+EthernetClient wired;
+MqttChannelTlsTransport<EthernetClient> tls(wired, "broker.example.com", 8883);
+
+tls.setCaCertificate(ROOT_CA);                 // validate: chain and host name (default)
+tls.setPinnedKeyFingerprint(BROKER_KEY);       // or trust one key, nothing else
+tls.setInsecureNoCertificateValidation();      // or check nothing
+tls.setClientCertificate(DEVICE_CERT, DEVICE_KEY);   // mutual TLS, PEM
+
+tls.peerKeyFingerprint();    // the key the broker showed - what a pin stores
+tls.certificateVerified();   // what was actually checked
+tls.lastErrorCode();         // why it refused: an MqttTlsError (security.md)
+tls.lastEngineCode();        // and the mbedTLS code, where the engine gave one
+tls.lastError();             // the two as one short line: "TLS: wrong host name"
+```
+
+Every PEM is kept as a pointer, not copied - on a board it is a literal in
+flash. Validation is the default and refuses to connect without a CA: a board
+has no system store. Compiled where `MQTT_CHANNEL_TLS` is 1, which is every
+ESP32 core and nothing else. Memory, PSRAM and what is offered on the wire are
+in [transports.md](transports.md#an-esp32-over-any-channel--wi-fi-ethernet-or-a-modem).
 
 **TLS is a transport, not a feature.** Nothing above the transport changes, and
 on Arduino it costs nothing extra because a secure channel already *is* an
@@ -1386,7 +1496,10 @@ everything it has already written.
 
 And below those: `MqttCodecV5` / `MqttCodecV311`, `MqttPacket`, `MqttWire`,
 `MqttTopic`, `MqttLink`. [ARCHITECTURE.md](ARCHITECTURE.md) explains what each
-layer is for and why the boundaries are where they are.
+layer is for and why the boundaries are where they are. Building packets by
+hand: on a board an `MqttPacket` carries one property set for whichever kind it
+is, so reach it with `MQ_PROPERTIES(packet, packet.publish)` rather than
+`packet.publish.properties` (`MqttPacket.h`); the same code then builds on a host.
 
 **Ask `capabilities()`, never the version number.** That is what keeps version
 handling out of application code, and what lets a layer written on top of this

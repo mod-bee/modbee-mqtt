@@ -62,10 +62,10 @@
 #define MQTT_SESSION_MAX_INFLIGHT 16
 #endif
 
-// Subscriptions the session holds and re-establishes.
-#ifndef MQTT_SESSION_MAX_SUBSCRIPTIONS
-#define MQTT_SESSION_MAX_SUBSCRIPTIONS 16
-#endif
+// Subscriptions the session holds and re-establishes: no fixed number, on a
+// host or a board. The table grows with the program's subscriptions, each
+// filter in its own allocation, until memory runs out (outOfMemory()). (It was
+// MQTT_SESSION_MAX_SUBSCRIPTIONS, 16.)
 
 // Inbound QoS 2 identifiers awaiting a PUBREL. This is what makes exactly-once
 // delivery work: an identifier remembered here means the message has already
@@ -90,7 +90,7 @@ struct MqttStoredPublish {
     // is what decides the DUP flag on a retransmission.
     bool sent = false;
 
-    std::vector<uint8_t> encoded;
+    MQ_AREA_BYTES encoded;
 
     bool inUse() const { return packetId != MQ_PACKET_ID_NONE; }
 };
@@ -108,7 +108,7 @@ static_assert(MQTT_SESSION_MAX_INBOUND_QOS2 <= 255,
 struct MqttStoredSubscription {
     // Owned, not a span: a subscription outlives the SUBSCRIBE that carried it
     // and has to be re-issued from memory after a reconnect.
-    std::vector<uint8_t> filter;
+    MQ_OWNED_BYTES filter;
     uint8_t options = 0;
     bool established = false;   // a positive acknowledgement has been seen
 
@@ -240,6 +240,16 @@ public:
     // --- Diagnostics ---
     uint32_t storedBytes() const;
 
+#if MQTT_LEAN
+    // On a board the resend copies live in the client's byte area
+    // (MqttFixed.h), bound here once, before use.
+    void bind(MqttByteArea& area);
+#endif
+
+    // A subscription was refused for want of memory (the table grows until
+    // there is none). Cleared by clear().
+    bool outOfMemory() const { return _outOfMemory; }
+
 private:
     MqttStoredPublish _outbound[MQTT_SESSION_MAX_INFLIGHT];
     // PACKET IDENTIFIERS HELD BY SUBSCRIBE AND UNSUBSCRIBE.
@@ -257,7 +267,8 @@ private:
     static const size_t kMaxControlIds = 8;
     uint16_t _controlIds[kMaxControlIds];
 
-    MqttStoredSubscription _subscriptions[MQTT_SESSION_MAX_SUBSCRIPTIONS];
+    MqttGrowList<MqttStoredSubscription> _subscriptions;
+    bool _outOfMemory = false;
 
     uint16_t _inbound[MQTT_SESSION_MAX_INBOUND_QOS2] = {0};
     uint8_t _inboundCount = 0;

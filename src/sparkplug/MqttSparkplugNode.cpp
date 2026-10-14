@@ -5,44 +5,67 @@
 
 #include "MqttSparkplugNode.h"
 
+#include <math.h>
+#include <new>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 
 // =============================================================================
 // CONSTRUCTION
 // =============================================================================
 
-MqttSparkplugNode::MqttSparkplugNode() {
-    memset(_scratch, 0, sizeof _scratch);
+MqttSparkplugNode::MqttSparkplugNode() MQ_NOEXCEPT : _client(_ownClient) {
     _topic[0] = '\0';
 }
 
-MqttSparkplugNode::MqttSparkplugNode(MqttTransport& transport) {
-    memset(_scratch, 0, sizeof _scratch);
+MqttSparkplugNode::MqttSparkplugNode(MqttTransport& transport) MQ_NOEXCEPT
+    : _client(_ownClient) {
     _topic[0] = '\0';
     _net.borrow(transport);
 }
 
+MqttSparkplugNode::MqttSparkplugNode(MqttClient& shared) MQ_NOEXCEPT
+    : _client(shared), _shared(true) {
+    _topic[0] = '\0';
+}
+
 MqttSparkplugNode::~MqttSparkplugNode() {
     // The client concludes what is outstanding before the transport it is
-    // bound to goes away with _net.
-    if (_begun) _client.end();
+    // bound to goes away with _net. A shared one is its owner's; the node
+    // only leaves it, and its Will with it.
+    if (_begun && !_shared) _client.end();
+    _client.detach(*this);
+    if (_points != nullptr) {
+        for (size_t index = 0; index < _pointCount; index++) {
+            freeQueue(_points[index].queue);
+            freeText(_points[index].text);
+        }
+        for (size_t index = 0; index < _pointCapacity; index++) {
+            _points[index].~MqttSparkplugPoint();
+        }
+        mq_freeLarge(_points);
+    }
+    mq_freeLarge(_stateBlock);
+    mq_freeLarge(_pointIndex);
+    mq_freeLarge(_scratch);
 }
 
 #if MQTT_TLS_SOCKETS
 // Before the client is begun only: it binds the transport it is given, and
 // swapping one underneath it would leave it talking to the other.
 bool MqttSparkplugNode::useTls(bool enabled) {
-    return !_begun && _net.useTls(enabled);
+    return !_shared && !_begun && _net.useTls(enabled);
 }
 
 bool MqttSparkplugNode::trustFile(const char* path) {
-    return !_begun && _net.trustFile(path);
+    return !_shared && !_begun && _net.trustFile(path);
 }
 
 bool MqttSparkplugNode::pinnedKey(const char* fingerprint) {
-    return !_begun && _net.pin(fingerprint);
+    return !_shared && !_begun && _net.pin(fingerprint);
 }
 #endif
 
@@ -116,6 +139,13 @@ void MqttSparkplugNode::credentials(const char* user, const char* password) {
     }
 }
 
+void MqttSparkplugNode::clearCredentials() {
+    _connection.userName.clear();
+    _connection.hasUserName = false;
+    _connection.password.clear();
+    _connection.hasPassword = false;
+}
+
 void MqttSparkplugNode::keepAlive(uint16_t seconds) {
     _connection.keepAlive = seconds;
 }
@@ -144,6 +174,9 @@ bool MqttSparkplugNode::server(const char* host, uint16_t port) {
 bool MqttSparkplugNode::addServer(const char* host, uint16_t port) {
     if (host == nullptr || host[0] == '\0') return false;
     if (_serverCount >= MQ_SP_MAX_SERVERS) return false;
+#if MQTT_LEAN
+    if (strlen(host) > _servers[_serverCount].host.capacity()) return false;
+#endif
     _servers[_serverCount].host = host;
     _servers[_serverCount].port = port;
     _serverCount++;
@@ -171,17 +204,70 @@ void MqttSparkplugNode::primaryHost(const char* sparkplugHostId) {
 // DECLARING METRICS
 // =============================================================================
 
+// The slot a name starts its search at: FNV-1a over the name, seeded with the
+// device so one name on two devices lands apart.
+static uint32_t mq_spPointHash(const char* name, int16_t device) {
+    uint32_t hash = 2166136261u ^ (uint32_t)(uint16_t)device;
+    for (; *name != '\0'; name++) {
+        hash ^= (uint8_t)*name;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 int MqttSparkplugNode::findPointIndex(const char* name, int16_t device) const {
     if (name == nullptr) return -1;
+    // Case SENSITIVE. [tck-id-case-sensitivity-metric-names]. A lookup that
+    // folded case would let a PLC declare "Level" and write "LEVEL" and
+    // silently hit the same metric - and then a Host Application shows one
+    // tag where the engineer wrote two.
+    if (_pointSlots != 0) {
+        const size_t mask = _pointSlots - 1;
+        for (size_t slot = mq_spPointHash(name, device) & mask;;
+             slot = (slot + 1) & mask) {
+            const uint32_t entry = _pointIndex[slot];
+            if (entry == 0) return -1;
+            const MqttSparkplugPoint& point = _points[entry - 1];
+            if (point.device == device && point.name == name) {
+                return (int)(entry - 1);
+            }
+        }
+    }
     for (size_t index = 0; index < _pointCount; index++) {
         if (_points[index].device != device) continue;
-        // Case SENSITIVE. [tck-id-case-sensitivity-metric-names]. A lookup that
-        // folded case would let a PLC declare "Level" and write "LEVEL" and
-        // silently hit the same metric - and then a Host Application shows one
-        // tag where the engineer wrote two.
         if (_points[index].name == name) return (int)index;
     }
     return -1;
+}
+
+// A point just declared goes into the name index - or the index is rebuilt,
+// twice the size, when it would be more than half full. Without the memory
+// for that the index is dropped and findPointIndex() searches instead: slower
+// to declare, never wrong.
+void MqttSparkplugNode::indexPoint(size_t index) {
+    if (_pointCount * 2 > _pointSlots) {
+        size_t slots = _pointSlots != 0 ? _pointSlots * 2 : 64;
+        while (slots < _pointCount * 2) slots *= 2;
+        uint32_t* grown = (uint32_t*)mq_allocLarge(slots * sizeof(uint32_t));
+        mq_freeLarge(_pointIndex);
+        _pointIndex = grown;
+        _pointSlots = grown != nullptr ? slots : 0;
+        if (grown == nullptr) return;
+        memset(grown, 0, slots * sizeof(uint32_t));
+        for (size_t i = 0; i < _pointCount; i++) {
+            size_t slot = mq_spPointHash(_points[i].name.c_str(),
+                                         _points[i].device) & (slots - 1);
+            while (grown[slot] != 0) slot = (slot + 1) & (slots - 1);
+            grown[slot] = (uint32_t)(i + 1);
+        }
+        return;
+    }
+    if (_pointSlots == 0) return;
+    const size_t mask = _pointSlots - 1;
+    size_t slot = mq_spPointHash(_points[index].name.c_str(),
+                                 _points[index].device) & mask;
+    while (_pointIndex[slot] != 0) slot = (slot + 1) & mask;
+    _pointIndex[slot] = (uint32_t)(index + 1);
 }
 
 int MqttSparkplugNode::findPointByAlias(uint64_t alias) const {
@@ -206,7 +292,13 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
                                             const char* units,
                                             int32_t quality) {
     if (name == nullptr || name[0] == '\0') return 0;
-    if (_pointCount >= MQ_SP_MAX_METRICS) return 0;
+#if MQTT_LEAN
+    if (strlen(name) > MQ_SP_POINT_NAME) return 0;   // a board's name field (MqttSparkplugNode.h)
+#endif
+    // The node's metric limit - small on a small board, see metricLimit().
+    // The two the library adds to a birth (bdSeq, Node Control/Rebirth) are
+    // not points and do not count against it.
+    if (_pointCount >= metricLimit()) return 0;
 
     // A datatype this build cannot carry is refused HERE rather than at encode
     // time. [tck-id-topics-nbirth-templates] requires every Template definition
@@ -227,6 +319,24 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
         return 0;
     }
 
+    // Room for one more, allocated now rather than at birth so a refusal is
+    // a refused declaration, which the declaring block reports, and not a
+    // birth that cannot be built.
+    if (!growPoints(_pointCount + 1)) return 0;
+
+    // The text a text metric owns, and nothing for a number (MQX-027).
+    MqttSparkplugValue probe;
+    probe.type = type;
+    MqttSparkplugPointText* text = nullptr;
+    if (probe.isText() || probe.isBytes()) {
+        void* raw = mq_allocLarge(sizeof(MqttSparkplugPointText));
+        if (raw == nullptr) {
+            _outOfMemory = true;
+            return 0;
+        }
+        text = new (raw) MqttSparkplugPointText();
+    }
+
     MqttSparkplugPoint& point = _points[_pointCount];
     point = MqttSparkplugPoint();
     point.name = name;
@@ -234,8 +344,16 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
     point.device = device;
     point.writable = writable;
     point.quality = quality;
+    point.text = text;
     if (units != nullptr) point.units = units;
-    point.value = mq_spNull(type);
+
+    // Not written yet: an explicit null, never a made-up zero (see the birth).
+    PointState& state = _state[_pointCount];
+    state = PointState();
+    state.type = (uint8_t)type;
+    state.device = device;
+    state.flags = kValueNull;
+    if (text != nullptr) state.flags |= kText;
 
     // [tck-id-payloads-alias-uniqueness] ... MUST be a unique number across
     // this Edge Node's ENTIRE set of metrics. One counter for the node and
@@ -243,6 +361,10 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
     point.alias = _aliasesEnabled ? _nextAlias++ : 0;
 
     _pointCount++;
+    indexPoint(_pointCount - 1);
+    // Never published: on its list, so one declared after the birth goes in
+    // the next message, as it did when every call looked at every metric.
+    markChanged(_pointCount - 1);
     return point.alias;
 }
 
@@ -279,16 +401,717 @@ const MqttSparkplugPoint* MqttSparkplugNode::findPoint(const char* name) const {
     return index < 0 ? nullptr : &_points[index];
 }
 
+const MqttSparkplugPoint* MqttSparkplugNode::findPointFor(const char* deviceId,
+                                                         const char* name) const {
+    const int device = findDeviceIndex(deviceId);
+    if (device < 0) return nullptr;
+    const int index = findPointIndex(name, (int16_t)device);
+    return index < 0 ? nullptr : &_points[index];
+}
+
+size_t MqttSparkplugNode::metricLimit() const {
+    if (_metricLimit != 0) return _metricLimit;
+    return (size_t)-1;   // what the program declares, memory permitting
+}
+
+bool MqttSparkplugNode::growPoints(size_t wanted) {
+    // THE STATE TABLE IS ONE CACHE LINE A METRIC on an ESP32, and 32 bytes on
+    // a 64-bit host too. Growing it is a design decision, not a detail.
+    static_assert(sizeof(PointState) == 32, "PointState is one cache line");
+    if (wanted <= _pointCapacity) return true;
+
+    // Doubling, from eight, and never past the limit - so a node's table is at
+    // most twice what it declared and usually far less.
+    size_t capacity = _pointCapacity == 0 ? 8 : _pointCapacity * 2;
+    if (capacity < wanted) capacity = wanted;
+    const size_t limit = metricLimit();
+    if (capacity > limit) capacity = limit < wanted ? wanted : limit;
+
+    // Both tables, or neither. The state table on a 32-byte boundary: one
+    // cache line an entry.
+    void* raw = mq_allocLarge(capacity * sizeof(MqttSparkplugPoint));
+    void* stateBlock = mq_allocLarge(capacity * sizeof(PointState) + 32);
+    // No room for the doubled tables: exactly what is wanted, if that fits.
+    if ((raw == nullptr || stateBlock == nullptr) && capacity > wanted) {
+        mq_freeLarge(raw);
+        mq_freeLarge(stateBlock);
+        capacity = wanted;
+        raw = mq_allocLarge(capacity * sizeof(MqttSparkplugPoint));
+        stateBlock = mq_allocLarge(capacity * sizeof(PointState) + 32);
+    }
+    if (raw == nullptr || stateBlock == nullptr) {
+        mq_freeLarge(raw);
+        mq_freeLarge(stateBlock);
+        _outOfMemory = true;
+        return false;
+    }
+    PointState* state = reinterpret_cast<PointState*>(
+        ((uintptr_t)stateBlock + 31) & ~(uintptr_t)31);
+    for (size_t index = 0; index < capacity; index++) {
+        new (&state[index]) PointState();
+    }
+    if (_state != nullptr) {
+        memcpy(state, _state, _pointCount * sizeof(PointState));
+    }
+    mq_freeLarge(_stateBlock);
+    _stateBlock = stateBlock;
+    _state = state;
+
+    MqttSparkplugPoint* grown = static_cast<MqttSparkplugPoint*>(raw);
+    for (size_t index = 0; index < capacity; index++) {
+        if (index < _pointCount) {
+            new (&grown[index]) MqttSparkplugPoint(std::move(_points[index]));
+        } else {
+            new (&grown[index]) MqttSparkplugPoint();
+        }
+    }
+    if (_points != nullptr) {
+        for (size_t index = 0; index < _pointCapacity; index++) {
+            _points[index].~MqttSparkplugPoint();
+        }
+        mq_freeLarge(_points);
+    }
+    _points = grown;
+    _pointCapacity = capacity;
+    return true;
+}
+
+bool MqttSparkplugNode::deadband(const char* name, double absolute,
+                                 double percent) {
+    const int index = findPointIndex(name, -1);
+    if (index < 0) return false;
+    if (!(absolute >= 0.0) || !(percent >= 0.0)) return false;
+    MqttSparkplugValue probe;
+    probe.type = _points[index].type;
+    if (!probe.isNumeric()) return false;
+    return deadbandAt((size_t)index, absolute, percent);
+}
+
+bool MqttSparkplugNode::deadbandFor(const char* deviceId, const char* name,
+                                    double absolute, double percent) {
+    if (deviceId == nullptr || deviceId[0] == '\0') {
+        return deadband(name, absolute, percent);
+    }
+    const int device = findDeviceIndex(deviceId);
+    if (device < 0) return false;
+    const int index = findPointIndex(name, (int16_t)device);
+    if (index < 0) return false;
+    if (!(absolute >= 0.0) || !(percent >= 0.0)) return false;
+    MqttSparkplugValue probe;
+    probe.type = _points[index].type;
+    if (!probe.isNumeric()) return false;
+    return deadbandAt((size_t)index, absolute, percent);
+}
+
+bool MqttSparkplugNode::changePending(const char* deviceId,
+                                      const char* name) const {
+    int16_t device = -1;
+    if (deviceId != nullptr && deviceId[0] != '\0') {
+        const int index = findDeviceIndex(deviceId);
+        if (index < 0) return false;
+        device = (int16_t)index;
+    }
+    const int index = findPointIndex(name, device);
+    return index >= 0 && pointChanged((size_t)index);
+}
+
+int MqttSparkplugNode::indexOf(const char* deviceId, const char* name) const {
+    int16_t device = -1;
+    if (deviceId != nullptr && deviceId[0] != '\0') {
+        const int index = findDeviceIndex(deviceId);
+        if (index < 0) return -1;
+        device = (int16_t)index;
+    }
+    return findPointIndex(name, device);
+}
+
+// =============================================================================
+// THE TWO TABLES - see TWO TABLES in the header
+// =============================================================================
+
+// A number's or a Boolean's value as the state table keeps it: the bits
+// differsFrom() compares and no others - a Float's four, a Boolean as 0 or 1,
+// the rest all eight - so two values differ exactly when their bits do, and a
+// scan compares two integers instead of calling differsFrom().
+static uint64_t mq_spBitsOf(const MqttSparkplugValue& value) {
+    switch (value.type) {
+        case MqttSparkplugDataType::Boolean:
+            return value.as.boolean ? 1u : 0u;
+        case MqttSparkplugDataType::Float: {
+            uint32_t bits;
+            memcpy(&bits, &value.as.float32, sizeof bits);
+            return bits;
+        }
+        default:
+            return value.as.unsignedValue;
+    }
+}
+
+static void mq_spSetBits(MqttSparkplugValue& value, uint64_t bits) {
+    switch (value.type) {
+        case MqttSparkplugDataType::Boolean:
+            value.as.boolean = bits != 0;
+            break;
+        case MqttSparkplugDataType::Float: {
+            const uint32_t low = (uint32_t)bits;
+            memcpy(&value.as.float32, &low, sizeof low);
+            break;
+        }
+        default:
+            value.as.unsignedValue = bits;
+            break;
+    }
+}
+
+// differsFrom(), for two values of one number metric kept as bits.
+static inline bool mq_spBitsDiffer(bool aNull, uint64_t a, bool bNull,
+                                   uint64_t b) {
+    if (aNull != bNull) return true;
+    return !aNull && a != b;
+}
+
+MqttSparkplugValue MqttSparkplugNode::stateValue(size_t index) const {
+    const PointState& state = _state[index];
+    MqttSparkplugValue value;
+    value.type = (MqttSparkplugDataType)state.type;
+    value.isNull = (state.flags & kValueNull) != 0;
+    if (state.flags & kText) {
+        const MqttSparkplugPointText& text = *_points[index].text;
+        value.as.bytes.data = text.data;
+        value.as.bytes.length = text.length;
+    } else {
+        mq_spSetBits(value, state.value);
+    }
+    return value;
+}
+
+MqttSparkplugValue MqttSparkplugNode::publishedValue(size_t index) const {
+    const PointState& state = _state[index];
+    MqttSparkplugValue value;
+    value.type = (MqttSparkplugDataType)state.type;
+    value.isNull = (state.flags & kPublishedNull) != 0;
+    if (state.flags & kText) {
+        const MqttSparkplugPointText& text = *_points[index].text;
+        value.as.bytes.data = (const uint8_t*)text.published.data();
+        value.as.bytes.length = (uint32_t)text.published.size();
+    } else {
+        mq_spSetBits(value, state.published);
+    }
+    return value;
+}
+
+void MqttSparkplugNode::storeValue(size_t index,
+                                   const MqttSparkplugValue& value) {
+    PointState& state = _state[index];
+    if (value.isNull) {
+        state.flags |= kValueNull;
+    } else {
+        state.flags &= (uint16_t)~kValueNull;
+    }
+    if (state.flags & kText) {
+        MqttSparkplugPointText& text = *_points[index].text;
+        text.data = value.isNull ? nullptr : value.as.bytes.data;
+        text.length = value.isNull ? 0 : value.as.bytes.length;
+    } else {
+        state.value = value.isNull ? 0 : mq_spBitsOf(value);
+    }
+}
+
+void MqttSparkplugNode::storeCommand(size_t index,
+                                     const MqttSparkplugValue& value) {
+    if ((_state[index].flags & kText) == 0 || value.isNull) {
+        storeValue(index, value);
+        return;
+    }
+    // A host's text lives in the receive buffer, or in a queue slot that is
+    // reused: copied into the metric's own storage, and the span pointed there.
+    MqttSparkplugPointText& text = *_points[index].text;
+    if (value.as.bytes.data != nullptr && value.as.bytes.length > 0) {
+        text.command.assign((const char*)value.as.bytes.data,
+                            (size_t)value.as.bytes.length);
+    } else {
+        text.command.clear();
+    }
+    MqttSparkplugValue owned = value;
+    owned.as.bytes.data = (const uint8_t*)text.command.data();
+    owned.as.bytes.length = (uint32_t)text.command.size();
+    storeValue(index, owned);
+}
+
+void MqttSparkplugNode::markPublished(size_t index) {
+    PointState& state = _state[index];
+    const bool isNull = (state.flags & kValueNull) != 0;
+    if (state.flags & kText) {
+        // Owned: the application's buffer moves on, the copy does not.
+        MqttSparkplugPointText& text = *_points[index].text;
+        if (!isNull) {
+            if (text.data != nullptr && text.length > 0) {
+                text.published.assign((const char*)text.data,
+                                      (size_t)text.length);
+            } else {
+                text.published.clear();
+            }
+        }
+    } else {
+        state.published = state.value;
+    }
+    if (isNull) {
+        state.flags |= kPublishedNull;
+    } else {
+        state.flags &= (uint16_t)~kPublishedNull;
+    }
+    state.flags |= kEverPublished;
+    state.flags &= (uint16_t)~kReportNext;
+}
+
+bool MqttSparkplugNode::putValue(size_t index, const MqttSparkplugValue& value,
+                                 bool& changed) {
+    changed = false;
+    if (index >= _pointCount) return false;
+    const PointState& state = _state[index];
+    // The declared type wins. A caller handing an Int32 metric a float has
+    // made a mistake, and coercing it would put a number on the wire that the
+    // NBIRTH said was something else.
+    if (value.type != (MqttSparkplugDataType)state.type) {
+        _lastPayloadError = MqttSparkplugError::ValueTypeMismatch;
+        return false;
+    }
+    // WHETHER IT CHANGED. Text handed over in the same buffer as last time - a
+    // PLC STRING - may have been rewritten in place, and a buffer compared
+    // with itself never differs, so that is compared with the copy last
+    // published instead.
+    if (!(state.flags & kText)) {
+        changed = mq_spBitsDiffer(value.isNull,
+                                  value.isNull ? 0 : mq_spBitsOf(value),
+                                  (state.flags & kValueNull) != 0, state.value);
+    } else if (!value.isNull && !(state.flags & kValueNull) &&
+               value.as.bytes.data != nullptr &&
+               value.as.bytes.data == _points[index].text->data) {
+        changed = !(state.flags & kEverPublished) ||
+                  value.differsFrom(publishedValue(index));
+    } else {
+        changed = value.differsFrom(stateValue(index));
+    }
+    storeValue(index, value);
+    if (changed) markChanged(index);
+    return true;
+}
+
+// --- The change lists ---
+
+MqttSparkplugNode::ChangeList& MqttSparkplugNode::changesOf(int16_t device) {
+    return device < 0 ? _nodeChanges : _devices[(size_t)device].changes;
+}
+
+void MqttSparkplugNode::markChanged(size_t index) {
+    PointState& state = _state[index];
+    if (state.flags & kListed) return;
+    state.flags |= kListed;
+    state.nextChanged = 0;
+    ChangeList& list = changesOf(state.device);
+    const uint32_t link = (uint32_t)index + 1;
+    if (list.tail == 0) {
+        list.head = link;
+    } else {
+        _state[list.tail - 1].nextChanged = link;
+        if (link < list.tail) list.sorted = false;
+    }
+    list.tail = link;
+}
+
+// Into index order - the order the metrics were declared in, and the order a
+// message carried them in when every call walked every metric. A scan marks
+// them in that order nearly always, so this is nearly always skipped. A merge
+// sort of the linked list itself: nothing allocated, n log n.
+void MqttSparkplugNode::sortChanges(ChangeList& list) {
+    if (list.sorted) return;
+    uint32_t head = list.head;
+    for (size_t width = 1;; width *= 2) {
+        uint32_t merged = 0, tail = 0;
+        size_t merges = 0;
+        uint32_t left = head;
+        while (left != 0) {
+            merges++;
+            uint32_t right = left;
+            size_t leftSize = 0;
+            for (size_t i = 0; i < width && right != 0; i++) {
+                leftSize++;
+                right = _state[right - 1].nextChanged;
+            }
+            size_t rightSize = width;
+            while (leftSize > 0 || (rightSize > 0 && right != 0)) {
+                uint32_t take;
+                if (leftSize == 0) {
+                    take = right;
+                    right = _state[right - 1].nextChanged;
+                    rightSize--;
+                } else if (rightSize == 0 || right == 0 || left < right) {
+                    take = left;
+                    left = _state[left - 1].nextChanged;
+                    leftSize--;
+                } else {
+                    take = right;
+                    right = _state[right - 1].nextChanged;
+                    rightSize--;
+                }
+                if (tail != 0) {
+                    _state[tail - 1].nextChanged = take;
+                } else {
+                    merged = take;
+                }
+                tail = take;
+            }
+            left = right;
+        }
+        if (tail != 0) _state[tail - 1].nextChanged = 0;
+        head = merged;
+        if (merges <= 1) {
+            list.head = head;
+            list.tail = tail;
+            list.sorted = true;
+            return;
+        }
+    }
+}
+
+void MqttSparkplugNode::settleChanges(ChangeList& list, bool published) {
+    uint32_t head = 0, tail = 0;
+    for (uint32_t link = list.head; link != 0;) {
+        const size_t index = link - 1;
+        const uint32_t next = _state[index].nextChanged;
+        // WHAT WENT, AND ONLY WHAT WENT, becomes the new reference. A value
+        // held back by its deadband keeps the old one, so the next comparison
+        // is still against what the far end actually has - which is how a
+        // slow drift adds up and is eventually reported rather than creeping
+        // past for ever.
+        if (published && pointChanged(index)) markPublished(index);
+        if (pointOwed(index)) {
+            _state[index].nextChanged = 0;
+            if (tail != 0) {
+                _state[tail - 1].nextChanged = link;
+            } else {
+                head = link;
+            }
+            tail = link;
+        } else {
+            _state[index].flags &= (uint16_t)~kListed;
+            _state[index].nextChanged = 0;
+        }
+        link = next;
+    }
+    list.head = head;
+    list.tail = tail;
+}
+
+void MqttSparkplugNode::forgetChanges(ChangeList& list) {
+    for (uint32_t link = list.head; link != 0;) {
+        PointState& state = _state[link - 1];
+        link = state.nextChanged;
+        state.flags &= (uint16_t)~kListed;
+        state.nextChanged = 0;
+    }
+    list = ChangeList();
+}
+
+// --- By index ---
+
+bool MqttSparkplugNode::setAt(size_t index, const MqttSparkplugValue& value) {
+    // WHETHER IT CHANGED. This answered true for every value it took, so a
+    // block counting what moved counted every member, every scan.
+    bool changed = false;
+    return putValue(index, value, changed) && changed;
+}
+
+MqttSparkplugValue MqttSparkplugNode::valueAt(size_t index) const {
+    if (index >= _pointCount) return MqttSparkplugValue();
+    return stateValue(index);
+}
+
+bool MqttSparkplugNode::changePendingAt(size_t index) const {
+    return index < _pointCount && pointChanged(index);
+}
+
+bool MqttSparkplugNode::commandPendingAt(size_t index) const {
+    return index < _pointCount && (_state[index].flags & kCommandPending);
+}
+
+void MqttSparkplugNode::queueWrites(size_t depth) {
+    _writeDepth = depth > 16 ? 16 : depth;
+}
+
+// ONE BLOCK for a metric's write queue, in PSRAM where there is some: the
+// header, the values, and a text metric's texts. See MqttSparkplugWriteQueue.
+bool MqttSparkplugNode::makeQueue(size_t index) {
+    MqttSparkplugPoint& point = _points[index];
+    if (point.queue != nullptr) return true;
+    const size_t depth = _writeDepth;
+    if (depth == 0) return false;
+    typedef MQ_STRING(MQ_SP_POINT_TEXT) QueuedText;
+    const size_t head = (sizeof(MqttSparkplugWriteQueue) + 15) & ~(size_t)15;
+    const size_t values = (depth * sizeof(MqttSparkplugValue) + 15) & ~(size_t)15;
+    const bool text = point.text != nullptr;
+    uint8_t* raw = (uint8_t*)mq_allocLarge(
+        head + values + (text ? depth * sizeof(QueuedText) : 0));
+    if (raw == nullptr) return false;
+    MqttSparkplugWriteQueue* queue = new (raw) MqttSparkplugWriteQueue();
+    queue->values = reinterpret_cast<MqttSparkplugValue*>(raw + head);
+    for (size_t slot = 0; slot < depth; slot++) {
+        new (&queue->values[slot]) MqttSparkplugValue();
+    }
+    if (text) {
+        queue->texts = reinterpret_cast<QueuedText*>(raw + head + values);
+        for (size_t slot = 0; slot < depth; slot++) {
+            new (&queue->texts[slot]) QueuedText();
+        }
+    }
+    queue->depth = (uint8_t)depth;
+    point.queue = queue;
+    return true;
+}
+
+void MqttSparkplugNode::freeQueue(MqttSparkplugWriteQueue* queue) {
+    if (queue == nullptr) return;
+    typedef MQ_STRING(MQ_SP_POINT_TEXT) QueuedText;
+    if (queue->texts != nullptr) {
+        for (size_t slot = 0; slot < queue->depth; slot++) {
+            queue->texts[slot].~QueuedText();
+        }
+    }
+    queue->~MqttSparkplugWriteQueue();
+    mq_freeLarge(queue);
+}
+
+void MqttSparkplugNode::freeText(MqttSparkplugPointText* text) {
+    if (text == nullptr) return;
+    text->~MqttSparkplugPointText();
+    mq_freeLarge(text);
+}
+
+#if MQTT_LEAN
+// On a board every writable metric's queue is made here, when the node
+// connects, so a command arriving later never allocates.
+void MqttSparkplugNode::prepareWriteQueues() {
+    if (_writeDepth == 0) return;
+    for (size_t index = 0; index < _pointCount; index++) {
+        if (!_points[index].writable || _points[index].queue) continue;
+        makeQueue(index);
+    }
+}
+#endif
+
+void MqttSparkplugNode::acceptWrite(size_t index,
+                                    const MqttSparkplugValue& value) {
+    MqttSparkplugPoint& point = _points[index];
+    PointState& state = _state[index];
+    if (_writeDepth > 0 && point.queue == nullptr) makeQueue(index);
+    if (_writeDepth == 0 || point.queue == nullptr) {
+        // The latest write wins - by choice (no queue), or for want of the
+        // memory for one, which still keeps the command rather than none.
+        storeCommand(index, value);
+        state.flags |= kCommandPending | kReportNext;
+        markChanged(index);
+        return;
+    }
+    MqttSparkplugWriteQueue& queue = *point.queue;
+    const size_t depth = queue.depth;
+    if (queue.count == depth) {
+        // FULL: the oldest goes and the newest is kept - the host's latest
+        // word is the one that matters - and the drop is counted, never
+        // silent.
+        queue.head = (uint8_t)((queue.head + 1) % depth);
+        queue.count--;
+        point.writesLost++;
+        _writesLost++;
+    }
+    const size_t slot = (queue.head + queue.count) % depth;
+    MqttSparkplugValue& kept = queue.values[slot];
+    kept = value;
+    if (queue.texts != nullptr && (value.isText() || value.isBytes()) &&
+        !value.isNull) {
+        // Its text owned by the slot, and the span pointed there.
+        if (value.as.bytes.data != nullptr && value.as.bytes.length > 0) {
+            queue.texts[slot].assign((const char*)value.as.bytes.data,
+                                     (size_t)value.as.bytes.length);
+        } else {
+            queue.texts[slot].clear();
+        }
+        kept.as.bytes.data = (const uint8_t*)queue.texts[slot].data();
+        kept.as.bytes.length = (uint32_t)queue.texts[slot].size();
+    }
+    queue.count++;
+    state.flags |= kCommandPending;
+}
+
+bool MqttSparkplugNode::takeAt(size_t index, MqttSparkplugValue& into) {
+    if (index >= _pointCount || !(_state[index].flags & kCommandPending)) {
+        return false;
+    }
+    MqttSparkplugPoint& point = _points[index];
+    PointState& state = _state[index];
+    if (point.queue && point.queue->count > 0) {
+        // The OLDEST write. Its text moves to the metric, so the span handed
+        // over stays good until the next take - the slot is reused.
+        MqttSparkplugWriteQueue& queue = *point.queue;
+        storeCommand(index, queue.values[queue.head]);
+        queue.head = (uint8_t)((queue.head + 1) % queue.depth);
+        queue.count--;
+        if (queue.count == 0) state.flags &= (uint16_t)~kCommandPending;
+        // Taken is applied: it goes back to the host, deadband or not.
+        state.flags |= kReportNext;
+        markChanged(index);
+        point.writesTaken++;
+        into = stateValue(index);
+        return true;
+    }
+    into = stateValue(index);
+    state.flags &= (uint16_t)~kCommandPending;
+    point.writesTaken++;
+    return true;
+}
+
+bool MqttSparkplugNode::peekAt(size_t index, MqttSparkplugValue& into) const {
+    if (index >= _pointCount || !(_state[index].flags & kCommandPending)) {
+        return false;
+    }
+    const MqttSparkplugPoint& point = _points[index];
+    if (point.queue && point.queue->count > 0) {
+        // Its span is the slot's own text already.
+        into = point.queue->values[point.queue->head];
+        return true;
+    }
+    into = stateValue(index);
+    return true;
+}
+
+uint32_t MqttSparkplugNode::writesLostAt(size_t index) const {
+    return index < _pointCount ? _points[index].writesLost : 0;
+}
+
+uint32_t MqttSparkplugNode::writesTakenAt(size_t index) const {
+    return index < _pointCount ? _points[index].writesTaken : 0;
+}
+
+bool MqttSparkplugNode::deadbandAt(size_t index, double absolute,
+                                   double percent) {
+    if (index >= _pointCount) return false;
+    if (!(absolute >= 0.0) || !(percent >= 0.0)) return false;
+    MqttSparkplugValue probe;
+    probe.type = _points[index].type;
+    if (!probe.isNumeric()) return absolute == 0.0 && percent == 0.0;
+    _points[index].deadband = absolute;
+    _points[index].deadbandPercent = percent;
+    if (absolute > 0.0 || percent > 0.0) {
+        _state[index].flags |= kDeadband;
+    } else {
+        _state[index].flags &= (uint16_t)~kDeadband;
+    }
+    return true;
+}
+
+bool MqttSparkplugNode::holdAt(size_t index, bool held) {
+    if (index >= _pointCount) return false;
+    if (held) {
+        _state[index].flags |= kHeld;
+    } else {
+        _state[index].flags &= (uint16_t)~kHeld;
+    }
+    return true;
+}
+
+bool MqttSparkplugNode::isHeldAt(size_t index) const {
+    return index < _pointCount && (_state[index].flags & kHeld);
+}
+
+bool MqttSparkplugNode::reportAt(size_t index) {
+    if (index >= _pointCount) return false;
+    _state[index].flags |= kReportNext;
+    markChanged(index);
+    return true;
+}
+
+bool MqttSparkplugNode::unitsAt(size_t index, const char* units) {
+    if (index >= _pointCount) return false;
+    if (units == nullptr) units = "";
+    if (_points[index].units != units) _points[index].units = units;
+    return true;
+}
+
+bool MqttSparkplugNode::rangeAt(size_t index, double low, double high) {
+    if (index >= _pointCount) return false;
+    MqttSparkplugPoint& point = _points[index];
+    point.hasRange = low < high;
+    point.engLow = point.hasRange ? low : 0.0;
+    point.engHigh = point.hasRange ? high : 0.0;
+    return true;
+}
+
+bool MqttSparkplugNode::pointChanged(size_t index) const {
+    const PointState& state = _state[index];
+    if (!(state.flags & kEverPublished)) return true;
+    // A host's own write goes back to it whatever the deadband says.
+    if (state.flags & kReportNext) return true;
+    // A held metric goes on its own clock - reportAt() - never for moving.
+    if (state.flags & kHeld) return false;
+    if (!(state.flags & kText)) {
+        if (!mq_spBitsDiffer((state.flags & kValueNull) != 0, state.value,
+                             (state.flags & kPublishedNull) != 0,
+                             state.published)) {
+            return false;
+        }
+    } else if (!stateValue(index).differsFrom(publishedValue(index))) {
+        return false;
+    }
+
+    // No deadband, or nothing a deadband can measure: any change is a change.
+    if (!(state.flags & kDeadband)) return true;
+    const MqttSparkplugValue value = stateValue(index);
+    const MqttSparkplugValue published = publishedValue(index);
+    if (!value.isNumeric() || value.isNull || published.isNull) return true;
+
+    // The deadband itself is in the metric's record: read only for a value
+    // that has moved.
+    const MqttSparkplugPoint& point = _points[index];
+    const double now = value.asNumber();
+    const double was = published.asNumber();
+    const double moved = fabs(now - was);
+    // NaN compares false with everything, so a value that became or stopped
+    // being NaN is never held back by a deadband - it is reported.
+    if (moved != moved) return true;
+    if (point.deadband > 0.0 && moved <= point.deadband) return false;
+    if (point.deadbandPercent > 0.0 &&
+        moved <= fabs(was) * point.deadbandPercent / 100.0) {
+        return false;
+    }
+    return true;
+}
+
+bool MqttSparkplugNode::pointOwed(size_t index) const {
+    const PointState& state = _state[index];
+    if (!(state.flags & kEverPublished)) return true;
+    if (state.flags & kReportNext) return true;
+    if (!(state.flags & kText)) {
+        return mq_spBitsDiffer((state.flags & kValueNull) != 0, state.value,
+                               (state.flags & kPublishedNull) != 0,
+                               state.published);
+    }
+    return stateValue(index).differsFrom(publishedValue(index));
+}
+
 // =============================================================================
 // DEVICES
 // =============================================================================
 
 bool MqttSparkplugNode::addDevice(const char* deviceId) {
     if (!mq_sparkplugValidId(deviceId)) return false;
-    if (_deviceCount >= MQ_SP_MAX_DEVICES) return false;
     // [tck-id-topic-structure-namespace-unique-device-id] The device_id MUST be
     // unique from other device_ids for this Edge Node.
     if (findDeviceIndex(deviceId) >= 0) return false;
+    // One more device, as far as memory goes (int16_t numbers them).
+    if (_deviceCount >= 32767) return false;
+    if (!_devices.reserve(_deviceCount + 1)) {
+        _outOfMemory = true;
+        return false;
+    }
 
     _devices[_deviceCount].id = deviceId;
     _devices[_deviceCount].online = false;
@@ -373,6 +1196,26 @@ bool MqttSparkplugNode::deviceIsOnline(const char* deviceId) const {
 // SEQUENCE NUMBERS
 // =============================================================================
 
+// THE SESSION'S BIRTH IS OVER, whatever ended it: the link, a valid offline
+// STATE, disconnect() or a new connect(). Every one of those paths has to owe
+// the online devices a DBIRTH, because a Host Application treats the node's
+// death as taking every device with it
+// [tck-id-operational-behavior-edge-node-termination-host-action-ndeath-
+// devices-offline] - and only the link-down path used to. The others cleared
+// _born first, so when the link went down a moment later its handler saw a
+// node already "not born" and skipped the devices: the node birthed again
+// when the host came back, and its devices never did. Found on a real broker
+// by the OpenPLC Sparkplug rig.
+void MqttSparkplugNode::endBirth() {
+    for (size_t index = 0; index < _deviceCount; index++) {
+        if (_devices[index].online) {
+            _devices[index].wantsBirth = true;
+            _devices[index].online = false;
+        }
+    }
+    _born = false;
+}
+
 void MqttSparkplugNode::nextSequence() {
     // [tck-id-payloads-sequence-num-incrementing] ... continually increasing by
     // one in each message from that Edge Node until a value of 255 is reached.
@@ -419,9 +1262,19 @@ void MqttSparkplugNode::applyConnectionConfig() {
     // library's defaults already, and a caller who changed them through
     // client() would get a node that is non-conformant in a way no test of
     // theirs would catch. Set here so that is impossible.
-    _connection.cleanStart = true;
-    _connection.sessionExpiryInterval = 0;
+}
 
+// EVERY CONNECT, the node's own client's or a shared one's, whoever starts
+// it: the first, an automatic reconnect, a 3.1.1 fallback. The client calls
+// this just before it encodes the packet, so the Will always carries the bdSeq
+// of the session it opens - there is no window in which a reconnect can go
+// out with the last one's.
+void MqttSparkplugNode::prepareConnect(MqttConnectionConfig& connection) {
+    _willArmed = false;
+    if (!_active) return;
+
+    connection.cleanStart = true;
+    connection.sessionExpiryInterval = 0;
     // --- The Will: an NDEATH carrying this connection's bdSeq ---
     //
     // [tck-id-payloads-ndeath-bdseq] The NDEATH message MUST include the same
@@ -430,7 +1283,8 @@ void MqttSparkplugNode::applyConnectionConfig() {
     // bdSeq number.
     // [tck-id-topics-ndeath-seq] The NDEATH message MUST NOT include a
     // sequence number.
-    MqttSparkplugPayload will;
+    // One metric, whose name is a literal: no arena needed.
+    MqttSparkplugPayload will(1, 0);
     MqttSparkplugMetric bdSeqMetric;
     bdSeqMetric.name = MQ_SP_METRIC_BDSEQ;
     bdSeqMetric.value = mq_spInt64((int64_t)_bdSeq);
@@ -445,13 +1299,15 @@ void MqttSparkplugNode::applyConnectionConfig() {
     // certificate has nothing to resolve an alias against.
     const size_t willSize =
         mq_sparkplugSize(will, MqttSparkplugType::NDeath, error);
-    if (error == MqttSparkplugError::None && willSize > 0 &&
-        willSize <= sizeof _scratch) {
-        const size_t wrote = mq_sparkplugEncode(_scratch, sizeof _scratch, will,
+#if MQTT_LEAN
+    if (willSize > _willBytes.capacity()) error = MqttSparkplugError::Overflow;
+#endif
+    if (error == MqttSparkplugError::None && willSize > 0) {
+        _willBytes.resize(willSize);
+        const size_t wrote = mq_sparkplugEncode(_willBytes.data(), willSize, will,
                                                 MqttSparkplugType::NDeath,
                                                 error);
         if (wrote > 0) {
-            _willBytes.assign(_scratch, _scratch + wrote);
 
             char willTopic[MQ_SP_MAX_TOPIC];
             if (mq_sparkplugBuildTopic(willTopic, sizeof willTopic,
@@ -463,13 +1319,14 @@ void MqttSparkplugNode::applyConnectionConfig() {
                 // Application's STATE Will, which must be retained true. The
                 // two are different messages with different rules and swapping
                 // them is a conformance failure in both directions.
-                _connection.will.set(willTopic, _willBytes.data(),
-                                     _willBytes.size(), MQ_QOS_1, false);
+                connection.will.set(willTopic, _willBytes.data(),
+                                    _willBytes.size(), MQ_QOS_1, false);
 
                 // No Will Delay. A delay would need 5.0 and would mean a Host
                 // Application waits to be told a node has gone - which is the
                 // opposite of what a death certificate is for.
-                _connection.will.delayInterval = 0;
+                connection.will.delayInterval = 0;
+                _willArmed = true;
             }
         }
     }
@@ -483,29 +1340,61 @@ void MqttSparkplugNode::beginClient() {
     applyConnectionConfig();
 
     _client.begin(*_net.get(), _connection, _behaviour);
-    _client.onMessage(&messageTrampoline, this);
-    _client.onSessionEstablished(&sessionTrampoline, this);
-    _client.onStateChange(&stateTrampoline, this);
+    _client.attach(*this);
+    _client.claimWill(*this);
     _begun = true;
 }
 
-bool MqttSparkplugNode::connect() {
-    if (_group.empty() || _node.empty()) return false;
-    if (_net.get() == nullptr) return false;
-    if (_serverCount == 0) return false;
-
+void MqttSparkplugNode::nextSession() {
     // [tck-id-topics-nbirth-bdseq-increment] The bdSeq number MUST start at
     // zero and increment by one on each new MQTT CONNECT.
     //
     // So the FIRST connect uses 0 and the second uses 1 - hence the flag rather
     // than incrementing unconditionally, which would start at 1.
-    if (_bdSeqUsed) {
-        _bdSeq++;
-    }
+    if (_bdSeqUsed) _bdSeq++;
     _bdSeqUsed = true;
-
-    _born = false;
+    endBirth();
     _seq = 0;
+}
+
+bool MqttSparkplugNode::startShared() {
+    if (!_client.attach(*this) || !_client.claimWill(*this)) {
+        _willRefused = true;
+        return false;
+    }
+    _willRefused = false;
+    _begun = true;
+    _active = true;
+    nextSession();
+    if (!sizeBuffers()) _outOfMemory = true;
+#if MQTT_LEAN
+    prepareWriteQueues();
+#endif
+    // A session already up, or a CONNECT already sent, went without the
+    // NDEATH: the next one carries it. Refused only while the owner keeps
+    // the client down, and then the owner's connect() carries it anyway.
+    if (_client.state() != MqttState::Idle &&
+        _client.state() != MqttState::Reconnecting) {
+        _client.restart();
+        _restartOwed = false;   // that restart is the one sizeBuffers() asked for
+    }
+    return true;
+}
+
+bool MqttSparkplugNode::connect() {
+    if (_group.empty() || _node.empty()) return false;
+    if (_shared) return startShared();
+    if (_net.get() == nullptr) return false;
+    if (_serverCount == 0) return false;
+    _active = true;
+    nextSession();
+
+    // Before the client exists the first time: it takes its transmit buffer
+    // size from _behaviour when it is begun, and never again on a board.
+    if (!sizeBuffers()) _outOfMemory = true;
+#if MQTT_LEAN
+    prepareWriteQueues();
+#endif
 
     if (!_begun) {
         beginClient();
@@ -521,9 +1410,35 @@ bool MqttSparkplugNode::connect() {
     return mq_accepted(_client.connect());
 }
 
+bool MqttSparkplugNode::rebind(MqttTransport& transport) {
+    if (_shared) return false;   // the transport is the client owner's
+    // The client first: it closes what the old transport holds, and the old
+    // transport may be the one _net owns and is about to release.
+    if (_begun) _client.rebind(transport);
+    _net.borrow(transport);
+    _disconnectAfterDeath = false;
+    _reconnectAfterOffline = false;
+    endBirth();
+    return true;
+}
+
 void MqttSparkplugNode::disconnect() {
     if (!_begun) return;
-
+    _active = false;
+    _restartOwed = false;
+    _cycleOwed = false;
+    _restartAfterDeath = false;
+    if (_shared) {
+        // The connection stays up for everybody else on it, so nothing makes
+        // the broker publish the Will: the NDEATH goes by hand, at either
+        // version, and the next CONNECT goes without it.
+        _disconnectAfterDeath = false;
+        _reconnectAfterOffline = false;
+        if (_willArmed && _client.isConnected()) publishNodeDeath();
+        _client.releaseWill(*this);
+        endBirth();
+        return;
+    }
     if (_client.activeVersion() == MqttVersion::V311) {
         // [tck-id-payloads-ndeath-will-message-publisher-disconnect-mqtt311]
         // If the Edge Node is using MQTT 3.1.1 and it sends an MQTT DISCONNECT
@@ -557,12 +1472,12 @@ void MqttSparkplugNode::disconnect() {
         // between our publish and our disconnect.
         _client.disconnect(MQ_REASON_DISCONNECT_WITH_WILL);
     }
-    _born = false;
+    endBirth();
 }
 
 bool MqttSparkplugNode::publishNodeDeath() {
-    MqttSparkplugPayload& payload = _outbound;
-    payload.clear();
+    // Its own one-metric payload: bdSeq's name is a literal, so no arena.
+    MqttSparkplugPayload payload(1, 0);
 
     MqttSparkplugMetric bdSeqMetric;
     bdSeqMetric.name = MQ_SP_METRIC_BDSEQ;
@@ -571,7 +1486,13 @@ bool MqttSparkplugNode::publishNodeDeath() {
     // No seq: [tck-id-topics-ndeath-seq].
 
     MqttSparkplugError error = MqttSparkplugError::None;
-    const size_t wrote = mq_sparkplugEncode(_scratch, sizeof _scratch, payload,
+    const size_t needed =
+        mq_sparkplugSize(payload, MqttSparkplugType::NDeath, error);
+    if (needed == 0 || !ensureScratch(needed)) {
+        _lastPayloadError = error;
+        return false;
+    }
+    const size_t wrote = mq_sparkplugEncode(_scratch, _scratchSize, payload,
                                             MqttSparkplugType::NDeath, error);
     _lastPayloadError = error;
     if (wrote == 0) return false;
@@ -597,13 +1518,41 @@ void MqttSparkplugNode::deathTrampoline(void* context, MqttResult result,
     // Whatever the result. A death certificate the server refused is not a
     // reason to stay connected, and the registered Will still covers us if the
     // link is cut instead.
-    node->_client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+    if (node->_shared) {
+        node->_restartAfterDeath = true;   // from poll(), not inside the client's
+    } else {
+        node->_client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+    }
 }
 
-void MqttSparkplugNode::poll() {
-    if (!_begun) return;
-    _client.poll();
+void MqttSparkplugNode::cycleSession() {
+    if (!_shared) {
+        _reconnectAfterOffline = true;
+        disconnect();
+        return;
+    }
+    // A shared client: the same goodbye in the same order, then the owner's
+    // connection again rather than the node's own connect(). From poll():
+    // this is reached from inside the client's poll (a STATE message), and a
+    // DISCONNECT sent from there would go out ahead of that message's PUBACK.
+    endBirth();
+    _cycleOwed = true;
+}
 
+void MqttSparkplugNode::restartShared(uint8_t reasonCode) {
+    // The Will registered for THIS session already carries its bdSeq; the
+    // numbers move on for the next one before its CONNECT is prepared.
+    nextSession();
+    if (!sizeBuffers()) _outOfMemory = true;
+    _restartOwed = false;
+    _client.restart(reasonCode);
+}
+void MqttSparkplugNode::poll() {
+    if (!_begun) {
+        publishOwed();   // answered: not born, nothing went
+        return;
+    }
+    if (!_shared) _client.poll();   // a shared client's owner polls it
     // A 3.1.1 DISCONNECT WAITS FOR THE NDEATH, AND NOT FOR EVER.
     //
     // The disconnect is deferred until the death certificate is acknowledged,
@@ -615,14 +1564,49 @@ void MqttSparkplugNode::poll() {
     if (_disconnectAfterDeath &&
         mq_elapsed(_deathAskedAt, mq_millis()) > 10000) {
         _disconnectAfterDeath = false;
-        _client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+        if (_shared) {
+            restartShared(MQ_REASON_NORMAL_DISCONNECTION);
+        } else {
+            _client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+        }
     }
 
+    // A shared client's session ends from here, never from inside its poll:
+    // the NDEATH first at 3.1.1, the Will by reason code at 5.0.
+    if (_cycleOwed && !_disconnectAfterDeath) {
+        _cycleOwed = false;
+        if (_client.activeVersion() == MqttVersion::V311) {
+            _disconnectAfterDeath = true;
+            _deathAskedAt = mq_millis();
+            if (!publishNodeDeath()) {
+                _disconnectAfterDeath = false;
+                restartShared(MQ_REASON_NORMAL_DISCONNECTION);
+            }
+        } else {
+            restartShared(MQ_REASON_DISCONNECT_WITH_WILL);
+        }
+    }
+    if (_restartAfterDeath) {
+        _restartAfterDeath = false;
+        restartShared(MQ_REASON_NORMAL_DISCONNECTION);
+    }
+
+    // A shared client restarts from here, never from inside its own poll -
+    // and a session the host has seen born ends as Sparkplug says one ends,
+    // with its NDEATH and the next bdSeq after it.
+    if (_restartOwed) {
+        _restartOwed = false;
+        if (_active && _born) {
+            cycleSession();
+        } else if (_active) {
+            _client.restart();
+        }
+    }
     // A BIRTH OR A SUBSCRIPTION THAT FAILED IS OWED, and retried - once a
     // second, while the session lasts. See _birthOwed in the header for the
     // node this was: connected, a primary host online, and never born.
     if ((_birthOwed || _subscriptionsOwed) && _client.isConnected() &&
-        !_disconnectAfterDeath && !_reconnectAfterOffline &&
+        !_disconnectAfterDeath && !_reconnectAfterOffline && !_cycleOwed &&
         mq_elapsed(_owedTriedAt, mq_millis()) >= 1000) {
         _owedTriedAt = mq_millis();
         if (_subscriptionsOwed) _subscriptionsOwed = !subscribeCommands();
@@ -635,12 +1619,18 @@ void MqttSparkplugNode::poll() {
         }
     }
 
-    // ANYTHING OWED GETS ANOTHER CHANCE, every poll.
+    // AN OWED DEVICE BIRTH GETS ANOTHER CHANCE - once a second after one was
+    // refused, as the owed NBIRTH above does.
     //
     // A birth or a device birth refused for want of queue room is owed, not
     // lost. Without this the only retry was the next reconnect, so a momentary
     // queue-full at the wrong instant cost a device until the link dropped.
-    if (_born && _client.isConnected()) {
+    // It used to try on every poll: a full queue stays full for a while, and
+    // each try built the device's whole birth to be refused again.
+    if (_born && _client.isConnected() &&
+        (!_deviceBirthWaiting ||
+         mq_elapsed(_deviceBirthTriedAt, mq_millis()) >= 1000)) {
+        bool refused = false;
         for (size_t index = 0; index < _deviceCount; index++) {
             if (_devices[index].wantsBirth) {
                 _devices[index].online = true;
@@ -648,10 +1638,17 @@ void MqttSparkplugNode::poll() {
                     _devices[index].wantsBirth = false;
                 } else {
                     _devices[index].online = false;
+                    refused = true;
                 }
             }
         }
+        deviceBirthRefused(refused);
     }
+
+    // ONE NDATA, AND ONE DDATA A DEVICE, for everything the program marked
+    // since the last poll (publishAtPoll()) - after the births above, never
+    // before them.
+    publishOwed();
 
     // The other half of a valid offline STATE: reconnect, on the next server.
     // Done here rather than inside handleState() because the disconnect it
@@ -668,23 +1665,22 @@ void MqttSparkplugNode::poll() {
 // SESSION
 // =============================================================================
 
-void MqttSparkplugNode::sessionTrampoline(void* context, bool sessionPresent) {
-    static_cast<MqttSparkplugNode*>(context)->sessionEstablished(sessionPresent);
+bool MqttSparkplugNode::message(const MqttMessage& message) {
+    // Never taken: a host on the same client may watch the same namespace,
+    // and the application's handler still sees everything.
+    handleMessage(message);
+    return false;
 }
-
-void MqttSparkplugNode::stateTrampoline(void* context, MqttState state,
-                                        MqttResult reason) {
-    static_cast<MqttSparkplugNode*>(context)->stateChanged(state, reason);
-}
-
-void MqttSparkplugNode::messageTrampoline(void* context,
-                                          const MqttMessage& message) {
-    static_cast<MqttSparkplugNode*>(context)->handleMessage(message);
-}
-
 void MqttSparkplugNode::sessionEstablished(bool sessionPresent) {
     (void)sessionPresent;   // Always false: Clean Start is mandatory.
-
+    if (!_active) return;   // a shared client's session; this node stood down
+    if (_shared && !_willArmed && _lastPayloadError == MqttSparkplugError::None) {
+        // Opened by a CONNECT sent before this node was there, so without its
+        // NDEATH. A session the host could not see die is not one to birth
+        // into: the next CONNECT carries it.
+        _restartOwed = true;
+        return;
+    }
     // Subscriptions first. [tck-id-message-flow-edge-node-ncmd-subscribe] makes
     // the NCMD subscription mandatory "as Edge Nodes MUST be able to respond to
     // rebirth requests", and a birth published before the subscription exists
@@ -715,36 +1711,20 @@ void MqttSparkplugNode::sessionEstablished(bool sessionPresent) {
 
 void MqttSparkplugNode::stateChanged(MqttState state, MqttResult reason) {
     (void)reason;
-    // Reconnecting is the state the client enters once the link is gone and the
-    // backoff is running - which is the moment the next CONNECT's Will has to
-    // be rewritten, because the client will send it without asking again.
     if (state == MqttState::Reconnecting || state == MqttState::Idle ||
         state == MqttState::Connecting) {
         _birthOwed = false;
         _subscriptionsOwed = false;
         if (!_born) return;
-        _born = false;
-        for (size_t index = 0; index < _deviceCount; index++) {
-            // A device is not offline - the LINK is. Its DBIRTH is owed again
-            // once the node births, because a Host Application treats an
-            // NDEATH as taking every device with it
-            // [tck-id-operational-behavior-edge-node-termination-host-action-
-            // ndeath-devices-offline].
-            if (_devices[index].online) {
-                _devices[index].wantsBirth = true;
-                _devices[index].online = false;
-            }
-        }
+        // A device is not offline - the LINK is. See endBirth().
+        endBirth();
 
-        // The next CONNECT needs a new bdSeq in its Will, and the client's own
-        // reconnect will send it. So the config is updated NOW, while the link
-        // is down, and the client picks it up on its next attempt - which is
-        // what reconfigure() is for and why autoReconnect can stay on.
+        // The next CONNECT needs a new bdSeq in its Will, and the client's
+        // own reconnect will send it - prepareConnect() writes it there, so
+        // autoReconnect can stay on and a shared client needs nothing more.
         if (_begun) {
             _bdSeq++;
             _seq = 0;
-            applyConnectionConfig();
-            _client.reconfigure(_connection);
         }
     }
 }
@@ -804,6 +1784,97 @@ bool MqttSparkplugNode::subscribeCommands() {
 // PUBLISHING
 // =============================================================================
 
+bool MqttSparkplugNode::ensureScratch(size_t bytes) {
+    if (bytes <= _scratchSize) return true;
+    // A little over, so a text metric that grows by a character does not
+    // reallocate on the next message.
+    const size_t want = bytes + bytes / 8 + 64;
+    uint8_t* grown = static_cast<uint8_t*>(mq_allocLarge(want));
+    if (grown == nullptr) return false;
+    mq_freeLarge(_scratch);
+    _scratch = grown;
+    _scratchSize = want;
+    return true;
+}
+
+bool MqttSparkplugNode::sizeBuffers() {
+    // --- What the biggest message must hold ---
+    //
+    // A birth certificate: the NBIRTH carries every node metric plus bdSeq and
+    // Node Control/Rebirth, a DBIRTH every metric of its device. Counted, not
+    // guessed, because the metric set is closed by the time anything births.
+    // One pass per slot (the node, then each device) rather than a table
+    // sized by a device limit, which there is not. Once per connect.
+    size_t writable = 0, writableNames = 0;
+    size_t mostMetrics = 0, mostNames = 0;
+    for (size_t slot = 0; slot <= _deviceCount; slot++) {
+        size_t metrics = slot == 0 ? 2 : 0;   // bdSeq and Node Control/Rebirth
+        size_t nameBytes = 0;
+        for (size_t index = 0; index < _pointCount; index++) {
+            const MqttSparkplugPoint& point = _points[index];
+            if ((point.device < 0 ? 0 : (size_t)point.device + 1) != slot) continue;
+            metrics++;
+            nameBytes += point.name.size() + 1;
+            if (point.writable) {
+                writable++;
+                writableNames += point.name.size() + 1;
+            }
+        }
+        if (metrics > mostMetrics) mostMetrics = metrics;
+        if (nameBytes > mostNames) mostNames = nameBytes;
+    }
+    if (!_outbound.reserve(mostMetrics, mostNames + 1)) return false;
+
+    // A command writes writable metrics, and Rebirth - so that many, with a
+    // little room for names a host sent that this node never declared (they
+    // are refused one by one rather than failing the whole message).
+    if (!_inbound.reserve(writable + 8, writableNames + 256)) return false;
+
+    // --- The bytes: the encode buffer, and the client's transmit buffer ---
+    //
+    // The client's buffer is allocated once, when it is begun, and on a board
+    // it never grows - so a birth larger than its 4 kB default could not be
+    // sent at all, and a hundred-metric node never birthed. It is told the
+    // size of the real birth certificate before it exists, with room for the
+    // topic and for text values that grow.
+    size_t largest = 0;
+    MqttSparkplugError error = MqttSparkplugError::None;
+    if (buildPayload(_outbound, MqttSparkplugType::NBirth, -1, false, true)) {
+        const size_t bytes =
+            mq_sparkplugSize(_outbound, MqttSparkplugType::NBirth, error);
+        if (bytes > largest) largest = bytes;
+    }
+    for (size_t index = 0; index < _deviceCount; index++) {
+        if (buildPayload(_outbound, MqttSparkplugType::DBirth, (int16_t)index,
+                         false, false)) {
+            const size_t bytes =
+                mq_sparkplugSize(_outbound, MqttSparkplugType::DBirth, error);
+            if (bytes > largest) largest = bytes;
+        }
+    }
+    _outbound.clear();
+    if (largest > 0 && !ensureScratch(largest)) return false;
+
+    const size_t packet = largest + largest / 4 + 512;
+    if (_shared) {
+        // A shared client grows its buffer only while the link is down. Room
+        // to grow is asked for, and taken the next time the link is down
+        // anyway; a new connection is owed only when the birth itself would
+        // not go - not when it merely ate into the room to grow. A STRING
+        // metric written longer since the last birth did exactly that, and
+        // the reconnect it caused was one the host never saw die.
+        _client.reserveTransmit(packet);
+        if (_client.isConnected() && _client.transmitCapacity() < largest + 512) {
+            _restartOwed = true;
+        }
+    } else if (!_begun) {
+        if (packet > _behaviour.transmitBufferSize) {
+            _behaviour.transmitBufferSize = packet;
+        }
+    }
+    return true;
+}
+
 bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
                                      MqttSparkplugType type, int16_t device,
                                      bool onlyChanged,
@@ -814,48 +1885,20 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
 
     const bool isBirth = mq_sparkplugIsBirth(type);
 
-    for (size_t index = 0; index < _pointCount; index++) {
-        MqttSparkplugPoint& point = _points[index];
-        if (point.device != device) continue;
-
-        if (onlyChanged && point.everPublished &&
-            !point.value.differsFrom(point.published)) {
-            continue;
+    if (onlyChanged) {
+        // THE CHANGE LIST, and nothing else: in index order, as when every
+        // metric was walked.
+        ChangeList& list = changesOf(device);
+        sortChanges(list);
+        for (uint32_t link = list.head; link != 0;
+             link = _state[link - 1].nextChanged) {
+            if (!pointChanged(link - 1)) continue;
+            if (!addPointMetric(payload, link - 1, isBirth)) return false;
         }
-
-        MqttSparkplugMetric metric;
-        // The name is interned into the payload's arena so the encoder has a
-        // stable pointer even if the registry is edited between here and the
-        // publish. std::string::c_str() would be stable too, and this also
-        // keeps the payload self-contained for the tests to inspect.
-        metric.name = payload.intern(point.name.c_str());
-        if (metric.name == nullptr) {
-            _lastPayloadError = MqttSparkplugError::TooManyMetrics;
-            return false;
-        }
-        if (point.alias != 0) {
-            metric.alias = point.alias;
-            metric.hasAlias = true;
-        }
-        metric.value = point.value;
-
-        // [tck-id-operational-behavior-data-publish-nbirth-values] For each
-        // metric in the NBIRTH, the value MUST be included. A metric never
-        // written yet is published as an explicit null rather than a made-up
-        // zero - which is the difference between "not commissioned" and "zero".
-        if (isBirth && point.units.length() > 0) {
-            metric.addProperty(mq_spEngUnit(point.units.c_str()));
-        }
-        if (isBirth) {
-            metric.addProperty(mq_spQuality(point.quality));
-        }
-        if (isBirth && point.description.length() > 0) {
-            metric.addProperty(mq_spDescription(point.description.c_str()));
-        }
-
-        if (!payload.addMetric(metric)) {
-            _lastPayloadError = MqttSparkplugError::TooManyMetrics;
-            return false;
+    } else {
+        for (size_t index = 0; index < _pointCount; index++) {
+            if (_state[index].device != device) continue;
+            if (!addPointMetric(payload, index, isBirth)) return false;
         }
     }
 
@@ -901,6 +1944,57 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
     return true;
 }
 
+bool MqttSparkplugNode::addPointMetric(MqttSparkplugPayload& payload,
+                                       size_t index, bool isBirth) {
+    const MqttSparkplugPoint& point = _points[index];
+    MqttSparkplugMetric metric;
+    if (isBirth || point.alias == 0) {
+        // The name is interned into the payload's arena so the encoder has a
+        // stable pointer even if the registry is edited between here and the
+        // publish. std::string::c_str() would be stable too, and this also
+        // keeps the payload self-contained for the tests to inspect.
+        metric.name = payload.intern(point.name.c_str());
+        if (metric.name == nullptr) {
+            _lastPayloadError = MqttSparkplugError::TooManyMetrics;
+            return false;
+        }
+    } else {
+        // A data message carries the alias alone
+        // [tck-id-payloads-alias-data-cmd-requirement], so the name is never
+        // read: pointed at, not copied, as publishRecords() does.
+        metric.name = point.name.c_str();
+    }
+    if (point.alias != 0) {
+        metric.alias = point.alias;
+        metric.hasAlias = true;
+    }
+    metric.value = stateValue(index);
+
+    // [tck-id-operational-behavior-data-publish-nbirth-values] For each
+    // metric in the NBIRTH, the value MUST be included. A metric never
+    // written yet is published as an explicit null rather than a made-up
+    // zero - which is the difference between "not commissioned" and "zero".
+    if (isBirth && point.units.length() > 0) {
+        metric.addProperty(mq_spEngUnit(point.units.c_str()));
+    }
+    if (isBirth) {
+        metric.addProperty(mq_spQuality(point.quality));
+    }
+    if (isBirth && point.hasRange) {
+        metric.addProperty(mq_spEngLow(point.engLow));
+        metric.addProperty(mq_spEngHigh(point.engHigh));
+    }
+    if (isBirth && point.description.length() > 0) {
+        metric.addProperty(mq_spDescription(point.description.c_str()));
+    }
+
+    if (!payload.addMetric(metric)) {
+        _lastPayloadError = MqttSparkplugError::TooManyMetrics;
+        return false;
+    }
+    return true;
+}
+
 bool MqttSparkplugNode::sendPayload(MqttSparkplugType type,
                                     const char* deviceId,
                                     const MqttSparkplugPayload& payload,
@@ -908,7 +2002,18 @@ bool MqttSparkplugNode::sendPayload(MqttSparkplugType type,
     (void)asWill;
 
     MqttSparkplugError error = MqttSparkplugError::None;
-    const size_t wrote = mq_sparkplugEncode(_scratch, sizeof _scratch, payload,
+    // Sized exactly, then encoded - the buffer grows to the largest message
+    // this node has sent, which after the first birth is almost never.
+    const size_t needed = mq_sparkplugSize(payload, type, error);
+    if (needed == 0) {
+        _lastPayloadError = error;
+        return false;
+    }
+    if (!ensureScratch(needed)) {
+        _lastPayloadError = MqttSparkplugError::Overflow;
+        return false;
+    }
+    const size_t wrote = mq_sparkplugEncode(_scratch, _scratchSize, payload,
                                             type, error);
     _lastPayloadError = error;
     if (wrote == 0) return false;
@@ -947,6 +2052,11 @@ bool MqttSparkplugNode::publishBirth() {
     // inconsistency in the specification. Emitting 0 satisfies both.
     _seq = 0;
 
+    // A metric declared after connect() is in this birth too, so the payloads
+    // grow to it. (The client's transmit buffer cannot - it was sized at the
+    // first connect - which is why the blocks declare everything first.)
+    if (!sizeBuffers()) _outOfMemory = true;
+
     if (!buildPayload(_outbound, MqttSparkplugType::NBirth, -1, false, true)) {
         // THE FLAG MUST NOT OUTLIVE THE ATTEMPT. _rebirthPending stops data
         // going out, and a birth that fails here with the flag still set would
@@ -975,10 +2085,10 @@ bool MqttSparkplugNode::publishBirth() {
     // Every metric now counts as published, because the NBIRTH carried all of
     // them. Without this, the first publishChanged() would resend the lot.
     for (size_t index = 0; index < _pointCount; index++) {
-        if (_points[index].device >= 0) continue;
-        _points[index].published = _points[index].value;
-        _points[index].everPublished = true;
+        if (_state[index].device >= 0) continue;
+        markPublished(index);
     }
+    forgetChanges(_nodeChanges);
 
     // [tck-id-payloads-dbirth-order] All DBIRTH messages sent by an Edge Node
     // MUST be sent after the NBIRTH.
@@ -994,12 +2104,19 @@ bool MqttSparkplugNode::publishBirth() {
             _devices[index].wantsBirth = false;
         } else {
             _devices[index].online = false;
+            deviceBirthRefused(true);
         }
     }
 
     // The whole birth sequence is away. Data may flow again.
     _rebirthPending = false;
     return true;
+}
+
+// Whether an owed DBIRTH was just refused: the next try then waits a second.
+void MqttSparkplugNode::deviceBirthRefused(bool refused) {
+    _deviceBirthWaiting = refused;
+    if (refused) _deviceBirthTriedAt = mq_millis();
 }
 
 bool MqttSparkplugNode::publishDeviceBirth(Device& device) {
@@ -1013,10 +2130,18 @@ bool MqttSparkplugNode::publishDeviceBirth(Device& device) {
     // [tck-id-payloads-dbirth-seq-inc] Every DBIRTH message MUST include a
     // sequence number value that is one greater than the previous sequence
     // number sent by the Edge Node. A DBIRTH is NOT seq 0 - only the NBIRTH is.
+    //
+    // NOT SENT, NOT SPENT. A DBIRTH refused here goes nowhere and is owed, so
+    // its number is the one the next message - this DBIRTH again - carries.
+    // Each refused try used to spend one, and the gap that left told the
+    // Host Application a message was lost: it asked for a rebirth, and the
+    // node sent its whole birth again with nothing changed.
+    const uint8_t sequenceBefore = _seq;
     nextSequence();
 
     if (!buildPayload(_outbound, MqttSparkplugType::DBirth,
                       (int16_t)deviceIndex, false, false)) {
+        _seq = sequenceBefore;
         return false;
     }
     _outbound.seq = _seq;
@@ -1024,14 +2149,15 @@ bool MqttSparkplugNode::publishDeviceBirth(Device& device) {
 
     if (!sendPayload(MqttSparkplugType::DBirth, device.id.c_str(), _outbound,
                      MQ_QOS_0, false, false)) {
+        _seq = sequenceBefore;
         return false;
     }
 
     for (size_t index = 0; index < _pointCount; index++) {
-        if (_points[index].device != (int16_t)deviceIndex) continue;
-        _points[index].published = _points[index].value;
-        _points[index].everPublished = true;
+        if (_state[index].device != (int16_t)deviceIndex) continue;
+        markPublished(index);
     }
+    forgetChanges(_devices[(size_t)deviceIndex].changes);
     _birthCount++;
     return true;
 }
@@ -1040,15 +2166,8 @@ bool MqttSparkplugNode::set(const char* name,
                             const MqttSparkplugValue& value) {
     const int index = findPointIndex(name, -1);
     if (index < 0) return false;
-    // The declared type wins. A caller handing an Int32 metric a float has made
-    // a mistake, and coercing it would put a number on the wire that the
-    // NBIRTH said was something else.
-    if (value.type != _points[index].type) {
-        _lastPayloadError = MqttSparkplugError::ValueTypeMismatch;
-        return false;
-    }
-    _points[index].value = value;
-    return true;
+    bool changed = false;
+    return putValue((size_t)index, value, changed);
 }
 
 bool MqttSparkplugNode::setFor(const char* deviceId, const char* name,
@@ -1057,12 +2176,8 @@ bool MqttSparkplugNode::setFor(const char* deviceId, const char* name,
     if (device < 0) return false;
     const int index = findPointIndex(name, (int16_t)device);
     if (index < 0) return false;
-    if (value.type != _points[index].type) {
-        _lastPayloadError = MqttSparkplugError::ValueTypeMismatch;
-        return false;
-    }
-    _points[index].value = value;
-    return true;
+    bool changed = false;
+    return putValue((size_t)index, value, changed);
 }
 
 bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
@@ -1075,16 +2190,33 @@ bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
 
     // Nothing to say is not a failure, and publishing an empty NDATA would
     // still cost a sequence number and a message.
+    //
+    // Report by exception looks at this slot's CHANGE LIST and nothing else:
+    // what was marked since its last message (see publishChanged()).
+    ChangeList& list = changesOf(device);
     bool anything = false;
-    for (size_t index = 0; index < _pointCount; index++) {
-        if (_points[index].device != device) continue;
-        if (!onlyChanged || !_points[index].everPublished ||
-            _points[index].value.differsFrom(_points[index].published)) {
-            anything = true;
-            break;
+    if (onlyChanged) {
+        for (uint32_t link = list.head; link != 0;
+             link = _state[link - 1].nextChanged) {
+            if (pointChanged(link - 1)) {
+                anything = true;
+                break;
+            }
         }
+        if (!anything) {
+            // What came back to the value last sent leaves the list.
+            settleChanges(list, false);
+            return true;
+        }
+    } else {
+        for (size_t index = 0; index < _pointCount; index++) {
+            if (_state[index].device == device) {
+                anything = true;
+                break;
+            }
+        }
+        if (!anything) return true;
     }
-    if (!anything) return true;
 
     const MqttSparkplugType type = device < 0 ? MqttSparkplugType::NData
                                               : MqttSparkplugType::DData;
@@ -1107,10 +2239,15 @@ bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
         return false;
     }
 
-    for (size_t index = 0; index < _pointCount; index++) {
-        if (_points[index].device != device) continue;
-        _points[index].published = _points[index].value;
-        _points[index].everPublished = true;
+    // WHAT WENT, AND ONLY WHAT WENT, becomes the new reference (see
+    // settleChanges()). Everything went: the list is empty.
+    if (onlyChanged) {
+        settleChanges(list, true);
+    } else {
+        for (size_t index = 0; index < _pointCount; index++) {
+            if (_state[index].device == device) markPublished(index);
+        }
+        forgetChanges(list);
     }
     return true;
 }
@@ -1131,6 +2268,82 @@ bool MqttSparkplugNode::publishAll() {
         ok = publishData((int16_t)index, false) && ok;
     }
     return ok;
+}
+
+bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
+                                       size_t count, bool historical) {
+    if (!_born || !_client.isConnected()) return false;
+    if (_rebirthPending) return false;
+    if (records == nullptr || count == 0) return true;
+
+    if (records[0].index >= _pointCount) return false;
+    const int16_t device = _points[records[0].index].device;
+    for (size_t i = 0; i < count; i++) {
+        if (records[i].index >= _pointCount) return false;
+        const MqttSparkplugPoint& point = _points[records[i].index];
+        if (point.device != device) return false;
+        if (records[i].value.type != point.type) {
+            _lastPayloadError = MqttSparkplugError::ValueTypeMismatch;
+            return false;
+        }
+    }
+    if (device >= 0 && !_devices[(size_t)device].online) return false;
+
+    // Grown to the batch if it is larger than the birth the buffer was sized
+    // for. Names are not interned: data messages carry aliases, and where a
+    // node has none the registry's own strings outlive the encode below.
+    if (_outbound.capacity() < count && !_outbound.reserve(count, 1)) {
+        _lastPayloadError = MqttSparkplugError::Overflow;
+        return false;
+    }
+
+    const MqttSparkplugType type = device < 0 ? MqttSparkplugType::NData
+                                              : MqttSparkplugType::DData;
+    _outbound.clear();
+    _outbound.timestamp = utcNow();
+    _outbound.hasTimestamp = true;
+    for (size_t i = 0; i < count; i++) {
+        const MqttSparkplugPoint& point = _points[records[i].index];
+        MqttSparkplugMetric metric;
+        metric.name = point.name.c_str();
+        if (point.alias != 0) {
+            metric.alias = point.alias;
+            metric.hasAlias = true;
+        }
+        metric.value = records[i].value;
+        metric.timestamp = records[i].timestamp;
+        metric.hasTimestamp = true;
+        metric.isHistorical = historical;
+        if (!_outbound.addMetric(metric)) {
+            _lastPayloadError = MqttSparkplugError::TooManyMetrics;
+            return false;
+        }
+    }
+
+    nextSequence();
+    _outbound.seq = _seq;
+    _outbound.hasSeq = true;
+    const char* deviceId = device < 0 ? nullptr : _devices[(size_t)device].id.c_str();
+    // [tck-id-topics-ndata-mqtt] QoS 0, retain false - as for every NDATA.
+    if (!sendPayload(type, deviceId, _outbound, MQ_QOS_0, false, false)) return false;
+
+    if (!historical) {
+        // Live: what went is now the metric's value and its reference, so
+        // report by exception does not send it a second time. (On a change
+        // list it stays there until the next look, which finds it settled.)
+        for (size_t i = 0; i < count; i++) {
+            storeValue(records[i].index, records[i].value);
+            markPublished(records[i].index);
+        }
+    }
+    return true;
+}
+
+void MqttSparkplugNode::publishOwed() {
+    if (!_publishOwed) return;
+    _publishOwed = false;
+    _pollPublishSent = publishChanged();
+    _pollPublishes++;
 }
 
 bool MqttSparkplugNode::rebirth() {
@@ -1257,6 +2470,39 @@ void MqttSparkplugNode::handleState(const uint8_t* payload, size_t length) {
     _lastStateOnline = online;
 
     if (online) {
+        // --- A NEW HOST SESSION WHILE WE ARE BORN TO THE OLD ONE ---
+        //
+        // An online STATE NEWER than the one this node births against is a
+        // different host MQTT session. That host's Will - its offline - carries
+        // the SAME timestamp as its online
+        // [tck-id-host-topic-phid-death-payload-connect]
+        // [tck-id-payloads-state-will-message-payload], so the old session's
+        // offline was stamped exactly the online we hold: valid under
+        // [tck-id-operational-behavior-edge-node-termination-host-offline]
+        // (section 5.5, Edge Node Session Termination), which requires the node to
+        // publish its NDEATH, disconnect and start session establishment
+        // over. We missed that offline - a host replaced quickly, its death
+        // certificate overtaken by its successor's birth on the retained
+        // topic, or ignored as stale behind it
+        // [-host-offline-timestamp] - and the new online is the proof that it
+        // happened. Staying born would send NDATA by aliases to a host that
+        // has no birth certificate to decode them with.
+        //
+        // So the rule is applied now: NDEATH and disconnect (the intentional
+        // one, as for a valid offline), then reconnect - to THIS server, not
+        // the next: the host has just said it is here - and birth on its
+        // retained online, with a new bdSeq [tck-id-topics-nbirth-bdseq-
+        // increment]. A duplicate online (the same timestamp) is not a new
+        // session and does nothing.
+        if (_born && _sawPrimaryHostOnline && timestamp > _primaryHostOnlineAt) {
+            _primaryHostOnlineAt = timestamp;
+            _primaryHostOnline = true;
+            endBirth();
+            _birthOwed = false;
+            cycleSession();
+            return;
+        }
+
         // [tck-id-payloads-state-birth-payload] carries the timestamp the host
         // used in its Will. Remembering it is what makes the offline check
         // below possible.
@@ -1331,7 +2577,7 @@ void MqttSparkplugNode::handleState(const uint8_t* payload, size_t length) {
     if (timestamp < _primaryHostOnlineAt) return;
 
     _primaryHostOnline = false;
-    _born = false;
+    endBirth();
     _birthOwed = false;
 
     // [-host-offline-reconnect] ... it MUST attempt to connect to the NEXT
@@ -1352,8 +2598,13 @@ void MqttSparkplugNode::handleState(const uint8_t* payload, size_t length) {
     // required, and the second one has to be driven because an intentional
     // disconnect concludes as Cancelled and the client's autoReconnect
     // correctly leaves that alone.
-    _reconnectAfterOffline = true;
-    _client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+    //
+    // AND THE DISCONNECT IS THE INTENTIONAL ONE, death certificate included:
+    // reason 0x04 at 5.0, an NDEATH first at 3.1.1. It sent a plain 0x00
+    // here, which tells the server to drop the Will - so every other host on
+    // the broker kept a node that had gone. The rule binds every DISCONNECT
+    // an edge node sends, not only the one an application asks for.
+    cycleSession();
 }
 
 const char* mq_sparkplugCommandOutcomeName(MqttSparkplugCommandOutcome outcome) {
@@ -1548,8 +2799,7 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
             continue;
         }
 
-        _points[point].value = metric.value;
-        _points[point].commandPending = true;
+        acceptWrite((size_t)point, metric.value);
         _commandsApplied++;
 
         MqttSparkplugCommand command;
@@ -1586,18 +2836,30 @@ void MqttSparkplugNode::onCommandRefused(MqttSparkplugCommandContextFn handler,
 
 bool MqttSparkplugNode::commandPending(const char* name) const {
     const int index = findPointIndex(name, -1);
-    return index >= 0 && _points[index].commandPending;
+    return index >= 0 && commandPendingAt((size_t)index);
+}
+
+bool MqttSparkplugNode::commandPendingFor(const char* deviceId,
+                                          const char* name) const {
+    if (deviceId == nullptr || deviceId[0] == '\0') return commandPending(name);
+    const int device = findDeviceIndex(deviceId);
+    if (device < 0) return false;
+    const int index = findPointIndex(name, (int16_t)device);
+    return index >= 0 && commandPendingAt((size_t)index);
+}
+
+bool MqttSparkplugNode::takeFor(const char* deviceId, const char* name,
+                                MqttSparkplugValue& into) {
+    const int index = indexOf(deviceId, name);
+    return index >= 0 && takeAt((size_t)index, into);
 }
 
 bool MqttSparkplugNode::take(const char* name, MqttSparkplugValue& into) {
+    // Cleared (or the oldest queued write removed) on the way out, so two
+    // callers cannot both act on one command - the same rule MqttStatus
+    // follows for its edge counters.
     const int index = findPointIndex(name, -1);
-    if (index < 0) return false;
-    if (!_points[index].commandPending) return false;
-    into = _points[index].value;
-    // Cleared on the way out, so two callers cannot both act on one command -
-    // the same rule MqttStatus follows for its edge counters.
-    _points[index].commandPending = false;
-    return true;
+    return index >= 0 && takeAt((size_t)index, into);
 }
 
 // THE BROKER'S ANSWER TO A SUBSCRIPTION, as opposed to the link going away
@@ -1634,8 +2896,9 @@ void MqttSparkplugNode::commandSubscribed(void* context, MqttResult result,
 // SHORT ON PURPOSE: these land on a 64-character STRING pin on a PLC panel,
 // and a sentence cut off before its reason is worse than a terse one.
 const char* MqttSparkplugNode::waitingFor() const {
+    if (_willRefused) return "another layer owns the client's Will";
     if (!_client.isConnected() || _born) return "";
-
+    if (_restartOwed) return "reconnecting to carry the NDEATH or a larger birth";
     if (_stateSubscribeRefused != MqttResult::Ok) {
         snprintf(_waitText, sizeof _waitText,
                  "broker refused STATE/%s subscription (%s)",

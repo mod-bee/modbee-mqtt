@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttTypes.h"
+#include "MqttNoExcept.h"
 
 namespace {
 
@@ -19,17 +20,21 @@ namespace {
 // table with a cast on every row is a table nobody proofreads.
 typedef unsigned PacketMask;
 
-inline PacketMask bit(uint8_t packetType) { return 1u << packetType; }
+// constexpr, and every mask below with it, so REASONS is a constant the
+// compiler lays out in flash. With an inline function here the table was built
+// in RAM by a static constructor at boot - about half a kilobyte of a board's
+// internal RAM, for a table that never changes.
+constexpr PacketMask bit(uint8_t packetType) { return 1u << packetType; }
 
-const PacketMask CONNACK    = bit(MQ_PKT_CONNACK);
-const PacketMask PUBACK     = bit(MQ_PKT_PUBACK);
-const PacketMask PUBREC     = bit(MQ_PKT_PUBREC);
-const PacketMask PUBREL     = bit(MQ_PKT_PUBREL);
-const PacketMask PUBCOMP    = bit(MQ_PKT_PUBCOMP);
-const PacketMask SUBACK     = bit(MQ_PKT_SUBACK);
-const PacketMask UNSUBACK   = bit(MQ_PKT_UNSUBACK);
-const PacketMask DISCONNECT = bit(MQ_PKT_DISCONNECT);
-const PacketMask AUTH       = bit(MQ_PKT_AUTH);
+constexpr PacketMask CONNACK    = bit(MQ_PKT_CONNACK);
+constexpr PacketMask PUBACK     = bit(MQ_PKT_PUBACK);
+constexpr PacketMask PUBREC     = bit(MQ_PKT_PUBREC);
+constexpr PacketMask PUBREL     = bit(MQ_PKT_PUBREL);
+constexpr PacketMask PUBCOMP    = bit(MQ_PKT_PUBCOMP);
+constexpr PacketMask SUBACK     = bit(MQ_PKT_SUBACK);
+constexpr PacketMask UNSUBACK   = bit(MQ_PKT_UNSUBACK);
+constexpr PacketMask DISCONNECT = bit(MQ_PKT_DISCONNECT);
+constexpr PacketMask AUTH       = bit(MQ_PKT_AUTH);
 
 // V5: Table 2-6, transcribed. The packet mask is the table's own third column.
 //
@@ -43,7 +48,7 @@ struct ReasonEntry {
     const char* name;
 };
 
-const ReasonEntry REASONS[] = {
+constexpr ReasonEntry REASONS[] = {
     // 0x00 has three names; which one applies is decided by the packet, so it
     // appears three times rather than once with a name that is wrong twice.
     { 0x00, CONNACK | PUBACK | PUBREC | PUBREL | PUBCOMP | UNSUBACK | AUTH, "Success" },
@@ -93,7 +98,7 @@ const ReasonEntry REASONS[] = {
     { 0xA2, SUBACK | DISCONNECT,                 "Wildcard Subscriptions not supported" },
 };
 
-const size_t REASON_COUNT = sizeof(REASONS) / sizeof(REASONS[0]);
+constexpr size_t REASON_COUNT = sizeof(REASONS) / sizeof(REASONS[0]);
 
 } // namespace
 

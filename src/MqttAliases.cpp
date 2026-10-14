@@ -10,10 +10,11 @@
 #include "MqttAliases.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
 
 namespace {
 
-bool sameTopic(const std::vector<uint8_t>& held, const uint8_t* topic, uint16_t length) {
+bool sameTopic(const MQ_BYTES_REF& held, const uint8_t* topic, uint16_t length) {
     return held.size() == length && memcmp(held.data(), topic, length) == 0;
 }
 

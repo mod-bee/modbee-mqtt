@@ -40,6 +40,13 @@
 
 #include <string>
 #include <vector>
+#include "MqttFixed.h"
+
+// A board's alias topics are fixed (MqttFixed.h), as long as a PLC block's
+// topic pin (STRING(128)).
+#if MQTT_LEAN && !defined(MQTT_ALIAS_TOPIC)
+#define MQTT_ALIAS_TOPIC 128
+#endif
 
 #ifndef MQTT_MAX_ALIASES
 #define MQTT_MAX_ALIASES 8
@@ -84,7 +91,7 @@ public:
 
 private:
     struct Entry {
-        std::vector<uint8_t> topic;
+        MQ_BYTES(MQTT_ALIAS_TOPIC) topic;
         uint16_t alias = 0;
         bool inUse() const { return alias != 0; }
     };

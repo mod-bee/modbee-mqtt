@@ -70,7 +70,35 @@ mq_time_t mq_micros();
 // This is here rather than behind a guard in the layer that needs it because
 // R9 is right: a platform's habits belong in the platform layer, and a wall
 // clock is a platform capability like any other.
+//
+// ON A BOARD THAT KEEPS A SYSTEM CLOCK - ESP32, ESP8266, RP2040 - this is that
+// clock, once something has set it: lwIP's SNTP client, settimeofday() from a
+// modem's network time, an RTC read at start-up. Until then those boards count
+// from boot like any other, and a reading before 2024 is answered as zero
+// rather than passed off as a date in 1970. Every other board answers zero.
 uint64_t mq_epochMillis();
+
+// Set the platform's wall clock, milliseconds since 1970-01-01 UTC. True where
+// the platform has a clock this library may set - the boards named above. A
+// host answers false: its clock belongs to the operating system and its time
+// service, and a program running as a service has no business stepping it.
+bool mq_setEpochMillis(uint64_t millisecondsSinceEpoch);
+
+// --- Large tables ---
+//
+// For the few tables that grow with an application rather than with the
+// library - a Sparkplug node's metric registry and its birth certificate. On an
+// ESP32 with PSRAM these PREFER the external RAM, whatever their size, so a
+// hundred-metric node costs the internal heap nothing; anywhere else, and when
+// the external RAM is full, they are malloc(). Null when there is no memory -
+// never an exception, because a board core builds without them.
+void* mq_allocLarge(size_t bytes);
+void mq_freeLarge(void* pointer);
+
+// Whether this target has memory to spare for large tables: external RAM on a
+// board, always on a host. What a capacity limit that must stay small on a
+// small board asks before allowing more.
+bool mq_hasLargeMemory();
 
 // How long has passed between two readings of the same clock.
 //

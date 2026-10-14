@@ -51,13 +51,14 @@
 #include <string>
 #include <type_traits>
 
-// Nodes this host will track at once.
-#ifndef MQ_SP_MAX_TRACKED_NODES
-#define MQ_SP_MAX_TRACKED_NODES 16
-#endif
-
-// Metrics remembered per tracked node, so alias-only data can be read back as
-// names.
+// HOW MANY NODES THIS HOST TRACKS, AND METRICS PER NODE: no fixed number, on a
+// host or a board. Both tables grow with the births that arrive, and the
+// decode payload with the largest message, until memory runs out
+// (outOfMemory()). (They were MQ_SP_MAX_TRACKED_NODES, 16, and
+// MQ_SP_MAX_TRACKED_METRICS, 256 on a host.)
+//
+// Metrics are remembered per tracked node, so alias-only data can be read
+// back as names.
 //
 // WHY A HOST CANNOT SKIP THIS. A conformant Edge Node puts names ONLY in its
 // birth certificates - [tck-id-payloads-alias-data-cmd-requirement] forbids
@@ -68,13 +69,6 @@
 // One table per NODE, not per device: [tck-id-payloads-alias-uniqueness] makes
 // an alias unique across "this Edge Node's entire set of metrics", devices
 // included, so a DBIRTH adds to the same table rather than needing its own.
-//
-// Sized with the node's own MQ_SP_MAX_METRICS by default. The memory is
-// MQ_SP_MAX_TRACKED_NODES x this, so a board watching a large estate should
-// lower the node count rather than raise this.
-#ifndef MQ_SP_MAX_TRACKED_METRICS
-#define MQ_SP_MAX_TRACKED_METRICS MQ_SP_MAX_METRICS
-#endif
 
 // What a host knows about one edge node.
 // One metric's entry in a tracked node's dictionary, learnt from a birth and
@@ -113,7 +107,7 @@ struct MqttSparkplugTrackedNode {
     std::string node;
 
     // The dictionary, rebuilt from each NBIRTH and extended by each DBIRTH.
-    MqttSparkplugTrackedMetric metrics[MQ_SP_MAX_TRACKED_METRICS];
+    MqttGrowList<MqttSparkplugTrackedMetric> metrics;
     size_t metricCount = 0;
 
     // The name this alias was born with, or nullptr if this node never
@@ -168,7 +162,7 @@ typedef void (*MqttSparkplugInboundFn)(const MqttSparkplugInbound& message);
 typedef void (*MqttSparkplugInboundContextFn)(void* context,
                                               const MqttSparkplugInbound& message);
 
-class MqttSparkplugHost {
+class MqttSparkplugHost : private MqttClientHook {
 public:
     // --- Construction: the network, three ways, as MqttSparkplugNode ---
 
@@ -181,11 +175,19 @@ public:
     }
 
     // On a host: plain TCP, or TLS after useTls().
-    MqttSparkplugHost();
+    MqttSparkplugHost() MQ_NOEXCEPT;
 
     // A transport you built and configured. Never reconfigured here.
-    explicit MqttSparkplugHost(MqttTransport& transport);
+    explicit MqttSparkplugHost(MqttTransport& transport) MQ_NOEXCEPT;
 
+    // On a client somebody else owns, as MqttSparkplugNode takes one: the
+    // owner keeps the connection - server(), credentials(), keepAlive(),
+    // only() and the TLS calls do nothing here, and poll() does not poll the
+    // client. The host takes the Will (its offline STATE, claimed - refused
+    // if another layer owns it), Clean Start and no session expiry on every
+    // CONNECT. connect() restarts a session opened without the Will;
+    // disconnect() publishes the offline STATE and leaves the connection up.
+    explicit MqttSparkplugHost(MqttClient& shared) MQ_NOEXCEPT;
     ~MqttSparkplugHost();
 
     MqttSparkplugHost(const MqttSparkplugHost&) = delete;
@@ -273,6 +275,9 @@ public:
     bool isBorn() const { return _born; }
 
     size_t nodeCount() const { return _nodeCount; }
+    // The tables grow with what arrives; this says one could not - a node, a
+    // metric or a large birth went untracked for want of memory.
+    bool outOfMemory() const { return _outOfMemory; }
     const MqttSparkplugTrackedNode* nodeAt(size_t index) const;
     const MqttSparkplugTrackedNode* findNode(const char* group,
                                              const char* node) const;
@@ -301,7 +306,9 @@ public:
     uint32_t decodeFailures() const { return _decodeFailures; }
 
     MqttClient& client() { return _client; }
-
+    bool sharesClient() const { return _shared; }
+    // Another layer owns the shared client's Will, so connect() was refused.
+    bool willRefused() const { return _willRefused; }
 private:
     void beginClient();
     void applyConnectionConfig();
@@ -312,7 +319,7 @@ private:
     void handleMessage(const MqttMessage& message);
 
     // Learn a node's alias dictionary from a birth, and apply it to everything
-    // else. See the comment on MQ_SP_MAX_TRACKED_METRICS for why a host cannot
+    // else. See the comment on the tracked tables (top) for why a host cannot
     // do without this.
     void rememberMetrics(MqttSparkplugTrackedNode& tracked,
                          const MqttSparkplugPayload& payload,
@@ -324,14 +331,22 @@ private:
                       const char* deviceId);
     int trackNode(const char* group, const char* node);
 
-    static void messageTrampoline(void* context, const MqttMessage& message);
     static void deathTrampoline(void* context, MqttResult result,
                                 uint16_t packetId);
-    static void sessionTrampoline(void* context, bool sessionPresent);
 
-    void sessionEstablished(bool sessionPresent);
+    // --- The client's events, as a layer on it (MqttClientHook) ---
+    void prepareConnect(MqttConnectionConfig& connection) override;
+    void sessionEstablished(bool sessionPresent) override;
+    bool message(const MqttMessage& message) override;
 
-    MqttClient _client;
+    // The client: the host's own, or a shared one.
+    MqttClient _ownClient;
+    MqttClient& _client;
+    bool _shared = false;
+    bool _active = false;       // connect() until disconnect()
+    bool _willArmed = false;    // this session's CONNECT carried the Will
+    bool _restartOwed = false;  // a shared session came up without it
+    bool _willRefused = false;
     MqttOwnedTransport _net;
     bool _begun = false;
 
@@ -369,7 +384,8 @@ private:
 
     mq_time_t _reorderTimeout = 5000;
 
-    MqttSparkplugTrackedNode _nodes[MQ_SP_MAX_TRACKED_NODES];
+    MqttGrowList<MqttSparkplugTrackedNode> _nodes;
+    bool _outOfMemory = false;
     size_t _nodeCount = 0;
 
     MqttSparkplugInboundFn _handler = nullptr;

@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttProperties.h"
+#include "MqttNoExcept.h"
 
 namespace {
 
@@ -18,25 +19,28 @@ enum class Kind : uint8_t {
 
 typedef unsigned PacketMask;
 
-inline PacketMask bit(uint8_t packetType) { return 1u << packetType; }
+// constexpr, and every mask below with it, so TABLE and the identifier index
+// are constants the compiler lays out in flash rather than tables a static
+// constructor builds in RAM at boot - see MqttTypes.cpp.
+constexpr PacketMask bit(uint8_t packetType) { return 1u << packetType; }
 
-const PacketMask CONNECT     = bit(MQ_PKT_CONNECT);
-const PacketMask CONNACK     = bit(MQ_PKT_CONNACK);
-const PacketMask PUBLISH     = bit(MQ_PKT_PUBLISH);
-const PacketMask PUBACK      = bit(MQ_PKT_PUBACK);
-const PacketMask PUBREC      = bit(MQ_PKT_PUBREC);
-const PacketMask PUBREL      = bit(MQ_PKT_PUBREL);
-const PacketMask PUBCOMP     = bit(MQ_PKT_PUBCOMP);
-const PacketMask SUBSCRIBE   = bit(MQ_PKT_SUBSCRIBE);
-const PacketMask SUBACK      = bit(MQ_PKT_SUBACK);
-const PacketMask UNSUBSCRIBE = bit(MQ_PKT_UNSUBSCRIBE);
-const PacketMask UNSUBACK    = bit(MQ_PKT_UNSUBACK);
-const PacketMask DISCONNECT  = bit(MQ_PKT_DISCONNECT);
-const PacketMask AUTH        = bit(MQ_PKT_AUTH);
-const PacketMask WILL        = bit(MQ_PROP_SCOPE_WILL);
+constexpr PacketMask CONNECT     = bit(MQ_PKT_CONNECT);
+constexpr PacketMask CONNACK     = bit(MQ_PKT_CONNACK);
+constexpr PacketMask PUBLISH     = bit(MQ_PKT_PUBLISH);
+constexpr PacketMask PUBACK      = bit(MQ_PKT_PUBACK);
+constexpr PacketMask PUBREC      = bit(MQ_PKT_PUBREC);
+constexpr PacketMask PUBREL      = bit(MQ_PKT_PUBREL);
+constexpr PacketMask PUBCOMP     = bit(MQ_PKT_PUBCOMP);
+constexpr PacketMask SUBSCRIBE   = bit(MQ_PKT_SUBSCRIBE);
+constexpr PacketMask SUBACK      = bit(MQ_PKT_SUBACK);
+constexpr PacketMask UNSUBSCRIBE = bit(MQ_PKT_UNSUBSCRIBE);
+constexpr PacketMask UNSUBACK    = bit(MQ_PKT_UNSUBACK);
+constexpr PacketMask DISCONNECT  = bit(MQ_PKT_DISCONNECT);
+constexpr PacketMask AUTH        = bit(MQ_PKT_AUTH);
+constexpr PacketMask WILL        = bit(MQ_PROP_SCOPE_WILL);
 
 // Every acknowledgement that may carry a Reason String or a User Property.
-const PacketMask ACKS = PUBACK | PUBREC | PUBREL | PUBCOMP | SUBACK | UNSUBACK;
+constexpr PacketMask ACKS = PUBACK | PUBREC | PUBREL | PUBCOMP | SUBACK | UNSUBACK;
 
 struct Entry {
     uint8_t identifier;
@@ -50,7 +54,7 @@ struct Entry {
 // properties are encoded in; V5:2.2.2.2 says order is not significant for
 // differing identifiers, so any order is legal - fixing one makes our own
 // output reproducible, which is what lets a test compare bytes.
-const Entry TABLE[] = {
+constexpr Entry TABLE[] = {
     { MQ_PROP_PAYLOAD_FORMAT_INDICATOR,          Kind::Byte,       PUBLISH | WILL,            false, "Payload Format Indicator" },
     { MQ_PROP_MESSAGE_EXPIRY_INTERVAL,           Kind::FourByte,   PUBLISH | WILL,            false, "Message Expiry Interval" },
     { MQ_PROP_CONTENT_TYPE,                      Kind::Utf8,       PUBLISH | WILL,            false, "Content Type" },
@@ -82,7 +86,7 @@ const Entry TABLE[] = {
     { MQ_PROP_SHARED_SUBSCRIPTION_AVAILABLE,     Kind::Byte,       CONNACK,                   false, "Shared Subscription Available" },
 };
 
-const size_t TABLE_SIZE = sizeof(TABLE) / sizeof(TABLE[0]);
+constexpr size_t TABLE_SIZE = sizeof(TABLE) / sizeof(TABLE[0]);
 
 // The table index is the bit position in MqttProperties::present, so the two
 // can never drift apart. 27 entries, which fits a uint32_t with room spare.
@@ -95,22 +99,24 @@ static_assert(TABLE_SIZE <= 32, "present is a uint32_t bitmask over this table")
 // twice per property - and each ask used to walk all 27 table entries. The
 // identifiers are single bytes, so 256 bytes of table answers in one load.
 //
-// Built once on first use rather than written out by hand, because a table
-// written out by hand is a second copy of TABLE that can disagree with it.
-const int8_t* identifierIndex() {
-    static int8_t map[256];
-    static bool built = false;
-    if (!built) {
-        for (size_t i = 0; i < 256; i++) map[i] = -1;
-        for (size_t i = 0; i < TABLE_SIZE; i++) {
-            map[TABLE[i].identifier] = (int8_t)i;
-        }
-        built = true;
-    }
-    return map;
+// Computed from TABLE by the compiler rather than written out by hand, because
+// a table written out by hand is a second copy of TABLE that can disagree with
+// it. It used to be built on first use, in 256 bytes of RAM; as a constant it
+// is in flash, and there is no first use to race between two tasks.
+struct IdentifierIndex {
+    int8_t at[256];
+};
+
+constexpr IdentifierIndex buildIdentifierIndex() {
+    IdentifierIndex index{};
+    for (size_t i = 0; i < 256; i++) index.at[i] = -1;
+    for (size_t i = 0; i < TABLE_SIZE; i++) index.at[TABLE[i].identifier] = (int8_t)i;
+    return index;
 }
 
-int indexOf(uint8_t identifier) { return identifierIndex()[identifier]; }
+constexpr IdentifierIndex IDENTIFIER_INDEX = buildIdentifierIndex();
+
+int indexOf(uint8_t identifier) { return IDENTIFIER_INDEX.at[identifier]; }
 
 // V5:3.2.2.3.4, 3.2.2.3.5, 3.1.2.11.6, 3.1.2.11.7 and the availability flags
 // all say the same thing: a value other than 0 or 1 is a Protocol Error.

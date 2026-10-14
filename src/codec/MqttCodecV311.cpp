@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttCodecV311.h"
+#include "../MqttNoExcept.h"
 
 namespace {
 
@@ -330,25 +331,25 @@ MqttError encodableAtV311(const MqttPacket& packet) {
 
     switch (type) {
     case MQ_PKT_CONNECT:
-        if (hasAnyProperty(packet.connect.properties) ||
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.connect)) ||
             hasAnyProperty(packet.connect.will.properties)) {
             return MqttError::NotSupportedByProtocol;
         }
         break;
     case MQ_PKT_CONNACK:
-        if (hasAnyProperty(packet.connack.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.connack))) return MqttError::NotSupportedByProtocol;
         break;
     case MQ_PKT_PUBLISH:
         // Topic Alias, Message Expiry Interval, Content Type, Response Topic,
         // Correlation Data, Payload Format Indicator, Subscription Identifier
         // and User Property all live here at 5.0 and nowhere at 3.1.1.
-        if (hasAnyProperty(packet.publish.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.publish))) return MqttError::NotSupportedByProtocol;
         break;
     case MQ_PKT_PUBACK:
     case MQ_PKT_PUBREC:
     case MQ_PKT_PUBREL:
     case MQ_PKT_PUBCOMP:
-        if (hasAnyProperty(packet.ack.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.ack))) return MqttError::NotSupportedByProtocol;
         // There is no reason code, so a caller trying to refuse a publish
         // cannot say so. Sending the acknowledgement anyway would report
         // success for something that failed.
@@ -357,7 +358,7 @@ MqttError encodableAtV311(const MqttPacket& packet) {
         }
         break;
     case MQ_PKT_SUBSCRIBE:
-        if (hasAnyProperty(packet.subscribe.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.subscribe))) return MqttError::NotSupportedByProtocol;
         for (uint8_t i = 0; i < packet.subscribe.count; i++) {
             // No Local, Retain As Published and Retain Handling are 5.0 only.
             // Stripping them would subscribe on terms nobody asked for.
@@ -367,7 +368,7 @@ MqttError encodableAtV311(const MqttPacket& packet) {
         }
         break;
     case MQ_PKT_SUBACK:
-        if (hasAnyProperty(packet.suback.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.suback))) return MqttError::NotSupportedByProtocol;
         for (uint8_t i = 0; i < packet.suback.count; i++) {
             if (!mq_subackCodeIsValidV311(packet.suback.reasons[i])) {
                 return MqttError::NotSupportedByProtocol;
@@ -375,13 +376,13 @@ MqttError encodableAtV311(const MqttPacket& packet) {
         }
         break;
     case MQ_PKT_UNSUBACK:
-        if (hasAnyProperty(packet.suback.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.suback))) return MqttError::NotSupportedByProtocol;
         break;
     case MQ_PKT_UNSUBSCRIBE:
-        if (hasAnyProperty(packet.unsubscribe.properties)) return MqttError::NotSupportedByProtocol;
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.unsubscribe))) return MqttError::NotSupportedByProtocol;
         break;
     case MQ_PKT_DISCONNECT:
-        if (hasAnyProperty(packet.disconnect.properties) ||
+        if (hasAnyProperty(MQ_PROPERTIES(packet, packet.disconnect)) ||
             packet.disconnect.reasonCode != MQ_REASON_NORMAL_DISCONNECTION) {
             // No way to say why, and no Session Expiry Interval to revise on
             // the way out.

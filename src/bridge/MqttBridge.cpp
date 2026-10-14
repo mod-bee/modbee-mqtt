@@ -11,6 +11,7 @@
 
 
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 const char* mq_bridgeDirectionName(MqttBridgeDirection direction) {
     switch (direction) {

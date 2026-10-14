@@ -156,6 +156,14 @@ MqttSparkplugProperty mq_spEngUnit(const char* units);
 MqttSparkplugProperty mq_spQuality(int32_t quality);
 MqttSparkplugProperty mq_spDescription(const char* text);
 
+// engLow and engHigh: the range a SCADA gauge or trend should show for the
+// metric. Not in the specification, which reserves only Quality; they are the
+// names Eclipse Tahu and Ignition use, as engUnit is, so a host that knows
+// them uses them and any other ignores them. A Double, whatever the metric's
+// own type: a range is a display hint, not a value.
+MqttSparkplugProperty mq_spEngLow(double low);
+MqttSparkplugProperty mq_spEngHigh(double high);
+
 // --- One metric ---
 //
 // A flat struct with presence flags rather than a class, because the OpenPLC
@@ -253,16 +261,40 @@ struct MqttSparkplugPayload {
     const uint8_t* body = nullptr;
     uint32_t bodyLength = 0;
 
-    MqttSparkplugMetric metrics[MQ_SP_MAX_METRICS];
+    // THE METRICS AND THE NAME ARENA ARE ALLOCATED, AND THE OWNER SIZES THEM.
+    //
+    // They were arrays of MQ_SP_MAX_METRICS and MQ_SP_NAME_BYTES inside this
+    // struct, so every payload cost the same 7 kB on a board whether it was a
+    // node's hundred-metric birth or a one-metric death certificate - and a
+    // node holds two. Worse, the limit was a compile-time number, and an
+    // OpenPLC project cannot pass -D: a site needing sixty metrics could not
+    // have them at all. Now a payload is constructed with what it must hold
+    // (the defaults are the old numbers), a node grows its own to exactly its
+    // birth certificate, and on an ESP32 with PSRAM the storage lives there
+    // (mq_allocLarge). `metrics` is still indexed as an array.
+    MqttSparkplugMetric* metrics = nullptr;
     size_t metricCount = 0;
 
     void clear();
 
     bool addMetric(const MqttSparkplugMetric& metric) {
-        if (metricCount >= MQ_SP_MAX_METRICS) return false;
+        if (metricCount >= _metricCapacity) return false;
         metrics[metricCount++] = metric;
         return true;
     }
+
+    // How many metrics, and how many bytes of names, this payload can hold.
+    // Zero for both when its storage could not be allocated - then every
+    // addMetric() and every decode fails by name (TooManyMetrics) rather than
+    // the board faulting.
+    size_t capacity() const { return _metricCapacity; }
+    size_t nameCapacity() const { return _nameCapacity; }
+
+    // Make room for at least this many metrics and name bytes. GROW ONLY, and
+    // a payload that grows is EMPTIED - call it before building, not halfway
+    // through. False when the memory is not there; the payload then keeps
+    // what it had.
+    bool reserve(size_t metricCapacity, size_t nameBytes);
 
     // --- Name storage, owned here ---
     //
@@ -278,7 +310,7 @@ struct MqttSparkplugPayload {
     //
     // Public because the node interns into it when it builds a payload from its
     // own registry. Not to be written to directly - use intern().
-    char names[MQ_SP_NAME_BYTES];
+    char* names = nullptr;
     size_t namesUsed = 0;
 
     // Copies `length` bytes and terminates them. Returns null when the arena is
@@ -299,13 +331,20 @@ struct MqttSparkplugPayload {
     // or bytes VALUE is deliberately left alone: those are spans into the
     // caller's buffer by design, and the contract is that names outlive the
     // buffer and values do not.
-    MqttSparkplugPayload() {}
-    MqttSparkplugPayload(const MqttSparkplugPayload& other) { copyFrom(other); }
+    //
+    // A copy is constructed with the source's capacity; an assignment keeps
+    // its own and grows only if the source's content would not fit.
+    MqttSparkplugPayload() : MqttSparkplugPayload(MQ_SP_MAX_METRICS, MQ_SP_NAME_BYTES) {}
+    MqttSparkplugPayload(size_t metricCapacity, size_t nameBytes);
+    ~MqttSparkplugPayload();
+    MqttSparkplugPayload(const MqttSparkplugPayload& other)
+        : MqttSparkplugPayload(other._metricCapacity, other._nameCapacity) {
+        copyFrom(other);
+    }
     MqttSparkplugPayload& operator=(const MqttSparkplugPayload& other) {
         if (this != &other) copyFrom(other);
         return *this;
     }
-
 
 
     // By name, case SENSITIVE - [tck-id-case-sensitivity-metric-names]. A
@@ -319,6 +358,14 @@ private:
     void copyFrom(const MqttSparkplugPayload& other);
     const char* rebase(const MqttSparkplugPayload& other,
                        const char* pointer) const;
+
+    // Frees what is held and allocates afresh, empty. False, and holding
+    // nothing, when the memory is not there.
+    bool allocate(size_t metricCapacity, size_t nameBytes);
+    void release();
+
+    size_t _metricCapacity = 0;
+    size_t _nameCapacity = 0;
 };
 
 // --- Encoding ---

@@ -52,10 +52,30 @@
 #include "MqttOwnedProperties.h"
 
 #include <vector>
+#include "MqttFixed.h"
 
-// Operations held at once. Past this, an operation is REFUSED with QueueFull
-// rather than dropped - a caller that was told "accepted" and got nothing is
-// the failure this whole file exists to prevent.
+// On a board (MQTT_LEAN) the queue keeps every topic, payload and property set
+// in the client's byte area (MqttFixed.h): MQTT_QUEUE_BYTES for the default
+// queue of MQTT_QUEUE_CAPACITY, in proportion for a larger one, sized when
+// the client is begun. A publish the area cannot take is refused with
+// QueueFull, as a full queue is.
+#if MQTT_LEAN
+    #ifndef MQTT_QUEUE_BYTES
+    #define MQTT_QUEUE_BYTES 4096
+    #endif
+    // Completions owed while a handler runs: never more than the queue holds.
+    #ifndef MQTT_DEFERRED_COMPLETIONS
+    #define MQTT_DEFERRED_COMPLETIONS 64
+    #endif
+#endif
+
+// Operations held at once, BY DEFAULT: MqttClientConfig::queueCapacity (a PLC's
+// MAX_PENDING) sets it per client, and nothing caps that but memory - the
+// slots are taken when the client is begun, and a size memory cannot hold is
+// refused there (setCapacity() false, outOfMemory()). Past the size, an
+// operation is REFUSED with QueueFull rather than dropped - a caller that was
+// told "accepted" and got nothing is the failure this whole file exists to
+// prevent.
 #ifndef MQTT_QUEUE_CAPACITY
 #define MQTT_QUEUE_CAPACITY 32
 #endif
@@ -80,8 +100,8 @@ struct MqttOperation {
 
     // Owned, because an operation outlives the buffer its caller built it
     // from - and on a reconnect it may outlive the connection as well.
-    std::vector<uint8_t> topic;      // the topic name, or the filter
-    std::vector<uint8_t> payload;
+    MQ_AREA_BYTES topic;      // the topic name, or the filter
+    MQ_AREA_BYTES payload;
 
     uint8_t qos = MQ_QOS_0;
     bool retain = false;
@@ -154,14 +174,26 @@ struct MqttOperation {
     void* context = nullptr;
 
     bool inUse() const { return opId != 0; }
+
+#if MQTT_LEAN
+    // Room held in the area for this publish's resend copy (QoS 1 and 2), so
+    // the copy is always there to make when it goes out.
+    uint16_t reserved = 0;
+#endif
 };
 
 class MqttOperations {
 public:
     MqttOperations();
 
-    void setCapacity(size_t capacity);
+    // How many operations may be held at once. The slots grow to it, keeping
+    // what is queued; false - and the size as it was - when memory cannot
+    // hold that many, which outOfMemory() then says too.
+    bool setCapacity(size_t capacity);
     size_t capacity() const { return _capacity; }
+    // The last setCapacity() (or the default slots) wanted memory that was
+    // not there. Cleared by the next one that succeeds.
+    bool outOfMemory() const { return _outOfMemory; }
 
     // --- Queueing ---
     //
@@ -208,7 +240,7 @@ public:
     // worked around: those bytes are on the wire and their acknowledgement is
     // still owed. Withdrawing a record whose PUBACK is in flight would leave
     // the acknowledgement arriving for an operation nobody remembers.
-    size_t withdraw(const std::vector<uint8_t>& topic, MqttResult result);
+    size_t withdraw(const MQ_AREA_BYTES& topic, MqttResult result);
 
     size_t concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
                            MqttResult result);
@@ -241,7 +273,7 @@ public:
     // Direct access to a slot, for the few callers that need to walk. Returns
     // null past the end; the slot may be unused, which inUse() answers.
     MqttOperation* at(size_t index) {
-        return index < MQTT_QUEUE_CAPACITY ? &_ops[index] : nullptr;
+        return index < _ops.capacity() ? &_ops[index] : nullptr;
     }
 
     // --- Diagnostics ---
@@ -256,8 +288,11 @@ public:
     uint32_t concludedCount() const { return _concluded; }
 
 private:
-    MqttOperation _ops[MQTT_QUEUE_CAPACITY];
+    // The slots, taken once for the capacity asked for; the loops below walk
+    // all of them, so there are exactly that many.
+    MqttGrowList<MqttOperation> _ops;
     size_t _capacity = MQTT_QUEUE_CAPACITY;
+    bool _outOfMemory = false;
     uint32_t _nextOpId = 1;
     bool _priorityMode = false;
 
@@ -284,11 +319,15 @@ private:
         uint16_t packetId;
     };
 
-    std::vector<Deferred> _deferred;
+    MQ_LIST(Deferred, MQTT_DEFERRED_COMPLETIONS) _deferred;
     int _dispatchDepth = 0;
 
-    // The live slots at the moment a conclude* walk starts; see the .cpp.
-    uint32_t liveMask() const;
+    // The live operations at the moment a conclude* walk starts; see the .cpp.
+    uint32_t mark() const { return _nextOpId; }
+    bool queuedBefore(const MqttOperation& operation, uint32_t mark) const {
+        return operation.inUse() && (int32_t)(operation.opId - mark) < 0;
+    }
+    size_t slots() const { return _ops.capacity(); }
 
     // Bounded, because "a handler may defer another" has no natural end. Every
     // entry is a real conclusion owed to somebody, so none is discarded - the
@@ -312,4 +351,21 @@ public:
     // taken on.
     void drainDeferred();
     size_t deferredCount() const { return _deferred.size(); }
+
+#if MQTT_LEAN
+    // Binds every slot to the client's byte area. Once, before use.
+    void bind(MqttByteArea& area);
+
+    // Just before a QoS 1/2 publish is encoded: hands the room it reserved to
+    // its resend copy. False when there is no room for one - only a publish
+    // going out again after a reconnect has none reserved - and it then waits.
+    bool makeRoomToStore(MqttOperation& operation, size_t length);
+
+private:
+    bool roomFor(const MqttOperation& operation) const;
+    static size_t resendRoom(const MqttOperation& operation);
+    void holdResendRoom(MqttOperation& operation);
+    void unreserve(MqttOperation& operation);
+    MqttByteArea* _area = nullptr;
+#endif
 };

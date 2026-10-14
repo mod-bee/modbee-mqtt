@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <string.h>
+#include "../MqttNoExcept.h"
 
 void MqttTypedBindings::begin(MqttClient& client) {
     _client = &client;

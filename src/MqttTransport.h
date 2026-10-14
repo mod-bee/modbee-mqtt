@@ -30,6 +30,7 @@
 // resumes on the next poll(). It never blocks to finish one.
 
 #include "MqttPlatform.h"
+#include "MqttFeatures.h"   // MQTT_LEAN: openFailed() below
 
 class MqttTransport {
 public:
@@ -148,6 +149,16 @@ public:
     // for an attempt that ended long before. Defaulted to false, so a medium
     // that cannot tell keeps that behaviour rather than guessing.
     virtual bool connectFailed() const { return false; }
+
+#if MQTT_LEAN
+    // A board only: whether the attempt begin() accepted never OPENED - what
+    // begin() returning false has always meant, reported a poll later because
+    // the open ran on a task of its own (MqttConnectTask). The client answers
+    // it exactly as it answers a false begin(): the reconnect backoff, and
+    // nothing outstanding concluded, since nothing was ever sent. Defaulted to
+    // false, so a transport that opens inside begin() never says it.
+    virtual bool openFailed() const { return false; }
+#endif
 
     // Where the far end is, in whatever words the medium has - "10.0.4.7:51544"
     // for TCP, empty for a loopback in a test.

@@ -229,7 +229,7 @@ data carrying the **alias alone** — that is where most of Sparkplug's bandwidt
 saving comes from, an alias being one or two bytes where a name is thirty. So a
 host that does not record the births receives a stream of numbers and cannot
 say what any of them measures. `MqttSparkplugHost` keeps a per-node alias table
-(`MQ_SP_MAX_TRACKED_METRICS`), rebuilt by each NBIRTH and extended by each
+(as large as the births, memory permitting), rebuilt by each NBIRTH and extended by each
 DBIRTH, and fills the names back in before handing a message to the
 application. One table per **node**, not per device, because an alias is unique
 across an edge node's entire set of metrics, devices included.

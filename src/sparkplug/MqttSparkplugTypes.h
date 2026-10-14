@@ -236,15 +236,18 @@ bool mq_sparkplugDataTypeSupported(MqttSparkplugDataType type);
 
 // --- Limits ---
 //
-// Fixed at compile time and allocated once, because this has to run inside a
-// PLC scan cycle on a 32-bit microcontroller. A board build that needs more
-// says so with -D rather than discovering a heap it does not have.
+// Allocated once, when the size is known, and never inside a scan's steady
+// state: a payload is sized when it is constructed, and a node sizes its own
+// tables while the metric set is being declared and its buffers at the first
+// birth - after that nothing grows unless a text value outgrows its slack.
 
-// Metrics per payload. 32 matches MQTT_STRUCT_MEMBERS in the OpenPLC wrapper,
-// which is what a SPARKPLUG_STRUCT block will bind, plus room for bdSeq and
-// Node Control/Rebirth - which an NBIRTH must carry whatever else is in it.
-// A host defaults to 256 (MqttFeatures.h), so a host application can read the
-// births of real plant nodes.
+// THE DEFAULT SIZE OF A PAYLOAD - where a payload nobody sized starts, and
+// where a host's decode payload starts before it grows to the largest birth it
+// meets. Not a limit on what a node declares: that is memory alone, on a host
+// or a board (MqttSparkplugNode::metricLimit()); the node's tables, payloads
+// and encode buffer grow to what was declared, in external RAM on an ESP32.
+// 34 is a SPARKPLUG_STRUCT's 32 members plus bdSeq and Node Control/Rebirth.
+// A host defaults to 256 (MqttFeatures.h).
 #ifndef MQ_SP_MAX_METRICS
 #define MQ_SP_MAX_METRICS 34
 #endif

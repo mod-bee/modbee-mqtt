@@ -70,14 +70,12 @@ void setup() {
   // and says so - never dropped silently, which on a site nobody visits is the
   // difference between missing data and not knowing you are missing data.
   //
-  // queueSize() returns what is ACTUALLY in force: the queue is a fixed array
-  // of MQTT_QUEUE_CAPACITY slots, so asking for more than that gives you less.
-  // Rebuild with -DMQTT_QUEUE_CAPACITY=64 if you need it, or plan for what you
-  // are given. Being quietly handed half of what you asked for is how a site
-  // loses an afternoon of data and nobody can say why.
-  if (mqtt.queueSize(64) < 64) {
-    Serial.println("queue is smaller than asked for - see MQTT_QUEUE_CAPACITY");
-  }
+  // Any size: the queue is taken when the device connects, as many as asked,
+  // and only memory refuses - then it keeps the size it had and
+  // queueOutOfMemory() says so (checked after connect(), below). Being
+  // quietly handed half of what you asked for is how a site loses an
+  // afternoon of data and nobody can say why.
+  mqtt.queueSize(64);
 
   // A longer keepalive, because every ping costs data and a cellular plan is
   // usually sold by the megabyte. The cost is that a dead link takes longer to
@@ -101,6 +99,10 @@ void setup() {
   mqtt.autoReconnect(false);
 
   if (bearerUp) mqtt.connect(BROKER, "bore-7");
+  if (mqtt.queueOutOfMemory()) {
+    Serial.print("no memory for a queue of 64 - it holds ");
+    Serial.println((unsigned long)mqtt.queueCapacity());
+  }
 }
 
 void loop() {

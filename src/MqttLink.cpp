@@ -10,6 +10,7 @@
 #include "MqttLink.h"
 
 #include <string.h>
+#include "MqttNoExcept.h"
 
 void MqttLink::begin(MqttTransport& transport, size_t receiveCapacity,
                      size_t transmitCapacity, size_t initialCapacity) {
@@ -37,8 +38,8 @@ void MqttLink::begin(MqttTransport& transport, size_t receiveCapacity,
     // A slot recycled from a connection that grew its buffers gives the
     // memory back here, rather than carrying it to the next occupant.
     if (_initialCapacity != 0) {
-        if (_receive.size() > receiveCapacity) std::vector<uint8_t>().swap(_receive);
-        if (_transmit.size() > transmitCapacity) std::vector<uint8_t>().swap(_transmit);
+        if (_receive.size() > receiveCapacity) MQ_HEAP_BYTES().swap(_receive);
+        if (_transmit.size() > transmitCapacity) MQ_HEAP_BYTES().swap(_transmit);
     }
 #else
     (void)initialCapacity;      // fixed buffers on a board; see MQTT_LINK_GROWS
@@ -97,7 +98,7 @@ void MqttLink::fill() {
     if (growing()) {
         if (_receiveLength == 0) {
             if (_receive.size() > _initialCapacity) {
-                std::vector<uint8_t>(_initialCapacity).swap(_receive);
+                MQ_HEAP_BYTES(_initialCapacity).swap(_receive);
                 _receiveStart = 0;
             }
         } else {
@@ -356,7 +357,7 @@ void MqttLink::shrinkTransmitIfIdle() {
 #if MQTT_LINK_GROWS
     if (!growing() || _sending || _transmitLength != 0) return;
     if (_transmit.size() > _initialCapacity) {
-        std::vector<uint8_t>(_initialCapacity).swap(_transmit);
+        MQ_HEAP_BYTES(_initialCapacity).swap(_transmit);
         _transmitCursor = 0;
     }
 #endif

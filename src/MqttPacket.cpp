@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttPacket.h"
+#include "MqttNoExcept.h"
 
 MqttError mq_decodeFixedHeader(const uint8_t* data, size_t available,
                                MqttFixedHeader& out) {

@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttResult.h"
+#include "MqttNoExcept.h"
 
 const char* mq_resultName(MqttResult result) {
     switch (result) {

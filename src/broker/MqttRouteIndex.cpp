@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttRouteIndex.h"
+#include "../MqttNoExcept.h"
 
 #if defined(MQTT_PLATFORM_HOST)
 
