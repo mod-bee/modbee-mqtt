@@ -337,6 +337,10 @@ If [Nginx Proxy Manager](https://nginxproxymanager.com) (version 2.12.3 or
 later) already owns ports 80 and 443 on the server, let it do the certificate
 instead of Traefik. Everything is done in its web page; nothing is copied.
 
+**`docker/npm/` is the simple way:** modbee and Kafka without Traefik, and
+two NPM streams (8883 for MQTT, 9093 for Kafka) with one certificate. Its
+README has the steps. The steps below instead put modbee on NPM's network.
+
 **1. Run modbee on NPM's network.** In `docker/stack/compose.yml` (or
 `docker/all-in-one/compose.yml`, for Kafka too), delete the `traefik` service
 and the `configs:` section, and make the network NPM's - its name is in
