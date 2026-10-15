@@ -9,6 +9,8 @@
 
 #include "MqttChannelTls.h"
 
+#include <cstdlib>
+
 #if MQTT_CHANNEL_TLS
 
 // The engine comes in HERE and nowhere a sketch can see it. See the header.
@@ -81,22 +83,16 @@ static const int kSuites[] = {
 #if defined(MQ_CHANNEL_TLS_PSRAM)
 namespace {
 
-// Blocks this size and up go to PSRAM first. The two record buffers are
-// 16 kB each; certificates and the handshake's working state are around a
-// kilobyte; the small, hot structures stay where the engine touches them
-// fastest.
-const size_t kExternalFrom = 1024;
-
+// The core's mbedTLS is built to allocate everything in internal RAM
+// (CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC), whatever the board decides for other
+// allocations. This hands its blocks to the ordinary allocator instead, so they
+// follow the board's own rule (heap_caps_malloc_extmem_enable: the ModBee Node
+// puts blocks from 16 bytes in PSRAM). A handshake with a Let's Encrypt broker
+// (P-384, a three-certificate chain) otherwise ran internal RAM down to a few
+// bytes and failed.
 void* tlsCalloc(size_t count, size_t size) {
     if (count != 0 && size > (size_t)-1 / count) return nullptr;
-    const size_t bytes = count * size;
-    const uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    const uint32_t external = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-    void* block = heap_caps_calloc(count, size, bytes >= kExternalFrom ? external : internal);
-    if (block == nullptr) {
-        block = heap_caps_calloc(count, size, bytes >= kExternalFrom ? internal : external);
-    }
-    return block;
+    return calloc(count, size);
 }
 
 // heap_caps_free() frees a block from ANY heap. That is what makes switching
