@@ -1,82 +1,54 @@
-# modbee and Kafka behind Nginx Proxy Manager (NPM). NPM does the TLS and the
-# Let's Encrypt certificate. README.md beside it has the steps.
+# modbee (MQTT broker) and Kafka, for a server with Nginx Proxy Manager (NPM).
+# Fixed network and addresses; NPM forwards to them. Nothing is published.
 #
-#   cp .env.example .env    set MQTT_PASSWORD
-#   docker compose up -d
-#
-# 1883 and 9095 are not encrypted: keep them closed in the server's firewall.
-# NPM forwards to them.
-name: modbee-npm
+#   modbee   10.80.80.10   MQTT 1883
+#   kafka    10.80.80.11   Kafka 9092 (inside), 9095 (with a password, for NPM)
+
+name: modbee
 
 services:
   modbee:
-    image: ${MODBEE_IMAGE:-ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}}
-    build:                                # used when the image cannot be pulled
-      context: ../..
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/mod-bee/modbee-mqtt:latest
     restart: unless-stopped
     depends_on:
       kafka-topics: {condition: service_completed_successfully}
     environment:
-      # The admin login (.env). Devices have their own: docs/logins.md.
-      MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
+      MODBEE_AUTHENTICATION_USERNAME: admin
       MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
     volumes:
       - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
-      - modbee-data:/var/lib/modbee        # device logins, and their backups
-    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
-    mem_limit: 2g
-    ports:
-      - "1883:1883"   # NPM forwards 8883 here
+      - modbee-data:/var/lib/modbee
+    networks:
+      modbee: {ipv4_address: 10.80.80.10}
 
-  # One Kafka node (KRaft, no ZooKeeper), its data kept in a volume.
-  #   kafka:9092   for containers on the "modbee" network - modbee uses this
-  #   :9094        for everything outside Docker, published on KAFKA_BIND
-  #                (this server only, by default) and announced to clients as
-  #                KAFKA_EXTERNAL_HOST:KAFKA_PORT. No password: keep it off
-  #                the internet.
-  #   :9095        reached through an NPM stream (9093 -> this server :9095), as DOMAIN:9093 with TLS and
-  #                the KAFKA_USERNAME / KAFKA_PASSWORD login. With no
-  #                KAFKA_PASSWORD it has no users, so it lets nobody in.
   kafka:
     image: apache/kafka:4.3.1
     restart: unless-stopped
     environment:
-      KAFKA_HEAP_OPTS: "-Xmx1g -Xms1g"
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094,REMOTE://:9095
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:${KAFKA_PORT:-9094},REMOTE://${DOMAIN:-localhost}:${KAFKA_TLS_PORT:-9093}
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,REMOTE://:9095
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,REMOTE://${DOMAIN:?set DOMAIN in .env}:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,REMOTE:SASL_PLAINTEXT
-      # The login on REMOTE. NPM does the TLS, so the password never
-      # crosses the internet in the clear; SASL/PLAIN over TLS is what
-      # managed Kafka services use too.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,REMOTE:SASL_PLAINTEXT
       KAFKA_LISTENER_NAME_REMOTE_SASL_ENABLED_MECHANISMS: PLAIN
-      KAFKA_LISTENER_NAME_REMOTE_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required ${KAFKA_PASSWORD:+user_${KAFKA_USERNAME:-app}="${KAFKA_PASSWORD}"};
+      KAFKA_LISTENER_NAME_REMOTE_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required user_app="${KAFKA_PASSWORD:?set KAFKA_PASSWORD in .env}";
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    ports:
-      - "${KAFKA_BIND:-127.0.0.1}:${KAFKA_PORT:-9094}:9094"
-      - "9095:9095"   # NPM forwards 9093 here (Kafka with a password)
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 10s
-      timeout: 15s
       retries: 30
-    mem_limit: 2g
+    networks:
+      modbee: {ipv4_address: 10.80.80.11}
 
-  # Runs once at start: creates the topics modbee.yaml uses, then exits.
-  # Kafka would create them on their first record anyway, but modbee reads
-  # mqtt-commands from the newest record on, so it would miss the record that
-  # created it. Add a topic here when you add a mapping that reads one.
+  # Creates the two topics once, then exits.
   kafka-topics:
     image: apache/kafka:4.3.1
     depends_on:
@@ -84,21 +56,19 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        for topic in mqtt-messages mqtt-commands; do
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
-            --create --if-not-exists --topic $$topic --partitions 6 || exit 1
+        for t in mqtt-messages mqtt-commands; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t --partitions 6 || exit 1
         done
     restart: "no"
-    mem_limit: 512m
+    networks: [modbee]
 
-# Named, so another compose project can join it and reach kafka:9092 and
-# modbee:1883 by name (docs/docker.md shows the three lines it needs). The
-# name is fixed - not prefixed with the project's - so those lines stay the
-# same; MODBEE_NETWORK changes it, for a second all-in-one on one server.
 networks:
-  default:
-    name: ${MODBEE_NETWORK:-modbee}
+  modbee:
+    name: modbee
+    ipam:
+      config:
+        - subnet: 10.80.80.0/24
 
 volumes:
-  kafka-data:
   modbee-data:
+  kafka-data:
