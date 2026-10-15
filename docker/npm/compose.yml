@@ -5,7 +5,7 @@
 #   modbee   10.80.80.10   MQTT 1883
 #   kafka    10.80.80.11   Kafka 9092 (inside), 9095 (with a password, for NPM)
 
-name: modbee
+name: modbee-broker
 
 services:
   modbee:
