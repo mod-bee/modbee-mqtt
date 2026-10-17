@@ -289,6 +289,7 @@ void MqttDevice::startProvisioning() {
     _provisionConnection.hasSessionExpiry = false;
     _provisionConnection.sessionExpiryInterval = 0;
     _provisionConnection.will = MqttWillConfig();
+    _provisionConnection.registration = true;   // and none a layer adds at CONNECT
     _provisioning = true;
     _reprovision = false;
     _provisionState = MqttProvisionState::Registering;

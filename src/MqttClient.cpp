@@ -378,7 +378,7 @@ void MqttClient::sendConnect() {
         connect.password = spanOf(_connection.password);
     }
 
-    if (_connection.will.enabled) {
+    if (_connection.will.enabled && !_connection.registration) {
         connect.hasWill = true;
         connect.will.topic = spanOf(_connection.will.topic);
         connect.will.payload = spanOf(_connection.will.payload);

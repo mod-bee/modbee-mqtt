@@ -159,6 +159,13 @@ struct MqttConnectionConfig {
     uint32_t maximumPacketSize = 0;      // 0 states no limit
 
     MqttWillConfig will;
+
+    // A registration session: logging in with a provisioning key to ask for a
+    // login of its own. It sends no Will - whatever a layer (Sparkplug's NDEATH,
+    // a presence message) has put on the connection - because such a session may
+    // publish nothing but its registration request, and a broker refuses a Will
+    // it may not publish. The Will stays configured for the device's own login.
+    bool registration = false;
 };
 
 // --- What is ours alone ---
