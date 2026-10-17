@@ -14,7 +14,7 @@ services:
     depends_on:
       kafka-topics: {condition: service_completed_successfully}
     environment:
-      MODBEE_AUTHENTICATION_USERNAME: admin
+      MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
       MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
     mem_limit: 256m
     volumes:
@@ -36,7 +36,7 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,REMOTE:SASL_PLAINTEXT
       KAFKA_LISTENER_NAME_REMOTE_SASL_ENABLED_MECHANISMS: PLAIN
-      KAFKA_LISTENER_NAME_REMOTE_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required user_app="${KAFKA_PASSWORD:?set KAFKA_PASSWORD in .env}";
+      KAFKA_LISTENER_NAME_REMOTE_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required user_${KAFKA_USERNAME:-app}="${KAFKA_PASSWORD:?set KAFKA_PASSWORD in .env}";
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_LOG_DIRS: /var/lib/kafka/data
