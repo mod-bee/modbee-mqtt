@@ -381,8 +381,10 @@ int cmdServe(int argc, char** argv) {
     std::printf(", up to %lld connections\n", b.maxConnections);
     if (gate) {
         std::printf("modbee serve: MQTT clients must log in - device logins in %s (%zu), "
-                    "admin \"%s\"\n", file.authentication.database.c_str(),
-                    gate->store().userCount(), file.authentication.accounts[0].username.c_str());
+                    "admin \"%s\"; a login without rules uses %s\n", file.authentication.database.c_str(),
+                    gate->store().userCount(), file.authentication.accounts[0].username.c_str(),
+                    file.authentication.defaultTopics == "none" ? "no topic (default-topics: none)"
+                                                                : "every topic (default-topics: all)");
     } else if (accounts.count() > 0) {
         std::printf("modbee serve: MQTT clients must log in (%zu user name(s))\n", accounts.count());
     } else {

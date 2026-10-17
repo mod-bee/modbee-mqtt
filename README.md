@@ -50,7 +50,7 @@ library.
 | --- | --- |
 | **`modbee serve`** | The broker as a server: one broker per CPU core, behind one port. Configured with one `modbee.yaml` |
 | **Kafka pipe** | MQTT to Apache Kafka and back, with messages passed through untouched. A publisher's PUBACK comes back only once Kafka has the message |
-| **Device logins** | A login per device, added, reset and removed while it runs - or devices that register themselves with a provisioning key - with per-device topic permissions |
+| **Device logins** | A login per device, added, reset and removed while it runs - or devices that register themselves with a provisioning key for their site - with per-device topic permissions (strict, or open to every topic for a login without rules: `authentication.default-topics`) |
 | **Retained messages that survive a restart** | Kept in memory as always, and in a file or a compacted Kafka topic as well, with one setting |
 | **`modbee` command** | Publish, subscribe, request/response and benchmark from a terminal |
 | **Docker image** | `ghcr.io/mod-bee/modbee-mqtt`: the server and the `modbee` command, for amd64 and arm64 |

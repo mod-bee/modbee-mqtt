@@ -13,8 +13,12 @@ broker:
 #   docker compose exec modbee modbee key create site-a --site a --publish 'plant/${username}/#'   devices that register themselves
 # MQTT_USERNAME / MQTT_PASSWORD from .env (compose.yml passes them in) is the
 # ADMIN login: for you, your own apps, and the modbee command. docs/logins.md.
+# A device may use only the topics its rules name (--publish / --subscribe);
+# one given no rules may use none. For a login that should use every topic,
+# give it '#' on purpose. docs/logins.md#what-a-device-may-do
 authentication:
   database: /var/lib/modbee/auth.db
+  default-topics: none
 
 metrics:
   port: 9464                 # Prometheus, on the private network

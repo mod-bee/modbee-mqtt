@@ -156,6 +156,22 @@ modbee provision 'site-north.eDjPQ...' --name gateway-3 -h mqtt.example.com --tl
 
 ---
 
+## A login store from an earlier version
+
+The login store's layout carries a version. This version keeps a site on every
+key and login; a store an earlier version made is refused when the broker
+starts:
+
+```
+modbee serve: the login store /var/lib/modbee/auth.db was made by an earlier version (schema 1, this one reads 2); remove it and add the logins again
+```
+
+Remove `auth.db` (and `auth.db-wal`, `auth.db-shm` beside it) from the
+`modbee-data` volume - only those files: retained messages and Kafka are not in
+it - start the broker, and add the logins and keys again.
+
+---
+
 ## What a device may do
 
 Each login has two lists of topic filters: what it may **publish** to and

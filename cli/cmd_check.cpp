@@ -56,8 +56,10 @@ int cmdCheck(int argc, char** argv) {
         std::printf(", %zu shard(s)%s, up to %lld connections", b.shards,
                     b.shards == 0 ? " (one per core)" : "", b.maxConnections);
         if (!config.authentication.database.empty()) {
-            std::printf("; MQTT: device logins in %s, admin \"%s\"", config.authentication.database.c_str(),
-                        config.authentication.accounts.empty() ? "?" : config.authentication.accounts[0].username.c_str());
+            std::printf("; MQTT: device logins in %s, admin \"%s\", default-topics %s",
+                        config.authentication.database.c_str(),
+                        config.authentication.accounts.empty() ? "?" : config.authentication.accounts[0].username.c_str(),
+                        config.authentication.defaultTopics.c_str());
         } else if (config.authentication.accounts.empty()) std::printf("; MQTT: no login");
         else std::printf("; MQTT: fixed logins (%zu)", config.authentication.accounts.size());
         std::printf("; retained: %s",

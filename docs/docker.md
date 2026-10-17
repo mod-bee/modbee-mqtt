@@ -119,9 +119,12 @@ docker compose exec modbee modbee user add tank-01 --publish 'plant/${username}/
 docker compose exec modbee modbee key create site-north --site north --publish 'plant/${username}/#'   # or: devices register themselves
 ```
 
-[logins.md](logins.md) explains both, and what each device may do. Devices
-connect to **`mqtts://mqtt.example.com:8883`** with their own login; anything
-without one is refused (`not authorized`). Computers, phones and
+[logins.md](logins.md) explains both, and what each device may do. These
+setups are strict about it (`default-topics: none` in `modbee.yaml`): a device
+uses only the topics its `--publish` / `--subscribe` rules name, and its Will
+must be inside them too; a login meant to use every topic is given `'#'` on
+purpose. Devices connect to **`mqtts://mqtt.example.com:8883`** with their own
+login; anything without one is refused (`not authorized`). Computers, phones and
 most MQTT tools trust Let's Encrypt already. An ESP32 using `WiFiClientSecure`
 needs Let's Encrypt's root certificate given to it once in the sketch
 (`secure.setCACert(...)` with *ISRG Root X1*), as for any public broker.
@@ -130,7 +133,9 @@ Good to know:
 
 - **The logins are kept in the `modbee-data` volume**, with a backup made
   every day - [logins.md](logins.md#backups) says how to keep a copy
-  elsewhere and how to restore one.
+  elsewhere and how to restore one. A login store made by an earlier version
+  of this broker is refused at start, saying so
+  ([logins.md](logins.md#a-login-store-from-an-earlier-version)).
 - **Practise first** if you like: uncomment `ACME_SERVER` in `.env` to use
   Let's Encrypt's staging service, which has no rate limits but whose
   certificates are not trusted. Comment it out again and
