@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -52,6 +53,10 @@ struct AuthUser {
     // added). A key re-provisions only logins of its own site, so one customer's key cannot take over
     // another's device.
     std::string site;
+    // Named values handed to the device: copied from its key when it registers, returned at sign-up and
+    // when it asks again (refresh). The broker stores them and does not read them - a group, a topic
+    // prefix, whatever the platform that made the key wants its devices to know (docs/logins.md).
+    std::map<std::string, std::string> data;
 };
 
 struct AuthKey {
@@ -65,6 +70,7 @@ struct AuthKey {
     std::string device;                  // "" or the one device name it may create
     int64_t created = 0;
     std::string site;                    // the site its devices belong to; "" = the shared one
+    std::map<std::string, std::string> data;   // handed to every device it registers (AuthUser::data)
 };
 
 enum class AuthResult { Ok, NotFound, Exists, Invalid, Failed };
@@ -89,7 +95,7 @@ public:
                    std::vector<AuthUser>& out);
     size_t userCount();
 
-    AuthResult putKey(const AuthKey& key);
+    AuthResult putKey(const AuthKey& key, bool replace = false);
     AuthResult removeKey(const std::string& name);
     bool findKey(const std::string& name, AuthKey& out);
     bool listKeys(std::vector<AuthKey>& out);

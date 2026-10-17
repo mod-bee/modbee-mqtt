@@ -142,8 +142,36 @@ registers again as well: it waits, pending, until you approve it.
 | `--days 30` | It stops working after 30 days |
 | `--site north` | The site its devices belong to: a key registers again only devices of its own site, so one customer's key cannot take another's device. Keys without a site share one - a broker for a single site needs none |
 | `--device tank-07` | It may register only that one device, and every claim uses it up (`--uses 1`: claimed once) - e.g. a key your platform creates for one device it is setting up or replacing |
+| `--data group=north-plant` | A value handed to each device it registers - repeat for more ([below](#what-a-key-hands-its-devices)) |
 
 `modbee key list` shows every key; `modbee key remove site-north` retires one.
+
+### What a key hands its devices
+
+A key can carry a few named values that every device it registers is given, so
+whoever sets the device up types only the key, the device's name and its
+network. The broker keeps them and hands them out; it does not read them.
+
+```bash
+docker compose exec modbee modbee key create site-north --site north \
+  --publish 'spBv1.0/north-plant/+/${username}' --publish 'acme/north/${username}/#' \
+  --data group=north-plant --data prefix=acme/north
+```
+
+- **At sign-up** the answer carries them: `"data": {"group": "north-plant", "prefix": "acme/north"}`.
+- **They stay with the device's login**, copied from the key when it registers.
+  `modbee user set tank-07 --data group=... --data prefix=...` changes one
+  device's; `modbee key set site-north --data ...` changes what the key hands
+  devices that register from then on. A set replaces them all; `--data ''`
+  clears them.
+- **A device asks again whenever it likes** (its own values only, no new
+  password) - devices of this library do so at every connect, so a change
+  reaches them at their next connect.
+
+Names are 1-32 letters, digits, `-`, `_` or `.`; values up to 255 bytes; 16 at
+most. ModBee's PLC library reads `group` (its Sparkplug group) and `prefix`
+(the start of its own topics, such as `prefix/<name>/$ota` for firmware
+updates); anything else is yours to name.
 
 ### A device that cannot register itself
 
@@ -337,8 +365,8 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 
 | `command` | Fields | Answer |
 | --- | --- | --- |
-| `user.add` | `username`; optional `password` (else one is generated), `publish`, `subscribe`, `admin`, `fingerprint` | `password` if generated |
-| `user.set` | `username`, and any of `fingerprint` (`""` clears it), `publish`, `subscribe`, `admin`, `enabled`, `password` - only those named change | `user`, as it now is |
+| `user.add` | `username`; optional `password` (else one is generated), `publish`, `subscribe`, `admin`, `fingerprint`, `data` | `password` if generated |
+| `user.set` | `username`, and any of `fingerprint` (`""` clears it), `publish`, `subscribe`, `admin`, `enabled`, `password`, `data` (the whole set; `{}` clears it) - only those named change | `user`, as it now is |
 | `user.get` | `username` | `user`, with its `fingerprint` (`""` for none) |
 | `user.list` | optional `prefix`, `after`, `limit` (up to 1000) | `users`, `total`, and `next` when there are more |
 | `user.reset` | `username` | the new `password` |
@@ -346,7 +374,8 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 | `user.permissions` | `username`, `publish`, `subscribe` | |
 | `user.enable`, `user.disable`, `user.approve`, `user.remove` | `username` | |
 | `user.admin` | `username`, `admin` (true/false) | |
-| `key.create` | `name`; optional `site`, `approval` (`auto`/`manual`), `publish`, `subscribe`, `uses`, `days`, `device` | `key` - shown once |
+| `key.create` | `name`; optional `site`, `approval` (`auto`/`manual`), `publish`, `subscribe`, `uses`, `days`, `device`, `data` | `key` - shown once |
+| `key.set` | `name`, `data` (the whole set; `{}` clears it): what the key hands devices that register from now on | `key`, as it now is |
 | `key.list`, `key.remove` | `name` for remove | `keys` |
 | `backup` | | `file` |
 | `status` | | counts of logins, accepted, refused, provisioned, and of logins by certificate: `certificate_accepted`, `certificate_refused` |
@@ -364,8 +393,12 @@ The device side is just as open, for firmware that does not use this library:
 CONNECT with user name `$provision`, the key as password and the device's name
 as Client Identifier; subscribe to `$modbee/provision/<name>/reply`; publish
 `{}` to `$modbee/provision/<name>/request`. The answer is
-`{"status": "ok", "username": "...", "password": "..."}`, `{"status": "pending"}`
-or `{"status": "refused", "reason": "..."}`.
+`{"status": "ok", "username": "...", "password": "...", "data": {...}}`,
+`{"status": "pending"}` or `{"status": "refused", "reason": "..."}`. A device
+signed in with its own login asks again the same way, on the same two topics
+of its Client Identifier (the only `$` topics it may use): the answer is
+`{"status": "ok", "data": {...}}` - its login's data, never a password.
+`data` is a JSON object, `"name": "value"` pairs, written without spaces.
 
 ---
 

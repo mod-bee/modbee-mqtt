@@ -122,7 +122,7 @@ void adminBuffers(CliClient& cli) {
 
 const char* kUserUsage =
     "modbee user <list|show|add|set|remove|enable|disable|approve|reset|password|permissions|admin> [name] [options]";
-const char* kKeyUsage = "modbee key <create|list|remove> [name] [options]";
+const char* kKeyUsage = "modbee key <create|set|list|remove> [name] [options]";
 
 const std::vector<ArgSpec>& adminSpecs() {
     static const std::vector<ArgSpec> specs = withConnectionSpecs({
@@ -139,6 +139,8 @@ const std::vector<ArgSpec>& adminSpecs() {
         {"days", 0, true, "key create: expires after this many days (default never)"},
         {"device", 0, true, "key create: the one device name it may create"},
         {"site", 0, true, "key create: the site its devices belong to; it registers again only those"},
+        {"data", 0, true, "key create / set, user add / set: a value handed to the device, name=value; "
+                          "repeat for more (set: replaces them all; --data '' clears them)"},
     });
     return specs;
 }
@@ -170,6 +172,30 @@ int prepare(int argc, char** argv, const char* usage, Args& args, CliClient& cli
 void rules(Args& args, json::Object& request) {
     if (args.has("publish")) request.raw("publish", json::array(args.all("publish")));
     if (args.has("subscribe")) request.raw("subscribe", json::array(args.all("subscribe")));
+}
+
+// --data name=value ..., as the request's "data" object. False, said, for one without "=".
+bool data(Args& args, json::Object& request) {
+    if (!args.has("data")) return true;
+    json::Object d;
+    for (const std::string& item : args.all("data")) {
+        if (item.empty()) continue;                      // --data '': none
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            std::fprintf(stderr, "modbee: --data takes name=value, not '%s'\n", item.c_str());
+            return false;
+        }
+        d.add(item.substr(0, eq), item.substr(eq + 1));
+    }
+    request.raw("data", d.str());
+    return true;
+}
+
+// A data object as "name=value, ...", or "-".
+std::string dataText(const json::Value& d) {
+    std::string out;
+    for (const auto& field : d.fields) out += (out.empty() ? "" : ", ") + field.first + "=" + field.second.text;
+    return out.empty() ? "-" : out;
 }
 
 } // namespace
@@ -238,6 +264,7 @@ int cmdUser(int argc, char** argv) {
         if (args.has("admin")) request.add("admin", true);
         if (args.has("fingerprint")) request.add("fingerprint", args.get("fingerprint"));
         rules(args, request);
+        if (!data(args, request)) return 2;
     } else if (action == "set") {
         // Only what was given changes: --fingerprint, --publish/--subscribe,
         // --admin/--no-admin, --secret.
@@ -247,6 +274,7 @@ int cmdUser(int argc, char** argv) {
         if (args.has("no-admin")) request.add("admin", false);
         if (args.has("secret")) request.add("password", args.get("secret"));
         rules(args, request);
+        if (!data(args, request)) return 2;
     } else if (action == "show") {
         request.add("command", "user.get").add("username", name);
     } else if (action == "remove" || action == "enable" || action == "disable" || action == "approve" ||
@@ -278,7 +306,7 @@ int cmdUser(int argc, char** argv) {
         const json::Value& u = reply["user"];
         std::printf("%s\n  status:          %s\n  password:        %s (never shown again; `modbee user reset` issues a new one)\n"
                     "  may publish:     %s\n  may subscribe:   %s\n  provisioned by:  %s\n  site:            %s\n  admin:           %s\n"
-                    "  certificate:     %s\n",
+                    "  certificate:     %s\n  data:            %s\n",
                     u.str("username").c_str(),
                     !u.flag("enabled") ? "disabled" : u.flag("pending") ? "pending approval" : "enabled",
                     u.str("password").c_str(), joined(u["publish"]).c_str(), joined(u["subscribe"]).c_str(),
@@ -286,7 +314,8 @@ int cmdUser(int argc, char** argv) {
                     u.str("site").empty() ? "-" : u.str("site").c_str(),
                     u.flag("admin") ? "yes" : "no",
                     u.str("fingerprint").empty() ? "any whose CN is this name (certificate-login)"
-                                                 : u.str("fingerprint").c_str());
+                                                 : u.str("fingerprint").c_str(),
+                    dataText(u["data"]).c_str());
     } else if (reply.has("password")) {
         std::printf("%s %s\n  password: %s\n  (shown once - it cannot be read back; `modbee user reset %s` "
                     "issues a new one)\n",
@@ -330,6 +359,14 @@ int cmdKey(int argc, char** argv) {
         }
         if (args.has("device")) request.add("device", args.get("device"));
         if (args.has("site")) request.add("site", args.get("site"));
+        if (!data(args, request)) return 2;
+    } else if (action == "set") {
+        if (name.empty() || !args.has("data")) {
+            std::fprintf(stderr, "usage: modbee key set <name> --data name=value [--data ...]\n");
+            return 2;
+        }
+        request.add("command", "key.set").add("name", name);
+        if (!data(args, request)) return 2;
     } else if (action == "list") {
         request.add("command", "key.list");
     } else if (action == "remove") {
@@ -352,15 +389,17 @@ int cmdKey(int argc, char** argv) {
                     name.c_str(), reply.str("key").c_str(), name.c_str());
     } else if (action == "list") {
         std::printf("%-20s %-12s %-9s %-10s %-12s %s\n", "KEY", "SITE", "APPROVAL", "USES LEFT", "DEVICE",
-                    "DEVICES MAY PUBLISH / SUBSCRIBE");
+                    "DEVICES MAY PUBLISH / SUBSCRIBE; DATA");
         for (const json::Value& k : reply["keys"].items) {
             const long long uses = k.integer("uses_left");
-            std::printf("%-20s %-12s %-9s %-10s %-12s %s / %s\n", k.str("name").c_str(),
+            std::printf("%-20s %-12s %-9s %-10s %-12s %s / %s; %s\n", k.str("name").c_str(),
                         k.str("site").empty() ? "-" : k.str("site").c_str(), k.str("approval").c_str(),
                         uses < 0 ? "unlimited" : std::to_string(uses).c_str(),
                         k.str("device").empty() ? "any" : k.str("device").c_str(),
-                        joined(k["publish"]).c_str(), joined(k["subscribe"]).c_str());
+                        joined(k["publish"]).c_str(), joined(k["subscribe"]).c_str(), dataText(k["data"]).c_str());
         }
+    } else if (action == "set") {
+        std::printf("key %s: data %s\n", name.c_str(), dataText(reply["key"]["data"]).c_str());
     } else {
         std::printf("removed key %s\n", name.c_str());
     }

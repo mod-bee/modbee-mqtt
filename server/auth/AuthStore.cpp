@@ -5,6 +5,8 @@
 
 #include "AuthStore.h"
 
+#include "Json.h"
+
 #include <ctime>
 
 #include <chrono>
@@ -48,7 +50,25 @@ int64_t now() {
 
 const char kUserColumns[] =
     "username, hash, generated, enabled, pending, admin, publish, subscribe, provisioned_by, created, updated, "
-    "fingerprint, site";
+    "fingerprint, site, data";
+
+// A login's or key's data: a JSON object of strings in one column ("" = none).
+std::string dataText(const std::map<std::string, std::string>& data) {
+    if (data.empty()) return std::string();
+    json::Object o;
+    for (const auto& item : data) o.add(item.first, item.second);
+    return o.str();
+}
+
+std::map<std::string, std::string> dataFrom(const std::string& text) {
+    std::map<std::string, std::string> out;
+    json::Value v;
+    if (text.empty() || !json::parse(text, v) || v.type != json::Value::Object) return out;
+    for (const auto& field : v.fields) {
+        if (field.second.type == json::Value::String) out[field.first] = field.second.text;
+    }
+    return out;
+}
 
 void readUser(sqlite3_stmt* s, AuthUser& u) {
     u.username = column(s, 0);
@@ -64,6 +84,7 @@ void readUser(sqlite3_stmt* s, AuthUser& u) {
     u.updated = sqlite3_column_int64(s, 10);
     u.fingerprint = column(s, 11);
     u.site = column(s, 12);
+    u.data = dataFrom(column(s, 13));
 }
 
 void readKey(sqlite3_stmt* s, AuthKey& k) {
@@ -77,12 +98,14 @@ void readKey(sqlite3_stmt* s, AuthKey& k) {
     k.device = column(s, 7);
     k.created = sqlite3_column_int64(s, 8);
     k.site = column(s, 9);
+    k.data = dataFrom(column(s, 10));
 }
 
-// The login store's shape. 2: keys and logins carry a site (2026-10-17).
-const char kSchema[] = "2";
+// The login store's shape. 2: keys and logins carry a site (2026-10-17). 3: and data (2026-10-18) - a
+// store of shape 2 gains the column in place, its logins and keys kept.
+const char kSchema[] = "3";
 
-const char kKeyColumns[] = "name, hash, manual, publish, subscribe, uses_left, expires, device, created, site";
+const char kKeyColumns[] = "name, hash, manual, publish, subscribe, uses_left, expires, device, created, site, data";
 
 struct Statement {
     sqlite3_stmt* s = nullptr;
@@ -126,12 +149,13 @@ bool AuthStore::open(const std::string& path, size_t readers, std::string& error
              " enabled INTEGER NOT NULL, pending INTEGER NOT NULL, admin INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, provisioned_by TEXT NOT NULL,"
              " created INTEGER NOT NULL, updated INTEGER NOT NULL,"
-             " fingerprint TEXT NOT NULL DEFAULT '', site TEXT NOT NULL DEFAULT '') WITHOUT ROWID") &&
+             " fingerprint TEXT NOT NULL DEFAULT '', site TEXT NOT NULL DEFAULT '',"
+             " data TEXT NOT NULL DEFAULT '') WITHOUT ROWID") &&
         exec("CREATE TABLE IF NOT EXISTS keys ("
              " name TEXT PRIMARY KEY, hash TEXT NOT NULL, manual INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, uses_left INTEGER NOT NULL,"
              " expires INTEGER NOT NULL, device TEXT NOT NULL, created INTEGER NOT NULL,"
-             " site TEXT NOT NULL)") &&
+             " site TEXT NOT NULL, data TEXT NOT NULL DEFAULT '')") &&
         exec("CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)") &&
         exec("CREATE TABLE IF NOT EXISTS settings ("
              " name TEXT PRIMARY KEY, value TEXT NOT NULL, updated INTEGER NOT NULL) WITHOUT ROWID") &&
@@ -148,6 +172,17 @@ bool AuthStore::open(const std::string& path, size_t readers, std::string& error
         // Finalised before any close below: SQLite will not close a connection with a statement open.
         Statement st(_writer, "SELECT value FROM meta WHERE name = 'schema'");
         if (st.ok() && st.step() == SQLITE_ROW) found = column(st.s, 0);
+    }
+    if (found == "2") {
+        // Shape 2 to 3: the data column, empty for every login and key already there.
+        if (!exec("ALTER TABLE users ADD COLUMN data TEXT NOT NULL DEFAULT ''") ||
+            !exec("ALTER TABLE keys ADD COLUMN data TEXT NOT NULL DEFAULT ''") ||
+            !exec((std::string("UPDATE meta SET value = '") + kSchema + "' WHERE name = 'schema'").c_str())) {
+            error = "cannot upgrade the login store " + path + ": " + sqlite3_errmsg(_writer);
+            close();
+            return false;
+        }
+        found = kSchema;
     }
     if (found != kSchema) {
         error = "the login store " + path + " was made by an earlier version (schema " + found +
@@ -197,7 +232,7 @@ AuthResult AuthStore::putUser(const AuthUser& u, bool replace) {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return AuthResult::Failed;
     const std::string sql = std::string(replace ? "INSERT OR REPLACE" : "INSERT") + " INTO users (" +
-                            kUserColumns + ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+                            kUserColumns + ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)";
     Statement st(_writer, sql.c_str());
     if (!st.ok()) return AuthResult::Failed;
     const int64_t t = now();
@@ -214,6 +249,7 @@ AuthResult AuthStore::putUser(const AuthUser& u, bool replace) {
     st.integer(11, t);
     st.text(12, u.fingerprint);
     st.text(13, u.site);
+    st.text(14, dataText(u.data));
     const int rc = st.step();
     if (rc == SQLITE_CONSTRAINT) return AuthResult::Exists;
     if (rc != SQLITE_DONE) return AuthResult::Failed;
@@ -273,11 +309,11 @@ size_t AuthStore::userCount() {
     return st.step() == SQLITE_ROW ? (size_t)sqlite3_column_int64(st.s, 0) : 0;
 }
 
-AuthResult AuthStore::putKey(const AuthKey& k) {
+AuthResult AuthStore::putKey(const AuthKey& k, bool replace) {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return AuthResult::Failed;
-    const std::string sql = std::string("INSERT INTO keys (") + kKeyColumns +
-                            ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)";
+    const std::string sql = std::string(replace ? "INSERT OR REPLACE" : "INSERT") + " INTO keys (" + kKeyColumns +
+                            ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)";
     Statement st(_writer, sql.c_str());
     st.text(1, k.name);
     st.text(2, k.hash);
@@ -289,6 +325,7 @@ AuthResult AuthStore::putKey(const AuthKey& k) {
     st.text(8, k.device);
     st.integer(9, k.created ? k.created : now());
     st.text(10, k.site);
+    st.text(11, dataText(k.data));
     const int rc = st.step();
     if (rc == SQLITE_CONSTRAINT) return AuthResult::Exists;
     if (rc != SQLITE_DONE) return AuthResult::Failed;

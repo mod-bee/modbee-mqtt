@@ -10,6 +10,7 @@
 
 #include "MqttTopic.h"
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -165,6 +166,34 @@ const char kFingerprintError[] =
     "fingerprint is the SHA-256 of the device's certificate: 64 hexadecimal characters "
     "(openssl x509 -noout -fingerprint -sha256 -in device.crt), or \"\" to clear it";
 
+// A login's or key's data as a JSON object (always one, {} when empty).
+std::string dataJson(const std::map<std::string, std::string>& data) {
+    json::Object o;
+    for (const auto& item : data) o.add(item.first, item.second);
+    return o.str();
+}
+
+// The data of an admin request: an object of strings, names of 1-32 letters, digits, - _ . and values of at
+// most 255 bytes, 16 at most. False, with `error` said, if it is anything else.
+bool requestData(const json::Value& request, std::map<std::string, std::string>& out, std::string& error) {
+    const json::Value& d = request["data"];
+    out.clear();
+    if (d.type == json::Value::Null) return true;
+    error = "data is an object of up to 16 names (1-32 letters, digits, - _ .) and text values (255 bytes at most)";
+    if (d.type != json::Value::Object || d.fields.size() > 16) return false;
+    for (const auto& field : d.fields) {
+        const std::string& name = field.first;
+        if (name.empty() || name.size() > 32 || field.second.type != json::Value::String || field.second.text.size() > 255) {
+            return false;
+        }
+        for (char c : name) {
+            if (!std::isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') return false;
+        }
+        out[name] = field.second.text;
+    }
+    return true;
+}
+
 std::string describeUser(const AuthUser& u) {
     json::Object o;
     o.add("username", u.username)
@@ -178,7 +207,8 @@ std::string describeUser(const AuthUser& u) {
         .add("site", u.site)
         .add("created", (long long)u.created)
         .add("updated", (long long)u.updated)
-        .add("fingerprint", u.fingerprint);
+        .add("fingerprint", u.fingerprint)
+        .raw("data", dataJson(u.data));
     return o.str();
 }
 
@@ -192,7 +222,8 @@ std::string describeKey(const AuthKey& k) {
         .add("expires", (long long)k.expires)
         .add("device", k.device)
         .add("site", k.site)
-        .add("created", (long long)k.created);
+        .add("created", (long long)k.created)
+        .raw("data", dataJson(k.data));
     return o.str();
 }
 
@@ -367,6 +398,9 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
     if (!c.found) return false;     // removed, disabled or pending since it connected
     if (c.admin) return true;
 
+    // Its own provisioning topics: a signed-in device asks again for its data (refresh), and hears the answer.
+    if (topic == std::string(kProvisionPrefix) + clientId + (publish ? "/request" : "/reply")) return safeName(clientId);
+
     // A shared subscription is judged by the filter inside it.
     if (!publish) {
         MqttSpan share, inner;
@@ -450,6 +484,7 @@ uint32_t AuthGate::offer(uint32_t shard, MqttBroker&, const MqttBrokerRouted& me
     const std::string clientId = text(message.clientId);
     Request request;
     request.clientId = clientId;
+    request.login = text(message.userName);
     request.payload = text(message.payload);
     if (topic == kAdminRequest) {
         // Only an admin could publish it: the hook refused everybody else.
@@ -508,7 +543,8 @@ void AuthGate::service(uint32_t shard, MqttBroker& broker) {
                 if (found != _provisioning.end()) keyName = found->second;
             }
             topic = std::string(kProvisionPrefix) + r.clientId + "/reply";
-            body = provision(r.clientId, keyName, r.payload);
+            body = r.login == kProvisionUser || r.login.empty() ? provision(r.clientId, keyName, r.payload)
+                                                                 : refresh(r.login);
         }
         MqttBrokerRouted out;
         out.topic = spanOf(topic);
@@ -590,6 +626,7 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
     user.generated = true;
     user.provisionedBy = key.name;
     user.site = key.site;
+    user.data = key.data;           // what the key hands its devices, as it is now
     if (!exists) {
         user.enabled = true;
         user.publish = key.publish;
@@ -607,8 +644,19 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
     if (user.pending) {
         o.add("status", "pending");
     } else {
-        o.add("status", "ok").add("username", name).add("password", secret);
+        o.add("status", "ok").add("username", name).add("password", secret).raw("data", dataJson(user.data));
     }
+    return o.str();
+}
+
+std::string AuthGate::refresh(const std::string& username) {
+    json::Object o;
+    AuthUser user;
+    if (!_store.findUser(username, user) || !user.enabled || user.pending) {
+        o.add("status", "refused").add("reason", "no usable login");
+        return o.str();
+    }
+    o.add("status", "ok").raw("data", dataJson(user.data));
     return o.str();
 }
 
@@ -641,6 +689,8 @@ std::string AuthGate::admin(const std::string& requestText) {
         if (request.has("fingerprint") && !certificateFingerprint(request.str("fingerprint"), u.fingerprint)) {
             return failure(request, kFingerprintError);
         }
+        std::string dataError;
+        if (!requestData(request, u.data, dataError)) return failure(request, dataError);
         const std::string chosen = request.str("password");
         const std::string secret = chosen.empty() ? auth::generateSecret(32) : chosen;
         u.generated = chosen.empty();
@@ -723,9 +773,15 @@ std::string AuthGate::admin(const std::string& requestText) {
             u.generated = false;
             kickAfter = changed = true;
         }
+        if (request.has("data")) {
+            // Replaces the whole set; the device has it at its next refresh. No reconnect needed.
+            std::string dataError;
+            if (!requestData(request, u.data, dataError)) return failure(request, dataError);
+            changed = true;
+        }
         if (!changed) {
-            return failure(request, "user.set changes fingerprint, publish, subscribe, admin, enabled "
-                                    "or password - the request named none of them");
+            return failure(request, "user.set changes fingerprint, publish, subscribe, admin, enabled, "
+                                    "password or data - the request named none of them");
         }
         if (_store.putUser(u, true) != AuthResult::Ok) return failure(request, "the login store could not be written");
         if (kickAfter) kick(username);
@@ -800,6 +856,8 @@ std::string AuthGate::admin(const std::string& requestText) {
         // keys without one share one site, as on a broker for a single site.
         k.site = request.str("site");
         if (!k.site.empty() && !keyNameOk(k.site)) return failure(request, "a site is 1-64 letters, digits, - or _");
+        std::string dataError;
+        if (!requestData(request, k.data, dataError)) return failure(request, dataError);
         const std::string secret = auth::generateSecret(32);
         k.hash = auth::hashGenerated(secret);
         const AuthResult r = _store.putKey(k);
@@ -819,6 +877,19 @@ std::string AuthGate::admin(const std::string& requestText) {
         }
         json::Object o;
         o.raw("keys", items + "]");
+        return reply(request, true, o);
+    }
+    if (command == "key.set") {
+        // A key's data: what the devices it registers from now on are handed. Devices it registered already
+        // keep theirs (user.set data changes those).
+        AuthKey k;
+        if (!_store.findKey(request.str("name"), k)) return failure(request, "no key " + request.str("name"));
+        if (!request.has("data")) return failure(request, "key.set changes data - the request named none");
+        std::string dataError;
+        if (!requestData(request, k.data, dataError)) return failure(request, dataError);
+        if (_store.putKey(k, true) != AuthResult::Ok) return failure(request, "the login store could not be written");
+        json::Object o;
+        o.raw("key", describeKey(k));
         return reply(request, true, o);
     }
     if (command == "key.remove") {

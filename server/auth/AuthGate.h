@@ -105,6 +105,8 @@ public:
     // The request handlers, callable directly (tests, and the CLI's own
     // offline commands): a request document in, a reply document out.
     std::string admin(const std::string& request);
+    // A signed-in device asking again for its data (its login's), with no new secret.
+    std::string refresh(const std::string& username);
     std::string provision(const std::string& clientId, const std::string& keyName,
                           const std::string& request);
 
@@ -124,6 +126,7 @@ private:
     struct Request {
         bool admin = false;
         std::string clientId;
+        std::string login;          // the publisher's login: "$provision", or a device asking again (refresh)
         std::string payload;
     };
     struct Shard {
