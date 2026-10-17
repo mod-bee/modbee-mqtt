@@ -50,11 +50,13 @@
     #define MQ_HAVE_EPOLL 1
 #endif
 
+#if defined(MQ_HAVE_EPOLL)
 namespace {
 // Events collected per wait. Level-triggered, so anything beyond this is
 // simply reported on the next wait rather than lost.
 const size_t kEventsPerWait = 4096;
 }
+#endif
 
 MqttPollSet::MqttPollSet() : _open(false) {}
 

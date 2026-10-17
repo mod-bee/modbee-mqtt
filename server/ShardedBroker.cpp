@@ -25,12 +25,14 @@
 
 namespace {
 
+#if defined(__linux__)
 // The token the wake-up eventfd is registered under in a shard's readiness
 // set. The broker ignores tokens that name no connection slot, and this one
-// cannot: no slot index is 0xFFFFFFFE.
+// cannot: no slot index is 0xFFFFFFFE. (Only Linux runs shards.)
 const uint64_t kWakeToken = 0xFFFFFFFFFFFFFFFEull;
 // And the extension's (ShardExtension::waitHandle), for the same reason.
 const uint64_t kExtensionToken = 0xFFFFFFFFFFFFFFFDull;
+#endif
 
 // Counters per shard for "might anybody here want this topic": one slot per
 // routing-key hash, 256 kB a shard. Collisions only ever make a shard look
@@ -223,6 +225,8 @@ struct ShardedBroker::Shard {
         }
 #if MQTT_TLS_SOCKETS
         if (context != nullptr) tlsListener.useContext(context);
+#else
+        (void)context;   // a build without a TLS engine has no listener to give it to
 #endif
     }
 

@@ -186,10 +186,13 @@ private:
     void (*_retarget)(void* transport, const char* host, uint16_t port) = nullptr;
     void (*_destroy)(void* transport) = nullptr;
 
-    // The same size MqttDevice gives a stream transport: a channel reference,
-    // a host pointer, a port and a few flags.
+#if defined(MQTT_PLATFORM_ARDUINO)
+    // Where a sketch's channel transport is built (only a board has one): the
+    // same size MqttDevice gives it - a channel reference, a host pointer, a
+    // port and a few flags.
     static const size_t kStorageSize = 64;
     alignas(void*) unsigned char _storage[kStorageSize];
+#endif
 
 #if defined(MQTT_PLATFORM_HOST)
     MqttTcpTransport _tcp;

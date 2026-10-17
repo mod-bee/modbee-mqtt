@@ -22,12 +22,15 @@ bool readText(const std::string& path, std::string& out) {
     return true;
 }
 
+#if MQTT_TLS_AVAILABLE
 // Where a piece of material came from, for a message that sends somebody to
-// the right place: the setting, and the file when it was one.
+// the right place: the setting, and the file when it was one. Only a build
+// with a TLS engine checks the material.
 std::string source(const char* setting, const std::string& file) {
     return file.empty() ? std::string("broker.tls.") + setting + "-pem"
                         : std::string("broker.tls.") + setting + " (" + file + ")";
 }
+#endif
 
 } // namespace
 

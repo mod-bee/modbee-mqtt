@@ -889,19 +889,24 @@ public:
     const MqttClientConfig& behaviour() const { return _behaviour; }
 
 private:
+#if defined(MQTT_PLATFORM_ARDUINO)
     // Big enough for MqttStreamTransport<anything>: a vtable pointer, a
     // reference, a string pointer and a port. Checked by a static_assert at
     // the point of construction rather than assumed.
     static const size_t kStorageSize = 64;
+#endif
 
     MqttClient _client;
     MqttTransport* _transport = nullptr;
 
-    // How to point the transport at a host, and how to take it down again.
-    // Null for a transport the caller brought, which is theirs to configure.
-    void (*_retarget)(void* transport, const char* host, uint16_t port) = nullptr;
+    // How to take an owned transport down again, and - for a sketch's channel
+    // transport, the only kind a board builds here - how to point it at a
+    // host, and where it lives. Null for a transport the caller brought.
     void (*_destroy)(void* transport) = nullptr;
+#if defined(MQTT_PLATFORM_ARDUINO)
+    void (*_retarget)(void* transport, const char* host, uint16_t port) = nullptr;
     alignas(void*) unsigned char _storage[kStorageSize];
+#endif
 
     // False for a transport the caller brought and configured. We point ours
     // at a host in connect(); theirs we leave entirely alone, because a class
