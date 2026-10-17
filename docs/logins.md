@@ -75,10 +75,11 @@ device a new one, and the old one stops working.
 
 ## Devices that register themselves
 
-Create a **provisioning key** once, for a site or a product:
+Create a **provisioning key** once, for a site or a product, and name the
+site its devices belong to:
 
 ```bash
-docker compose exec modbee modbee key create site-north \
+docker compose exec modbee modbee key create site-north --site north \
   --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 ```
 
@@ -118,13 +119,17 @@ page *13 Provisioning* has the whole of it.
 
 | Situation | What happens |
 | --- | --- |
-| A board is replaced | Flash the new one with the same key and name. It registers, gets a new login, and the old board's login stops working |
+| A board is replaced | Flash the new one with the same name and a key of the same site. It registers, gets a new login, and the old board's login stops working |
 | A device's flash is wiped | It has no login, so it registers again |
 | You reset a device (`modbee user reset`) | Its stored login is refused, so it registers again by itself - no site visit |
 | You disable a device | It stays out: registering again does not undo it |
 | You remove the key (`modbee key remove`) | No new device can register with it; devices already registered keep working |
+| You issue a new key for the site | Devices keep working (they log in with their own login, not the key); a new or wiped device registers with the new key |
+| A key of **another** site is used with a device's name | Refused: a key registers again only devices of its own site, so one customer's key cannot take another's device |
 
 A login **you** added by hand is never taken over by a device holding a key.
+A key that wants each device approved (`--approval manual`) holds a device that
+registers again as well: it waits, pending, until you approve it.
 
 ### Options for a key
 
@@ -133,7 +138,8 @@ A login **you** added by hand is never taken over by a device holding a key.
 | `--approval manual` | A new device waits until you approve it: `modbee user list` shows it `pending`, `modbee user approve tank-07` lets it in. Without this, devices are let in straight away |
 | `--uses 50` | At most 50 devices may register with it |
 | `--days 30` | It stops working after 30 days |
-| `--device tank-07` | It may register only that one device - a single-use key, e.g. one your platform creates for a device it is setting up |
+| `--site north` | The site its devices belong to. A key registers again only devices of its own site; keys without a site share one (a broker for one site needs none) |
+| `--device tank-07` | It may register only that one device, and every claim uses it up (`--uses 1`: claimed once) - e.g. a key your platform creates for one device it is setting up or replacing |
 
 `modbee key list` shows every key; `modbee key remove site-north` retires one.
 

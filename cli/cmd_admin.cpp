@@ -138,6 +138,7 @@ const std::vector<ArgSpec>& adminSpecs() {
         {"uses", 0, true, "key create: how many devices it may create (default unlimited)"},
         {"days", 0, true, "key create: expires after this many days (default never)"},
         {"device", 0, true, "key create: the one device name it may create"},
+        {"site", 0, true, "key create: the site its devices belong to; it re-provisions only those"},
     });
     return specs;
 }
@@ -276,12 +277,13 @@ int cmdUser(int argc, char** argv) {
     if (action == "show") {
         const json::Value& u = reply["user"];
         std::printf("%s\n  status:          %s\n  password:        %s (never shown again; `modbee user reset` issues a new one)\n"
-                    "  may publish:     %s\n  may subscribe:   %s\n  provisioned by:  %s\n  admin:           %s\n"
+                    "  may publish:     %s\n  may subscribe:   %s\n  provisioned by:  %s\n  site:            %s\n  admin:           %s\n"
                     "  certificate:     %s\n",
                     u.str("username").c_str(),
                     !u.flag("enabled") ? "disabled" : u.flag("pending") ? "pending approval" : "enabled",
                     u.str("password").c_str(), joined(u["publish"]).c_str(), joined(u["subscribe"]).c_str(),
                     u.str("provisioned_by").empty() ? "-" : u.str("provisioned_by").c_str(),
+                    u.str("site").empty() ? "-" : u.str("site").c_str(),
                     u.flag("admin") ? "yes" : "no",
                     u.str("fingerprint").empty() ? "any whose CN is this name (certificate-login)"
                                                  : u.str("fingerprint").c_str());
@@ -327,6 +329,7 @@ int cmdKey(int argc, char** argv) {
             request.add("days", n);
         }
         if (args.has("device")) request.add("device", args.get("device"));
+        if (args.has("site")) request.add("site", args.get("site"));
     } else if (action == "list") {
         request.add("command", "key.list");
     } else if (action == "remove") {
@@ -348,10 +351,12 @@ int cmdKey(int argc, char** argv) {
                     "  themselves with it. `modbee key remove %s` stops it working.)\n",
                     name.c_str(), reply.str("key").c_str(), name.c_str());
     } else if (action == "list") {
-        std::printf("%-20s %-9s %-10s %-12s %s\n", "KEY", "APPROVAL", "USES LEFT", "DEVICE", "DEVICES MAY PUBLISH / SUBSCRIBE");
+        std::printf("%-20s %-12s %-9s %-10s %-12s %s\n", "KEY", "SITE", "APPROVAL", "USES LEFT", "DEVICE",
+                    "DEVICES MAY PUBLISH / SUBSCRIBE");
         for (const json::Value& k : reply["keys"].items) {
             const long long uses = k.integer("uses_left");
-            std::printf("%-20s %-9s %-10s %-12s %s / %s\n", k.str("name").c_str(), k.str("approval").c_str(),
+            std::printf("%-20s %-12s %-9s %-10s %-12s %s / %s\n", k.str("name").c_str(),
+                        k.str("site").empty() ? "-" : k.str("site").c_str(), k.str("approval").c_str(),
                         uses < 0 ? "unlimited" : std::to_string(uses).c_str(),
                         k.str("device").empty() ? "any" : k.str("device").c_str(),
                         joined(k["publish"]).c_str(), joined(k["subscribe"]).c_str());

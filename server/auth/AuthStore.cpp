@@ -48,7 +48,7 @@ int64_t now() {
 
 const char kUserColumns[] =
     "username, hash, generated, enabled, pending, admin, publish, subscribe, provisioned_by, created, updated, "
-    "fingerprint";
+    "fingerprint, site";
 
 void readUser(sqlite3_stmt* s, AuthUser& u) {
     u.username = column(s, 0);
@@ -63,6 +63,7 @@ void readUser(sqlite3_stmt* s, AuthUser& u) {
     u.created = sqlite3_column_int64(s, 9);
     u.updated = sqlite3_column_int64(s, 10);
     u.fingerprint = column(s, 11);
+    u.site = column(s, 12);
 }
 
 void readKey(sqlite3_stmt* s, AuthKey& k) {
@@ -75,9 +76,10 @@ void readKey(sqlite3_stmt* s, AuthKey& k) {
     k.expires = sqlite3_column_int64(s, 6);
     k.device = column(s, 7);
     k.created = sqlite3_column_int64(s, 8);
+    k.site = column(s, 9);
 }
 
-const char kKeyColumns[] = "name, hash, manual, publish, subscribe, uses_left, expires, device, created";
+const char kKeyColumns[] = "name, hash, manual, publish, subscribe, uses_left, expires, device, created, site";
 
 struct Statement {
     sqlite3_stmt* s = nullptr;
@@ -137,10 +139,13 @@ bool AuthStore::open(const std::string& path, size_t readers, std::string& error
         // it is added in place - empty, which is what "no certificate bound"
         // means - rather than the server refusing every login over it.
         hasColumn("users", "fingerprint", "TEXT NOT NULL DEFAULT ''") &&
+        // Likewise the site (a file made before keys and logins had one): "" = no site.
+        hasColumn("users", "site", "TEXT NOT NULL DEFAULT ''") &&
         exec("CREATE TABLE IF NOT EXISTS keys ("
              " name TEXT PRIMARY KEY, hash TEXT NOT NULL, manual INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, uses_left INTEGER NOT NULL,"
              " expires INTEGER NOT NULL, device TEXT NOT NULL, created INTEGER NOT NULL)") &&
+        hasColumn("keys", "site", "TEXT NOT NULL DEFAULT ''") &&
         exec("CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)") &&
         exec("CREATE TABLE IF NOT EXISTS settings ("
              " name TEXT PRIMARY KEY, value TEXT NOT NULL, updated INTEGER NOT NULL) WITHOUT ROWID") &&
@@ -192,7 +197,7 @@ AuthResult AuthStore::putUser(const AuthUser& u, bool replace) {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return AuthResult::Failed;
     const std::string sql = std::string(replace ? "INSERT OR REPLACE" : "INSERT") + " INTO users (" +
-                            kUserColumns + ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)";
+                            kUserColumns + ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
     Statement st(_writer, sql.c_str());
     if (!st.ok()) return AuthResult::Failed;
     const int64_t t = now();
@@ -208,6 +213,7 @@ AuthResult AuthStore::putUser(const AuthUser& u, bool replace) {
     st.integer(10, u.created ? u.created : t);
     st.integer(11, t);
     st.text(12, u.fingerprint);
+    st.text(13, u.site);
     const int rc = st.step();
     if (rc == SQLITE_CONSTRAINT) return AuthResult::Exists;
     if (rc != SQLITE_DONE) return AuthResult::Failed;
@@ -271,7 +277,7 @@ AuthResult AuthStore::putKey(const AuthKey& k) {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return AuthResult::Failed;
     const std::string sql = std::string("INSERT INTO keys (") + kKeyColumns +
-                            ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+                            ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)";
     Statement st(_writer, sql.c_str());
     st.text(1, k.name);
     st.text(2, k.hash);
@@ -282,6 +288,7 @@ AuthResult AuthStore::putKey(const AuthKey& k) {
     st.integer(7, k.expires);
     st.text(8, k.device);
     st.integer(9, k.created ? k.created : now());
+    st.text(10, k.site);
     const int rc = st.step();
     if (rc == SQLITE_CONSTRAINT) return AuthResult::Exists;
     if (rc != SQLITE_DONE) return AuthResult::Failed;

@@ -175,6 +175,7 @@ std::string describeUser(const AuthUser& u) {
         .raw("publish", json::array(u.publish))
         .raw("subscribe", json::array(u.subscribe))
         .add("provisioned_by", u.provisionedBy)
+        .add("site", u.site)
         .add("created", (long long)u.created)
         .add("updated", (long long)u.updated)
         .add("fingerprint", u.fingerprint);
@@ -190,6 +191,7 @@ std::string describeKey(const AuthKey& k) {
         .add("uses_left", (long long)k.usesLeft)
         .add("expires", (long long)k.expires)
         .add("device", k.device)
+        .add("site", k.site)
         .add("created", (long long)k.created);
     return o.str();
 }
@@ -551,9 +553,8 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
     AuthUser existing;
     const bool exists = _store.findUser(name, existing);
     if (exists && (existing.admin || existing.provisionedBy.empty())) {
-        // Owner's rule: re-provisioning is always allowed with a valid key -
-        // for devices that were PROVISIONED. A login an admin added by hand,
-        // or an admin, cannot be taken over by anyone holding a site key.
+        // A login an admin added by hand, or an admin, cannot be taken over
+        // by anyone holding a key.
         return refused("that name has a login an admin created; an admin must reset it");
     }
     if (exists && !existing.enabled) {
@@ -566,22 +567,40 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
         o.add("status", "pending");
         return o.str();
     }
-    if (!exists && !_store.spendKey(keyName)) return refused("the provisioning key has no uses left");
+    if (exists) {
+        // Re-provisioning (a replaced or wiped device gets a new secret, the
+        // old one stops working) stays inside the device's own site: a key of
+        // another site - another customer - must not take its login, its
+        // topic rights and its place on the broker.
+        std::string site = existing.site;
+        AuthKey made;
+        if (site.empty() && _store.findKey(existing.provisionedBy, made)) site = made.site;
+        if (site != key.site) return refused("that name belongs to another site; an admin must reset it");
+    }
+    // Approved, its secret not collected yet: the device that waited takes it now.
+    const bool collecting = exists && existing.hash.empty();
+    // A key's uses count the devices it lets in: a site key's new devices, and
+    // every claim of a key made for one device, which is then spent.
+    if ((!exists || (!key.device.empty() && !collecting)) && !_store.spendKey(keyName)) {
+        return refused("the provisioning key has no uses left");
+    }
 
     const std::string secret = auth::generateSecret(32);
     AuthUser user = exists ? existing : AuthUser();
     user.username = name;
-    user.hash = auth::hashGenerated(secret);
     user.generated = true;
+    user.provisionedBy = key.name;
+    user.site = key.site;
     if (!exists) {
         user.enabled = true;
-        user.pending = key.manualApproval;
         user.publish = key.publish;
         user.subscribe = key.subscribe;
-        user.provisionedBy = key.name;
-    } else {
-        user.provisionedBy = key.name;
     }
+    // A key that wants each device approved holds a new or re-provisioned one
+    // pending, with no usable secret, until an admin approves it; the device
+    // asks again and collects its secret then.
+    user.pending = key.manualApproval && !collecting;
+    user.hash = user.pending ? std::string() : auth::hashGenerated(secret);
     if (_store.putUser(user, true) != AuthResult::Ok) return refused("the login store could not be written");
     if (exists) kick(name);   // the old secret, and any device still using it, are done
     _provisioned.fetch_add(1, std::memory_order_relaxed);
@@ -778,6 +797,9 @@ std::string AuthGate::admin(const std::string& requestText) {
         k.expires = days > 0 ? nowSeconds() + days * 86400 : request.integer("expires", 0);
         k.device = request.str("device");
         if (!k.device.empty() && !safeName(k.device)) return failure(request, "device is not a valid name");
+        // The site its devices belong to: a key re-provisions only devices of its own site.
+        k.site = request.str("site");
+        if (!k.site.empty() && !keyNameOk(k.site)) return failure(request, "a site is 1-64 letters, digits, - or _");
         const std::string secret = auth::generateSecret(32);
         k.hash = auth::hashGenerated(secret);
         const AuthResult r = _store.putKey(k);

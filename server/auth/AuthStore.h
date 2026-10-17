@@ -48,6 +48,9 @@ struct AuthUser {
     // (authentication.certificate-login): 64 lowercase hex, or "" for any
     // certificate whose CN is this login's name.
     std::string fingerprint;
+    // The site the login belongs to: the site of the key that provisioned it. A key re-provisions only
+    // logins of its own site, so one customer's key cannot take over another's device. "" = no site.
+    std::string site;
 };
 
 struct AuthKey {
@@ -60,6 +63,7 @@ struct AuthKey {
     int64_t expires = 0;                 // UTC seconds; 0: never
     std::string device;                  // "" or the one device name it may create
     int64_t created = 0;
+    std::string site;                    // the site its devices belong to; "" = no site
 };
 
 enum class AuthResult { Ok, NotFound, Exists, Invalid, Failed };
