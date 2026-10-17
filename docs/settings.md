@@ -24,8 +24,8 @@ it.
 
 - **`authentication: database:`** - in the file, or as
   `MODBEE_AUTHENTICATION_DATABASE`. The settings are kept in the same SQLite
-  file as the logins, in a table of their own. `docker/stack/` and
-  `docker/all-in-one/` already have it.
+  file as the logins, in a table of their own. The `docker/examples` setups
+  already have it.
 - **The server started with a file** (`modbee serve -C modbee.yaml`). The
   Docker image always is: `/etc/modbee/modbee.yaml`.
 - **An admin login**, as for managing logins.

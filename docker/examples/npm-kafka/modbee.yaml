@@ -1,0 +1,70 @@
+# modbee.yaml for docker/examples/npm-kafka - docs/kafka.md describes every key.
+# Nginx Proxy Manager in front does TLS (port 8883), so the broker listens in
+# plain MQTT on the private Docker network only. Because NPM ends TLS, devices
+# can not sign in with a client certificate, and they should check the
+# certificate against the public roots, not pin its key (Let's Encrypt renewals
+# change it).
+# `docker compose exec modbee modbee check` validates this file.
+
+broker:
+  port: 1883
+  shards: 1                  # one worker thread: a small server
+  max-connections: 2000
+
+# Logins. The admin (MQTT_USERNAME / MQTT_PASSWORD in .env) is for you, your
+# apps and the modbee command. Every device gets a login of its own, kept in
+# the modbee-data volume and changed live, no restart (README.md, docs/logins.md).
+# A login may use only the topics it was given: nothing is open by default.
+authentication:
+  database: /var/lib/modbee/auth.db
+  default-topics: none
+
+metrics:
+  port: 9464                 # Prometheus /metrics, inside the Docker network only
+
+# What clients do - connected, disconnected, subscribed, unsubscribed - is
+# published on $modbee/events/... and written to Kafka (modbee-events, below).
+# A SCADA learns from it which devices are online. docs/events.md.
+events:
+  enabled: true
+
+# Retained messages are kept in Kafka as well as memory (the compacted topic
+# modbee-retained, created by modbee), so a restart or an upgrade keeps them.
+retained:
+  store: kafka
+
+kafka:
+  clusters:
+    - id: main
+      bootstrap-servers: kafka:9092
+
+  mqtt-to-kafka:
+    # Every MQTT message, to the Kafka topic mqtt-messages: the payload as it
+    # is, and headers with the MQTT topic, QoS, retain flag and properties.
+    # The record's key is the publisher's client id, so each device's messages
+    # stay in order (one partition per device).
+    - id: messages
+      mqtt-topic-filters: ["#"]
+      kafka-topic: mqtt-messages
+      key: clientid
+      headers: all
+
+    # The client events. "#" never matches a topic starting with "$", so they
+    # need a mapping of their own.
+    - id: events
+      mqtt-topic-filters: ["$modbee/events/#"]
+      kafka-topic: modbee-events
+      key: clientid
+      headers: all
+
+  kafka-to-mqtt:
+    # A record written to the Kafka topic mqtt-commands is published to MQTT:
+    #  - with the header mqtt-topic: as its mqtt-* headers say - the topic, QoS,
+    #    retain flag and properties (the same headers mqtt-messages carries), so
+    #    a retained setpoint arrives retained;
+    #  - without it: on the topic in the record's key, at QoS 1 - key
+    #    "plant/pump-7/cmd", value "start" is "start" on plant/pump-7/cmd.
+    - id: commands
+      kafka-topics: [mqtt-commands]
+      from-headers: true
+      mqtt-topic: "${KAFKA_KEY}"

@@ -1,15 +1,19 @@
-# modbee (MQTT broker) and Kafka, for a server with Nginx Proxy Manager (NPM).
-# Fixed network and addresses; NPM forwards to them. Nothing is published.
+# modbee and Kafka on a server that already runs Nginx Proxy Manager (NPM).
+# NPM does TLS with its Let's Encrypt certificate and forwards to these fixed
+# addresses; nothing here is published on the server's ports.
 # Sized for a small server (1 CPU, 2 GB): together under 1 GB.
 #
-#   modbee   10.80.80.10   MQTT 1883
-#   kafka    10.80.80.11   Kafka 9092 (inside), 9095 (with a password, for NPM)
-
-name: modbee-broker
+#   modbee   10.80.80.10   MQTT 1883             NPM stream 8883 -> here
+#   kafka    10.80.80.11   Kafka 9095 (password)  NPM stream 9093 -> here
+#                          Kafka 9092 (inside Docker only)
+#
+#   cp .env.example .env      # set DOMAIN, MQTT_PASSWORD and KAFKA_PASSWORD
+#   docker compose up -d      # then the two NPM streams: README.md
+name: modbee-npm-kafka
 
 services:
   modbee:
-    image: ghcr.io/mod-bee/modbee-mqtt:latest
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
     restart: unless-stopped
     depends_on:
       kafka-topics: {condition: service_completed_successfully}
@@ -52,7 +56,9 @@ services:
     networks:
       modbee: {ipv4_address: 10.80.80.11}
 
-  # Creates the two topics once, then exits.
+  # Creates the Kafka topics modbee.yaml uses, once, before modbee starts (a
+  # topic Kafka creates on its first record is joined after that record, which
+  # is then never read), then exits. Add a topic here when you add a mapping.
   kafka-topics:
     image: apache/kafka:4.3.1
     mem_limit: 256m
@@ -63,7 +69,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        for t in mqtt-messages mqtt-commands; do
+        for t in mqtt-messages mqtt-commands modbee-events; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t --partitions 6 || exit 1
         done
     restart: "no"

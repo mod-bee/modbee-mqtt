@@ -33,15 +33,16 @@ them commands, and a working Node.js app.
 
 The image `ghcr.io/mod-bee/modbee-mqtt` has the pipe built in.
 `docker/compose.yml` runs it beside a single Kafka node to try it.
-`docker/all-in-one/` runs modbee, Kafka and a Let's Encrypt certificate
-together on a server, with nothing to set up but a domain name, and
-`docker/stack/` is the same without Kafka, for one you already run.
+The `*-kafka` folders of [`docker/examples/`](../docker/examples) run modbee
+and Kafka together on a server - on your own network, or on the internet behind
+Traefik or Nginx Proxy Manager - with nothing to set up but passwords and a
+domain name.
 [docker.md](docker.md) walks through each, through connecting your own
 programs to that Kafka, and through using a Nginx Proxy Manager you already
 have.
 
 ```bash
-docker compose -f docker/compose.yml up -d --build    # --build: until the image is published
+docker compose -f docker/compose.yml up -d
 modbee pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
 ```
 
@@ -145,7 +146,7 @@ written twice, and retries never reorder a partition. Setting a mapping to
   For **one mapping that carries everything** (`mqtt-topic-filters: ["#"]`),
   `clientid` is the one to choose: it keeps the order MQTT itself promises,
   each publisher's messages as it sent them, which `topic` does not once one
-  device publishes on several topics. `docker/all-in-one` ships this way. The
+  device publishes on several topics. The `docker/examples` ship this way. The
   topic is then read from the `mqtt-topic` header (`headers: all`).
 
 - **Headers** (`headers:`): none by default. `headers: all` writes every one
@@ -218,7 +219,7 @@ written twice, and retries never reorder a partition. Setting a mapping to
   `properties:`.
 - **Create a topic before writing to it.** If Kafka creates the topic on its
   first record, modbee joins it after that record, which is then never read.
-  `docker/all-in-one` creates its topics before modbee starts.
+  The `docker/examples` create their topics before modbee starts.
 
 **No loops.** A message read from Kafka topic T is never written back to T by
 an mqtt-to-kafka mapping, even when its filters match. It is still written to
@@ -251,7 +252,7 @@ starting with `$`. [events.md](events.md) has the messages.
 
 Births, data, deaths (through Wills), commands and STATE all pass as they
 are. With a mapping keyed by publisher - `key: clientid`, as
-`docker/all-in-one` ships - nothing Sparkplug-specific is needed: a node's
+the `docker/examples` ship - nothing Sparkplug-specific is needed: a node's
 NBIRTH, NDATA and DDATA, and its Will (NDEATH), all carry its client id, so
 they share a partition and are read in the order they were published, which
 keeps Sparkplug's `seq` in order.

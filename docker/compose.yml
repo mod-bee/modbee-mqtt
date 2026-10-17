@@ -4,7 +4,7 @@
 #   modbee pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
 #
 # Plain MQTT on 1883 and metrics on 9464. For a server on the internet with a
-# certificate, use docker/stack/ instead (docs/docker.md).
+# certificate, use a folder of docker/examples/ instead (docs/docker.md).
 #
 # One Kafka node with no replication: for trying it out, not for production.
 # Every service has a memory limit - without one a JVM sizes itself from the

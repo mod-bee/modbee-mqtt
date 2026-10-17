@@ -1,0 +1,89 @@
+# modbee and Kafka on your own network - a LAN, a VPN or a private cloud
+# network. Every MQTT message lands in Kafka; Kafka apps send commands back.
+# Not for the open internet: use ../traefik-kafka or ../npm-kafka for that.
+#
+#   cp .env.example .env      # set MQTT_PASSWORD
+#   docker compose up -d
+#
+# Where to reach them:
+#   devices                          mqtt://<this server>:1883
+#   apps in Docker (network modbee)  modbee:1883, kafka:9092
+#   apps on this server              localhost:9094 (Kafka)
+#   apps on other machines           set KAFKA_BIND and KAFKA_EXTERNAL_HOST in .env
+#
+# README.md has the rest.
+name: modbee-broker-kafka
+
+services:
+  modbee:
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      kafka-topics: {condition: service_completed_successfully}
+    environment:
+      MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
+      MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+    ports:
+      - "${MQTT_BIND:-0.0.0.0}:${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
+      - modbee-data:/var/lib/modbee        # logins
+    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
+    mem_limit: 1g
+
+  # One Kafka node (KRaft), its data in the volume kafka-data.
+  #   kafka:9092  for containers on the network "modbee" - modbee uses this
+  #   :9094       for everything outside Docker, published on KAFKA_BIND (this
+  #               server only, by default). No password: keep it off the internet.
+  kafka:
+    image: apache/kafka:4.3.1
+    restart: unless-stopped
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx1g -Xms1g"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:${KAFKA_PORT:-9094}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    ports:
+      - "${KAFKA_BIND:-127.0.0.1}:${KAFKA_PORT:-9094}:9094"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9092'"]
+      interval: 10s
+      retries: 30
+    mem_limit: 2g
+
+  # Creates the Kafka topics modbee.yaml uses, once, before modbee starts (a
+  # topic Kafka creates on its first record is joined after that record, which
+  # is then never read), then exits. Add a topic here when you add a mapping.
+  kafka-topics:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka: {condition: service_healthy}
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx128m"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for t in mqtt-messages mqtt-commands modbee-events; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t --partitions 6 || exit 1
+        done
+    restart: "no"
+    mem_limit: 512m
+
+networks:
+  default:
+    name: ${MODBEE_NETWORK:-modbee}
+
+volumes:
+  modbee-data:
+  kafka-data:

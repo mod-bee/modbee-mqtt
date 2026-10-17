@@ -10,26 +10,21 @@ or 5, an ARM cloud server).
 
 | You want | Use | Takes |
 | --- | --- | --- |
-| Just an MQTT broker | [one command](#just-the-broker) | a minute |
+| Just an MQTT broker, to try | [one command](#just-the-broker) | a minute |
 | To try the Kafka pipe on this computer | [`docker/compose.yml`](#try-it-with-kafka) | five minutes |
-| A broker on the internet, with a real certificate (Kafka optional, your own) | [`docker/stack/`](#on-the-internet-with-a-certificate) | ten minutes and a domain name |
-| The same, **with Kafka included**, all in one file | [`docker/all-in-one/`](#everything-in-one-file-broker-certificate-and-kafka) | ten minutes and a domain name |
-| Either of those behind a Nginx Proxy Manager you already run | [the NPM route](#already-running-nginx-proxy-manager) | ten minutes |
+| **A server in production** | [`docker/examples/`](../docker/examples) - pick yours below | ten minutes |
 
-In none of them do you copy a certificate file, write a path to one, or renew
-one. The two that put the broker on the internet also require every device to
-**log in**, each with a login of its own that you can add, reset and remove
-while it runs ([logins.md](logins.md)).
+| Your server | Without Kafka | With Kafka |
+| --- | --- | --- |
+| Your own network - a LAN, a VPN, a private cloud network | [`broker`](../docker/examples/broker) | [`broker-kafka`](../docker/examples/broker-kafka) |
+| On the internet, nothing else running - [Traefik](#on-the-internet-with-a-certificate) gets the certificate | [`traefik`](../docker/examples/traefik) | [`traefik-kafka`](../docker/examples/traefik-kafka) |
+| On the internet, [Nginx Proxy Manager](#already-running-nginx-proxy-manager) already running | [`npm`](../docker/examples/npm) | [`npm-kafka`](../docker/examples/npm-kafka) |
 
-**Until the image is published**, build it from this checkout: the compose
-files below each have a `build:` beside their `image:`, so
-`docker compose up -d --build` builds it (a few minutes, the first time) and
-then starts everything. That needs the compose file where it is, inside the
-repository. Once the image is published, `--build` can be left off, and the
-files can be copied anywhere. `MODBEE_IMAGE` in `.env` names another image -
-your own registry's, say - for the stack to run instead. For the `docker run`
-commands, build it once under the published name, from the repository root:
-`docker build -t ghcr.io/mod-bee/modbee-mqtt -f docker/Dockerfile .`
+Each folder is four files - `compose.yml`, `modbee.yaml`, `.env.example` and a
+README with the steps - that run the published image and can be copied
+anywhere. In none of them do you copy a certificate file, write a path to one,
+or renew one. All six require every device to **log in**, each with a login of
+its own that you can add, reset and remove while it runs ([logins.md](logins.md)).
 
 ---
 
@@ -62,7 +57,7 @@ docker exec modbee modbee pub -t test/hello -m hi -q 1
 
 ```bash
 git clone https://github.com/mod-bee/modbee-mqtt && cd modbee-mqtt
-docker compose -f docker/compose.yml up -d --build    # --build: until the image is published
+docker compose -f docker/compose.yml up -d
 docker compose -f docker/compose.yml exec modbee modbee pub -t plant/tank-01/level -m 4.25 -q 1
 ```
 
@@ -76,30 +71,28 @@ If something else already uses port 1883:
 
 This Kafka is for trying things out: one node, no replication, nothing kept
 when it is removed, and reachable only from inside the compose project. For
-Kafka you can connect to and keep, use [`docker/all-in-one/`](#everything-in-one-file-broker-certificate-and-kafka);
+Kafka you can connect to and keep, use a `*-kafka` folder of [`docker/examples/`](../docker/examples);
 for a cluster you already run, see [Your own Kafka](#your-own-kafka).
 
 ---
 
 ## On the internet, with a certificate
 
-`docker/stack/` is three files: `compose.yml`, `.env.example` and
-`modbee.yaml`. It runs **Traefik** in front of modbee. Traefik fetches a free
-Let's Encrypt certificate for your domain, renews it before it expires, and
-does the TLS. There is no Kafka in it: the pipe is off until you point
-`modbee.yaml` at [your own Kafka](#your-own-kafka). For Kafka included, use
-[`docker/all-in-one/`](#everything-in-one-file-broker-certificate-and-kafka)
-instead - everything below applies to it too.
+[`docker/examples/traefik/`](../docker/examples/traefik) runs **Traefik** in
+front of modbee. Traefik fetches a free Let's Encrypt certificate for your
+domain, renews it before it expires, and does the TLS. For Kafka included, use
+[`docker/examples/traefik-kafka/`](#on-the-internet-with-kafka) instead -
+everything below applies to it too.
 
 **Before you start:** a domain name (say `mqtt.example.com`) whose DNS points
 at the server, and ports **80** and **8883** open to the internet. Port 80 is
 how Let's Encrypt checks the domain is yours; 8883 is where devices connect.
 
 ```bash
-cd docker/stack                 # or copy these three files anywhere
+cd docker/examples/traefik      # or copy its files anywhere
 cp .env.example .env
 nano .env                       # set DOMAIN, EMAIL and MQTT_PASSWORD - the only three settings
-docker compose up -d --build    # --build: until the image is published
+docker compose up -d
 ```
 
 A minute later the certificate is in place. Check from any computer with
@@ -145,23 +138,24 @@ Good to know:
   cross the LAN readable; keep that port off the internet.
 - **The broker sees Traefik's address**, not the device's, for each
   connection. Traefik's own log has the devices' addresses.
-- The stack's name is `modbee-stack` (`modbee-all-in-one` for the one with
-  Kafka), so the two can run on one server side by side:
-  `docker compose logs -f modbee`, `docker compose ps`.
+- **Traefik ends TLS**, so devices cannot sign in with a client certificate,
+  and must not pin the certificate's key - every renewal brings a new one.
+  They check the certificate against the public roots.
 
 ---
 
-## Everything in one file: broker, certificate and Kafka
+## On the internet, with Kafka
 
-`docker/all-in-one/` is `docker/stack/` with a Kafka server added: Traefik for
-the certificate, modbee, and one Kafka node with its data kept in a volume.
-The same three files, and the same three settings:
+[`docker/examples/traefik-kafka/`](../docker/examples/traefik-kafka) is
+`traefik` with a Kafka server added: Traefik for the certificate, modbee, and
+one Kafka node with its data kept in a volume. The same steps, with a Kafka
+password as well:
 
 ```bash
-cd docker/all-in-one            # or copy these three files anywhere
+cd docker/examples/traefik-kafka    # or copy its files anywhere
 cp .env.example .env
-nano .env                       # set DOMAIN, EMAIL and MQTT_PASSWORD
-docker compose up -d --build    # --build: until the image is published
+nano .env                           # set DOMAIN, EMAIL, MQTT_PASSWORD and KAFKA_PASSWORD
+docker compose up -d
 ```
 
 Devices connect to **`mqtts://mqtt.example.com:8883`**, as above, and as it
@@ -172,11 +166,15 @@ ships:
   read in the order it sent them; its value is the payload exactly as sent;
   and its headers carry the topic (`mqtt-topic`), QoS and MQTT 5 properties.
   The publisher's PUBACK comes back only once Kafka has the record.
-- **a record written to the Kafka topic `mqtt-commands` is published to MQTT**,
-  on the topic named by its key.
+- **what clients do goes to the Kafka topic `modbee-events`** - connected,
+  disconnected, subscribed ([events.md](events.md)), so a SCADA knows which
+  devices are online.
+- **a record written to the Kafka topic `mqtt-commands` is published to MQTT**:
+  as its `mqtt-*` headers say (topic, QoS, retain flag), or, without an
+  `mqtt-topic` header, on the topic named by its key.
 
-Both are two short blocks in `modbee.yaml`; [kafka.md](kafka.md) has every
-option, and `docker compose restart modbee` applies a change. The two topics
+These are short blocks in `modbee.yaml`; [kafka.md](kafka.md) has every
+option, and `docker compose restart modbee` applies a change. The three topics
 are created when the stack starts, by the `kafka-topics` service in
 `compose.yml`; if you add a mapping that reads another topic, add its name
 there too, so no record written before modbee joins it is missed.
@@ -223,7 +221,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
 #### Send a command from Kafka to MQTT
 
 Type a key, `|`, and a value; each line becomes an MQTT message on the topic
-in the key:
+in the key (a record with an `mqtt-topic` header goes where the header says):
 
 ```bash
 docker compose exec kafka /opt/kafka/bin/kafka-console-producer.sh \
@@ -340,48 +338,16 @@ password only ever travels encrypted. Apps on the server itself keep using
 
 If [Nginx Proxy Manager](https://nginxproxymanager.com) (version 2.12.3 or
 later) already owns ports 80 and 443 on the server, let it do the certificate
-instead of Traefik. Everything is done in its web page; nothing is copied.
+instead of Traefik: [`docker/examples/npm/`](../docker/examples/npm) (the
+broker) or [`docker/examples/npm-kafka/`](../docker/examples/npm-kafka) (the
+broker and Kafka). modbee - and Kafka's password-protected listener - sit at
+fixed addresses on the Docker network `modbee`, and NPM forwards one stream to
+each (8883 for MQTT, 9093 for Kafka), with its Let's Encrypt certificate on
+the stream's SSL tab. Their READMEs have the steps, field by field.
 
-**`docker/npm/` is the simple way:** modbee and Kafka without Traefik, and
-two NPM streams (8883 for MQTT, 9093 for Kafka) with one certificate. Its
-README has the steps. The steps below instead put modbee on NPM's network.
-
-**1. Run modbee on NPM's network.** In `docker/stack/compose.yml` (or
-`docker/all-in-one/compose.yml`, for Kafka too), delete the `traefik` service
-and the `configs:` section, and make the network NPM's - its name is in
-`docker network ls`, often `npm_default`:
-
-```yaml
-networks:
-  default:
-    name: npm_default
-    external: true
-```
-
-(In `all-in-one`, that replaces the `networks:` section already there.) Then
-`docker compose up -d`. modbee is now reachable from NPM as `modbee`, port
-`1883`.
-
-**2. Let NPM publish port 8883.** In NPM's own compose file, add `- "8883:8883"`
-under its `ports:`, and `docker compose up -d` it again.
-
-**3. In NPM's web page:**
-
-1. **SSL Certificates → Add SSL Certificate → Let's Encrypt.** Domain:
-   `mqtt.example.com`. Save. (This needs port 80 reaching NPM, which it
-   already does.)
-2. **Hosts → Streams → Add Stream.** Incoming port `8883`. Forward host
-   `modbee`, forward port `1883`. Tick **TCP**.
-3. On the stream's **SSL** tab, choose the certificate from step 1. Save.
-
-Devices connect to `mqtts://mqtt.example.com:8883`, exactly as with Traefik,
-and NPM renews the certificate.
-
-**Kafka from anywhere, with a password** (`all-in-one` only, optional): add
-`- "9093:9093"` to NPM's ports too, and a second stream - incoming port
-`9093`, forward host `kafka`, forward port `9095`, TCP, the same certificate
-on its SSL tab. `KAFKA_PASSWORD` in `.env` is the login, as with Traefik, and
-`DOMAIN` in `.env` must still be set: it is the name Kafka tells apps to use.
+As with Traefik, NPM ends TLS: devices cannot sign in with a client
+certificate, and check the certificate against the public roots rather than
+pinning its key.
 
 ---
 
@@ -432,8 +398,8 @@ place in it - which suits a compose file:
 Passwords never need to be in either: `password-file:` in the YAML, or
 `MODBEE_..._PASSWORD_FILE` in the environment, names a Docker secret.
 
-**Changing settings over MQTT.** `docker/stack/` and `docker/all-in-one/`
-keep logins in a database, and the settings can be kept there too - changed
+**Changing settings over MQTT.** The `docker/examples/` setups keep logins in
+a database, and the settings can be kept there too - changed
 from `modbee config`, or from your own platform, with no shell on the server
 and no edit to the file:
 
@@ -450,10 +416,11 @@ contrast, change live. [settings.md](settings.md) has the whole of it.
 
 ## Your own Kafka
 
-Use `docker/stack/` and uncomment the `kafka:` section of its `modbee.yaml`,
-with `bootstrap-servers` set to your cluster. (In `all-in-one` or
-`docker/compose.yml`, delete the `kafka` service and modbee's `depends_on`
-first.) For a managed cluster with a password:
+Take one of the `*-kafka` examples, delete its `kafka` and `kafka-topics`
+services and modbee's `depends_on`, and set `bootstrap-servers` in its
+`modbee.yaml` to your cluster. Create the topics `mqtt-messages`,
+`mqtt-commands` and `modbee-events` there first. For a managed cluster with a
+password:
 
 ```yaml
 kafka:
@@ -503,7 +470,7 @@ named `kafka-password`.
 | --- | --- | --- |
 | **Retained messages** | memory, and where `retained: store` says | **Yes**, with `store: kafka` or `store: file` |
 | **Sessions**, and messages queued for a device that is away | memory | No |
-| **Everything sent to Kafka** | Kafka, on disk (the `kafka-data` volume in `all-in-one`) | Yes |
+| **Everything sent to Kafka** | Kafka, on disk (the `kafka-data` volume in the `*-kafka` examples) | Yes |
 
 ### Retained messages
 
@@ -516,9 +483,9 @@ retained:
 
 | `store` | Where | Used by |
 | --- | --- | --- |
-| `memory` | Nowhere else: a restart starts empty | the default; `docker/stack/` |
-| `file` | `/var/lib/modbee/retained.db`, saved two seconds after a change and when modbee stops | anywhere - mount a volume at `/var/lib/modbee` |
-| `kafka` | A compacted Kafka topic, `modbee-retained`, written as each change happens | `docker/all-in-one/` and `docker/compose.yml` |
+| `memory` | Nowhere else: a restart starts empty | the default |
+| `file` | `/var/lib/modbee/retained.db`, saved two seconds after a change and when modbee stops | `broker`, `traefik`, `npm` in `docker/examples/` |
+| `kafka` | A compacted Kafka topic, `modbee-retained`, written as each change happens | the `*-kafka` examples and `docker/compose.yml` |
 
 When modbee starts, it puts the kept messages back before it accepts a single
 client, so the first subscriber after a restart sees exactly what was retained
@@ -531,8 +498,7 @@ modbee was stopped.
   (and Docker restarts it), rather than serve an empty store as if it were the
   real one.
 - **`file`** needs somewhere to write that outlives the container.
-  `docker/stack/` already mounts the volume `modbee-data` there, so switching
-  is one word in its `modbee.yaml`. With `docker run`:
+  The `docker/examples/` setups mount the volume `modbee-data` there. With `docker run`:
 
   ```bash
   docker run -d --name modbee -p 1883:1883 -v modbee-data:/var/lib/modbee \

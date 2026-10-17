@@ -15,7 +15,7 @@ There are two ways a device gets its login:
 Both are kept in a small database in the broker's data volume, and both can
 be managed from the command line or from your own platform.
 
-This is how `docker/stack/` and `docker/all-in-one/` ship. [Without Docker](#without-docker)
+This is how the [`docker/examples`](../docker/examples) ship. [Without Docker](#without-docker)
 is the same with one setting.
 
 ---

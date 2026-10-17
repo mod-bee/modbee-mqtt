@@ -7,7 +7,7 @@
 //   devices --MQTT--> modbee --> Kafka topic "mqtt-messages" --> this app
 //   this app --> Kafka topic "mqtt-commands" --> modbee --MQTT--> devices
 //
-// Run it next to docker/all-in-one:
+// Run it next to a docker/examples/*-kafka setup:
 //   npm install
 //   node tank-rule.js                  (on the same computer: localhost:9094)
 //   KAFKA_BROKERS=kafka:9092 node ...  (in a container on the "modbee" network)
@@ -21,7 +21,7 @@ const kafka = new Kafka({
   kafkaJS: { brokers, clientId: "tank-rule", logLevel: logLevel.WARN },
 });
 
-// The two Kafka topics docker/all-in-one/modbee.yaml sets up.
+// The two Kafka topics the docker/examples/*-kafka modbee.yaml sets up.
 const FROM_MQTT = "mqtt-messages";   // every MQTT message lands here
 const TO_MQTT = "mqtt-commands";     // a record here is published to MQTT
 

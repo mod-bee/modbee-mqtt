@@ -9,8 +9,9 @@ It reads and writes **Kafka**, and modbee carries everything between the two:
  devices ◄──MQTT── modbee ◄── Kafka topic "mqtt-commands" ◄── your app
 ```
 
-This page is for building that app on [`docker/all-in-one`](docker.md#everything-in-one-file-broker-certificate-and-kafka),
-which sets all of this up as it ships. It assumes no Kafka experience.
+This page is for building that app on one of the `*-kafka` setups in
+[`docker/examples`](../docker/examples) - [`broker-kafka`](../docker/examples/broker-kafka)
+on your own computer is the quickest - which set all of this up as they ship. It assumes no Kafka experience.
 
 **Why go through Kafka rather than subscribe to MQTT directly?** Kafka keeps
 every message (seven days by default), so an app that was down catches up when
@@ -73,9 +74,11 @@ Write a record to **`mqtt-commands`**:
 
 modbee publishes it to MQTT at QoS 1, not retained, and every device
 subscribed to that topic receives it. Both rules - the key as the topic, QoS
-1 - are the `kafka-to-mqtt` mapping in `docker/all-in-one/modbee.yaml`, and
+1 - are the `kafka-to-mqtt` mapping in the examples' `modbee.yaml`, and
 [kafka.md](kafka.md#kafka--mqtt) shows how to change them (a fixed topic, a
-different QoS, retained, properties).
+different QoS, retained, properties). To choose them per record instead, give
+the record the headers `mqtt-topic`, `mqtt-qos` and `mqtt-retain`
+(`"true"`): the examples take those over the key.
 
 The key means something different in each direction: here it is the topic to
 publish on; on `mqtt-messages` it is the device that published. Each is its
@@ -125,7 +128,7 @@ Confluent's official Node.js client, through its KafkaJS-style API.
 
 ### Run it
 
-With `docker/all-in-one` running, from the example's folder:
+With `docker/examples/broker-kafka` running, from the example's folder:
 
 ```bash
 cd examples/kafka/nodejs
@@ -146,14 +149,14 @@ Act as two devices, with the `modbee` command that is inside the stack. In one
 terminal, be the pump, listening for its commands:
 
 ```bash
-cd docker/all-in-one
+cd docker/examples/broker-kafka
 docker compose exec modbee modbee sub -t plant/pump-2/cmd -v
 ```
 
 In a second terminal, be the tank, publishing its level:
 
 ```bash
-cd docker/all-in-one
+cd docker/examples/broker-kafka
 docker compose exec modbee modbee pub -t plant/tank-01/level -m 8.6 -q 1
 docker compose exec modbee modbee pub -t plant/tank-01/level -m 1.5 -q 1
 ```
@@ -267,7 +270,7 @@ topic to `mqtt-commands`.
   guarantees each record at least once, not exactly once. Make what your app
   does safe to repeat - setting a value is; adding to a total is not.
 - **A new Kafka topic for commands must exist before anything is written to
-  it**, or the first record is missed. `all-in-one` creates `mqtt-commands`;
+  it**, or the first record is missed. The examples create `mqtt-commands`;
   if you add another, add it to the `kafka-topics` service in `compose.yml`
   ([kafka.md](kafka.md#kafka--mqtt)).
 - **Which MQTT topics reach Kafka, and which Kafka topics reach MQTT, is

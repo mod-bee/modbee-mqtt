@@ -1,18 +1,13 @@
-# modbee on the internet: MQTT over TLS with a free Let's Encrypt certificate.
-# No Kafka here - point modbee.yaml at the Kafka you already run, or leave the
-# pipe off. For Kafka in the same file, use docker/all-in-one/ instead.
+# modbee on the internet: MQTT over TLS on port 8883, with a free Let's
+# Encrypt certificate that Traefik fetches and renews. Nobody handles a
+# certificate file.
 #
 #   1. Point a DNS name (mqtt.example.com) at this server. Open ports 80 and 8883.
 #   2. cp .env.example .env   and set DOMAIN, EMAIL and MQTT_PASSWORD.
-#   3. docker compose up -d --build
+#   3. docker compose up -d
 #
-# Devices connect to  mqtts://DOMAIN:8883. The certificate is fetched and
-# renewed by Traefik; nobody handles a certificate file. docs/docker.md has
-# the rest, including using a Nginx Proxy Manager you already run instead.
-#
-# Until the image is published, --build builds it from this checkout (a few
-# minutes, once). That needs this file where it is, inside the repository.
-name: modbee-stack
+# Devices connect to mqtts://DOMAIN:8883. README.md has the rest.
+name: modbee-traefik
 
 services:
   # TLS, and the certificate. Port 80 answers Let's Encrypt's check; 8883 is
@@ -40,24 +35,26 @@ services:
     mem_limit: 256m
 
   modbee:
-    image: ${MODBEE_IMAGE:-ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}}
-    build:                                # used when the image cannot be pulled
-      context: ../..
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
     restart: unless-stopped
     environment:
-      # The admin login (.env). Devices have their own: docs/logins.md.
       MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
       MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
     volumes:
       - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
-      - modbee-data:/var/lib/modbee        # device logins; retained messages with store: file
+      - modbee-data:/var/lib/modbee        # logins and retained messages
     ulimits: {nofile: {soft: 1048576, hard: 1048576}}
-    mem_limit: 2g
-    # Plain MQTT for devices on this LAN as well - uncomment to open it:
+    mem_limit: 1g
+    # Plain MQTT for devices on this server's own LAN as well - uncomment:
     # ports: ["1883:1883"]
 
-# Traefik's routes, kept here so the stack is one file plus .env. Every MQTT
+# Named, so another compose project (your own app) can join it and reach
+# modbee:1883 by name.
+networks:
+  default:
+    name: ${MODBEE_NETWORK:-modbee}
+
+# Traefik's routes, kept here so the setup is one file plus .env. Every MQTT
 # connection on 8883 is decrypted with the Let's Encrypt certificate for
 # DOMAIN - served even to a client that connects by IP address - and passed
 # to modbee.

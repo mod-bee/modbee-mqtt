@@ -1,0 +1,36 @@
+# modbee on a server that already runs Nginx Proxy Manager (NPM). NPM does
+# TLS with its Let's Encrypt certificate and forwards to modbee's fixed
+# address; nothing here is published on the server's ports.
+#
+#   modbee   10.80.80.10   MQTT 1883             NPM stream 8883 -> here
+#
+#   cp .env.example .env      # set MQTT_PASSWORD
+#   docker compose up -d      # then the NPM stream: README.md
+name: modbee-npm
+
+services:
+  modbee:
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
+      MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+    volumes:
+      - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
+      - modbee-data:/var/lib/modbee        # logins and retained messages
+    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
+    mem_limit: 512m
+    networks:
+      modbee: {ipv4_address: 10.80.80.10}
+
+# A fixed network and address, so NPM can forward to them. If NPM runs in
+# Docker, connect it once: docker network connect modbee <npm container>
+networks:
+  modbee:
+    name: modbee
+    ipam:
+      config:
+        - subnet: 10.80.80.0/24
+
+volumes:
+  modbee-data:

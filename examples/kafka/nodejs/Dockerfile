@@ -1,4 +1,4 @@
-# The tank rule as a container, to run beside docker/all-in-one.
+# The tank rule as a container, to run beside a docker/examples/*-kafka setup.
 FROM node:24-bookworm-slim
 WORKDIR /app
 COPY package.json ./

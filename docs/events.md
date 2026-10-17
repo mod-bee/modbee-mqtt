@@ -131,9 +131,9 @@ kafka:
   followed it.
 - **Create the topic first**, with the partitions you want - a topic Kafka
   creates by itself has the cluster's default, and some clusters do not
-  create topics at all. In `docker/all-in-one/`, add `modbee-events` to the
-  list its `kafka-topics` service creates.
-- A mapping with `["#"]`, like the all-in-one's, does not carry them: that is
+  create topics at all. The `*-kafka` setups in `docker/examples/` already
+  create `modbee-events` and map the events to it.
+- A mapping with `["#"]`, like the examples' `messages` one, does not carry them: that is
   the `$` rule above. They need a mapping of their own.
 
 What a record looks like, and how to read one from your own app, is in

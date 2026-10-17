@@ -1,0 +1,33 @@
+# modbee on your own network - a LAN, a VPN or a private cloud network.
+# Plain MQTT on port 1883; every device has its own login.
+# Not for the open internet: use ../traefik or ../npm for that (TLS).
+#
+#   cp .env.example .env      # set MQTT_PASSWORD
+#   docker compose up -d
+#
+# README.md has the rest: adding devices, upgrading, backups.
+name: modbee-broker
+
+services:
+  modbee:
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
+      MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+    ports:
+      - "${MQTT_BIND:-0.0.0.0}:${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
+      - modbee-data:/var/lib/modbee        # logins and retained messages
+    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
+    mem_limit: 1g
+
+# Named, so another compose project (your own app) can join it and reach
+# modbee:1883 by name.
+networks:
+  default:
+    name: ${MODBEE_NETWORK:-modbee}
+
+volumes:
+  modbee-data:

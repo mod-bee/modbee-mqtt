@@ -153,21 +153,19 @@ while (running) broker.poll();             // never waits
 docker run -d --name modbee -p 1883:1883 --restart unless-stopped ghcr.io/mod-bee/modbee-mqtt
 ```
 
-That is an MQTT broker on port 1883. For more, [docker.md](docs/docker.md) has
-ready-to-run compose files:
+That is an MQTT broker on port 1883. For a server in production,
+[`docker/examples/`](docker/examples) has one ready-to-run folder per case,
+each with a README:
 
-| | |
-| --- | --- |
-| [`docker/compose.yml`](docker/compose.yml) | modbee and Kafka on this computer, to try the Kafka pipe |
-| [`docker/stack/`](docker/stack) | modbee on the internet, with a free Let's Encrypt certificate from Traefik |
-| [`docker/all-in-one/`](docker/all-in-one) | The same, with Kafka included, in one file |
+| Your server | Without Kafka | With Kafka |
+| --- | --- | --- |
+| Your own network (LAN, VPN) | [`broker`](docker/examples/broker) | [`broker-kafka`](docker/examples/broker-kafka) |
+| On the internet - Traefik gets the certificate | [`traefik`](docker/examples/traefik) | [`traefik-kafka`](docker/examples/traefik-kafka) |
+| On the internet - Nginx Proxy Manager already runs | [`npm`](docker/examples/npm) | [`npm-kafka`](docker/examples/npm-kafka) |
 
-Each needs, at most, a domain name, an email address and a password for your
-devices, all in one `.env` file. You never handle a certificate file.
-
-Until the image is published, `docker compose up -d --build` builds it from
-this checkout, and `docker build -t ghcr.io/mod-bee/modbee-mqtt -f docker/Dockerfile .`
-builds it for the `docker run` commands ([docker.md](docs/docker.md)).
+Each needs, at most, a domain name, an email address and passwords, all in one
+`.env` file. You never handle a certificate file. To try the Kafka pipe on
+this computer first: [`docker/compose.yml`](docker/compose.yml).
 
 ### From a terminal
 

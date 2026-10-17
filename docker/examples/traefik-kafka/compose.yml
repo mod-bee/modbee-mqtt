@@ -1,12 +1,10 @@
-# Everything in one file: modbee, Kafka, and Traefik for TLS with a free
-# Let's Encrypt certificate.
+# modbee and Kafka on the internet: MQTT over TLS on port 8883 and Kafka over
+# TLS on 9093 (with a password), on a free Let's Encrypt certificate that
+# Traefik fetches and renews. Every MQTT message lands in Kafka.
 #
-#   1. Point a DNS name (mqtt.example.com) at this server. Open ports 80 and 8883.
-#   2. cp .env.example .env   and set DOMAIN, EMAIL and MQTT_PASSWORD.
-#   3. docker compose up -d --build
-#
-# Until the image is published, --build builds it from this checkout (a few
-# minutes, once). That needs this file where it is, inside the repository.
+#   1. Point a DNS name (mqtt.example.com) at this server. Open ports 80, 8883 and 9093.
+#   2. cp .env.example .env   and set DOMAIN, EMAIL, MQTT_PASSWORD and KAFKA_PASSWORD.
+#   3. docker compose up -d
 #
 # Devices connect to  mqtts://DOMAIN:8883, and every MQTT message lands in the
 # Kafka topic mqtt-messages. Where to reach Kafka from:
@@ -17,8 +15,8 @@
 #   another machine on your network   set KAFKA_EXTERNAL_HOST and KAFKA_BIND in .env
 #   anywhere, with a password         DOMAIN:9093 over TLS - set KAFKA_PASSWORD in .env
 #
-# docs/docker.md, "Connecting to Kafka", has examples of each.
-name: modbee-all-in-one
+# README.md has the rest.
+name: modbee-traefik-kafka
 
 services:
   # TLS, and the certificate. Port 80 answers Let's Encrypt's check; 8883 is
@@ -48,10 +46,7 @@ services:
     mem_limit: 256m
 
   modbee:
-    image: ${MODBEE_IMAGE:-ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}}
-    build:                                # used when the image cannot be pulled
-      context: ../..
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/mod-bee/modbee-mqtt:${MODBEE_VERSION:-latest}
     restart: unless-stopped
     depends_on:
       kafka-topics: {condition: service_completed_successfully}
@@ -61,7 +56,7 @@ services:
       MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
     volumes:
       - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
-      - modbee-data:/var/lib/modbee        # device logins, and their backups
+      - modbee-data:/var/lib/modbee        # logins, and their backups
     ulimits: {nofile: {soft: 1048576, hard: 1048576}}
     mem_limit: 2g
     # Plain MQTT for devices on this LAN as well - uncomment to open it:
@@ -98,7 +93,6 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     ports:
       - "${KAFKA_BIND:-127.0.0.1}:${KAFKA_PORT:-9094}:9094"
     volumes:
@@ -110,10 +104,9 @@ services:
       retries: 30
     mem_limit: 2g
 
-  # Runs once at start: creates the topics modbee.yaml uses, then exits.
-  # Kafka would create them on their first record anyway, but modbee reads
-  # mqtt-commands from the newest record on, so it would miss the record that
-  # created it. Add a topic here when you add a mapping that reads one.
+  # Creates the Kafka topics modbee.yaml uses, once, before modbee starts (a
+  # topic Kafka creates on its first record is joined after that record, which
+  # is then never read), then exits. Add a topic here when you add a mapping.
   kafka-topics:
     image: apache/kafka:4.3.1
     depends_on:
@@ -121,17 +114,15 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        for topic in mqtt-messages mqtt-commands; do
+        for topic in mqtt-messages mqtt-commands modbee-events; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
             --create --if-not-exists --topic $$topic --partitions 6 || exit 1
         done
     restart: "no"
     mem_limit: 512m
 
-# Named, so another compose project can join it and reach kafka:9092 and
-# modbee:1883 by name (docs/docker.md shows the three lines it needs). The
-# name is fixed - not prefixed with the project's - so those lines stay the
-# same; MODBEE_NETWORK changes it, for a second all-in-one on one server.
+# Named, so another compose project (your own app) can join it and reach
+# kafka:9092 and modbee:1883 by name.
 networks:
   default:
     name: ${MODBEE_NETWORK:-modbee}

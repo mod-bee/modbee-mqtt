@@ -1,0 +1,27 @@
+# modbee.yaml for docker/examples/traefik - docs/settings.md describes every key.
+# Traefik in front does TLS, so the broker listens in plain MQTT on the private
+# Docker network only. Because Traefik ends TLS, devices can not sign in with a
+# client certificate, and they should check the certificate against the public
+# roots, not pin its key (Let's Encrypt renewals change it).
+# `docker compose exec modbee modbee check` validates this file.
+
+broker:
+  port: 1883
+  shards: 0                  # one worker per CPU core
+  max-connections: 10000
+
+# Logins. The admin (MQTT_USERNAME / MQTT_PASSWORD in .env) is for you, your
+# apps and the modbee command. Every device gets a login of its own, kept in
+# the modbee-data volume and changed live, no restart (README.md, docs/logins.md).
+# A login may use only the topics it was given: nothing is open by default.
+authentication:
+  database: /var/lib/modbee/auth.db
+  default-topics: none
+
+metrics:
+  port: 9464                 # Prometheus /metrics, inside the Docker network only
+
+# Retained messages are saved in the modbee-data volume as well as memory, so
+# a restart or an upgrade keeps them.
+retained:
+  store: file
