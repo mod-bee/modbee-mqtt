@@ -5,7 +5,7 @@
 // one is lost or a board is replaced. Instead every device is flashed with
 // the SAME provisioning key, created once on the broker:
 //
-//   docker compose exec modbee modbee key create site-north --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
+//   docker compose exec modbee modbee key create site-north --site north --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 //
 // On first boot the device connects with the key, is given a login of its
 // own (its name, and a secret only it holds), keeps it in flash, and connects

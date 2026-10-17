@@ -115,8 +115,8 @@ docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h mqtt.example.com \
 broker runs and never needing a restart:
 
 ```bash
-docker compose exec modbee modbee user add tank-01        # prints the device's secret
-docker compose exec modbee modbee key create site-north   # or: devices register themselves
+docker compose exec modbee modbee user add tank-01 --publish 'plant/${username}/#'   # prints the device's secret
+docker compose exec modbee modbee key create site-north --site north --publish 'plant/${username}/#'   # or: devices register themselves
 ```
 
 [logins.md](logins.md) explains both, and what each device may do. Devices

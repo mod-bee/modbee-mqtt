@@ -79,6 +79,9 @@ void readKey(sqlite3_stmt* s, AuthKey& k) {
     k.site = column(s, 9);
 }
 
+// The login store's shape. 2: keys and logins carry a site (2026-10-17).
+const char kSchema[] = "2";
+
 const char kKeyColumns[] = "name, hash, manual, publish, subscribe, uses_left, expires, device, created, site";
 
 struct Statement {
@@ -97,16 +100,6 @@ AuthStore::~AuthStore() { close(); }
 
 bool AuthStore::exec(const char* sql) {
     return sqlite3_exec(_writer, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
-}
-
-bool AuthStore::hasColumn(const char* table, const char* column, const char* declaration) {
-    const std::string query = std::string("SELECT count(*) FROM pragma_table_info('") + table +
-                              "') WHERE name = '" + column + "'";
-    Statement st(_writer, query.c_str());
-    if (!st.ok() || st.step() != SQLITE_ROW) return false;
-    if (sqlite3_column_int(st.s, 0) > 0) return true;
-    const std::string add = std::string("ALTER TABLE ") + table + " ADD COLUMN " + column + " " + declaration;
-    return exec(add.c_str());
 }
 
 std::string AuthStore::lastError() const {
@@ -133,25 +126,32 @@ bool AuthStore::open(const std::string& path, size_t readers, std::string& error
              " enabled INTEGER NOT NULL, pending INTEGER NOT NULL, admin INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, provisioned_by TEXT NOT NULL,"
              " created INTEGER NOT NULL, updated INTEGER NOT NULL,"
-             " fingerprint TEXT NOT NULL DEFAULT '') WITHOUT ROWID") &&
-        // A file made before logins could be bound to a certificate has no
-        // fingerprint column. It is the table's shape, not anybody's data, so
-        // it is added in place - empty, which is what "no certificate bound"
-        // means - rather than the server refusing every login over it.
-        hasColumn("users", "fingerprint", "TEXT NOT NULL DEFAULT ''") &&
-        // Likewise the site (a file made before keys and logins had one): "" = no site.
-        hasColumn("users", "site", "TEXT NOT NULL DEFAULT ''") &&
+             " fingerprint TEXT NOT NULL DEFAULT '', site TEXT NOT NULL DEFAULT '') WITHOUT ROWID") &&
         exec("CREATE TABLE IF NOT EXISTS keys ("
              " name TEXT PRIMARY KEY, hash TEXT NOT NULL, manual INTEGER NOT NULL,"
              " publish TEXT NOT NULL, subscribe TEXT NOT NULL, uses_left INTEGER NOT NULL,"
-             " expires INTEGER NOT NULL, device TEXT NOT NULL, created INTEGER NOT NULL)") &&
-        hasColumn("keys", "site", "TEXT NOT NULL DEFAULT ''") &&
+             " expires INTEGER NOT NULL, device TEXT NOT NULL, created INTEGER NOT NULL,"
+             " site TEXT NOT NULL)") &&
         exec("CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)") &&
         exec("CREATE TABLE IF NOT EXISTS settings ("
              " name TEXT PRIMARY KEY, value TEXT NOT NULL, updated INTEGER NOT NULL) WITHOUT ROWID") &&
-        exec("INSERT OR IGNORE INTO meta VALUES ('schema', '1')");
+        exec((std::string("INSERT OR IGNORE INTO meta VALUES ('schema', '") + kSchema + "')").c_str());
     if (!schema) {
         error = "cannot set up the login store " + path + ": " + sqlite3_errmsg(_writer);
+        close();
+        return false;
+    }
+    // One shape of file, the current one: a file an earlier version made is refused, by name, rather
+    // than read with columns it does not have.
+    std::string found;
+    {
+        // Finalised before any close below: SQLite will not close a connection with a statement open.
+        Statement st(_writer, "SELECT value FROM meta WHERE name = 'schema'");
+        if (st.ok() && st.step() == SQLITE_ROW) found = column(st.s, 0);
+    }
+    if (found != kSchema) {
+        error = "the login store " + path + " was made by an earlier version (schema " + found +
+                ", this one reads " + kSchema + "); remove it and add the logins again";
         close();
         return false;
     }

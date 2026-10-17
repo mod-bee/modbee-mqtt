@@ -9,8 +9,8 @@ broker:
 
 # Logins. Every device has its own, kept in a database in the modbee-data
 # volume and changed live - no restart:
-#   docker compose exec modbee modbee user add tank-01      a device, by hand
-#   docker compose exec modbee modbee key create site-a     devices that register themselves
+#   docker compose exec modbee modbee user add tank-01 --publish 'plant/${username}/#'   a device, by hand
+#   docker compose exec modbee modbee key create site-a --site a --publish 'plant/${username}/#'   devices that register themselves
 # MQTT_USERNAME / MQTT_PASSWORD from .env (compose.yml passes them in) is the
 # ADMIN login: for you, your own apps, and the modbee command. docs/logins.md.
 authentication:

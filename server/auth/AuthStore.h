@@ -39,7 +39,7 @@ struct AuthUser {
     bool enabled = true;
     bool pending = false;                // provisioned through a key that needs approval
     bool admin = false;                  // may use $modbee/admin
-    std::vector<std::string> publish;    // topic filters; empty = any topic
+    std::vector<std::string> publish;    // topic filters; empty = none (every topic: `#`)
     std::vector<std::string> subscribe;  // likewise; ${username} and ${clientid} expand
     std::string provisionedBy;           // the key's name, or "" if added by an admin
     int64_t created = 0;                 // UTC seconds
@@ -48,8 +48,9 @@ struct AuthUser {
     // (authentication.certificate-login): 64 lowercase hex, or "" for any
     // certificate whose CN is this login's name.
     std::string fingerprint;
-    // The site the login belongs to: the site of the key that provisioned it. A key re-provisions only
-    // logins of its own site, so one customer's key cannot take over another's device. "" = no site.
+    // The site the login belongs to: the site of the key that provisioned it ("" for a login an admin
+    // added). A key re-provisions only logins of its own site, so one customer's key cannot take over
+    // another's device.
     std::string site;
 };
 
@@ -63,7 +64,7 @@ struct AuthKey {
     int64_t expires = 0;                 // UTC seconds; 0: never
     std::string device;                  // "" or the one device name it may create
     int64_t created = 0;
-    std::string site;                    // the site its devices belong to; "" = no site
+    std::string site;                    // the site its devices belong to (required)
 };
 
 enum class AuthResult { Ok, NotFound, Exists, Invalid, Failed };
@@ -116,8 +117,6 @@ public:
 
 private:
     bool exec(const char* sql);
-    // Adds `column` to `table` if it is not there yet. True if it is now.
-    bool hasColumn(const char* table, const char* column, const char* declaration);
     void changed() { _generation.fetch_add(1, std::memory_order_acq_rel); }
 
     std::string _path;

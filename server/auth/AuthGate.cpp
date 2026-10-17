@@ -376,8 +376,9 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
     }
     if (!topic.empty() && topic[0] == '$') return false;
 
+    // A login may use only the topics its rules name: none named, none allowed. Every topic is `#`,
+    // written on purpose.
     const std::vector<std::string>& rules = publish ? c.publish : c.subscribe;
-    if (rules.empty()) return true;
     for (const std::string& rule : rules) {
         std::string filter;
         if (!expand(rule, username, clientId, filter)) continue;
@@ -572,10 +573,7 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
         // old one stops working) stays inside the device's own site: a key of
         // another site - another customer - must not take its login, its
         // topic rights and its place on the broker.
-        std::string site = existing.site;
-        AuthKey made;
-        if (site.empty() && _store.findKey(existing.provisionedBy, made)) site = made.site;
-        if (site != key.site) return refused("that name belongs to another site; an admin must reset it");
+        if (existing.site != key.site) return refused("that name belongs to another site; an admin must reset it");
     }
     // Approved, its secret not collected yet: the device that waited takes it now.
     const bool collecting = exists && existing.hash.empty();
@@ -797,9 +795,12 @@ std::string AuthGate::admin(const std::string& requestText) {
         k.expires = days > 0 ? nowSeconds() + days * 86400 : request.integer("expires", 0);
         k.device = request.str("device");
         if (!k.device.empty() && !safeName(k.device)) return failure(request, "device is not a valid name");
-        // The site its devices belong to: a key re-provisions only devices of its own site.
+        // The site its devices belong to: a key provisions and re-provisions only devices of its own site.
         k.site = request.str("site");
-        if (!k.site.empty() && !keyNameOk(k.site)) return failure(request, "a site is 1-64 letters, digits, - or _");
+        if (!keyNameOk(k.site)) return failure(request, "site is required: 1-64 letters, digits, - or _");
+        if (k.publish.empty() && k.subscribe.empty()) {
+            return failure(request, "a key needs publish and/or subscribe rules: its devices may use only those topics");
+        }
         const std::string secret = auth::generateSecret(32);
         k.hash = auth::hashGenerated(secret);
         const AuthResult r = _store.putKey(k);
