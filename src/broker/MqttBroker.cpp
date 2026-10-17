@@ -1952,6 +1952,29 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         return;
     }
 
+    // --- May its Will be published? ---
+    //
+    // A Will is a publish the broker makes for the client when it vanishes, so
+    // it is held to the client's own publish rights, as if the client sent it
+    // now. Unchecked, any login could reach any topic - another customer's, or
+    // a $ channel an extension acts on - by connecting with a Will and pulling
+    // the cable. Refused like a CONNECT that is not authorised [V5:MQTT-3.2.2-8],
+    // before a session is taken over or created.
+    if (request.hasWill) {
+        uint8_t willRefusal = MQ_REASON_NOT_AUTHORIZED;
+        const MqttSpan willUser = !login.empty() ? asSpan(login)
+                                  : request.hasUserName ? request.userName : MqttSpan();
+        MqttSpan none;
+        if (!authorise(connection, MqttBrokerAction::Publish, request.will.topic, request.will.qos,
+                       request.will.retain, clientId, willUser, none, willRefusal)) {
+            const uint8_t code = isV5 ? MQ_REASON_NOT_AUTHORIZED : MQ_RETURN_NOT_AUTHORIZED;
+            sendConnAck(connection, code, false, nullptr);
+            _status.refused++;
+            closeConnection(connection, code, false, false);
+            return;
+        }
+    }
+
     // --- Session takeover ---
     //
     // [V5:MQTT-3.1.4-3] "If the ClientID represents a Client already connected
