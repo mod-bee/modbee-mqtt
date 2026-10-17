@@ -208,6 +208,12 @@ struct AuthenticationSection {
     // is its subject's CN, and no password is asked for (docs/logins.md).
     // Needs the database, whose logins it names.
     bool certificateLogin = false;
+
+    // What a database login with no publish / subscribe rules may use:
+    // "all" (the default) every topic but the $ ones, as a broker without
+    // per-login rules; "none" nothing - a login uses only the topics its rules
+    // name, for a broker shared by several customers.
+    std::string defaultTopics = "all";
 };
 
 struct ServerConfig {

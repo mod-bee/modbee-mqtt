@@ -54,8 +54,7 @@ To choose the password yourself, add `--secret '<password>'`
 (`modbee user password tank-01 --secret ...` changes it later).
 Put `tank-01` and that password into the device (for this library:
 `mqtt.credentials("tank-01", "F3mQ...")`). The `--publish` and `--subscribe`
-rules are [what it may do](#what-a-device-may-do) - a login without them may do
-nothing.
+rules are [what it may do](#what-a-device-may-do).
 
 **The secret is shown once, and the broker cannot show it again** - it keeps
 only a salted hash of it, so a copy of the database is no use to anyone. If a
@@ -141,7 +140,7 @@ registers again as well: it waits, pending, until you approve it.
 | `--approval manual` | A new device waits until you approve it: `modbee user list` shows it `pending`, `modbee user approve tank-07` lets it in. Without this, devices are let in straight away |
 | `--uses 50` | At most 50 devices may register with it |
 | `--days 30` | It stops working after 30 days |
-| `--site north` | Required. The site its devices belong to: a key registers, and registers again, only devices of its own site |
+| `--site north` | The site its devices belong to: a key registers again only devices of its own site, so one customer's key cannot take another's device. Keys without a site share one - a broker for a single site needs none |
 | `--device tank-07` | It may register only that one device, and every claim uses it up (`--uses 1`: claimed once) - e.g. a key your platform creates for one device it is setting up or replacing |
 
 `modbee key list` shows every key; `modbee key remove site-north` retires one.
@@ -167,8 +166,18 @@ replaced by the device's own, so one rule fits every device:
 | --- | --- |
 | publish `plant/${username}/#` | publish to `plant/tank-07/level`, `plant/tank-07/status`... and nowhere else |
 | subscribe `plant/${username}/cmd` | receive its own commands - not another device's |
-| publish `#` and subscribe `#` | use every topic (except the broker's own `$` topics) - only on purpose |
-| no rules at all | use no topic at all |
+| no rules at all | use every topic (except the broker's own `$` topics), as on any broker without per-login rules - or, with `default-topics: none`, no topic at all |
+
+A broker shared by several customers should not let a login without rules see
+everything. Set, in `modbee.yaml`:
+
+```yaml
+authentication:
+  default-topics: none     # all (default) | none - MODBEE_AUTHENTICATION_DEFAULT_TOPICS
+```
+
+and a login uses only the topics its rules name; one that should use every
+topic is given `#` on purpose.
 
 A device's **Will** is held to its publish rules too: a CONNECT whose Will it
 could not publish is refused. A Sparkplug node's NDEATH topic must be inside
@@ -321,7 +330,7 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 | `user.permissions` | `username`, `publish`, `subscribe` | |
 | `user.enable`, `user.disable`, `user.approve`, `user.remove` | `username` | |
 | `user.admin` | `username`, `admin` (true/false) | |
-| `key.create` | `name`, `site`, and `publish` and/or `subscribe`; optional `approval` (`auto`/`manual`), `uses`, `days`, `device` | `key` - shown once |
+| `key.create` | `name`; optional `site`, `approval` (`auto`/`manual`), `publish`, `subscribe`, `uses`, `days`, `device` | `key` - shown once |
 | `key.list`, `key.remove` | `name` for remove | `keys` |
 | `backup` | | `file` |
 | `status` | | counts of logins, accepted, refused, provisioned, and of logins by certificate: `certificate_accepted`, `certificate_refused` |

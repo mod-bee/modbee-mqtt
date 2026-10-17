@@ -138,7 +138,7 @@ const std::vector<ArgSpec>& adminSpecs() {
         {"uses", 0, true, "key create: how many devices it may create (default unlimited)"},
         {"days", 0, true, "key create: expires after this many days (default never)"},
         {"device", 0, true, "key create: the one device name it may create"},
-        {"site", 0, true, "key create (required): the site its devices belong to; it registers only those"},
+        {"site", 0, true, "key create: the site its devices belong to; it registers again only those"},
     });
     return specs;
 }

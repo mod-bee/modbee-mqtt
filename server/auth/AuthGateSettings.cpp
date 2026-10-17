@@ -139,7 +139,7 @@ bool settingText(const json::Value& v, std::string& out) {
 
 bool sameAuthentication(const AuthenticationSection& a, const AuthenticationSection& b) {
     if (a.database != b.database || a.hasAdmin != b.hasAdmin || a.accounts.size() != b.accounts.size() ||
-        a.certificateLogin != b.certificateLogin) {
+        a.certificateLogin != b.certificateLogin || a.defaultTopics != b.defaultTopics) {
         return false;
     }
     for (size_t i = 0; i < a.accounts.size(); i++) {

@@ -348,6 +348,7 @@ int cmdServe(int argc, char** argv) {
         // the server stays stopped, which config.set's reply says.
         g.restart = [](void*) { std::raise(SIGTERM); };
         g.certificateLogin = file.authentication.certificateLogin;
+        g.noTopicsWithoutRules = file.authentication.defaultTopics == "none";
         g.server = &server;
         for (size_t i = 0; i < file.authentication.accounts.size(); i++) {
             const MqttAccount& a = file.authentication.accounts[i];

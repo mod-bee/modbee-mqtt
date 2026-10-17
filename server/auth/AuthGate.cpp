@@ -376,9 +376,10 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
     }
     if (!topic.empty() && topic[0] == '$') return false;
 
-    // A login may use only the topics its rules name: none named, none allowed. Every topic is `#`,
-    // written on purpose.
+    // No rules: every topic, as a broker without per-login rules - or, with
+    // authentication.default-topics: none, no topic at all.
     const std::vector<std::string>& rules = publish ? c.publish : c.subscribe;
+    if (rules.empty()) return !_config.noTopicsWithoutRules;
     for (const std::string& rule : rules) {
         std::string filter;
         if (!expand(rule, username, clientId, filter)) continue;
@@ -795,12 +796,10 @@ std::string AuthGate::admin(const std::string& requestText) {
         k.expires = days > 0 ? nowSeconds() + days * 86400 : request.integer("expires", 0);
         k.device = request.str("device");
         if (!k.device.empty() && !safeName(k.device)) return failure(request, "device is not a valid name");
-        // The site its devices belong to: a key provisions and re-provisions only devices of its own site.
+        // The site its devices belong to: a key re-provisions only devices of its own site. Optional;
+        // keys without one share one site, as on a broker for a single site.
         k.site = request.str("site");
-        if (!keyNameOk(k.site)) return failure(request, "site is required: 1-64 letters, digits, - or _");
-        if (k.publish.empty() && k.subscribe.empty()) {
-            return failure(request, "a key needs publish and/or subscribe rules: its devices may use only those topics");
-        }
+        if (!k.site.empty() && !keyNameOk(k.site)) return failure(request, "a site is 1-64 letters, digits, - or _");
         const std::string secret = auth::generateSecret(32);
         k.hash = auth::hashGenerated(secret);
         const AuthResult r = _store.putKey(k);

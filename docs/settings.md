@@ -80,7 +80,8 @@ refuses a document whose `authentication:` differs from what the file and
 the environment give. That includes `authentication.certificate-login`
 ([logins.md](logins.md#logging-in-with-a-certificate)): turned on, an admin
 presenting a certificate is the login its CN names, so it is set with
-`MODBEE_AUTHENTICATION_CERTIFICATE_LOGIN=true` or in the file. A document must therefore carry the file's
+`MODBEE_AUTHENTICATION_CERTIFICATE_LOGIN=true` or in the file - and
+`authentication.default-topics` (`MODBEE_AUTHENTICATION_DEFAULT_TOPICS`). A document must therefore carry the file's
 `authentication:` section as it is.
 
 **If the stored settings no longer load** when the server starts - a newer

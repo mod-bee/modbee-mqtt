@@ -315,7 +315,7 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
 | Section | Keys |
 | --- | --- |
 | `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca, client-certificates, cert-pem, key-pem, client-ca-pem}` ([below](#tls-for-mqtt)), `shards`, `max-connections`, `max-sessions`, `max-session-expiry`, `max-packet`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
-| `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required. `certificate-login`: a verified client certificate logs in as the login its CN names ([logins.md](logins.md#logging-in-with-a-certificate)) |
+| `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required. `certificate-login`: a verified client certificate logs in as the login its CN names ([logins.md](logins.md#logging-in-with-a-certificate)). `default-topics`: `all` (default) or `none` - what a database login with no rules may use ([logins.md](logins.md#what-a-device-may-do)) |
 | `retained:` | `store` (`memory`, `file` or `kafka`), `file` (default `/var/lib/modbee/retained.db`), `topic` (default `modbee-retained`), `cluster` |
 | `metrics:` | `enabled`, `address`, `port` (default 9464) |
 | `events:` | `enabled`: publish what clients do on `$modbee/events/...` ([events.md](events.md)) |

@@ -1008,6 +1008,8 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
         }
         auth.text("database", out.authentication.database);
         auth.flag("certificate-login", out.authentication.certificateLogin);
+        static const char* const kDefaultTopics[] = {"all", "none", nullptr};
+        auth.choice("default-topics", out.authentication.defaultTopics, kDefaultTopics);
         const size_t users = auth.count("users");
         for (size_t i = 0; i < users; i++) {
             Section user = auth.item("users", i);

@@ -69,6 +69,8 @@ struct AuthGateConfig {
     // authentication.certificate-login: a verified client certificate's CN is
     // the login, without a password.
     bool certificateLogin = false;
+    // authentication.default-topics "none": a login with no rules may use no topic (default: every topic).
+    bool noTopicsWithoutRules = false;
     // The running server, for what its TLS listeners serve and to change
     // their certificate live (config.*). Not owned; may be set after the gate
     // is made, before the server starts. Null: TLS is reported as not served

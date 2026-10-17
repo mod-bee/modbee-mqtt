@@ -39,7 +39,7 @@ struct AuthUser {
     bool enabled = true;
     bool pending = false;                // provisioned through a key that needs approval
     bool admin = false;                  // may use $modbee/admin
-    std::vector<std::string> publish;    // topic filters; empty = none (every topic: `#`)
+    std::vector<std::string> publish;    // topic filters; empty = authentication.default-topics
     std::vector<std::string> subscribe;  // likewise; ${username} and ${clientid} expand
     std::string provisionedBy;           // the key's name, or "" if added by an admin
     int64_t created = 0;                 // UTC seconds
@@ -64,7 +64,7 @@ struct AuthKey {
     int64_t expires = 0;                 // UTC seconds; 0: never
     std::string device;                  // "" or the one device name it may create
     int64_t created = 0;
-    std::string site;                    // the site its devices belong to (required)
+    std::string site;                    // the site its devices belong to; "" = the shared one
 };
 
 enum class AuthResult { Ok, NotFound, Exists, Invalid, Failed };
