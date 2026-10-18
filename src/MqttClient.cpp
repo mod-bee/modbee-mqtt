@@ -404,8 +404,13 @@ void MqttClient::sendConnect() {
             MQ_PROPERTIES(packet, connect).receiveMaximum = _connection.receiveMaximum;
             MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_RECEIVE_MAXIMUM);
         }
-        if (_connection.topicAliasMaximum != 0) {
-            MQ_PROPERTIES(packet, connect).topicAliasMaximum = _connection.topicAliasMaximum;
+        // What the alias table can actually hold, not what was asked for: the
+        // broker may use every alias up to the number advertised here, and one
+        // above the table's size would be refused with 0x94 - a protocol error
+        // this client had invited. See MqttAliases::offerable().
+        const uint16_t aliases = MqttAliases::offerable(_connection.topicAliasMaximum);
+        if (aliases != 0) {
+            MQ_PROPERTIES(packet, connect).topicAliasMaximum = aliases;
             MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_TOPIC_ALIAS_MAXIMUM);
         }
         if (_connection.maximumPacketSize != 0) {
@@ -832,7 +837,11 @@ void MqttClient::handleConnAck(const MqttPacket& packet) {
     _keepAlive.begin(effective, mq_millis());
 
     _status.connects++;
-    _reconnectDelay = _behaviour.reconnectInitialMs;   // a success resets the backoff
+    // NOT a reset of the backoff. A CONNACK says the broker answered, not that
+    // the connection works: one that accepts and then drops this client at
+    // once would have it back every second for ever. The backoff starts again
+    // only once the connection has stayed up for MQ_RECONNECT_STABLE_MS - see
+    // closeConnection().
     enterState(MqttState::Connected);
 
     establishSession(connack.sessionPresent);
@@ -957,6 +966,10 @@ void MqttClient::handlePublish(const MqttPacket& packet) {
 
         if (topic.length > 0) {
             // A name AND an alias: this establishes or reassigns the mapping.
+            // Refused when a board cannot hold the topic in full, and then the
+            // alias means nothing: this message still goes out under its own
+            // full topic, and a later alias-only one is 0x94 just below -
+            // never a delivery under a shortened or stale name.
             _aliases.rememberInbound(alias, topic.data, topic.length);
         } else {
             // An alias alone. It must already mean something, or the peer has
@@ -1445,6 +1458,16 @@ void MqttClient::failConnection(MqttResult reason, uint8_t disconnectReason) {
 void MqttClient::closeConnection(MqttResult reason) {
     const bool wasUp = _status.state == MqttState::Connected;
 
+    // A connection that stayed up long enough to have been working earns a
+    // fresh backoff: the network failed, and the next attempt starts from
+    // reconnectInitialMs. One that went down sooner keeps the backoff it had,
+    // so a broker that accepts and immediately drops this device is retried
+    // at a doubling interval rather than once a second. _stateSince is when
+    // Connected was entered - enterState() sets it on every change.
+    if (wasUp && mq_elapsed(_stateSince, mq_millis()) >= (mq_time_t)MQ_RECONNECT_STABLE_MS) {
+        _reconnectDelay = _behaviour.reconnectInitialMs;
+    }
+
     if (_transport) _transport->end();
 
     _link.reset();
@@ -1548,10 +1571,21 @@ void MqttClient::scheduleReconnect() {
     // start-up, so the spread is a hash rather than a random number - and the
     // hash must include something that differs between devices, or forty of
     // them compute the same delay. See deviceSeed().
+    //
+    // FULL JITTER: anywhere from MQ_RECONNECT_FLOOR_MS to the whole backoff,
+    // uniformly. It used to be the backoff PLUS up to half of it again, and
+    // that window is far too narrow for a fleet: a broker restart brought two
+    // thousand devices back inside the same half second, every one of them a
+    // TLS handshake and a session to restore. Drawing from [floor, base]
+    // spreads the same fleet over the whole interval, and the doubling below
+    // widens it on every failed round. The mean wait is shorter than it was -
+    // half the backoff rather than one and a quarter - and the doubling is
+    // what keeps a broker that stays away from being asked too often.
     const uint32_t seed = (_status.reconnects * 2654435761u + 1) ^
                           deviceSeed(_connection.clientId, this);
-    const mq_time_t jitter = spread(seed, _reconnectDelay / 2);
-    _reconnectAt = mq_millis() + _reconnectDelay + jitter;
+    const mq_time_t least = _reconnectDelay < (mq_time_t)MQ_RECONNECT_FLOOR_MS
+                                ? _reconnectDelay : (mq_time_t)MQ_RECONNECT_FLOOR_MS;
+    _reconnectAt = mq_millis() + least + spread(seed, _reconnectDelay - least + 1);
 
     _reconnectDelay *= 2;
     if (_reconnectDelay > _behaviour.reconnectMaximumMs) {

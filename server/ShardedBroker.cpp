@@ -831,7 +831,13 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
 
     auto abandon = [this](const std::string& why) {
         _lastError = why;
-        for (std::unique_ptr<Shard>& other : _shards) other->endListeners();
+        for (std::unique_ptr<Shard>& other : _shards) {
+            other->endListeners();
+            // Each shard's wake-up descriptor, too: a server that failed to
+            // start and was asked again leaked one per shard per attempt.
+            if (other->wakeFd >= 0) ::close(other->wakeFd);
+            other->wakeFd = -1;
+        }
         _shards.clear();
         return false;
     };
@@ -901,6 +907,7 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
         if (!s.readiness.beginPersistent()) return abandon("could not create an epoll set");
         s.broker.useReadiness(s.readiness);
         s.wakeFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (s.wakeFd < 0) return abandon("could not create a wake-up descriptor");
         s.readiness.add(s.wakeFd, kWakeToken, false);
         if (_extension != nullptr) {
             const int handle = _extension->waitHandle(s.index);

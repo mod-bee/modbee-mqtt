@@ -414,9 +414,10 @@ size_t sizeOfFixedValue(const Entry& entry) {
     }
 }
 
-} // namespace
-
-size_t mq_propertiesSize(const MqttProperties& properties, uint8_t packetType) {
+// The property block without its Property Length prefix. The prefix is the
+// VBI of THIS number; deriving it from the total instead writes a length one
+// short at every VBI width boundary (a 127-byte block said 126).
+size_t bodySize(const MqttProperties& properties, uint8_t packetType) {
     size_t body = 0;
 
     for (size_t i = 0; i < TABLE_SIZE; i++) {
@@ -466,6 +467,13 @@ size_t mq_propertiesSize(const MqttProperties& properties, uint8_t packetType) {
         }
     }
 
+    return body;
+}
+
+} // namespace
+
+size_t mq_propertiesSize(const MqttProperties& properties, uint8_t packetType) {
+    const size_t body = bodySize(properties, packetType);
     return mq_vbiSize((uint32_t)body) + body;
 }
 
@@ -475,9 +483,7 @@ void mq_encodeProperties(MqttWriter& writer, const MqttProperties& properties,
     // then going back to fill in a length would mean either a second pass or a
     // reserved gap, and a reserved gap that turns out to be the wrong width is
     // a packet nothing can parse.
-    const size_t total = mq_propertiesSize(properties, packetType);
-    const uint8_t prefix = mq_vbiSize((uint32_t)(total));
-    const size_t body = total - prefix;
+    const size_t body = bodySize(properties, packetType);
 
     writer.vbi((uint32_t)body);
 

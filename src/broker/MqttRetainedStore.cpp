@@ -29,7 +29,32 @@ MqttSpan asSpan(const std::string& text) {
 
 } // namespace
 
+// A login's count of topics held. A short list rather than a map: the logins
+// that keep retained messages are few, and a board carries this too.
+void MqttRetainedStore::own(const std::string& owner, int change) {
+    if (owner.empty()) return;
+    for (size_t index = 0; index < _owners.size(); index++) {
+        if (_owners[index].first != owner) continue;
+        if (change < 0 && _owners[index].second <= 1) {
+            _owners[index] = _owners.back();
+            _owners.pop_back();
+        } else {
+            _owners[index].second = (uint32_t)((int)_owners[index].second + change);
+        }
+        return;
+    }
+    if (change > 0) _owners.push_back(std::make_pair(owner, (uint32_t)change));
+}
+
+size_t MqttRetainedStore::ownedBy(const std::string& owner) const {
+    for (const auto& entry : _owners) {
+        if (entry.first == owner) return entry.second;
+    }
+    return 0;
+}
+
 void MqttRetainedStore::configure(size_t maximum) {
+    _owners.clear();
     _messages.clear();
     _messages.resize(maximum);
 #if MQTT_RETAINED_INDEX
@@ -53,6 +78,7 @@ void MqttRetainedStore::release(size_t index) {
         _free.push_back((uint32_t)index);
     }
 #endif
+    if (_messages[index].inUse()) own(_messages[index].owner, -1);
     _messages[index] = MqttRetainedMessage();
 }
 
@@ -111,7 +137,7 @@ bool MqttRetainedStore::hasExpired(const MqttRetainedMessage& message, mq_time_t
 
 bool MqttRetainedStore::store(const MqttSpan& topic, const MqttSpan& payload,
                               uint8_t qos, const MqttProperties& properties,
-                              mq_time_t now) {
+                              mq_time_t now, const MqttSpan& ownerSpan, uint32_t ownerLimit) {
     if (topic.data == nullptr || topic.length == 0) return false;
 
     const int existing = indexOf(topic);
@@ -125,14 +151,30 @@ bool MqttRetainedStore::store(const MqttSpan& topic, const MqttSpan& payload,
         return true;
     }
 
+    // ONE LOGIN MAY NOT TAKE THE WHOLE STORE. Every login shares its slots,
+    // and a full store refuses every other login's new topics. A topic the
+    // login does not hold yet - new, or another's - counts against it;
+    // replacing one of its own never does.
+    const std::string owner = toString(ownerSpan);
+    const std::string previous = existing >= 0 ? _messages[(size_t)existing].owner : std::string();
+    const bool itsOwn = existing >= 0 && previous == owner;
+    if (ownerLimit != 0 && !owner.empty() && !itsOwn && ownedBy(owner) >= ownerLimit) {
+        return false;
+    }
+
     int slot = existing;
     if (slot < 0) {
         slot = freeSlot();
         if (slot < 0) return false;    // full, and this is a new topic
     }
 
+    if (!itsOwn) {
+        if (existing >= 0) own(previous, -1);
+        own(owner, +1);
+    }
     MqttRetainedMessage& message = _messages[slot];
     message = MqttRetainedMessage();
+    message.owner = owner;
     message.topic = toString(topic);
     message.payload.assign(payload.data, payload.data + payload.length);
     message.qos = qos;
@@ -208,11 +250,13 @@ bool hasWildcard(const MqttSpan& filter) {
 } // namespace
 
 size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t now,
-                                            size_t from, StepFn visit, void* context) {
+                                            size_t from, StepFn visit, void* context,
+                                            size_t budget) {
     const size_t end = _messages.size();
     if (visit == nullptr || from >= end) return end;
 
     size_t first = from, last = end;
+    bool exact = false;     // one topic, found directly: done once looked at
 #if MQTT_RETAINED_INDEX
     // One topic, found directly. A resume that finds it already taken - or
     // gone - is complete.
@@ -221,8 +265,13 @@ size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t no
         if (found < 0 || (size_t)found < from) return end;
         first = (size_t)found;
         last = first + 1;
+        exact = true;
     }
 #endif
+    // BOUNDED: a wildcard looks at every slot, and a SUBSCRIBE of sixteen of
+    // them against a full store was a hundred thousand topic matches in one
+    // pass of the only thread. Stopping short returns where to go on from.
+    if (budget != 0 && last - first > budget) last = first + budget;
 
     for (size_t index = first; index < last; index++) {
         const MqttRetainedMessage& message = _messages[index];
@@ -237,7 +286,7 @@ size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t no
         const bool hasRemaining = remainingExpiryOf(message, now, remaining);
         if (!visit(context, message, remaining, hasRemaining)) return index;
     }
-    return end;
+    return exact ? end : last;
 }
 
 void MqttRetainedStore::visitMatching(const MqttSpan& filter, mq_time_t now,

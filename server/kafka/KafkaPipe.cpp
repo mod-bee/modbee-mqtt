@@ -61,12 +61,15 @@ std::string expandKey(const std::string& pattern, const MqttSpan& topic, const M
         if (open == std::string::npos) { out.append(pattern, at, std::string::npos); break; }
         out.append(pattern, at, open - at);
         const size_t close = pattern.find('}', open);
+        // An unclosed "${" is text: without this, at = npos + 1 = 0 and the
+        // loop began again from the start, for ever.
+        if (close == std::string::npos) { out.append(pattern, open, std::string::npos); break; }
         const std::string name = pattern.substr(open + 2, close - open - 2);
         if (name == "MQTT_TOPIC") {
             out.append((const char*)topic.data, topic.length);
         } else if (name == "MQTT_CLIENTID") {
             out.append((const char*)clientId.data, clientId.length);
-        } else {
+        } else if (name.compare(0, 17, "MQTT_TOPIC_LEVEL_") == 0) {
             const size_t want = (size_t)std::strtoul(name.c_str() + 17, nullptr, 10);
             size_t level = 0, start = 0;
             for (size_t i = 0; i <= topic.length; i++) {
@@ -95,6 +98,9 @@ std::string expandTopic(const std::string& pattern, const char* kafkaTopic,
         if (open == std::string::npos) { out.append(pattern, at, std::string::npos); break; }
         out.append(pattern, at, open - at);
         const size_t close = pattern.find('}', open);
+        // An unclosed "${" is text: without this, at = npos + 1 = 0 and the
+        // loop began again from the start, for ever.
+        if (close == std::string::npos) { out.append(pattern, open, std::string::npos); break; }
         const std::string name = pattern.substr(open + 2, close - open - 2);
         if (name == "KAFKA_TOPIC") out.append(kafkaTopic);
         else if (key != nullptr) out.append((const char*)key, keyLength);
@@ -287,6 +293,13 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
                 // 60 s). Thirty seconds rides out a broker restart and still
                 // answers inside the client's patience. The file can change it.
                 kafkaSet(conf, "message.timeout.ms", "30000", error) &&
+                // What may wait for Kafka, in memory. librdkafka's default is
+                // a gigabyte, per producer - so a Kafka that stalled while
+                // devices published large payloads took a broker in a 256 MB
+                // container past its limit, and the kernel killed it. A full
+                // queue is answered, not waited out (offer()). The file can
+                // change it.
+                kafkaSet(conf, "queue.buffering.max.kbytes", "65536", error) &&
                 // Broker state for /readyz (onStatistics). The file can change it.
                 kafkaSet(conf, "statistics.interval.ms", "5000", error) &&
                 kafkaPassThrough(conf, cluster, error);
@@ -610,7 +623,13 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
     }
 
     if (!contentType.empty()) { properties.contentType = spanOf(contentType); properties.markPresent(MQ_PROP_CONTENT_TYPE); }
-    if (!responseTopic.empty()) { properties.responseTopic = spanOf(responseTopic); properties.markPresent(MQ_PROP_RESPONSE_TOPIC); }
+    // A Response Topic is a topic name [MQTT-3.3.2-13]: one from a header that
+    // is not - a wildcard, bad UTF-8 - is left off rather than handed to every
+    // subscriber, which would be right to refuse the whole PUBLISH for it.
+    if (!responseTopic.empty() && mq_topicNameIsValid(spanOf(responseTopic))) {
+        properties.responseTopic = spanOf(responseTopic);
+        properties.markPresent(MQ_PROP_RESPONSE_TOPIC);
+    }
     if (hasCorrelation) { properties.correlationData = spanOf(correlation); properties.markPresent(MQ_PROP_CORRELATION_DATA); }
     if (hasFormat) { properties.payloadFormatIndicator = format; properties.markPresent(MQ_PROP_PAYLOAD_FORMAT_INDICATOR); }
     if (hasExpiry) { properties.messageExpiryInterval = expiry; properties.markPresent(MQ_PROP_MESSAGE_EXPIRY_INTERVAL); }
@@ -628,7 +647,10 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
         message.retain = retain;
         message.properties = &properties;
         message.origin = &origin;
-        if (!mq_topicNameIsValid(message.topic)) {
+        // A $ topic is the server's own [MQTT-4.7.2-1]: $modbee/admin/request,
+        // $modbee/events/... A record never speaks on one - whoever can write
+        // to the Kafka topic must not be able to issue requests or forge events.
+        if (!mq_topicNameIsValid(message.topic) || topic[0] == '$') {
             from.counters.invalid.fetch_add(1, std::memory_order_relaxed);
             continue;
         }

@@ -19,7 +19,9 @@ docker compose ps           # kafka-topics "exited (0)"; modbee and kafka "runni
 ```
 
 modbee is now at `10.80.80.10:1883` and Kafka's password-protected listener at
-`10.80.80.11:9095`, on the Docker network `modbee`.
+`10.80.80.11:9095`, on the Docker network `modbee`. Kafka's listener without a
+password is on a second network, `modbee-internal`, that only modbee shares -
+connect nothing else to it.
 
 **If NPM runs in Docker**, let it reach that network (once):
 
@@ -52,6 +54,13 @@ NPM's own container must publish both ports (`ports:` in its compose file).
 | `mqtt-commands` | **You write here**, and modbee publishes it to MQTT: with the header `mqtt-topic` (optionally `mqtt-qos`, `mqtt-retain`) exactly so; without it, on the topic in the record's key |
 | `modbee-retained` | modbee's own copy of the retained messages - leave it alone |
 
+The Kafka login (`KAFKA_USERNAME`) may read `mqtt-messages` and
+`modbee-events`, write `mqtt-commands`, and use consumer groups - nothing
+else: it cannot delete a topic, nor write `modbee-retained`. A record on
+`mqtt-commands` can publish to any topic devices use, but never to a `$`
+topic: those are the broker's own (`$modbee/admin/...`, `$modbee/events/...`).
+Give a new topic its ACL in `kafka-topics` (compose.yml) when your apps need it.
+
 ## Add a device
 
 ```bash
@@ -69,6 +78,23 @@ themselves with one key instead (`modbee key create`):
   with a client certificate here, and must not pin the certificate's key: every
   renewal brings a new one. They check the certificate against the public roots.
 - **Metrics** (port 9464) stay inside Docker: they are not forwarded.
+- **Limit connections per address in NPM.** modbee sees every device arrive
+  from NPM's address, so only NPM can tell one source from another. NPM
+  includes custom files in its stream block; for example, in NPM's data
+  folder, `nginx/custom/stream.conf`:
+
+  ```nginx
+  limit_conn_zone $binary_remote_addr zone=per_address:10m;
+  ```
+
+  and `nginx/custom/server_stream_tcp.conf` (every TCP stream):
+
+  ```nginx
+  limit_conn per_address 50;
+  ```
+
+  then restart NPM. Choose the number from how many devices sit behind one
+  address - a site router, a cellular carrier's NAT.
 
 ## Keep it running
 

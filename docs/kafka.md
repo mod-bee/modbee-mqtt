@@ -192,7 +192,10 @@ written twice, and retries never reorder a partition. Setting a mapping to
 
 - **`mqtt-topic`** defaults to `${KAFKA_TOPIC}`. `${KAFKA_KEY}` is the record's
   key. A record that makes an invalid MQTT topic is skipped and counted
-  (`invalid`).
+  (`invalid`) - and so is one that makes a topic starting with `$`: those are
+  the server's own (`$modbee/admin/request`, `$modbee/events/...`), and
+  writing to a Kafka topic must not be a way to send the broker admin
+  requests or forge events.
 - **`from-headers: true`** takes the topic, QoS, retain flag and properties
   from the `mqtt-*` headers a `headers: all` mapping wrote, and every other
   header becomes a user property. The message republished is the one that was
@@ -315,7 +318,7 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
 
 | Section | Keys |
 | --- | --- |
-| `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca, client-certificates, cert-pem, key-pem, client-ca-pem}` ([below](#tls-for-mqtt)), `shards`, `max-connections`, `max-sessions`, `max-session-expiry`, `max-packet`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
+| `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca, client-certificates, cert-pem, key-pem, client-ca-pem}` ([below](#tls-for-mqtt)), `shards`, `max-connections`, `max-sessions`, `max-session-expiry`, `connect-timeout`, `max-keepalive`, `max-packet`, `queue-bytes`, `queue-bytes-total`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
 | `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required. `certificate-login`: a verified client certificate logs in as the login its CN names ([logins.md](logins.md#logging-in-with-a-certificate)). `default-topics`: `all` (default) or `none` - what a database login with no rules may use ([logins.md](logins.md#what-a-device-may-do)) |
 | `retained:` | `store` (`memory`, `file` or `kafka`), `file` (default `/var/lib/modbee/retained.db`), `topic` (default `modbee-retained`), `cluster` |
 | `metrics:` | `enabled`, `address`, `port` (default 9464) |
@@ -326,8 +329,23 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
 
 - **`broker: max-session-expiry`** is the longest a disconnected session, and
   the messages queued for it, is kept: in seconds, whatever an MQTT 5 client
-  asks for; 3600 by default. `4294967295` keeps it until the broker restarts,
-  since sessions are held in memory.
+  asks for, and for an MQTT 3.1.1 persistent session too; 3600 by default.
+  `4294967295` keeps it until the broker restarts, since sessions are held in
+  memory.
+- **`broker: queue-bytes`** and **`queue-bytes-total`** bound the memory queued
+  messages hold - each is its own copy of topic and payload, and a session
+  that is offline queues as well: 1 MB for one session, 64 MB for all of them
+  together by default (0 = no cap). A message that would go past either is
+  not queued for that subscriber, and is counted as dropped, as with a full
+  `queue`; a QoS 1 or 2 publisher whose every subscriber refused it hears
+  0x97.
+- **`broker: connect-timeout`** is how long, in seconds, a connection has to
+  send its CONNECT - a TLS handshake included - before it is closed; 10 by
+  default. It bounds how long a socket that never signs in holds a slot.
+- **`broker: max-keepalive`** is the longest Keep Alive a client may use, in
+  seconds; a client asking for more, or for 0, is given this (MQTT 5 tells it
+  so in CONNACK). 0, the default, lets every client choose - including never
+  being timed out for silence.
 - **Any value can come from the environment**, named after its path:
   `kafka.clusters[0].bootstrap-servers` is
   `MODBEE_KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS`. A list of values is one

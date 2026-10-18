@@ -54,6 +54,7 @@
 #include "MqttRouteIndex.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // One of a client's subscriptions.
@@ -135,6 +136,10 @@ struct MqttBrokerDelivery {
     // clock wraps every 49.7 days - at which point "oldest first" would
     // silently become "newest first" for one pass.
     uint64_t sequence = 0;
+
+    // The bytes this entry holds against the session's and the broker's
+    // budget (MqttBrokerSession::limitQueueBytes), refunded by discard().
+    size_t charged = 0;
 
     bool inUse() const { return !topic.empty() || !payload.empty() || packetId != MQ_PACKET_ID_NONE; }
     // RELEASED IN PLACE, keeping the buffers this slot has already grown.
@@ -268,8 +273,26 @@ public:
     // a buffer the slot already owns, with no allocation at all once a queue
     // has been round once. commitDelivery() is what makes it ordered; until
     // then the slot is in use but has no sequence, and nothing looks at it.
-    MqttBrokerDelivery* reserveDelivery();
+    // `bytes`: what the message will hold - refused, and counted as dropped,
+    // when it would take the session or the broker past its byte budget.
+    MqttBrokerDelivery* reserveDelivery(size_t bytes = 0);
     void commitDelivery(MqttBrokerDelivery& entry);
+
+    // EVERY QUEUED MESSAGE IS ALSO BYTES. The queue's depth was its only
+    // bound, and each entry holds its own copy of the payload: 64 messages of
+    // 64 kB for each of a few thousand sessions - offline ones fill as well -
+    // is gigabytes. `perSession` caps one session, `totalMax` all of them
+    // together through the broker's `total`; 0 = no cap.
+    void limitQueueBytes(size_t perSession, size_t* total, size_t totalMax) {
+        _maxQueuedBytes = perSession;
+        _queuedBytesTotal = total;
+        _maxQueuedBytesTotal = totalMax;
+    }
+    size_t queuedBytes() const { return _queuedBytes; }
+    // Done with an entry, however it ended - delivered, acknowledged, expired
+    // or dropped. Its bytes go back to the budget, and a payload buffer that
+    // grew large is given back rather than kept for the next message.
+    void discard(MqttBrokerDelivery& entry);
     size_t queued() const;
     size_t queuedExtent() const { return _queueExtent; }
     size_t queueCapacity() const { return _maxQueued; }
@@ -316,6 +339,25 @@ public:
     // asked about, so a permission can depend on who is asking - and so a
     // login that is revoked can have its connections found.
     std::string userName;
+
+    // Sets userName, and keeps the broker's count of sessions per login
+    // (attachLoginCounts) right: the one place a session changes hands.
+    void setOwner(const std::string& name) {
+        if (name == userName) return;
+        if (_loginCounts) {
+            if (!userName.empty()) {
+                auto found = _loginCounts->find(userName);
+                if (found != _loginCounts->end() && --found->second == 0) _loginCounts->erase(found);
+            }
+            if (!name.empty()) (*_loginCounts)[name]++;
+        }
+        userName = name;
+    }
+    void attachLoginCounts(std::unordered_map<std::string, uint32_t>* counts) { _loginCounts = counts; }
+
+    // How many retained topics its login may hold (MqttBrokerRetainedStore's
+    // quota), as the authorise hook said at CONNECT; 0 = no limit.
+    uint32_t retainedLimit = 0;
 
     // Which connection slot serves this session while it is connected, or
     // kNoConnection. Kept so that a broker can find the connection from the
@@ -390,6 +432,13 @@ private:
 #endif
     void bumpRevision() { if (_revision) (*_revision)++; }
     std::vector<MqttBrokerDelivery> _queue;
+    size_t _queuedBytes = 0;
+    std::unordered_map<std::string, uint32_t>* _loginCounts = nullptr;
+    size_t _maxQueuedBytes = 0;
+    size_t* _queuedBytesTotal = nullptr;
+    size_t _maxQueuedBytesTotal = 0;
+    bool withinBudget(size_t bytes) const;
+    void charge(MqttBrokerDelivery& entry);
     size_t _retainedOwed = 0;
 
     // NO LIVE DELIVERY SITS AT OR ABOVE THIS INDEX.

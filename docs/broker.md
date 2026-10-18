@@ -241,6 +241,7 @@ guessing.
 | `maxSessions` | 64 | Including clients currently away. Larger than `maxConnections` on purpose: offline sessions are the normal state of a plant at 3 a.m. |
 | `maxSubscriptionsPerSession` | 32 | |
 | `maxQueuedPerSession` | 64 | Messages held for one client. The retained messages a new subscription is sent go a queue's worth at a time, as the client takes them - all of them, however many [MQTT-3.3.1-9]. |
+| `maxQueuedBytesPerSession`, `maxQueuedBytesTotal` | 0 (no cap) | The same in bytes - one client's queue, and every client's together. Each queued message is its own copy of topic and payload, and an offline session queues too, so the depth alone does not bound memory. A message past either is refused for that subscriber and counted as dropped. `modbee serve` sets 1 MB and 64 MB. |
 | `maxRetained` | 256 | Retained topics. A new one past this is delivered but not kept, and refused with `0x97`. From 1024 up, on a host, topics are found through a hash index rather than a walk. |
 | `receiveBufferSize` / `transmitBufferSize` | 8192 | One whole packet each. |
 | `reserveUpFront` | true | Reserve every slot and buffer at `begin()`. False reserves a session's slots on first use and starts each connection's buffers at 512 bytes, growing them only when a packet needs it. The limits are unchanged. |
@@ -470,7 +471,8 @@ inside a tap handler does not re-enter the delivery path.
 | | |
 | --- | --- |
 | **Sessions** | per Client Identifier, surviving disconnection, expiring on their interval |
-| **Takeover** | a second connection with the same identifier displaces the first, with `0x8E` |
+| **Takeover** | a second connection with the same identifier displaces the first, with `0x8E` - when it is the same login. A session belongs to the login that made it: another login naming its identifier is refused (`0x85`, or `0x02` at 3.1.1) while it is connected or when asking to resume it, and with Clean Start on a session nobody is connected to it gets a new one. An authorise hook can let a login stand in for the owner (`MqttBrokerRequest::replaceSession`): the session is then replaced, never resumed |
+| **Resumed sessions** | held to the login's rights as they are now: each subscription, and each message queued while it was away, is asked of the authorise hook again; a Will is asked again when it is published |
 | **Retained** | stored, replaced, cleared by a zero-length payload, served at subscribe time with RETAIN=1 |
 | **Retain Handling** | 0, 1 and 2 |
 | **Retain As Published** | per subscription |

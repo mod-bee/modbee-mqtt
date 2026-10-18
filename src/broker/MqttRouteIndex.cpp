@@ -8,6 +8,7 @@
 // tooling the opposite of what LICENSE says.
 
 #include "MqttRouteIndex.h"
+#include "MqttSessionIndex.h"    // mq_indexHashSeed
 #include "../MqttNoExcept.h"
 
 #if defined(MQTT_PLATFORM_HOST)
@@ -25,7 +26,7 @@ void MqttRouteIndex::configure(size_t buckets, size_t reserveEntries) {
 
 uint32_t MqttRouteIndex::keyOf(bool prefix, const uint8_t* data, size_t length) {
     // FNV-1a, seeded differently for the two kinds.
-    uint32_t hash = prefix ? 0x811C9DC5u : 0x050C5D1Fu;
+    uint32_t hash = (prefix ? 0x811C9DC5u : 0x050C5D1Fu) ^ mq_indexHashSeed();
     for (size_t index = 0; index < length; index++) {
         hash ^= data[index];
         hash *= 16777619u;

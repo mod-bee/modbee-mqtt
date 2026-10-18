@@ -335,6 +335,7 @@ bool MqttTcpListener::begin() {
         _boundPort = _port;
     }
 
+    _spare = mq_socket::openSpareDescriptor();
     _lastError.clear();
     return true;
 }
@@ -344,6 +345,7 @@ void MqttTcpListener::end() {
         MQ_CLOSE(_socket);
         _socket = -1;
     }
+    mq_socket::closeSpareDescriptor(_spare);
     // Connections already handed out are NOT closed. They belong to whoever
     // took them, and ending a plant's sessions because somebody closed a
     // listening socket would be a surprising way to lose a shift's data.
@@ -397,6 +399,7 @@ MqttTransport* MqttTcpListener::accept() {
         // perfectly healthy while accepting nobody. Recording it is the
         // difference between a diagnosable fault and a mystery.
         if (!MQ_WOULD_BLOCK) {
+            mq_socket::shedWaitingConnection(_socket, _spare);
             fail("accept failed");
         }
         return nullptr;

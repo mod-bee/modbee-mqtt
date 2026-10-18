@@ -67,11 +67,21 @@ struct BrokerSection {
     long long maxSessions = 0;         // 0: = maxConnections
     uint32_t maxPacket = 65536;
     size_t queue = 64;                 // messages held per session
+    // And the bytes they may hold: one session's queue, and every session's
+    // together (the whole server; split evenly between shards). 0 = no cap.
+    long long queueBytes = 1048576;
+    long long queueBytesTotal = 67108864;
     size_t subscriptions = 32;         // per session
     // The longest a disconnected session (and its queued messages) is kept, in
     // seconds, whatever an MQTT 5 client asks for. 4294967295 = until the
     // broker restarts (sessions are held in memory).
     long long maxSessionExpiry = 3600;
+    // Seconds a connection has to send its CONNECT (a TLS handshake included)
+    // before it is closed: how long a socket that never signs in holds a slot.
+    long long connectTimeout = 10;
+    // The longest Keep Alive a client may use, in seconds; 0 = whatever it
+    // asks, including 0 - never timed out for silence.
+    long long maxKeepAlive = 0;
     // Retained topics the server keeps. Every shard holds all of them (a
     // retained message must reach a subscriber on any shard), so the memory
     // is this times the shard count: about 216 bytes a slot, reserved at
@@ -214,6 +224,11 @@ struct AuthenticationSection {
     // per-login rules; "none" nothing - a login uses only the topics its rules
     // name, for a broker shared by several customers.
     std::string defaultTopics = "all";
+
+    // What one login may hold, admins excepted: sessions (client
+    // identifiers), and retained topics. 0 = no limit. Per shard.
+    long long maxSessionsPerLogin = 8;
+    long long maxRetainedPerLogin = 1000;
 };
 
 struct ServerConfig {

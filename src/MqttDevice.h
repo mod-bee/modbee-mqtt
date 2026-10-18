@@ -271,9 +271,13 @@ struct MqttDeviceReport {
 // Where a provisioned device keeps its login between restarts - flash, NVS,
 // a file - supplied by the application, because only it knows what storage
 // the board has. Load fills both buffers (NUL-terminated) and returns true if
-// a login was stored; save stores one, and is called with "" and "" to
-// forget it. Neither is required: without them the device provisions again
-// at every start, which works, at the cost of a new login each time.
+// a login was stored; save stores one, and is called only when the broker has
+// issued a new login - never to forget the old one. A login the broker refuses
+// stays stored, and in use, until its replacement arrives: a broker whose login
+// store was lost or restored from an old backup must not be able to make a
+// whole fleet erase good logins. Neither is required: without them the device
+// provisions again at every start, which works, at the cost of a new login
+// each time.
 typedef bool (*MqttDeviceLoadLoginFn)(void* context, char* user, size_t userSize,
                                       char* password, size_t passwordSize);
 typedef void (*MqttDeviceSaveLoginFn)(void* context, const char* user, const char* password);
@@ -351,7 +355,11 @@ public:
     // stores it, and reconnects as itself - nobody types or records a
     // per-device password. If the broker later refuses that login as wrong
     // (it was reset, or the device was replaced and re-registered), the
-    // device forgets it and registers again by itself. docs/provisioning.md.
+    // device registers again by itself - keeping the old login, stored and in
+    // use, until the broker issues a new one. While registration is pending or
+    // refused the old login is tried again every rejectedCredentialsRetryMs
+    // (five minutes), so a broker whose login store comes back from a backup
+    // lets its devices straight back in. docs/logins.md.
     void provision(const char* key, MqttDeviceLoadLoginFn load = nullptr,
                    MqttDeviceSaveLoginFn save = nullptr, void* context = nullptr);
     MqttProvisionState provisionState() const { return _provisionState; }
@@ -981,8 +989,10 @@ private:
     bool _provisioning = false;          // the client is configured with the key, not a login
     bool _switchToLogin = false;         // provisioned: reconnect as the device
     bool _reprovision = false;           // the stored login was refused: register again
+    bool _retryingLogin = false;         // registering, and trying the held login once more
     bool _switchDisconnected = false;
     mq_time_t _provisionAskedAt = 0;
+    mq_time_t _loginRefusedAt = 0;       // when the held login was last refused
     MqttConnectionConfig _provisionConnection;
     void startProvisioning();
     void provisionSession();

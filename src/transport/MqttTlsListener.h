@@ -249,6 +249,7 @@ private:
     bool _reusePort = false;
     size_t _servingCapacity = 0;
     int _socket = -1;
+    int _spare = -1;            // given up to refuse a connection when descriptors run out
     std::string _lastError;
 
     const MqttTlsListener* _sharedFrom = nullptr;

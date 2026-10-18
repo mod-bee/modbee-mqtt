@@ -31,6 +31,9 @@
 #include "../MqttTypes.h"
 #include "../MqttPlatform.h"
 
+#include <string>
+#include <vector>
+
 struct MqttBrokerConfig {
     // --- Capacity ---
 
@@ -48,6 +51,27 @@ struct MqttBrokerConfig {
     // dropped silently - the drop is counted, and at QoS > 0 the publisher is
     // told with 0x97 rather than being allowed to believe it was delivered.
     size_t maxQueuedPerSession = 64;
+
+    // And in BYTES: each queued message is its own copy of topic and payload,
+    // so the depth alone lets a few thousand sessions - offline ones fill as
+    // well - hold gigabytes. A message that would take one session past
+    // maxQueuedBytesPerSession, or all of them past maxQueuedBytesTotal, is
+    // refused for that subscriber and counted, as a full queue is. 0 = no cap.
+    size_t maxQueuedBytesPerSession = 0;
+    size_t maxQueuedBytesTotal = 0;
+
+    // ONE LOGIN, ONE SHARE. Sessions any one login may hold (a CONNECT that
+    // would make one more is refused with 0x97 Quota exceeded), and retained
+    // topics it may hold (a new one past it is refused with 0x97). 0 = no
+    // limit. The authorise hook may set either per login at CONNECT
+    // (MqttBrokerRequest::sessionLimit, ::retainedLimit) - an admin's tools
+    // need more than a device. Counted per broker: on a server of several
+    // shards, per shard.
+    uint32_t maxSessionsPerLogin = 0;
+    uint32_t maxRetainedPerLogin = 0;
+    // Logins neither limit applies to - an admin's tools, a registration
+    // login every new device shares. Names, compared exactly.
+    std::vector<std::string> unlimitedLogins;
 
     size_t maxRetained = 256;
 

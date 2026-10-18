@@ -124,6 +124,14 @@ public:
     const uint8_t* rawPacket() const { return _receive.data() + _receiveStart; }
 
     size_t buffered() const { return _receiveLength; }
+    // Whether what is buffered can be acted on without reading again: a whole
+    // packet, or bytes already known to be wrong. Part of a packet is not -
+    // only the peer can finish it, and its socket will say when it has.
+    bool actionable() const {
+        if (_receiveLength == 0) return false;
+        MqttFixedHeader header;
+        return inspect(header) != MqttLinkStatus::Incomplete;
+    }
 
     // What the buffers hold right now. With growth on (begin()'s initial
     // capacity) these move between that and the limits; for diagnostics and

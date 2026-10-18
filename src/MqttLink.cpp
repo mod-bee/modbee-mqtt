@@ -107,12 +107,21 @@ void MqttLink::fill() {
                                      header) == MqttError::None &&
                 header.packetSize() > _receive.size() &&
                 header.packetSize() <= _receiveLimit) {
-                // Room for the whole packet, at the front of a larger buffer.
+                // At the front, so the room left is all at the back.
                 if (_receiveStart > 0) {
                     memmove(_receive.data(), _receive.data() + _receiveStart, _receiveLength);
                     _receiveStart = 0;
                 }
-                _receive.resize(header.packetSize());
+                // GROWN BY WHAT ARRIVED, NOT BY WHAT WAS ANNOUNCED. Sized to
+                // the header at once, four bytes - "10 FA FF 03", before any
+                // CONNECT - held a whole maximum packet per connection, and a
+                // few thousand sockets held the broker's memory. Doubled only
+                // once the bytes have filled it, the buffer is never more than
+                // twice what the peer has actually sent.
+                if (_receiveLength >= _receive.size()) {
+                    const size_t doubled = _receive.size() * 2;
+                    _receive.resize(doubled < header.packetSize() ? doubled : header.packetSize());
+                }
             }
         }
     }

@@ -104,6 +104,10 @@ MqttError MqttCodecV311::decode(const MqttFixedHeader& header,
         connect.hasUserName = (flags & CONNECT_USER_NAME) != 0;
         connect.hasPassword = (flags & CONNECT_PASSWORD) != 0;
 
+        // [V311:MQTT-3.1.2-22] "If the User Name Flag is set to 0, the
+        // Password Flag MUST be set to 0." (5.0 allows a password alone.)
+        if (connect.hasPassword && !connect.hasUserName) return MqttError::PropertyValueInvalid;
+
         // [V311:MQTT-3.1.2-11] and [V311:MQTT-3.1.2-13]
         if (!connect.hasWill) {
             if (connect.will.qos != MQ_QOS_0 || connect.will.retain) {

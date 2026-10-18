@@ -17,6 +17,11 @@
 #include <stdio.h>
 #include "../MqttNoExcept.h"
 
+#if defined(MQTT_PLATFORM_HOST)
+#include <unordered_map>
+#include <unordered_set>
+#endif
+
 namespace {
 
 const MqttCodecV5 g_brokerCodecV5;
@@ -35,6 +40,10 @@ const size_t kAcceptsPerPoll = 16;
 // enough for a CONNECT, the acknowledgements and most telemetry, which is
 // nearly everything most connections ever carry.
 const size_t kLinkInitialBytes = 512;
+
+// How many retained slots one pass may look at for one subscription owed its
+// retained messages; the next pass goes on from there (continueRetained).
+const size_t kRetainedSlotsPerPass = 1024;
 
 #if defined(MQTT_PLATFORM_HOST)
 // The readiness token a listener is registered under. A connection's token is
@@ -191,6 +200,8 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     _routeMark.assign(_config.maxSessions, 0);
     _routeGeneration = 0;
     _subscriptionRevision = 0;
+    _queuedBytes = 0;
+    _sessionsPerLogin.clear();
     _indexBuiltAt = 0xFFFFFFFFu;   // stale until the first route()
 
 
@@ -225,6 +236,9 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
         session.configure(_config.maxSubscriptionsPerSession,
                           _config.maxQueuedPerSession, _config.reserveUpFront);
         session.attachSubscriptionRevision(&_subscriptionRevision);
+        session.limitQueueBytes(_config.maxQueuedBytesPerSession, &_queuedBytes,
+                                _config.maxQueuedBytesTotal);
+        session.attachLoginCounts(&_sessionsPerLogin);
 #if defined(MQTT_PLATFORM_HOST)
         session.attachIndex(&_sessionIndex, (uint32_t)(&session - _sessions.data()));
         session.attachRoutes(&_routeIndex);
@@ -497,8 +511,12 @@ void MqttBroker::afterService(MqttBrokerConnection& connection) {
     connection.readable = false;
     if (!connection.inUse()) return;
 
+    // Buffered input relists only when it can be acted on. Part of a packet
+    // used to relist every poll, so one peer that sent four bytes and stopped
+    // kept the shard from ever sleeping; the socket - or the TLS engine's own
+    // buffer, hasBufferedInput() - says when the rest has come.
     bool again = connection.closing || connection.watchedHandle < 0 ||
-                 connection.link.buffered() != 0 ||
+                 connection.link.actionable() ||
                  connection.transport->hasBufferedInput();
 
     const bool blocked = connection.link.transmitPending() != 0;
@@ -694,7 +712,10 @@ size_t MqttBroker::publishForwarded(const MqttBrokerRouted& message, size_t* dro
     // multi-core server keeps the whole retained set, so a SUBSCRIBE is
     // answered from its own store without asking the others.
     if (message.retain && _config.retainAvailable) {
-        _retained.store(message.topic, message.payload, message.qos, properties, mq_millis());
+        // Its publisher's, so every shard counts the same topics against the
+        // same login; the limit was applied where it was published.
+        _retained.store(message.topic, message.payload, message.qos, properties, mq_millis(),
+                        message.userName);
     }
     size_t dropped = 0;
     const size_t matched = route(message.topic, message.payload, message.qos,
@@ -1006,9 +1027,20 @@ MqttBrokerConnection* MqttBroker::freeConnection() {
 #if defined(MQTT_PLATFORM_HOST)
 // A serving slot coming free goes back on the stack. The reserve never does.
 void MqttBroker::releaseConnectionSlot(MqttBrokerConnection& connection) {
+    pauseListeners(false);      // a slot - serving or the reserve - is free again
     const uint32_t index = slotOf(connection);
     if (_connections.empty() || index + 1 >= _connections.size()) return;
     _freeConnections.push_back(index);
+}
+
+void MqttBroker::pauseListeners(bool pause) {
+    if (pause == _listenersPaused || !_eventDriven || _readiness == nullptr) return;
+    for (MqttListener* listener : _listeners) {
+        if (listener == nullptr || listener->waitHandle() < 0) continue;
+        if (pause) _readiness->remove(listener->waitHandle());
+        else _readiness->add(listener->waitHandle(), kListenerToken, false);
+    }
+    _listenersPaused = pause;
 }
 #endif
 
@@ -1040,7 +1072,14 @@ void MqttBroker::acceptNew() {
         // never reaches the bound and behaves exactly as before.
         for (size_t accepted = 0; accepted < kAcceptsPerPoll; accepted++) {
             MqttBrokerConnection* slot = freeConnection();
-            if (slot == nullptr) return;
+            if (slot == nullptr) {
+#if defined(MQTT_PLATFORM_HOST)
+                // Full, the reserve too: those waiting stay in the backlog,
+                // and the shard sleeps until a slot comes free.
+                pauseListeners(true);
+#endif
+                return;
+            }
 
             MqttTransport* transport = listener->accept();
             if (transport == nullptr) break;
@@ -1489,8 +1528,11 @@ bool MqttBroker::sendConnAck(MqttBrokerConnection& connection, uint8_t reasonCod
         properties.maximumPacketSize = _config.maximumPacketSize;
         properties.markPresent(MQ_PROP_MAXIMUM_PACKET_SIZE);
 
+        // No more than the alias table holds (MqttAliases::offerable): a
+        // client told it may use more would be closed with 0x94 the first time
+        // it did.
         if (_config.topicAliasMaximum > 0) {
-            properties.topicAliasMaximum = _config.topicAliasMaximum;
+            properties.topicAliasMaximum = MqttAliases::offerable(_config.topicAliasMaximum);
             properties.markPresent(MQ_PROP_TOPIC_ALIAS_MAXIMUM);
         }
 
@@ -1684,13 +1726,16 @@ void MqttBroker::publishWill(MqttBrokerSession& session) {
     session.will.clear();
 
     if (!will.present || will.topic.empty()) return;
+    // Its topic was allowed at CONNECT; the login's rights may have narrowed
+    // since - an admin closing a device for exactly that publishes its Will.
+    if (!stillPermitted(session, MqttBrokerAction::Publish, will.topic, will.qos, will.retain)) return;
 
     MqttProperties properties;
     restoreProperties(will.properties, properties);
 
     if (will.retain && _config.retainAvailable) {
         _retained.store(asSpan(will.topic), asSpan(will.payload), will.qos,
-                        properties, mq_millis());
+                        properties, mq_millis(), asSpan(session.userName), session.retainedLimit);
     }
 
     size_t dropped = 0;
@@ -1739,7 +1784,8 @@ bool MqttBroker::authorise(MqttBrokerConnection& connection, MqttBrokerAction ac
                            const MqttSpan& topic, uint8_t qos, bool retain,
                            const MqttSpan& clientId, const MqttSpan& userName,
                            const MqttSpan& password, uint8_t& reasonCode,
-                           std::string* login) {
+                           std::string* login, bool* replaceSession,
+                           uint32_t* sessionLimit, uint32_t* retainedLimit) {
     reasonCode = MQ_REASON_NOT_AUTHORIZED;
 
     const char* certificateName =
@@ -1775,8 +1821,62 @@ bool MqttBroker::authorise(MqttBrokerConnection& connection, MqttBrokerAction ac
         connection.transport ? connection.transport->peerCertificateFingerprint() : "";
     if (request.certificateFingerprint == nullptr) request.certificateFingerprint = "";
     request.login = action == MqttBrokerAction::Connect ? login : nullptr;
+    request.replaceSession = action == MqttBrokerAction::Connect ? replaceSession : nullptr;
+    request.sessionLimit = action == MqttBrokerAction::Connect ? sessionLimit : nullptr;
+    request.retainedLimit = action == MqttBrokerAction::Connect ? retainedLimit : nullptr;
 
     return _onAuthorise(_authoriseContext, request, reasonCode);
+}
+
+bool MqttBroker::stillPermitted(const MqttBrokerSession& session, MqttBrokerAction action,
+                                const std::string& topic, uint8_t qos, bool retain) {
+    if (_onAuthorise == nullptr) return true;
+    MqttBrokerRequest request;
+    request.action = action;
+    request.clientId = asSpan(session.clientId());
+    request.userName = asSpan(session.userName);
+    request.topic = asSpan(topic);
+    request.qos = qos;
+    request.retain = retain;
+    request.version = session.version;
+    request.peerName = "";
+    request.certificateName = "";
+    request.certificateFingerprint = "";
+    uint8_t reasonCode = MQ_REASON_NOT_AUTHORIZED;
+    return _onAuthorise(_authoriseContext, request, reasonCode);
+}
+
+// A RESUMED SESSION IS HELD TO TODAY'S RIGHTS. Its subscriptions were granted
+// under whatever its login could read when it subscribed, and an admin may
+// have narrowed that since: a device closed for it reconnected with Clean
+// Start 0 and carried on with every subscription it had, and everything
+// queued for it while it was away. Each subscription is asked for again, and
+// each queued message is held to its own topic.
+void MqttBroker::recheckSession(MqttBrokerSession& session) {
+    if (_onAuthorise == nullptr) return;
+    std::vector<std::string> refused;
+    for (size_t index = 0; index < session.subscriptionCount(); index++) {
+        const MqttBrokerSubscription* subscription = session.subscriptionAt(index);
+        if (subscription == nullptr || !subscription->inUse()) continue;
+        if (!stillPermitted(session, MqttBrokerAction::Subscribe, subscription->filter,
+                            subscription->qos(), false)) {
+            refused.push_back(subscription->filter);
+        }
+    }
+    for (const std::string& filter : refused) {
+        if (session.removeSubscription(asSpan(filter))) {
+            clientEvent(MqttBrokerClientEventKind::Unsubscribed, session, asSpan(filter), 0, 0);
+        }
+    }
+    for (size_t index = 0; index < session.queuedExtent(); index++) {
+        MqttBrokerDelivery* entry = session.deliveryAt(index);
+        // A QoS 2 exchange waiting on its PUBREL has been delivered already.
+        if (entry == nullptr || !entry->inUse() || entry->topic.empty() || entry->pubrelOwed) continue;
+        if (!stillPermitted(session, MqttBrokerAction::Subscribe, entry->topic, entry->qos, false)) {
+            session.discard(*entry);
+            session.messagesDropped++;
+        }
+    }
 }
 
 // =============================================================================
@@ -1921,11 +2021,15 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
 
         // Per broker instance, never a process-wide counter - R5, and two
         // brokers in one test binary would otherwise hand out the same names.
-        std::snprintf(assigned, sizeof assigned, "%.20s%08x",
-                      _config.assignedIdPrefix ? _config.assignedIdPrefix : "auto-",
-                      (unsigned)_nextAssignedId++);
-        assignedSpan.data = (const uint8_t*)assigned;
-        assignedSpan.length = (uint32_t)strlen(assigned);
+        // Never one that names a session already: the names are sequential, so
+        // a client could have taken the next one itself, by asking for it.
+        do {
+            std::snprintf(assigned, sizeof assigned, "%.20s%08x",
+                          _config.assignedIdPrefix ? _config.assignedIdPrefix : "auto-",
+                          (unsigned)_nextAssignedId++);
+            assignedSpan.data = (const uint8_t*)assigned;
+            assignedSpan.length = (uint32_t)strlen(assigned);
+        } while (sessionFor(assignedSpan) != nullptr);
         clientId = assignedSpan;
         didAssign = true;
     }
@@ -1934,17 +2038,33 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     uint8_t refusal = MQ_REASON_NOT_AUTHORIZED;
     MqttSpan noTopic;
     std::string login;      // set by a hook that took the login from somewhere else
+    bool mayReplace = false;    // set by a hook: this login may replace another's session
+    uint32_t sessionLimit = _config.maxSessionsPerLogin;      // and these, per login
+    uint32_t retainedLimit = _config.maxRetainedPerLogin;
+    if (request.hasUserName) {
+        for (const std::string& name : _config.unlimitedLogins) {
+            if (name.size() == request.userName.length &&
+                memcmp(name.data(), request.userName.data, name.size()) == 0) {
+                sessionLimit = retainedLimit = 0;
+                break;
+            }
+        }
+    }
     if (!authorise(connection, MqttBrokerAction::Connect, noTopic, 0, false,
                    clientId, request.hasUserName ? request.userName : MqttSpan(),
                    request.hasPassword ? request.password : MqttSpan(), refusal,
-                   &login)) {
+                   &login, &mayReplace, &sessionLimit, &retainedLimit)) {
         if (!isV5) {
             // 3.1.1's value space is different and much smaller. Mapping 0x87
             // to 0x05 rather than sending it raw matters: 0x87 is "Granted
             // QoS 2" in no version at all, but a 3.1.1 client reading a byte
             // it does not recognise has no defined behaviour.
-            refusal = (refusal == MQ_REASON_BAD_USER_NAME_OR_PASSWORD)
-                          ? MQ_RETURN_BAD_CREDENTIALS : MQ_RETURN_NOT_AUTHORIZED;
+            // A hook that is busy (0x89, 0x97) means "come back", and 3.1.1
+            // says that only as 0x03 Server unavailable.
+            refusal = (refusal == MQ_REASON_BAD_USER_NAME_OR_PASSWORD) ? MQ_RETURN_BAD_CREDENTIALS
+                      : (refusal == MQ_REASON_SERVER_BUSY || refusal == MQ_REASON_QUOTA_EXCEEDED)
+                          ? MQ_RETURN_SERVER_UNAVAILABLE
+                          : MQ_RETURN_NOT_AUTHORIZED;
         }
         sendConnAck(connection, refusal, false, nullptr);
         _status.refused++;
@@ -1960,6 +2080,27 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // a $ channel an extension acts on - by connecting with a Will and pulling
     // the cable. Refused like a CONNECT that is not authorised [V5:MQTT-3.2.2-8],
     // before a session is taken over or created.
+    //
+    // And first, a TOPIC NAME at all [MQTT-3.1.3-11]: no wildcard, not empty.
+    // A PUBLISH is held to that; a Will was not, so "dev/+/#" went out under
+    // that literal name - matched by a rule "dev/<me>/#" - and was kept as a
+    // retained message that disconnected every wildcard subscriber it reached.
+    if (request.hasWill && !mq_topicNameIsValid(request.will.topic)) {
+        _status.protocolErrors++;
+        if (isV5) sendConnAck(connection, MQ_REASON_TOPIC_NAME_INVALID, false, nullptr);
+        _status.refused++;
+        closeConnection(connection, MQ_REASON_TOPIC_NAME_INVALID, false, false);
+        return;
+    }
+    // A Will that says it is text is held to it, as a PUBLISH is (0x99).
+    if (request.hasWill && isV5 && request.will.properties.has(MQ_PROP_PAYLOAD_FORMAT_INDICATOR) &&
+        request.will.properties.payloadFormatIndicator == 1 &&
+        mq_validateUtf8(request.will.payload.data, request.will.payload.length) != MqttError::None) {
+        sendConnAck(connection, MQ_REASON_PAYLOAD_FORMAT_INVALID, false, nullptr);
+        _status.refused++;
+        closeConnection(connection, MQ_REASON_PAYLOAD_FORMAT_INVALID, false, false);
+        return;
+    }
     if (request.hasWill) {
         uint8_t willRefusal = MQ_REASON_NOT_AUTHORIZED;
         const MqttSpan willUser = !login.empty() ? asSpan(login)
@@ -1968,6 +2109,35 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         if (!authorise(connection, MqttBrokerAction::Publish, request.will.topic, request.will.qos,
                        request.will.retain, clientId, willUser, none, willRefusal)) {
             const uint8_t code = isV5 ? MQ_REASON_NOT_AUTHORIZED : MQ_RETURN_NOT_AUTHORIZED;
+            sendConnAck(connection, code, false, nullptr);
+            _status.refused++;
+            closeConnection(connection, code, false, false);
+            return;
+        }
+    }
+
+    // --- Whose session is it? ---
+    //
+    // A SESSION BELONGS TO THE LOGIN THAT MADE IT. Its subscriptions were
+    // granted under that login's rights and its queue holds what that login
+    // may read, so another login naming the same client identifier may not
+    // resume it - that handed over both - nor close a connection of it that is
+    // live - nor, with Clean Start, discard it while its device is away and
+    // take the name. Refused as an identifier this server will not accept
+    // [V5:MQTT-3.1.3-8]. A hook that says this login may stand in for the
+    // owner (replaceSession: a registration claiming a device's name)
+    // replaces it - and a replaced session is discarded, never resumed,
+    // whatever Clean Start asked.
+    const std::string owner = !login.empty() ? login
+                              : request.hasUserName ? std::string((const char*)request.userName.data,
+                                                                  request.userName.length)
+                                                    : std::string();
+    bool foreign = false;
+    {
+        const MqttBrokerSession* held = sessionFor(clientId);
+        foreign = held != nullptr && held->userName != owner;
+        if (foreign && !mayReplace) {
+            const uint8_t code = isV5 ? MQ_REASON_CLIENT_IDENTIFIER_NOT_VALID : MQ_RETURN_IDENTIFIER_REJECTED;
             sendConnAck(connection, code, false, nullptr);
             _status.refused++;
             closeConnection(connection, code, false, false);
@@ -1998,10 +2168,10 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // --- Clean Start ---
     bool sessionPresent = false;
 
-    if (request.cleanStart) {
+    if (request.cleanStart || foreign) {
         // [V5:MQTT-3.1.2-4] "If a CONNECT packet is received with Clean Start
         // set to 1, the Client and Server MUST discard any existing Session
-        // and start a new Session."
+        // and start a new Session." Another login's is discarded either way.
         if (session != nullptr) session->release();
         session = nullptr;
     } else if (session != nullptr && session->version != connection.version) {
@@ -2055,6 +2225,22 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         }
     }
 
+    // --- One login, one share ---
+    //
+    // A new session, past the most this login may hold: one login connecting
+    // with ever-new client identifiers used to take every session slot there
+    // was. Asked only for a NEW session - resuming its own takes nothing more.
+    if (session == nullptr && sessionLimit != 0 && !owner.empty()) {
+        const auto held = _sessionsPerLogin.find(owner);
+        if (held != _sessionsPerLogin.end() && held->second >= sessionLimit) {
+            const uint8_t code = isV5 ? MQ_REASON_QUOTA_EXCEEDED : MQ_RETURN_SERVER_UNAVAILABLE;
+            sendConnAck(connection, code, false, nullptr);
+            _status.refused++;
+            closeConnection(connection, code, false, false);
+            return;
+        }
+    }
+
     if (session == nullptr) {
         session = freeSession();
         if (session == nullptr) {
@@ -2095,8 +2281,11 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         connection.sessionExpiryRevised = requested != asked;
     } else {
         // 3.1.1 has two behaviours and no interval: Clean Session 1 discards
-        // at close, Clean Session 0 keeps indefinitely [V311:3.1.2.4].
-        session->expiryInterval = request.cleanStart ? 0 : 0xFFFFFFFFu;
+        // at close, Clean Session 0 keeps - "indefinitely" in the standard
+        // [V311:3.1.2.4], but no longer than this broker keeps a 5.0 session.
+        // Uncapped, one login connecting with ever-new client identifiers
+        // held every session slot until a restart.
+        session->expiryInterval = request.cleanStart ? 0 : _config.maximumSessionExpiry;
     }
 
     // --- The Will ---
@@ -2119,12 +2308,8 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     }
 
     session->connected = true;
-    if (!login.empty()) {
-        session->userName = login;
-    } else {
-        session->userName.assign(request.hasUserName ? (const char*)request.userName.data : "",
-                                 request.hasUserName ? request.userName.length : 0);
-    }
+    session->setOwner(owner);
+    session->retainedLimit = retainedLimit;
     session->connectionSlot = (uint32_t)(&connection - _connections.data());
 #if defined(MQTT_PLATFORM_HOST)
     // Back before its deadlines: the Will is cancelled by the reconnect
@@ -2157,6 +2342,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // A resumed session may have messages waiting from while the client was
     // away, and a half-finished QoS 2 exchange to complete [V5:4.4].
     if (sessionPresent) {
+        recheckSession(*session);
         session->markAllUnsent();
         deliverQueued(connection);
     }
@@ -2168,6 +2354,12 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
 
 uint32_t MqttBroker::nextInGroup(const std::string& key, uint32_t members) {
     if (members == 0) return 0;
+#if defined(MQTT_PLATFORM_HOST)
+    uint32_t& next = _shareCursors[key];     // a new group starts at member 0
+    const uint32_t chosen = next % members;
+    next = chosen + 1;
+    return chosen;
+#else
     for (ShareCursor& cursor : _shareCursors) {
         if (cursor.key == key) {
             const uint32_t chosen = cursor.next % members;
@@ -2180,6 +2372,7 @@ uint32_t MqttBroker::nextInGroup(const std::string& key, uint32_t members) {
     cursor.next = 1;
     _shareCursors.push_back(cursor);
     return 0;
+#endif
 }
 
 namespace {
@@ -2268,6 +2461,28 @@ void MqttBroker::pruneShareCursors() {
     // Run when subscriptions have changed, which is exactly when a group may
     // have gone away: from the rebuild on a board, and from route() - at most
     // once a second - where the index is kept incrementally instead.
+#if defined(MQTT_PLATFORM_HOST)
+    // The groups that still have a member, in ONE pass over the sessions -
+    // not one pass per cursor, which at thousands of groups was seconds.
+    if (!_shareCursors.empty()) {
+        std::unordered_set<std::string> live;
+        for (const MqttBrokerSession& session : _sessions) {
+            if (!session.inUse()) continue;
+            for (size_t k = 0; k < session.subscriptionCount(); k++) {
+                const MqttBrokerSubscription* sub = session.subscriptionAt(k);
+                if (sub == nullptr || !sub->inUse() || !sub->shared()) continue;
+                std::string key = sub->shareName;
+                key.push_back('\0');
+                key += sub->effective;
+                live.insert(std::move(key));
+            }
+        }
+        for (auto cursor = _shareCursors.begin(); cursor != _shareCursors.end();) {
+            if (live.count(cursor->first) == 0) cursor = _shareCursors.erase(cursor);
+            else ++cursor;
+        }
+    }
+#else
     if (!_shareCursors.empty()) {
         size_t kept = 0;
         for (size_t index = 0; index < _shareCursors.size(); index++) {
@@ -2291,6 +2506,7 @@ void MqttBroker::pruneShareCursors() {
         }
         _shareCursors.resize(kept);
     }
+#endif
 
 #if defined(MQTT_PLATFORM_HOST)
     _sharePrunedRevision = _subscriptionRevision;
@@ -2368,6 +2584,9 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
         std::vector<ShareCandidate> members;
     };
     std::vector<ShareGroup> groups;
+#if defined(MQTT_PLATFORM_HOST)
+    std::unordered_map<std::string, size_t> groupAt;   // key -> index in groups
+#endif
 
     // ONLY THE SESSIONS THAT COULD MATCH. Everything inside this loop is
     // exactly as it was - including the mq_topicMatches() check, which is what
@@ -2424,14 +2643,22 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
                 key += subscription->effective;
 
                 ShareGroup* group = nullptr;
+#if defined(MQTT_PLATFORM_HOST)
+                const auto found = groupAt.find(key);
+                if (found != groupAt.end()) group = &groups[found->second];
+#else
                 for (ShareGroup& candidate : groups) {
                     if (candidate.key == key) { group = &candidate; break; }
                 }
+#endif
                 if (group == nullptr) {
                     ShareGroup fresh;
                     fresh.key = key;
                     groups.push_back(fresh);
                     group = &groups.back();
+#if defined(MQTT_PLATFORM_HOST)
+                    groupAt.emplace(key, groups.size() - 1);
+#endif
                 }
                 ShareCandidate member;
                 member.session = &session;
@@ -2465,7 +2692,7 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
         // place makes it one copy into a buffer the slot already owns. A
         // refused reservation is still counted as matched-and-dropped exactly
         // as before, so what the publisher is told does not change.
-        MqttBrokerDelivery* slot = session.reserveDelivery();
+        MqttBrokerDelivery* slot = session.reserveDelivery(topic.length + payload.length);
         if (slot == nullptr) {
             matched++;
             _status.dropped++;
@@ -2529,7 +2756,7 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
         ShareCandidate& member = group.members[chosen];
 
         // Filled in place, for the same reason as the ordinary path above.
-        MqttBrokerDelivery* slot = member.session->reserveDelivery();
+        MqttBrokerDelivery* slot = member.session->reserveDelivery(topic.length + payload.length);
         if (slot == nullptr) {
             matched++;
             _status.dropped++;
@@ -2624,7 +2851,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         if (next->properties.hasExpiry) {
             const uint32_t waited = (uint32_t)(mq_elapsed(next->queuedAt, now) / 1000u);
             if (waited >= next->properties.expiryInterval) {
-                next->release();
+                session->discard(*next);
                 _status.dropped++;
                 continue;
             }
@@ -2733,7 +2960,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
                 // whether this attempt allocated it or a previous one did -
                 // there is nothing left to acknowledge it.
                 if (packetId != MQ_PACKET_ID_NONE) session->releasePacketId(packetId);
-                next->release();
+                session->discard(*next);
                 _status.dropped++;
                 continue;
             }
@@ -2755,7 +2982,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         if (next->qos == MQ_QOS_0) {
             // Nothing acknowledges a QoS 0 delivery, so reaching the wire is
             // its conclusion.
-            next->release();
+            session->discard(*next);
         } else {
             next->packetId = packetId;
             next->sent = true;
@@ -2928,6 +3155,15 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
     // or PUBREC with Reason Code 0x99." It does validate: a payload that
     // claims to be text and is not will be read as text by something
     // downstream, and that something is usually a dashboard.
+    // [V5:MQTT-3.3.4-6] "A PUBLISH packet sent from a Client to a Server MUST
+    // NOT contain a Subscription Identifier." It was stripped on forwarding;
+    // it is a protocol error.
+    if (isV5 && MQ_PROPERTIES(packet, message).has(MQ_PROP_SUBSCRIPTION_IDENTIFIER)) {
+        _status.protocolErrors++;
+        closeConnection(connection, MQ_REASON_PROTOCOL_ERROR, true, true);
+        return;
+    }
+
     if (isV5 && MQ_PROPERTIES(packet, message).has(MQ_PROP_PAYLOAD_FORMAT_INDICATOR) &&
         MQ_PROPERTIES(packet, message).payloadFormatIndicator == 1) {
         if (mq_validateUtf8(message.payload.data, message.payload.length)
@@ -2980,6 +3216,14 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
         } else if (!session->rememberInbound(message.packetId)) {
             // No room to remember it, so exactly-once cannot be promised.
             // Saying so is better than forwarding it twice later.
+            //
+            // At 3.1.1 a PUBREC has no reason code: this one read as "taken",
+            // and the message was gone. There the only honest refusal is to
+            // close - the client sends it again on its next connection.
+            if (connection.version != MqttVersion::V5) {
+                closeConnection(connection, 0, false, true);
+                return;
+            }
             sendSimpleAck(connection, MQ_PKT_PUBREC, message.packetId,
                           MQ_REASON_QUOTA_EXCEEDED);
             return;
@@ -3009,7 +3253,8 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
             // been kept for the next subscriber to arrive. It had not.
             retainedStoreFull = !_retained.store(topic, message.payload,
                                                  message.qos, MQ_PROPERTIES(packet, message),
-                                                 mq_millis());
+                                                 mq_millis(), asSpan(session->userName),
+                                                 session->retainedLimit);
         }
 
         matched = route(topic, message.payload, message.qos, message.retain,
@@ -3132,7 +3377,7 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
         // packet". A failure is a conclusion, not a retry trigger.
         MqttBrokerDelivery* delivery = session->findByPacketId(packetId);
         if (delivery == nullptr) return;   // unknown identifier; nothing owed
-        delivery->release();
+        session->discard(*delivery);
         connection.toPeer.returnOne();
         return;
     }
@@ -3153,7 +3398,7 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
         if (reason >= 0x80) {
             // [V5:MQTT-4.4.0-2] A PUBREC carrying a failure ENDS the exchange.
             // No PUBREL follows, and the identifier is free again.
-            delivery->release();
+            session->discard(*delivery);
             connection.toPeer.returnOne();
             return;
         }
@@ -3183,14 +3428,17 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
             return;
         }
         session->forgetInbound(packetId);
-        if (connection.inFlightFromPeer > 0) connection.inFlightFromPeer--;
+        // Only an exchange that was open closes one: a PUBREL for an
+        // identifier never seen lowered the count all the same, and a client
+        // mixing those in could send past the Receive Maximum we advertised.
+        if (known && connection.inFlightFromPeer > 0) connection.inFlightFromPeer--;
         return;
     }
 
     case MQ_PKT_PUBCOMP: {
         MqttBrokerDelivery* delivery = session->findByPacketId(packetId);
         if (delivery == nullptr) return;
-        delivery->release();
+        session->discard(*delivery);
         connection.toPeer.returnOne();
         return;
     }
@@ -3270,7 +3518,7 @@ bool MqttBroker::continueRetained(MqttBrokerSession& session) {
         visit.queuedAny = false;
         const size_t next = _retained.visitMatchingFrom(
             asSpan(subscription->effective), now, subscription->retainedNext,
-            &MqttBroker::visitRetained, &visit);
+            &MqttBroker::visitRetained, &visit, kRetainedSlotsPerPass);
         queuedAny = queuedAny || visit.queuedAny;
         session.retainedProgress(index, next, next >= _retained.capacity());
     }
@@ -3312,6 +3560,13 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
                             true, true);
             return;
         }
+        // [V5:3.8.2.1.2] "It is a Protocol Error to include the Subscription
+        // Identifier more than once." Only the first was used, silently.
+        if (MQ_PROPERTIES(packet, request).subscriptionIdCount > 1) {
+            _status.protocolErrors++;
+            closeConnection(connection, MQ_REASON_PROTOCOL_ERROR, true, true);
+            return;
+        }
         subscriptionId = MQ_PROPERTIES(packet, request).subscriptionIds[0];
     }
 
@@ -3335,6 +3590,12 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
 
         if (!mq_topicFilterIsValid(filter.filter)) {
             granted = isV5 ? MQ_REASON_TOPIC_FILTER_INVALID : 0x80;
+        } else if (isShared && (filter.options & MQ_SUBOPT_NO_LOCAL) != 0) {
+            // [V5:MQTT-3.8.3-4] "It is a Protocol Error to set the No Local
+            // bit to 1 on a Shared Subscription."
+            _status.protocolErrors++;
+            closeConnection(connection, MQ_REASON_PROTOCOL_ERROR, true, true);
+            return;
         } else if (isShared && !_config.sharedSubscriptionAvailable) {
             // [V5:MQTT-3.2.2-13] Advertised as unavailable, so refused here
             // rather than accepted and quietly never delivered.
@@ -3518,7 +3779,8 @@ bool MqttBroker::publishMessage(const MqttBrokerRouted& message) {
     const MqttProperties& properties = message.properties ? *message.properties : kNone;
     bool kept = true;
     if (message.retain && _config.retainAvailable) {
-        kept = _retained.store(message.topic, message.payload, message.qos, properties, mq_millis());
+        kept = _retained.store(message.topic, message.payload, message.qos, properties, mq_millis(),
+                               message.userName);
     }
     size_t refusedByQueue = 0;
     const size_t matched = route(message.topic, message.payload, message.qos, message.retain,
@@ -3541,7 +3803,8 @@ size_t MqttBroker::disconnectUser(const MqttSpan& userName, uint8_t reasonCode) 
         if (name.size() != userName.length) continue;
         if (userName.length != 0 && memcmp(name.data(), userName.data, userName.length) != 0) continue;
         // Will published: to everyone else this device has gone, which is
-        // what its Will is for.
+        // what its Will is for - if its login may still publish it
+        // (publishWill asks again: a login removed or narrowed may not).
         closeConnection(connection, reasonCode, true, true);
         closed++;
     }

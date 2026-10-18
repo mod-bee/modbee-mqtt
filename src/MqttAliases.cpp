@@ -27,10 +27,12 @@ void MqttAliases::reset(uint16_t outboundMaximum, uint16_t inboundMaximum) {
     }
     // Never more than this build holds, whatever the peer offered. A peer
     // offering 65535 aliases is not an instruction to allocate 65535 entries.
+    //
+    // The inbound cap is offerable(), the same function the client's CONNECT
+    // uses, so what it advertised and what it accepts cannot drift apart.
     _outboundMaximum = outboundMaximum > MQTT_MAX_ALIASES
                            ? (uint16_t)MQTT_MAX_ALIASES : outboundMaximum;
-    _inboundMaximum = inboundMaximum > MQTT_MAX_ALIASES
-                          ? (uint16_t)MQTT_MAX_ALIASES : inboundMaximum;
+    _inboundMaximum = offerable(inboundMaximum);
     _nextOutbound = 1;
 }
 
@@ -65,6 +67,12 @@ uint16_t MqttAliases::assignOutbound(const uint8_t* topic, uint16_t length,
         if (existing != 0) return existing;
     }
 
+    // A topic too long for an entry is not aliased at all. Stored cut short
+    // it would be worse than useless: a later publish to a topic that IS the
+    // first MQTT_ALIAS_TOPIC bytes of this one would find it, send the alias
+    // alone, and the broker would deliver that message to the long topic.
+    if (!fits(length)) return 0;
+
     if (_nextOutbound > _outboundMaximum) {
         // Full. Evicting an entry would be worse than not aliasing: the peer
         // would keep the old meaning until it saw the new mapping, and any
@@ -84,6 +92,26 @@ uint16_t MqttAliases::assignOutbound(const uint8_t* topic, uint16_t length,
 bool MqttAliases::rememberInbound(uint16_t alias, const uint8_t* topic, uint16_t length) {
     if (!inboundAllowed(alias)) return false;
     if (!topic || length == 0) return false;
+
+    // A TOPIC THE ENTRY CANNOT HOLD IS NOT HELD AT ALL.
+    //
+    // A board's entries are fixed (MqttFixed.h), and MqttFixedBytes cuts what
+    // it is given to its capacity, silently - which is right for a PLC's
+    // STRING pin and wrong here. A 200-byte topic was kept as its first 128
+    // bytes, and every later alias-only message was delivered under that
+    // shortened name: a topic nobody published to, matched against the
+    // subscriptions as if it were real. So the mapping is refused instead,
+    // and any earlier meaning of this alias is dropped with it - the peer has
+    // replaced it, and keeping the old one would deliver the next alias-only
+    // message to the previous topic. The alias now means nothing, and a
+    // PUBLISH that relies on it is 0x94, which is the truth: this end cannot
+    // honour that mapping.
+    if (!fits(length)) {
+        for (int i = 0; i < MQTT_MAX_ALIASES; i++) {
+            if (_inbound[i].alias == alias) _inbound[i] = Entry();
+        }
+        return false;
+    }
 
     // A peer may reassign an alias mid-connection: V5:3.3.2.3.4 - "A sender
     // can modify the Topic Alias mapping by sending another PUBLISH in the

@@ -532,8 +532,12 @@ void readBroker(Loader& loader, Section broker, BrokerSection& out) {
     broker.integer("max-sessions", out.maxSessions, 0, 100000000);
     if (broker.integer("max-packet", n, 64, 268435455)) out.maxPacket = (uint32_t)n;
     if (broker.integer("queue", n, 1, 1000000)) out.queue = (size_t)n;
+    broker.integer("queue-bytes", out.queueBytes, 0, 1LL << 40);
+    broker.integer("queue-bytes-total", out.queueBytesTotal, 0, 1LL << 44);
     if (broker.integer("subscriptions", n, 1, 100000)) out.subscriptions = (size_t)n;
     broker.integer("max-session-expiry", out.maxSessionExpiry, 0, 4294967295LL);
+    broker.integer("connect-timeout", out.connectTimeout, 1, 300);
+    broker.integer("max-keepalive", out.maxKeepAlive, 0, 65535);
     if (broker.integer("max-retained", n, 0, 10000000)) out.maxRetained = (size_t)n;
     broker.flag("pin-threads", out.pinThreads);
     broker.integer("status-every", out.statusEvery, 0, 86400);
@@ -1010,6 +1014,8 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
         auth.flag("certificate-login", out.authentication.certificateLogin);
         static const char* const kDefaultTopics[] = {"all", "none", nullptr};
         auth.choice("default-topics", out.authentication.defaultTopics, kDefaultTopics);
+        auth.integer("max-sessions-per-login", out.authentication.maxSessionsPerLogin, 0, 1000000);
+        auth.integer("max-retained-per-login", out.authentication.maxRetainedPerLogin, 0, 10000000);
         const size_t users = auth.count("users");
         for (size_t i = 0; i < users; i++) {
             Section user = auth.item("users", i);

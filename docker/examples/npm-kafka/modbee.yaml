@@ -10,6 +10,7 @@ broker:
   port: 1883
   shards: 1                  # one worker thread: a small server
   max-connections: 2000
+  connect-timeout: 5         # seconds a connection has to sign in
 
 # Logins. The admin (MQTT_USERNAME / MQTT_PASSWORD in .env) is for you, your
 # apps and the modbee command. Every device gets a login of its own, kept in
@@ -36,7 +37,7 @@ retained:
 kafka:
   clusters:
     - id: main
-      bootstrap-servers: kafka:9092
+      bootstrap-servers: 10.80.81.11:9092   # Kafka on the internal network (compose.yml)
 
   mqtt-to-kafka:
     # Every MQTT message, to the Kafka topic mqtt-messages: the payload as it

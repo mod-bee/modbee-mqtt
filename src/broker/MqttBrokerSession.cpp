@@ -81,7 +81,7 @@ void MqttBrokerSession::adopt(const MqttSpan& clientId) {
     will.clear();
     clearSubscriptions();
     clearInbound();
-    for (MqttBrokerDelivery& entry : _queue) entry.release();
+    for (MqttBrokerDelivery& entry : _queue) discard(entry);
     _queueExtent = 0;
 }
 
@@ -93,15 +93,17 @@ void MqttBrokerSession::release() {
         _index->giveBack(_self);
     }
 #endif
+    if (_inUse) setOwner(std::string());
     _inUse = false;
     _clientId.clear();
     connected = false;
     userName.clear();
+    retainedLimit = 0;
     connectionSlot = kNoConnection;
     will.clear();
     clearSubscriptions();
     clearInbound();
-    for (MqttBrokerDelivery& entry : _queue) entry.release();
+    for (MqttBrokerDelivery& entry : _queue) discard(entry);
     _queueExtent = 0;
 }
 
@@ -253,8 +255,48 @@ void MqttBrokerSession::retainedProgress(size_t index, size_t next, bool finishe
 // THE DELIVERY QUEUE
 // =============================================================================
 
-MqttBrokerDelivery* MqttBrokerSession::reserveDelivery() {
+namespace {
+// What an entry holds: the topic and payload copies. Properties are small and
+// bounded, and are not counted.
+size_t bytesOf(const MqttBrokerDelivery& entry) { return entry.topic.size() + entry.payload.size(); }
+// A payload buffer above this is given back when its entry is done with;
+// below it, kept for the next message, as every slot always did.
+const size_t kKeptPayloadBytes = 256;
+} // namespace
+
+bool MqttBrokerSession::withinBudget(size_t bytes) const {
+    if (_maxQueuedBytes != 0 && _queuedBytes + bytes > _maxQueuedBytes) return false;
+    if (_queuedBytesTotal != nullptr && _maxQueuedBytesTotal != 0 &&
+        *_queuedBytesTotal + bytes > _maxQueuedBytesTotal) {
+        return false;
+    }
+    return true;
+}
+
+void MqttBrokerSession::charge(MqttBrokerDelivery& entry) {
+    entry.charged = bytesOf(entry);
+    _queuedBytes += entry.charged;
+    if (_queuedBytesTotal) *_queuedBytesTotal += entry.charged;
+}
+
+void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
+    if (entry.charged != 0) {
+        _queuedBytes -= entry.charged < _queuedBytes ? entry.charged : _queuedBytes;
+        if (_queuedBytesTotal) {
+            *_queuedBytesTotal -= entry.charged < *_queuedBytesTotal ? entry.charged : *_queuedBytesTotal;
+        }
+        entry.charged = 0;
+    }
+    entry.release();
+    if (entry.payload.capacity() > kKeptPayloadBytes) std::vector<uint8_t>().swap(entry.payload);
+}
+
+MqttBrokerDelivery* MqttBrokerSession::reserveDelivery(size_t bytes) {
     reserveQueue();
+    if (!withinBudget(bytes)) {
+        messagesDropped++;
+        return nullptr;
+    }
     for (size_t index = 0; index < _queue.size(); index++) {
         MqttBrokerDelivery& entry = _queue[index];
         if (entry.inUse()) continue;
@@ -269,15 +311,21 @@ MqttBrokerDelivery* MqttBrokerSession::reserveDelivery() {
 
 void MqttBrokerSession::commitDelivery(MqttBrokerDelivery& entry) {
     entry.sequence = _nextSequence++;
+    charge(entry);
 }
 
 bool MqttBrokerSession::enqueue(const MqttBrokerDelivery& message) {
     reserveQueue();
+    if (!withinBudget(bytesOf(message))) {
+        messagesDropped++;
+        return false;
+    }
     for (size_t index = 0; index < _queue.size(); index++) {
         MqttBrokerDelivery& entry = _queue[index];
         if (!entry.inUse()) {
             entry = message;
             entry.sequence = _nextSequence++;
+            charge(entry);
             if (index + 1 > _queueExtent) _queueExtent = index + 1;
             return true;
         }
@@ -300,6 +348,11 @@ bool MqttBrokerSession::queueFull() const {
     // Still the full array: "is there any room anywhere" is a question about
     // the whole queue, not about how deep it currently goes. A queue not yet
     // reserved has all of its room.
+    //
+    // And full when its bytes are spent: a queue that has slots but no byte
+    // budget takes nothing, and a caller told otherwise - retained messages
+    // still owed - would ask again on every pass.
+    if (!withinBudget(1)) return true;
     if (_queue.empty()) return false;
     for (const MqttBrokerDelivery& entry : _queue) {
         if (!entry.inUse()) return false;
@@ -342,7 +395,7 @@ MqttBrokerDelivery* MqttBrokerSession::deliveryAt(size_t index) {
 
 void MqttBrokerSession::releaseDelivery(uint16_t packetId) {
     MqttBrokerDelivery* entry = findByPacketId(packetId);
-    if (entry) entry->release();
+    if (entry) discard(*entry);
 }
 
 void MqttBrokerSession::markAllUnsent() {

@@ -98,19 +98,34 @@ bool filtersOk(const std::vector<std::string>& filters) {
 
 // ${username} and ${clientid}, or false if either would put a wildcard or a
 // level separator into a filter.
+//
+// ONE PASS OVER THE PATTERN: a value is copied in and never read again. The
+// two used to be replaced one after the other, the second searched for in the
+// result of the first - so a login named "t${clientid}" connecting as "ank-07"
+// had "plant/${username}/#" become "plant/tank-07/#", another device's.
 bool expand(const std::string& pattern, const std::string& username, const std::string& clientId,
             std::string& out) {
-    out = pattern;
-    struct { const char* name; const std::string* value; } vars[] = {
-        {"${username}", &username}, {"${clientid}", &clientId}};
-    for (auto& v : vars) {
-        size_t at = out.find(v.name);
-        if (at == std::string::npos) continue;
-        if (!safeName(*v.value, 65535)) return false;
-        while (at != std::string::npos) {
-            out.replace(at, std::strlen(v.name), *v.value);
-            at = out.find(v.name, at + v.value->size());
+    static const char kUser[] = "${username}";
+    static const char kClient[] = "${clientid}";
+    out.clear();
+    size_t at = 0;
+    while (at < pattern.size()) {
+        const std::string* value = nullptr;
+        size_t length = 0;
+        if (pattern.compare(at, sizeof kUser - 1, kUser) == 0) {
+            value = &username;
+            length = sizeof kUser - 1;
+        } else if (pattern.compare(at, sizeof kClient - 1, kClient) == 0) {
+            value = &clientId;
+            length = sizeof kClient - 1;
         }
+        if (value == nullptr) {
+            out.push_back(pattern[at++]);
+            continue;
+        }
+        if (!safeName(*value, 65535)) return false;
+        out += *value;
+        at += length;
     }
     return true;
 }
@@ -358,6 +373,19 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
                 std::lock_guard<std::mutex> lock(_provisioningMutex);
                 _provisioning[clientId] = keyName;
             }
+            // A device registering again under its own name - wiped, or
+            // replaced while the old one is still connected - takes the client
+            // identifier from that login's session. Only where this key may
+            // re-provision the login anyway (provision() below says the same),
+            // so it grants nothing the key did not have: the session is
+            // replaced, never resumed, and nobody else's is touched.
+            AuthUser existing;
+            AuthKey key;
+            if (ok && request.replaceSession != nullptr && _store.findUser(clientId, existing) &&
+                _store.findKey(keyName, key) && !existing.admin && !existing.provisionedBy.empty() &&
+                existing.enabled && existing.site == key.site) {
+                *request.replaceSession = true;
+            }
         } else if (fixedLogin(_config.admins, request.userName, request.password) ||
                    fixedLogin(_config.logins, request.userName, request.password)) {
             ok = true;
@@ -480,6 +508,11 @@ bool AuthGate::certificateLogin(Shard& shard, const MqttBrokerRequest& request, 
 
 uint32_t AuthGate::offer(uint32_t shard, MqttBroker&, const MqttBrokerRouted& message, uint64_t) {
     if (message.topic.length < 8 || message.topic.data[0] != '$') return 0;
+    // A request is a CLIENT's: published over MQTT, through the hook. What an
+    // extension injected (the Kafka pipe's records carry an origin) or the
+    // application published (no client) never met the hook, so a record on
+    // $modbee/admin/request is nobody's request - not an admin's.
+    if (message.origin != nullptr || message.clientId.length == 0) return 0;
     const std::string topic = text(message.topic);
     const std::string clientId = text(message.clientId);
     Request request;
@@ -487,7 +520,9 @@ uint32_t AuthGate::offer(uint32_t shard, MqttBroker&, const MqttBrokerRouted& me
     request.login = text(message.userName);
     request.payload = text(message.payload);
     if (topic == kAdminRequest) {
-        // Only an admin could publish it: the hook refused everybody else.
+        // The hook refused everybody else; asked again here, so the request
+        // stands on the publisher's login and not on the topic alone.
+        if (!isFixedAdmin(request.login) && !permissions(*_shards[shard], request.login).admin) return 0;
         request.admin = true;
         queue(shard, request);
     } else if (topic == std::string(kProvisionPrefix) + clientId + "/request") {

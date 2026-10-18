@@ -31,6 +31,13 @@ bool MqttTlsAcceptContext::begin() {
 
     mq_tls::useChannelIo(ctx);
 
+    // 1.2 is the floor, as it is for every other context this library makes
+    // (MqttTlsTransport, MqttTlsListener) - and this one was the exception,
+    // so a board serving TLS would agree to 1.0 or 1.1 with any client that
+    // asked. The same call on both engines: wolfSSL's compatibility layer
+    // takes it as OpenSSL does.
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
     if (!loadIdentity()) {
         SSL_CTX_free(ctx);
         _context = nullptr;

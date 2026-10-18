@@ -3,9 +3,18 @@
 # addresses; nothing here is published on the server's ports.
 # Sized for a small server (1 CPU, 2 GB): together under 1 GB.
 #
+#   network modbee (NPM joins this one):
 #   modbee   10.80.80.10   MQTT 1883             NPM stream 8883 -> here
 #   kafka    10.80.80.11   Kafka 9095 (password)  NPM stream 9093 -> here
-#                          Kafka 9092 (inside Docker only)
+#
+#   network modbee-internal (internal: nothing else joins it, NPM included):
+#   modbee   10.80.81.10
+#   kafka    10.80.81.11   Kafka 9092, no password - modbee's own
+#
+# Kafka checks who may do what (an authorizer): the password login
+# (KAFKA_USERNAME) may read mqtt-messages and modbee-events and write
+# mqtt-commands - nothing else, so it can neither delete a topic nor write
+# modbee's retained store. Only modbee, on the internal network, has more.
 #
 #   cp .env.example .env      # set DOMAIN, MQTT_PASSWORD and KAFKA_PASSWORD
 #   docker compose up -d      # then the two NPM streams: README.md
@@ -20,12 +29,14 @@ services:
     environment:
       MODBEE_AUTHENTICATION_USERNAME: ${MQTT_USERNAME:-admin}
       MODBEE_AUTHENTICATION_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+    ulimits: {nofile: {soft: 1048576, hard: 1048576}}
     mem_limit: 256m
     volumes:
       - ./modbee.yaml:/etc/modbee/modbee.yaml:ro
       - modbee-data:/var/lib/modbee
     networks:
       modbee: {ipv4_address: 10.80.80.10}
+      modbee-internal: {ipv4_address: 10.80.81.10}
 
   kafka:
     image: apache/kafka:4.3.1
@@ -35,14 +46,22 @@ services:
       KAFKA_HEAP_OPTS: "-Xmx256m -Xms256m"
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,REMOTE://:9095
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,REMOTE://${DOMAIN:?set DOMAIN in .env}:9093
+      # Each listener on its own network: the one without a password on the
+      # internal network only, the controller on localhost only.
+      KAFKA_LISTENERS: PLAINTEXT://10.80.81.11:9092,CONTROLLER://localhost:9093,REMOTE://10.80.80.11:9095
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://10.80.81.11:9092,REMOTE://${DOMAIN:?set DOMAIN in .env}:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,REMOTE:SASL_PLAINTEXT
       KAFKA_LISTENER_NAME_REMOTE_SASL_ENABLED_MECHANISMS: PLAIN
       KAFKA_LISTENER_NAME_REMOTE_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required user_${KAFKA_USERNAME:-app}="${KAFKA_PASSWORD:?set KAFKA_PASSWORD in .env}";
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      # Who may do what. A connection without a password (User:ANONYMOUS) can
+      # only come from the internal network or localhost - modbee, the topic
+      # set-up below, and Kafka itself - and may do anything. The password
+      # login gets exactly the ACLs kafka-topics grants it.
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_SUPER_USERS: User:ANONYMOUS
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -50,30 +69,39 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9092'"]   # cheap: no Java started
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/10.80.81.11/9092'"]   # cheap: no Java started
       interval: 10s
       retries: 30
     networks:
       modbee: {ipv4_address: 10.80.80.11}
+      modbee-internal: {ipv4_address: 10.80.81.11}
 
   # Creates the Kafka topics modbee.yaml uses, once, before modbee starts (a
   # topic Kafka creates on its first record is joined after that record, which
-  # is then never read), then exits. Add a topic here when you add a mapping.
+  # is then never read), and what the password login may do with them; then
+  # exits. Add a topic here when you add a mapping - and an ACL, if your apps
+  # are to use it.
   kafka-topics:
     image: apache/kafka:4.3.1
     mem_limit: 256m
     environment:
       KAFKA_HEAP_OPTS: "-Xmx64m"
+      APP_USER: ${KAFKA_USERNAME:-app}
     depends_on:
       kafka: {condition: service_healthy}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        k=/opt/kafka/bin; at=10.80.81.11:9092
         for t in mqtt-messages mqtt-commands modbee-events; do
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t --partitions 6 || exit 1
+          $$k/kafka-topics.sh --bootstrap-server $$at --create --if-not-exists --topic $$t --partitions 6 || exit 1
         done
+        acl() { $$k/kafka-acls.sh --bootstrap-server $$at --add --allow-principal "User:$$APP_USER" "$$@" >/dev/null || exit 1; }
+        for t in mqtt-messages modbee-events; do acl --operation Read --operation Describe --topic $$t; done
+        acl --operation Write --operation Describe --topic mqtt-commands
+        acl --operation Read --group '*'
     restart: "no"
-    networks: [modbee]
+    networks: [modbee-internal]
 
 networks:
   modbee:
@@ -81,6 +109,12 @@ networks:
     ipam:
       config:
         - subnet: 10.80.80.0/24
+  modbee-internal:
+    name: modbee-internal
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.80.81.0/24
 
 volumes:
   modbee-data:

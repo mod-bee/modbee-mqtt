@@ -270,9 +270,15 @@ void MqttDevice::startProvisioning() {
         }
     }
     if (_connection.hasUserName && !_reprovision) {
-        _provisionState = MqttProvisionState::Provisioned;
+        // A held login being tried again is not known to be good yet: the
+        // state the key's session last reported - Pending, Refused - stands
+        // until the broker takes it (provisionStateChanged()), so a block's
+        // STATE does not claim Provisioned every five minutes for one refused
+        // CONNECT.
+        if (!_retryingLogin) _provisionState = MqttProvisionState::Provisioned;
         return;
     }
+    _retryingLogin = false;
     if (_connection.clientId.empty()) {
         _provisionState = MqttProvisionState::Refused;
         _provisionReason = "provisioning needs the device's name: connect(host, \"name\")";
@@ -312,7 +318,10 @@ void MqttDevice::provisionReply(const MqttMessage& message) {
     std::string status, user, password;
     jsonField(doc, "status", status);
     if (status == "ok" && jsonField(doc, "username", user) && jsonField(doc, "password", password)) {
+        // THE ONLY PLACE A STORED LOGIN IS REPLACED: here, with one the broker
+        // has just issued. Pending and refused below leave it as it was.
         if (_saveLogin) _saveLogin(_loginContext, user.c_str(), password.c_str());
+        _retryingLogin = false;
         credentials(user.c_str(), password.c_str());
         _provisionState = MqttProvisionState::Provisioned;
         _provisionReason.clear();
@@ -340,17 +349,45 @@ void MqttDevice::serviceProvisioning() {
         }
         if (_client.state() != MqttState::Idle && _client.state() != MqttState::Reconnecting) return;
         _switchDisconnected = false;
-        if (_reprovision) {
-            if (_saveLogin) _saveLogin(_loginContext, "", "");
-            _connection.hasUserName = false;
-            _connection.userName.clear();
-            _connection.hasPassword = false;
-            _connection.password.clear();
-        }
+        // THE STORED LOGIN IS NOT FORGOTTEN HERE, and for a long time it was:
+        // one refused CONNECT and it was wiped - from memory and through
+        // _saveLogin, from the block's retained memory too - before the key
+        // had been asked anything. A broker whose login store is lost, or put
+        // back from last month's backup, refuses EVERY device's login at
+        // once, and the whole fleet erased itself and sat in "pending" for an
+        // admin to approve each one again, although the logins they held
+        // were good the moment the store came back.
+        //
+        // So a refused login is only a reason to ASK. The device registers
+        // with the key and keeps what it holds, in memory and in the store;
+        // the login is replaced in provisionReply() when the broker has
+        // actually issued a new one, and not before. Until then it is tried
+        // again at the rejected-credentials pace (just below), so a store
+        // that comes back lets the device back in without anyone approving
+        // anything.
         _switchToLogin = false;
         startProvisioning();
         beginClient();
         _client.connect();
+        return;
+    }
+    // Registering again with a login still held: the login is tried once
+    // more at the pace a refused credential is always retried at
+    // (rejectedCredentialsRetryMs, five minutes), whatever the key's session
+    // is doing - up, waiting for approval, refused, or not reachable at all.
+    // A broker whose store came back takes the old login and the device is
+    // itself again; one that still refuses it sends the device back to the
+    // key, and five minutes later the same again. Never faster: a password
+    // repeated every second is how a device gets itself banned (MqttClient's
+    // closeConnection() says why), and the pace is the one the client keeps
+    // for a device with no key at all. Zero there means a refused credential
+    // is never repeated, and then this does not repeat it either.
+    if (_provisioning && _connection.hasUserName &&
+        _provisionState != MqttProvisionState::Provisioned &&
+        _behaviour.rejectedCredentialsRetryMs != 0 &&
+        mq_elapsed(_loginRefusedAt, mq_millis()) >= _behaviour.rejectedCredentialsRetryMs) {
+        _retryingLogin = true;
+        _switchToLogin = true;          // the next poll() makes the switch
         return;
     }
     if (!_provisioning || !_client.isConnected()) return;
@@ -362,18 +399,29 @@ void MqttDevice::serviceProvisioning() {
 }
 
 void MqttDevice::provisionStateChanged(MqttState state) {
-    if (state == MqttState::Connected) return;
+    if (state == MqttState::Connected) {
+        // A held login tried again, and taken: the broker knows this device
+        // after all, and whatever the key's session last said is history.
+        if (!_provisioning && _retryingLogin) {
+            _retryingLogin = false;
+            _provisionState = MqttProvisionState::Provisioned;
+            _provisionReason.clear();
+        }
+        return;
+    }
     // 0x86 at 5.0, return code 4 at 3.1.1: neither means anything else in a
     // CONNACK.
     const uint8_t code = _client.status().connectReasonCode;
     if (!_provisioning) {
         // A provisioned login the broker no longer accepts - reset, removed,
-        // or the device replaced and the name registered again - is
-        // forgotten, and the device registers afresh. Only a refused
-        // PASSWORD: 0x87 (disabled, or pending) is an admin's decision, which
-        // registering again would undo.
+        // the device replaced and the name registered again, or a login store
+        // that was lost - sends the device to the key to register again. The
+        // login itself is KEPT until a new one is issued: see
+        // serviceProvisioning(). Only a refused PASSWORD: 0x87 (disabled, or
+        // pending) is an admin's decision, which registering again would undo.
         if (code == MQ_REASON_BAD_USER_NAME_OR_PASSWORD || code == MQ_RETURN_BAD_CREDENTIALS) {
             _reprovision = true;
+            _loginRefusedAt = mq_millis();
         }
     } else if (code != 0 && _provisionState == MqttProvisionState::Registering) {
         _provisionState = MqttProvisionState::Refused;

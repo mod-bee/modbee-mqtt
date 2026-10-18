@@ -45,6 +45,7 @@
 #include "../MqttOwnedProperties.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 #if MQTT_RETAINED_INDEX
 #include <unordered_map>
@@ -69,6 +70,10 @@ struct MqttRetainedMessage {
     // for ever.
     mq_time_t storedAt = 0;
 
+    // The login that stored it, for that login's quota. Empty: nobody's - a
+    // store put back from elsewhere, or a broker without logins.
+    std::string owner;
+
     bool inUse() const { return !topic.empty(); }
 };
 
@@ -83,8 +88,13 @@ public:
     // Returns false only when the store is full and this is a new topic. The
     // caller still delivers the message to current subscribers: failing to
     // RETAIN it is not a reason to fail to DELIVER it.
+    // `owner` and `ownerLimit`: a login may hold at most `ownerLimit` topics
+    // here (0 = no limit). A new topic past it is refused; replacing one of
+    // its own, or clearing one, always works.
     bool store(const MqttSpan& topic, const MqttSpan& payload, uint8_t qos,
-               const MqttProperties& properties, mq_time_t now);
+               const MqttProperties& properties, mq_time_t now,
+               const MqttSpan& owner = MqttSpan(), uint32_t ownerLimit = 0);
+    size_t ownedBy(const std::string& owner) const;
 
     void clear(const MqttSpan& topic);
     void clearAll();
@@ -117,8 +127,10 @@ public:
     // subscriber as an ordinary message.
     typedef bool (*StepFn)(void* context, const MqttRetainedMessage& message,
                            uint32_t remainingExpiry, bool hasRemainingExpiry);
+    // At most `budget` slots are looked at (0 = every one); what is returned
+    // is where to go on from, as when `visit` declines.
     size_t visitMatchingFrom(const MqttSpan& filter, mq_time_t now, size_t from,
-                             StepFn visit, void* context);
+                             StepFn visit, void* context, size_t budget = 0);
 
     // Whether this message has outlived its Message Expiry Interval.
     static bool hasExpired(const MqttRetainedMessage& message, mq_time_t now);
@@ -150,6 +162,8 @@ private:
     void occupied(size_t index);
 
     bool _indexed = false;
+    std::vector<std::pair<std::string, uint32_t>> _owners;   // logins holding topics, and how many
+    void own(const std::string& owner, int change);
 #if MQTT_RETAINED_INDEX
     std::unordered_map<std::string, uint32_t> _index;
     std::vector<uint32_t> _free;

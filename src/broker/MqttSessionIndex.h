@@ -41,6 +41,27 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
+
+// WHERE THE INDEX HASHES START, chosen once per process. FNV-1a from its
+// published offset was a hash anybody could run ahead of time: client
+// identifiers, or topic filters, made to share a bucket turn every lookup into
+// a walk. One value for the whole process, because the routing index's keys
+// are compared between shards.
+inline uint32_t mq_indexHashSeed() {
+    static const uint32_t seed = [] {
+        uint32_t value = 0;
+#if defined(__linux__)
+        if (getrandom(&value, sizeof value, GRND_NONBLOCK) != (ssize_t)sizeof value) value = 0;
+#endif
+        // Elsewhere, or if the kernel had nothing: weaker, still not public.
+        if (value == 0) value = ((uint32_t)(uintptr_t)&value ^ (uint32_t)mq_millis()) * 2654435761u;
+        return value;
+    }();
+    return seed;
+}
 
 class MqttSessionIndex {
 public:
@@ -172,7 +193,7 @@ private:
     // FNV-1a. Identifiers are short and often differ only at the end
     // ("pump-0001", "pump-0002"), which it spreads well enough here.
     static uint32_t hashOf(const uint8_t* data, size_t length) {
-        uint32_t hash = 2166136261u;
+        uint32_t hash = 2166136261u ^ mq_indexHashSeed();
         for (size_t index = 0; index < length; index++) {
             hash ^= data[index];
             hash *= 16777619u;

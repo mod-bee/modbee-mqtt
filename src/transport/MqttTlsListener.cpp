@@ -369,6 +369,13 @@ void* MqttTlsListener::createContext() {
     // this is the difference between gigabytes and not.
     SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 #endif
+#if defined(SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER)
+    // A write that could not finish is retried from wherever the bytes are
+    // now. The broker's transmit buffer grows - and moves - while a write is
+    // pending, and without this the retry is refused as a bad write retry and
+    // a slow reader's connection is dropped.
+    SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+#endif
 
     // A client that goes away mid-handshake must produce an error code, never
     // a signal that terminates the broker. A broker is where this matters
@@ -597,6 +604,7 @@ bool MqttTlsListener::begin() {
     } else {
         _boundPort = _port;
     }
+    _spare = mq_socket::openSpareDescriptor();
     return true;
 }
 
@@ -605,6 +613,7 @@ void MqttTlsListener::end() {
         MQ_CLOSE(_socket);
         _socket = -1;
     }
+    mq_socket::closeSpareDescriptor(_spare);
     // Connections already handed out are NOT closed here, exactly as
     // MqttTcpListener does not close them: the caller still holds them and is
     // entitled to finish what it was saying.
@@ -643,7 +652,12 @@ MqttTransport* MqttTlsListener::accept() {
     struct sockaddr_in from;
     socklen_t fromSize = sizeof from;
     const int accepted = (int)::accept(_socket, (struct sockaddr*)&from, &fromSize);
-    if (accepted < 0) return nullptr;
+    if (accepted < 0) {
+        // Out of descriptors: refuse the waiting connection rather than spin
+        // on it (mq_socket::shedWaitingConnection).
+        if (!MQ_WOULD_BLOCK) mq_socket::shedWaitingConnection(_socket, _spare);
+        return nullptr;
+    }
 
     if (!mq_socket::setNonBlocking(accepted)) { MQ_CLOSE(accepted); return nullptr; }
     mq_socket::suppressSigPipe(accepted);

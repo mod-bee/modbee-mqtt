@@ -100,6 +100,43 @@ inline void ensureWinsock() { static WinsockGuard guard; (void)guard; }
 inline void ensureWinsock() {}
 #endif
 
+/** RUNNING OUT OF DESCRIPTORS (EMFILE, ENFILE) leaves the connection that
+ *  could not be accepted in the backlog, and the listening socket readable for
+ *  as long as it waits: a level-triggered poll returns at once, every time,
+ *  and the loop spins a whole core while accepting nobody. A descriptor kept
+ *  spare for this lets that connection be taken and closed at once - refused
+ *  promptly instead of left hanging - and the spare is opened again. A
+ *  listener opens one in begin() and closes it in end(); shed() runs right
+ *  after the accept() that failed, while errno still says why. POSIX only:
+ *  elsewhere there is no spare and shed() does nothing. */
+inline int openSpareDescriptor() {
+#if defined(_WIN32)
+    return -1;
+#else
+    return ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+#endif
+}
+
+inline void shedWaitingConnection(int listenSocket, int& spare) {
+#if defined(_WIN32)
+    (void)listenSocket;
+    (void)spare;
+#else
+    if (spare < 0 || (errno != EMFILE && errno != ENFILE)) return;
+    ::close(spare);
+    const int taken = ::accept(listenSocket, nullptr, nullptr);
+    if (taken >= 0) ::close(taken);
+    spare = openSpareDescriptor();
+#endif
+}
+
+inline void closeSpareDescriptor(int& spare) {
+#if !defined(_WIN32)
+    if (spare >= 0) ::close(spare);
+#endif
+    spare = -1;
+}
+
 /** Put a socket into non-blocking mode. False if the call failed, which every
  *  caller treats as "this socket is unusable" rather than carrying on. */
 inline bool setNonBlocking(int socketHandle) {

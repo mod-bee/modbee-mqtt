@@ -93,6 +93,8 @@ private:
                         kafkaSet(conf, "acks", "all", error) &&
                         kafkaSet(conf, "linger.ms", "5", error) &&
                         kafkaSet(conf, "message.timeout.ms", "30000", error) &&
+                        // Not librdkafka's gigabyte: see KafkaPipe.cpp.
+                        kafkaSet(conf, "queue.buffering.max.kbytes", "32768", error) &&
                         kafkaPassThrough(conf, _cluster, error);
         if (!ok) {
             rd_kafka_conf_destroy(conf);

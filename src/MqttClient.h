@@ -134,6 +134,24 @@ class MqttClient;
 #define MQ_RESTART_SETTLE_MS 250
 #endif
 
+// How long a connection has to have stayed up before its loss starts the
+// reconnect backoff again from reconnectInitialMs. A CONNACK alone is not a
+// working connection: a broker that accepts and then drops a client at once -
+// overloaded, a rule that closes it, a takeover loop between two devices with
+// one identifier - would otherwise be answered with a fresh one-second backoff
+// every time, for ever. See scheduleReconnect() in MqttClient.cpp.
+#ifndef MQ_RECONNECT_STABLE_MS
+#define MQ_RECONNECT_STABLE_MS 30000
+#endif
+
+// The shortest reconnect delay full jitter may draw. Zero would put some
+// devices straight back on a broker that has only just gone away; this is
+// small enough to change nothing else. Never more than the backoff itself,
+// so a test or a LAN configured with a 1 ms backoff still gets 1 ms.
+#ifndef MQ_RECONNECT_FLOOR_MS
+#define MQ_RECONNECT_FLOOR_MS 100
+#endif
+
 class MqttClientHook {
 public:
     // Out of line, in MqttClient.cpp: one vtable in the program, not one per

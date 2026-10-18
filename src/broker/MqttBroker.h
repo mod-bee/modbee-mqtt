@@ -121,6 +121,21 @@ struct MqttBrokerRequest {
     // disconnectUser(). Null for every other action.
     std::string* login = nullptr;
 
+    // Connect only. A session belongs to the login that made it: another login
+    // naming its client identifier may neither resume it nor close it while it
+    // is connected. A hook that knows this login may stand in for the owner -
+    // a registration claiming a device's name - sets this true, and the
+    // session is then REPLACED: the owner's connection closed and its session
+    // discarded, never resumed. Null for every other action.
+    bool* replaceSession = nullptr;
+
+    // Connect only: the most sessions, and retained topics, this login may
+    // hold - set to MqttBrokerConfig::maxSessionsPerLogin and
+    // ::maxRetainedPerLogin, for the hook to change (0 = no limit). Null for
+    // every other action.
+    uint32_t* sessionLimit = nullptr;
+    uint32_t* retainedLimit = nullptr;
+
     MqttVersion version = MqttVersion::V5;
 };
 
@@ -630,6 +645,12 @@ private:
     std::vector<uint32_t> _freeConnections;
     void releaseConnectionSlot(MqttBrokerConnection& connection);
 
+    // Listeners out of the readiness set while no slot is free: a listening
+    // socket with connections waiting stays readable, and the shard would
+    // wake for it at once on every pass with nothing it could do.
+    bool _listenersPaused = false;
+    void pauseListeners(bool pause);
+
     // --- One broker per core ---
     MqttBrokerEgressFn _onEgress = nullptr;
     void* _egressContext = nullptr;
@@ -694,7 +715,13 @@ private:
         std::string key;      // group name, a NUL, then the inner filter
         uint32_t next = 0;
     };
+#if defined(MQTT_PLATFORM_HOST)
+    // By key, on a host: found by a scan, a server with tens of thousands of
+    // groups spent most of each publish looking for one (a board has few).
+    std::unordered_map<std::string, uint32_t> _shareCursors;   // key -> next member
+#else
     std::vector<ShareCursor> _shareCursors;
+#endif
 
     // --- The routing index ---
     //
@@ -730,6 +757,8 @@ private:
 
     // Bumped by the SESSIONS themselves; see attachSubscriptionRevision().
     uint32_t _subscriptionRevision = 0;
+    size_t _queuedBytes = 0;             // every session's queue, together
+    std::unordered_map<std::string, uint32_t> _sessionsPerLogin;
     uint32_t _indexBuiltAt = 0xFFFFFFFFu;
 
     std::vector<uint32_t> _routeCandidates;  // scratch, reused every route()
@@ -814,7 +843,14 @@ private:
                    const MqttSpan& topic, uint8_t qos, bool retain,
                    const MqttSpan& clientId, const MqttSpan& userName,
                    const MqttSpan& password, uint8_t& reasonCode,
-                   std::string* login = nullptr);
+                   std::string* login = nullptr, bool* replaceSession = nullptr,
+                   uint32_t* sessionLimit = nullptr, uint32_t* retainedLimit = nullptr);
+    // The hook asked again on a session's own login, with no connection: for
+    // what was granted earlier and is about to be used now (a Will, a resumed
+    // session's subscriptions and queue).
+    bool stillPermitted(const MqttBrokerSession& session, MqttBrokerAction action,
+                        const std::string& topic, uint8_t qos, bool retain);
+    void recheckSession(MqttBrokerSession& session);
 
     // The static trampoline the retained store visits through, and what it
     // needs to know. A file-static would be process-wide state, which R5

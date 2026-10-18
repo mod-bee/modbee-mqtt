@@ -276,16 +276,21 @@ int cmdServe(int argc, char** argv) {
     // Per shard, with a quarter more than an even share: the hash spreads
     // sessions evenly on average, not exactly.
     const size_t perShard = (size_t)(b.maxConnections + (long long)count - 1) / count;
-    config.broker.maxConnections = perShard + perShard / 4 + 16;
+    // One shard has nothing to spread: max-connections means what it says.
+    config.broker.maxConnections = count == 1 ? perShard : perShard + perShard / 4 + 16;
     const long long totalSessions = b.maxSessions > 0 ? b.maxSessions : b.maxConnections;
     const size_t sessionsPerShard = (size_t)(totalSessions + (long long)count - 1) / count;
-    config.broker.maxSessions = sessionsPerShard + sessionsPerShard / 4 + 16;
+    config.broker.maxSessions = count == 1 ? sessionsPerShard : sessionsPerShard + sessionsPerShard / 4 + 16;
     config.broker.receiveBufferSize = b.maxPacket;
     config.broker.transmitBufferSize = b.maxPacket;
     config.broker.maximumPacketSize = b.maxPacket;
     config.broker.maxQueuedPerSession = b.queue;
+    config.broker.maxQueuedBytesPerSession = (size_t)b.queueBytes;
+    config.broker.maxQueuedBytesTotal = (size_t)((b.queueBytesTotal + (long long)count - 1) / (long long)count);
     config.broker.maxSubscriptionsPerSession = b.subscriptions;
     config.broker.maximumSessionExpiry = (uint32_t)b.maxSessionExpiry;
+    config.broker.connectTimeoutMs = (mq_time_t)(b.connectTimeout * 1000);
+    config.broker.serverKeepAliveMaximum = (uint16_t)b.maxKeepAlive;
     config.broker.maxRetained = b.maxRetained;
     config.broker.reserveUpFront = args.has("reserve-up-front");
 
@@ -349,6 +354,14 @@ int cmdServe(int argc, char** argv) {
         g.restart = [](void*) { std::raise(SIGTERM); };
         g.certificateLogin = file.authentication.certificateLogin;
         g.noTopicsWithoutRules = file.authentication.defaultTopics == "none";
+        // What one login may hold, set on every shard's broker; the fixed
+        // admin and the registration login are not limited.
+        config.broker.maxSessionsPerLogin = (uint32_t)file.authentication.maxSessionsPerLogin;
+        config.broker.maxRetainedPerLogin = (uint32_t)file.authentication.maxRetainedPerLogin;
+        config.broker.unlimitedLogins.push_back("$provision");
+        if (file.authentication.hasAdmin && !file.authentication.accounts.empty()) {
+            config.broker.unlimitedLogins.push_back(file.authentication.accounts[0].username);
+        }
         g.server = &server;
         for (size_t i = 0; i < file.authentication.accounts.size(); i++) {
             const MqttAccount& a = file.authentication.accounts[i];

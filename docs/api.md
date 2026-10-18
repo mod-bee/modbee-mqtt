@@ -841,7 +841,7 @@ uint32_t sessionExpiryInterval = 0;     // 5.0 only
 bool     hasSessionExpiry      = false;
 
 uint16_t receiveMaximum     = 0;        // 0 leaves the default of 65,535
-uint16_t topicAliasMaximum  = 0;        // how many aliases WE will accept
+uint16_t topicAliasMaximum  = 0;        // how many aliases WE will accept, up to MQTT_MAX_ALIASES (8)
 uint32_t maximumPacketSize  = 0;        // 0 states no limit
 
 MqttWillConfig will;
@@ -892,6 +892,24 @@ bool      autoReconnect      = true;
 mq_time_t connectTimeoutMs   = 20000;
 mq_time_t acknowledgementTimeoutMs = 60000;   // 0 = wait for ever
 ```
+
+**The reconnect backoff.** Each attempt waits a delay drawn uniformly from
+100 ms (`MQ_RECONNECT_FLOOR_MS`) up to the current backoff - full jitter - and
+the backoff then doubles, up to `reconnectMaximumMs`. The draw is a hash of the
+Client Identifier and the attempt count, so devices that lose the broker
+together spread across the whole interval instead of returning in one burst.
+The backoff starts again from `reconnectInitialMs` only once a connection has
+stayed up for 30 s (`MQ_RECONNECT_STABLE_MS`); a broker that accepts a client
+and drops it at once is retried at a doubling interval, not every second. A
+refused credential is separate: it waits `rejectedCredentialsRetryMs`.
+
+**`topicAliasMaximum` is capped at what the table holds.** The CONNECT
+advertises at most `MQTT_MAX_ALIASES` (8 by default), whatever is configured,
+so a broker is never invited to use an alias the client would refuse. On a
+board an alias's topic is held in `MQTT_ALIAS_TOPIC` bytes (128): a longer one
+is delivered under its full name, but not kept as a mapping, and a later
+message that sends that alias alone closes the connection with 0x94 rather
+than being delivered under a shortened topic.
 
 **`acknowledgementTimeoutMs` is not a retransmission timer.** MQTT sets no
 deadline by which a server must acknowledge a PUBLISH, so a broker that accepts

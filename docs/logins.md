@@ -124,6 +124,7 @@ page *13 Provisioning* has the whole of it.
 | A board is replaced | Flash the new one with the same name and a key of the same site. It registers, gets a new login, and the old board's login stops working |
 | A device's flash is wiped | It has no login, so it registers again |
 | You reset a device (`modbee user reset`) | Its stored login is refused, so it registers again by itself - no site visit |
+| The broker's login store is lost, or restored from an old backup | Every device's login is refused at once. Each registers again with its key but **keeps its stored login** - it is replaced only when the broker issues a new one - and tries it again every five minutes, so a store that comes back lets the fleet straight back in, with nothing to approve |
 | You disable a device | It stays out: registering again does not undo it |
 | You remove the key (`modbee key remove`) | No new device can register with it; devices already registered keep working |
 | You issue a new key for the site | Devices keep working (they log in with their own login, not the key); a new or wiped device registers with the new key |
@@ -131,7 +132,10 @@ page *13 Provisioning* has the whole of it.
 
 A login **you** added by hand is never taken over by a device holding a key.
 A key that wants each device approved (`--approval manual`) holds a device that
-registers again as well: it waits, pending, until you approve it.
+registers again as well: it waits, pending, until you approve it. While it
+waits it still holds its old login, and tries it again every five minutes
+(`rejectedCredentialsRetryMs`); on a PLC, `MQTT_PROVISION`'s retained login is
+not cleared by a refusal, only overwritten by a login the broker has issued.
 
 ### Options for a key
 
@@ -212,6 +216,12 @@ replaced by the device's own, so one rule fits every device:
 | subscribe `plant/${username}/cmd` | receive its own commands - not another device's |
 | no rules at all | use every topic (except the broker's own `$` topics), as on any broker without per-login rules - or, with `default-topics: none`, no topic at all |
 
+**Separate devices by `${username}`, not `${clientid}`.** The user name is
+proven by the password; the client identifier is whatever the client sends. A
+login may not take an identifier another login's session holds, but it may
+choose any identifier nobody is using - so `plant/${clientid}/#` lets a login
+connecting as `tank-08` reach `tank-08`'s topics while that device is away.
+
 A broker shared by several customers should not let a login without rules see
 everything. Set, in `modbee.yaml`:
 
@@ -222,6 +232,21 @@ authentication:
 
 and a login uses only the topics its rules name; one that should use every
 topic is given `#` on purpose.
+
+**One login, one share.** On a shared broker, no login may take what the
+others need:
+
+```yaml
+authentication:
+  max-sessions-per-login: 8      # client identifiers one login may hold (0 = no limit)
+  max-retained-per-login: 1000   # retained topics one login may hold (0 = no limit)
+```
+
+A CONNECT that would give a login one session more is refused with 0x97
+Quota exceeded (0x03 at 3.1.1); a retained message on a new topic past the
+second limit is refused with 0x97 too, while replacing or clearing one of its
+own always works. The admin login (`MQTT_USERNAME`) and `$provision` are not
+limited; a database login marked admin is. Both are counted per shard.
 
 A device's **Will** is held to its publish rules too: a CONNECT whose Will it
 could not publish is refused. A Sparkplug node's NDEATH topic must be inside
@@ -251,7 +276,9 @@ docker compose exec modbee modbee user add acme/riverbend/pump-plc \
 
 **A `${username}` or `${clientid}` rule never widens.** The broker will not
 put a value containing `/`, `+` or `#` into a filter - for such a login the
-rule simply does not match, and grants nothing. Otherwise `plant/${username}/#`
+rule simply does not match, and grants nothing. A value is put in once and
+never read again, so a login named `t${clientid}` connecting as `ank-07` is
+`plant/t${clientid}/#`, not `plant/tank-07/#`. Otherwise `plant/${username}/#`
 for a login named `+` would become `plant/+/#` - every device's topics - and
 one named `acme/riverbend` would reach into the levels of every device below
 it. (Mosquitto made the same choice for the same reason: CVE-2017-7650.)
