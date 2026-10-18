@@ -635,17 +635,24 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
         // device an admin turned off would provision itself straight back.
         return refused("this device is disabled; an admin must enable it");
     }
-    if (exists && existing.pending) {
-        json::Object o;
-        o.add("status", "pending");
-        return o.str();
-    }
     if (exists) {
         // Re-provisioning (a replaced or wiped device gets a new secret, the
         // old one stops working) stays inside the device's own site: a key of
         // another site - another customer - must not take its login, its
         // topic rights and its place on the broker.
+        //
+        // ASKED BEFORE "pending", and for every state of the login. Answered
+        // after it, a name waiting on site A told site B's key "pending" with
+        // no reason - and A's admin approving it would have given a device
+        // holding B's key a login with A's rights. A pending login, and an
+        // approved one whose secret is not collected yet, belong to their
+        // site exactly as a working one does.
         if (existing.site != key.site) return refused("that name belongs to another site; an admin must reset it");
+    }
+    if (exists && existing.pending) {
+        json::Object o;
+        o.add("status", "pending");
+        return o.str();
     }
     // Approved, its secret not collected yet: the device that waited takes it now.
     const bool collecting = exists && existing.hash.empty();
