@@ -1149,13 +1149,28 @@ bool MqttSparkplugNode::deviceOnline(const char* deviceId) {
     // that, the birth is OWED rather than refused: a caller bringing a device
     // up during start-up should not have to sequence itself against the
     // session coming up.
-    if (!_born) {
+    //
+    // ALREADY OWED: poll() births it - after the NBIRTH, or a second after a
+    // refusal - and only poll(). Publishing here as well sent the device's
+    // birth twice whenever a caller asked again while the node still owed it
+    // (a program re-asking for its device each scan after a rebirth).
+    if (!_born || device.wantsBirth) {
         device.wantsBirth = true;
         return true;
     }
 
+    // ONLINE ONLY WITH ITS DBIRTH SENT. A DBIRTH refused for want of queue room
+    // (a burst of large births on a slow link) left the device marked online
+    // and owed nothing: its DDATA then went out for a device the host had
+    // never seen born, and a Host Application asks for a rebirth of
+    // everything when that happens. Refused, it is owed like any other
+    // device birth, and poll() tries again a second later.
     device.online = true;
-    return publishDeviceBirth(device);
+    if (publishDeviceBirth(device)) return true;
+    device.online = false;
+    device.wantsBirth = true;
+    deviceBirthRefused(true);
+    return true;
 }
 
 bool MqttSparkplugNode::deviceOffline(const char* deviceId) {

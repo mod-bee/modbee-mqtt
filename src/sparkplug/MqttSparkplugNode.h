@@ -549,7 +549,10 @@ public:
 
     // DBIRTH. [tck-id-message-flow-device-birth-publish-nbirth-wait] A device
     // can publish a DBIRTH only once an NBIRTH has been sent, so this is
-    // deferred until the node has birthed rather than refused.
+    // deferred until the node has birthed rather than refused. A DBIRTH the
+    // queue has no room for is owed the same way: the device is online only
+    // once its DBIRTH is away, and poll() births an owed device - once, however
+    // often this is called meanwhile. False only for an unknown device.
     bool deviceOnline(const char* deviceId);
 
     // DDEATH. [tck-id-operational-behavior-device-ddeath] Required when the
