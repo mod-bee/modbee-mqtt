@@ -16,7 +16,7 @@
 // answered both by walking it. Filling a broker therefore cost O(N^2): a test
 // that built 70,000 sessions spent four minutes in those two loops under the
 // sanitizers, and a broker accepting connections at 40,000 spent most of each
-// poll there (internal/CLOUD-PLAN.md, L11).
+// poll there.
 //
 // WHAT IT IS. An open-addressing table of session indices, keyed by the hash
 // of the identifier, with linear probing and backward-shift deletion - no

@@ -324,7 +324,7 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
     // birth that cannot be built.
     if (!growPoints(_pointCount + 1)) return 0;
 
-    // The text a text metric owns, and nothing for a number (MQX-027).
+    // The text a text metric owns, and nothing for a number.
     MqttSparkplugValue probe;
     probe.type = type;
     MqttSparkplugPointText* text = nullptr;
@@ -1220,7 +1220,7 @@ bool MqttSparkplugNode::deviceIsOnline(const char* deviceId) const {
 // _born first, so when the link went down a moment later its handler saw a
 // node already "not born" and skipped the devices: the node birthed again
 // when the host came back, and its devices never did. Found on a real broker
-// by the OpenPLC Sparkplug rig.
+// in testing.
 void MqttSparkplugNode::endBirth() {
     for (size_t index = 0; index < _deviceCount; index++) {
         if (_devices[index].online) {
@@ -1929,7 +1929,7 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
         // MUST include BOTH a metric name and alias - and that is every metric
         // in the payload, not only the application's own. bdSeq and Node
         // Control/Rebirth went out with names and no aliases until an
-        // independent host application in the docker rig counted them and
+        // independent host application in a test setup counted them and
         // found two short.
         //
         // The aliases are reserved constants rather than taken from the

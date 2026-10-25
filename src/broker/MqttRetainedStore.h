@@ -28,8 +28,8 @@
 //     [V5:MQTT-3.3.1-7] - it is a live message that also happens to clear the
 //     store, not a store operation.
 //   - A message delivered BECAUSE it was retained goes out with RETAIN = 1
-//     [V5:MQTT-3.3.1-9]. NanoMQ gets this one wrong - see internal/INTEROP.md
-//     D-2 - which is exactly why our own is tested rather than assumed.
+//     [V5:MQTT-3.3.1-9]. NanoMQ gets this one wrong -
+//     which is exactly why our own is tested rather than assumed.
 //   - A retained message does NOT expire with the connection that published
 //     it. It is the one piece of broker state that outlives everything.
 //

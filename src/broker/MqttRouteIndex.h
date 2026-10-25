@@ -18,7 +18,7 @@
 // it a hundred thousand times. And every filter containing a wildcard sat in
 // one list that EVERY publish walked, so a fleet in which each device
 // subscribes to its own "devices/<id>/cmd/#" made every message visit every
-// device (internal/CLOUD-PLAN.md, L5 and L6).
+// device.
 //
 // THE IDEA. An MQTT filter can only match a topic that begins with the
 // filter's LITERAL PREFIX - its levels before the first wildcard. So:

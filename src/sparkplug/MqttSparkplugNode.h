@@ -156,7 +156,7 @@ typedef void (*MqttSparkplugCommandContextFn)(void* context,
 // packet overwrites, so a value kept past the message it came in cannot be
 // one. A number's slots carry no text. They each carried 127 characters, four
 // to every writable metric whatever its type, and as four small allocations
-// they went to a board's internal RAM first (MQX-027).
+// they went to a board's internal RAM first.
 struct MqttSparkplugWriteQueue {
     MqttSparkplugValue* values = nullptr;          // `depth` of them
     MQ_STRING(MQ_SP_POINT_TEXT)* texts = nullptr;  // a text metric's; else null
@@ -169,7 +169,7 @@ struct MqttSparkplugWriteQueue {
 //
 // A STRING, TEXT, UUID, BYTES or FILE metric, and only one of those: made when
 // it is declared, in PSRAM where the board has some. A number used to carry
-// these two 127-character buffers too, empty, for ever (MQX-027).
+// these two 127-character buffers too, empty, for ever.
 struct MqttSparkplugPointText {
     // The value: a span, as MqttSparkplugValue's - into the application's
     // buffer (a PLC STRING), or into `command`.
@@ -207,7 +207,7 @@ struct MqttSparkplugRecord {
 // small state table, a cache line a metric (see MqttSparkplugNode, "TWO
 // TABLES"). Read it with valueAt(), changePendingAt(), commandPendingAt() and
 // isHeldAt(). (It was all one record, 608 bytes on a board, and a scan touched
-// five of its cache lines to set one value - MQX-027.)
+// five of its cache lines to set one value.)
 struct MqttSparkplugPoint {
     MQ_STRING(MQ_SP_POINT_NAME) name;
     MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
@@ -601,14 +601,14 @@ public:
     // published - a move inside its deadband, a held metric - and leaves the
     // mark when it goes. So a call walks the metrics that moved, not all of
     // them: it walked every metric of the node once, and again for every
-    // online device, on every call (MQX-026).
+    // online device, on every call.
     bool publishChanged();
 
     // ONE MESSAGE A POLL, for a program that sets its values in many places.
     // Owes one publishChanged() to the next poll(): every part of the program
     // with something to say asks, and the node then sends ONE NDATA, and one
     // DDATA per online device, carrying everything that moved - where each
-    // asking part used to send its own (MQX-026). Asking twice before the poll
+    // asking part used to send its own. Asking twice before the poll
     // is asking once.
     //
     // pollPublishes() counts the ones poll() has made, and pollPublishSent()

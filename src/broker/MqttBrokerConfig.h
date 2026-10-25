@@ -17,8 +17,7 @@
 // and then ENFORCES. That pairing is the whole point: a broker that advertises
 // a Maximum Packet Size and then accepts a larger one has taught its clients
 // a lie, and a broker that advertises nothing leaves every client guessing -
-// which is how NanoMQ ends up with an undiscoverable 10 kB ceiling
-// (internal/INTEROP.md, D-1).
+// which is how NanoMQ ends up with an undiscoverable 10 kB ceiling.
 //
 // The defaults are sized for a plant gateway, not for a cloud cluster: a few
 // dozen devices, small messages, a modest amount of RAM. Everything is
@@ -88,7 +87,7 @@ struct MqttBrokerConfig {
     // False is for a broker holding a hundred thousand connections, most of
     // which are devices that publish and never receive. With every slot
     // reserved up front, each connection cost about 43 kB whether it used any
-    // of it or not (internal/STATE.md, 2026-10-04). With this off:
+    // of it or not. With this off:
     //   - a session reserves its subscription slots on its first SUBSCRIBE,
     //     and its delivery slots on its first queued message - all of them at
     //     once, so they never move afterwards;

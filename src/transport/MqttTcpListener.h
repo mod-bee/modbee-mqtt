@@ -71,7 +71,7 @@ private:
     // ALLOCATED ON FIRST USE, and the broker never uses it. MqttLink reads in
     // bulk, straight into its own buffer, so for every connection a broker
     // serves this was 4 kB copied through and never needed - 4 GB at a
-    // million connections (internal/CLOUD-PLAN.md, L12). read() now recv()s
+    // million connections. read() now recv()s
     // directly into the caller's buffer whenever nothing is held here.
     static const size_t kReceiveBufferSize = MQTT_SOCKET_READ_SIZE;
     std::vector<uint8_t> _receive;
@@ -139,8 +139,8 @@ private:
 
     // Free pool entries, lowest on top, and each entry's place in the pool -
     // what accept() and release() used to find by walking it, once per
-    // connection, which at 200,000 connections was most of a broker's poll
-    // (internal/CLOUD-PLAN.md, L14). Both built in configure() and never grown.
+    // connection, which at 200,000 connections was most of a broker's poll.
+    // Both built in configure() and never grown.
     std::vector<uint32_t> _free;
     std::vector<uint8_t> _isFree;
     std::unordered_map<const MqttTransport*, uint32_t> _poolIndex;

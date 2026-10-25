@@ -15,7 +15,7 @@
 // that goes out after its delay, a session that ends when its expiry passes.
 // It used to find them by walking every session on every poll, which costs
 // nothing at a plant's sixty-four sessions and was most of the idle cost of a
-// broker holding a hundred and forty thousand (internal/STATE.md, 2026-10-04).
+// broker holding a hundred and forty thousand.
 // A wheel finds the due ones by looking only where they are.
 //
 // HOW. A hashed wheel: 1024 slots of 16 ms each, so one revolution is about

@@ -265,7 +265,7 @@ private:
     std::vector<MqttAcceptedTlsTransport*> _pool;
 
     // Free pool entries and each entry's place in the pool, as in
-    // MqttTcpListener (internal/CLOUD-PLAN.md, L14): accept() and release()
+    // MqttTcpListener: accept() and release()
     // walked the pool once per connection.
     std::vector<uint32_t> _free;
     std::vector<uint8_t> _isFree;

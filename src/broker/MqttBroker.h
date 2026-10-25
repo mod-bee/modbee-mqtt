@@ -192,7 +192,7 @@ typedef void (*MqttBrokerClientEventFn)(void* context, const MqttBrokerClientEve
 //
 // A broker is single-threaded and instance-scoped (R5), so a multi-core server
 // runs SEVERAL - one per core - and these are the seams between them. Each is
-// optional and unused by a board; see internal/CLOUD-PLAN.md, section 5.
+// optional and unused by a board.
 
 // A message this broker has just routed to its own sessions, offered onward.
 // `matched` and `dropped` are its local outcome, as route() counts them.

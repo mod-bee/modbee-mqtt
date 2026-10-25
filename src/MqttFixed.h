@@ -19,7 +19,7 @@
 //   MQ_STRING_REF / MQ_BYTES_REF   a parameter that takes any of them
 //
 // On a host each macro is the very type it replaces, token for token, so the
-// host build compiles exactly as before (test/wire/host_same.sh proves it).
+// host build compiles exactly as before (checked token for token).
 // The board types offer the part of the std interface the library uses.
 //
 // What a board gives up: text longer than its field is cut to the field (the

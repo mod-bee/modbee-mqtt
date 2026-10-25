@@ -28,8 +28,7 @@
 // citation is the schema instead.
 //
 // Source of truth: Sparkplug Specification 3.0.0, 2022-11-16, and
-// sparkplug_b.proto from eclipse-tahu/tahu. Both are kept, with hashes, in
-// internal/sparkplug/ - grep internal/sparkplug/spec.txt for any tck-id below.
+// sparkplug_b.proto from eclipse-tahu/tahu. Both are public. The tck-ids below refer to the specification.
 // 3.0.0 is current: the specification repository carries exactly two tags,
 // v3.0.0 and v3.0.0-rc1.
 //

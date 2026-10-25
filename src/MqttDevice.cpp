@@ -204,7 +204,7 @@ void MqttDevice::credentials(const char* user, const char* password) {
 // PROVISIONING
 // =============================================================================
 //
-// The protocol is a modbee broker's (internal/AUTH-PLAN.md): CONNECT with user
+// The protocol is a modbee broker's: CONNECT with user
 // name "$provision" and the key as password, Client Identifier = the device's
 // name; SUBSCRIBE $modbee/provision/<name>/reply; PUBLISH {} to
 // $modbee/provision/<name>/request; the answer is JSON with "status" ok

@@ -449,7 +449,7 @@ bool MqttBroker::shouldRead(const MqttBrokerConnection& connection) const {
 // The sweep above visits every connection on every poll. At a plant's scale
 // that is nothing; at twenty thousand connections it was 81 ms per poll, and
 // the broker stopped accepting new connections because it could not get round
-// to them (internal/STATE.md, 2026-10-04). Here a poll does work in proportion
+// to them. Here a poll does work in proportion
 // to the connections that HAVE work, and nothing in proportion to the ones
 // that are merely connected.
 //
@@ -3474,7 +3474,7 @@ bool MqttBroker::visitRetained(void* context, const MqttRetainedMessage& message
     // subscription being made by a Client." Always 1 here, whatever Retain As
     // Published says - RAP governs ordinary delivery, not this.
     //
-    // This is exactly where NanoMQ is wrong (internal/INTEROP.md D-2), which
+    // This is exactly where NanoMQ is wrong, which
     // is why ours is asserted in test_broker.cpp rather than assumed.
     delivery.retain = true;
 

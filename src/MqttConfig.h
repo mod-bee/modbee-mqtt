@@ -205,7 +205,7 @@ struct MqttClientConfig {
     // PROTOCOL VERSION, for the same reason and with a comment saying so. The
     // reconnect path did not, so with autoReconnect on - which is the default
     // - a wrong password meant a PLC hammering the broker for ever with the
-    // same wrong password. Found by pointing the interoperability rig at a
+    // same wrong password. Found by testing against a
     // broker that actually checks credentials, which it had never done.
     //
     // Turn it on where the credential is expected to become valid without the

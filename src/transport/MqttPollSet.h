@@ -62,7 +62,7 @@ public:
     // a plant broker and costs O(connections) per poll at any scale - poll(2)
     // walks the list in the kernel and isReady() walks it again here. Past a
     // few thousand connections that walk IS the broker's time (measured: 81 ms
-    // per poll at 21,000 connections; internal/CLOUD-PLAN.md, L4).
+    // per poll at 21,000 connections).
     //
     // In this mode a descriptor is registered ONCE, with a 64-bit token the
     // caller chooses, and a wait reports the tokens that became ready - so the

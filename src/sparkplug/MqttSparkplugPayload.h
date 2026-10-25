@@ -38,8 +38,7 @@
 // vendor extension WILL arrive with field numbers this build has never heard
 // of. A decoder that refused them would break on the next specification.
 //
-// Source: sparkplug_b.proto (eclipse-tahu/tahu) and specification section 6.4,
-// both in internal/sparkplug/.
+// Source: sparkplug_b.proto (eclipse-tahu/tahu) and specification section 6.4.
 
 #include "MqttSparkplugTypes.h"
 #include "MqttSparkplugValue.h"

@@ -209,7 +209,7 @@
 // that a board needs and a host must not get. The host build (the broker, the
 // Kafka pipe, the Docker image, the CLI and its bench) is tuned for speed and
 // compiles exactly as it did before any of them: with the switch off, not one
-// preprocessed line of it changes, which test/wire/host_same.sh proves.
+// preprocessed line of it changes, which was checked token for token.
 //
 // What it turns on, each where it is used:
 //   - no exception tables or unwind code for the library's own functions
