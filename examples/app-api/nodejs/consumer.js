@@ -58,7 +58,13 @@ function consume() {
       call.write({ ack: { ids: [down.event.id] } });
     }
   });
-  const again = () => setTimeout(consume, 1000);
+  // A stream that fails says so twice (error, then end): one retry for both.
+  let retried = false;
+  const again = () => {
+    if (retried) return;
+    retried = true;
+    setTimeout(consume, 1000);
+  };
   call.on('error', (err) => {
     if (err.code !== grpc.status.CANCELLED) console.error(`consume: ${err.message}`);
   });

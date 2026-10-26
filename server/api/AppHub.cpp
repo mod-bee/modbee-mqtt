@@ -7,6 +7,7 @@
 
 #include "Authority.h"
 #include "AppConnections.h"
+#include "GroupStore.h"
 #include "Json.h"
 #include "MqttTopic.h"
 
@@ -78,6 +79,7 @@ AppClientEvent eventOf(const std::string& topic, const std::string& payload) {
 
 struct AppHub::Entry {
     std::shared_ptr<const AppMessage> message;
+    uint64_t stored = 0;          // its id in the GroupStore; 0 not kept
     bool replay = false;          // it waited while no member was connected
     bool redelivered = false;     // sent before, to a member that did not acknowledge it
 };
@@ -114,6 +116,9 @@ struct AppHub::Shard {
     // While this hub's own publish is routed: its offer() knows it by this.
     char marker = 0;
     const std::string* publishingOrigin = nullptr;
+    // PUBACKs held until what they gave a group is on disk: (the GroupStore
+    // change, the deferral). This shard's thread only, in change order.
+    std::deque<std::pair<uint64_t, uint64_t>> holds;
 
     void wake() {
         const uint64_t one = 1;
@@ -131,6 +136,7 @@ AppHub::~AppHub() {
     }
     _tick.notify_all();
     if (_timer.joinable()) _timer.join();
+    if (_store) _store->close();
     for (auto& group : _groups) {
         for (Member* member : group.second->members) delete member;
     }
@@ -151,8 +157,56 @@ bool AppHub::begin(size_t shards, std::string& error) {
         }
         _shards.push_back(std::move(shard));
     }
+    if (!_config.directory.empty()) {
+        GroupStoreConfig c;
+        c.directory = _config.directory;
+        c.syncFull = _config.syncFull;
+        _store.reset(new GroupStore(c));
+        std::vector<StoredGroup> kept;
+        // After each commit the shards look at the PUBACKs they hold.
+        if (!_store->open(kept, _nextStored, [this] { for (auto& shard : _shards) shard->wake(); }, error)) {
+            _store.reset();
+            return false;
+        }
+        // Back as they were, collecting; what they held waits for a member.
+        const int64_t now = utcNowMs();
+        for (StoredGroup& one : kept) {
+            std::unique_ptr<Group> group(new Group());
+            group->name = one.name;
+            group->connection = one.connection;
+            group->durable = true;
+            group->options = one.options;
+            if (one.emptySinceMs > 0 && one.emptySinceMs < now) {
+                group->emptySince = Clock::now() - std::chrono::milliseconds(now - one.emptySinceMs);
+            }
+            for (auto& message : one.messages) {
+                std::shared_ptr<Entry> entry(new Entry());
+                entry->message = message.second;
+                entry->stored = message.first;
+                entry->replay = true;
+                entry->redelivered = true;     // it may have been sent before the restart
+                group->waiting.push_back(entry);
+                group->queued++;
+                _restoredMessages++;
+            }
+            _restoredGroups++;
+            std::string key = one.connection;
+            key.push_back('\0');
+            key += one.name;
+            _groups[key] = std::move(group);
+        }
+    }
     _timer = std::thread([this] { timers(); });
     return true;
+}
+
+void AppHub::keepGroup(const Group& group) {
+    if (!_store || !group.durable) return;
+    _store->putGroup(group.name, group.connection, group.options, group.members.empty() ? utcNowMs() : 0);
+}
+
+void AppHub::forgetGroup(const Group& group) {
+    if (_store && group.durable) _store->dropGroup(group.name, group.connection);
 }
 
 void AppHub::prepare(uint32_t shard, MqttBroker& broker) {
@@ -164,7 +218,14 @@ int AppHub::waitHandle(uint32_t shard) {
     return shard < _shards.size() ? _shards[shard]->eventFd : -1;
 }
 
-void AppHub::stop(uint32_t, MqttBroker&) {}
+void AppHub::stop(uint32_t index, MqttBroker& broker) {
+    if (index >= _shards.size()) return;
+    Shard& shard = *_shards[index];
+    // What is still being written, a bounded wait; then every PUBACK goes.
+    if (_store && !shard.holds.empty()) _store->flush(2000);
+    for (auto& hold : shard.holds) broker.concludeDeferred(hold.second, 1, 0);
+    shard.holds.clear();
+}
 
 // --- Taking a message ------------------------------------------------------
 
@@ -180,6 +241,7 @@ uint32_t AppHub::offer(uint32_t index, MqttBroker& broker, const MqttBrokerRoute
 
     bool refused = false;
     bool taken = false;
+    uint64_t kept = 0;            // the last GroupStore change that keeps it
     {
         std::lock_guard<std::mutex> guard(_lock);
         if (_groups.empty()) return 0;
@@ -221,8 +283,10 @@ uint32_t AppHub::offer(uint32_t index, MqttBroker& broker, const MqttBrokerRoute
                     built->event = eventOf(topic, built->payload);
                 }
             }
-            if (take(group, built)) {
+            uint64_t change = 0;
+            if (take(group, built, &change)) {
                 taken = true;
+                kept = std::max(kept, change);
             } else if (group.options.onFull == AppOnFull::Refuse) {
                 refused = true;
             }
@@ -237,13 +301,15 @@ uint32_t AppHub::offer(uint32_t index, MqttBroker& broker, const MqttBrokerRoute
     // A group took it, so it has somewhere to go: not 0x10 No matching
     // subscribers, as with a Kafka mapping that took it.
     if (taken) {
-        broker.concludeDeferred(deferral, 1, 0);
+        // Kept by a group: the PUBACK waits for the disk (service()).
+        if (kept != 0) shard.holds.emplace_back(kept, deferral);
+        else broker.concludeDeferred(deferral, 1, 0);
         return 1;
     }
     return 0;
 }
 
-bool AppHub::take(Group& group, const std::shared_ptr<const AppMessage>& message) {
+bool AppHub::take(Group& group, const std::shared_ptr<const AppMessage>& message, uint64_t* change) {
     if (group.queued >= _config.maxQueued) {
         group.refused++;
         (group.options.onFull == AppOnFull::Refuse ? _refused : _dropped)++;
@@ -251,6 +317,11 @@ bool AppHub::take(Group& group, const std::shared_ptr<const AppMessage>& message
     }
     std::shared_ptr<Entry> entry(new Entry());
     entry->message = message;
+    if (_store && group.durable) {
+        entry->stored = _nextStored++;
+        const uint64_t n = _store->putMessage(entry->stored, group.name, group.connection, *message);
+        if (change) *change = n;
+    }
     group.queued++;
     _taken++;
     assign(group, entry);
@@ -302,7 +373,10 @@ void AppHub::pump(Group&, Member& member) {
 void AppHub::leave(Group& group, Member& member) {
     group.members.erase(std::remove(group.members.begin(), group.members.end(), &member),
                         group.members.end());
-    if (group.members.empty()) group.emptySince = Clock::now();
+    if (group.members.empty()) {
+        group.emptySince = Clock::now();
+        keepGroup(group);
+    }
     // What it was sent and did not acknowledge, oldest first, then what was
     // still to be sent: dealt again to the others - or kept for the next.
     std::vector<std::shared_ptr<Entry>> held;
@@ -347,6 +421,7 @@ AppHub::Member* AppHub::open(const AppConsumeOptions& options, AppConsumer* cons
         group->durable = durable;
         group->options = options;
         found = _groups.emplace(key, std::move(group)).first;
+        keepGroup(*found->second);
     } else {
         std::vector<std::string> mine = options.filters, theirs = found->second->options.filters;
         std::sort(mine.begin(), mine.end());
@@ -377,7 +452,10 @@ void AppHub::ack(Member* member, const std::vector<uint64_t>& ids) {
     std::lock_guard<std::mutex> guard(_lock);
     Group& group = *member->group;
     for (uint64_t id : ids) {
-        if (member->inFlight.erase(id) == 0) continue;
+        auto found = member->inFlight.find(id);
+        if (found == member->inFlight.end()) continue;
+        if (_store && found->second->stored != 0) _store->dropMessage(found->second->stored);
+        member->inFlight.erase(found);
         group.queued--;
         _acknowledged++;
     }
@@ -444,6 +522,7 @@ void AppHub::timers() {
             // A durable group nobody has opened for its expiry is gone.
             if (group.durable && group.members.empty() &&
                 now - group.emptySince > std::chrono::seconds(group.options.expirySeconds)) {
+                forgetGroup(group);
                 at = _groups.erase(at);
                 continue;
             }
@@ -571,6 +650,14 @@ void AppHub::service(uint32_t index, MqttBroker& broker) {
     uint64_t counter = 0;
     const ssize_t ignored = ::read(shard.eventFd, &counter, sizeof counter);
     (void)ignored;
+    // PUBACKs whose messages are now on disk.
+    if (_store) {
+        const uint64_t written = _store->committed();
+        while (!shard.holds.empty() && shard.holds.front().first <= written) {
+            broker.concludeDeferred(shard.holds.front().second, 1, 0);
+            shard.holds.pop_front();
+        }
+    }
     std::deque<std::pair<AppPublish, std::function<void(const AppPublishResult&)>>> publishes;
     {
         std::lock_guard<std::mutex> guard(shard.lock);
@@ -688,6 +775,7 @@ bool AppHub::deleteGroup(const std::string& name, const std::string& connection,
     }
     if (discarded) *discarded = found->second->queued;
     const std::string onConnection = found->second->connection;
+    forgetGroup(*found->second);
     _groups.erase(found);
     if (!onConnection.empty()) groupsChanged(onConnection);
     return true;
@@ -707,5 +795,7 @@ AppHubStatus AppHub::status() const {
     out.refused = _refused.load();
     out.dropped = _dropped.load();
     out.published = _published.load();
+    out.restoredGroups = _restoredGroups;
+    out.restoredMessages = _restoredMessages;
     return out;
 }

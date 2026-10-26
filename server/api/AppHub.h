@@ -24,6 +24,9 @@
 //   WENT                          stream ended goes to the others (`redelivered`)
 //   THE GROUP MUST TAKE IT        a group at its queue limit refuses: a QoS 1/2
 //                                 publisher is told 0x97 and keeps the message
+//   KEPT (sessions: store: file)  a named group and what it holds are on disk
+//                                 (GroupStore) before a QoS 1/2 publisher's
+//                                 PUBACK, and back after a restart
 //
 // And Publish: a message from the application, routed on a shard's own thread.
 // Nothing here knows gRPC (ApiServer.cpp is the wire), so it is tested without.
@@ -125,15 +128,19 @@ struct AppGroupInfo {
 struct AppHubConfig {
     size_t maxQueued = 100000;                   // per group: past it, the group refuses
     bool eventsEnabled = false;                  // events: enabled - $modbee/events/... exist
+    std::string directory;                       // set: named groups are kept in <directory>/groups.db
+    bool syncFull = false;                       // and every commit reaches the disk first
 };
 
 struct AppHubStatus {
     size_t groups = 0, members = 0;
     uint64_t taken = 0, delivered = 0, acknowledged = 0, redelivered = 0, refused = 0, dropped = 0;
     uint64_t published = 0;
+    uint64_t restoredGroups = 0, restoredMessages = 0;   // put back at start
 };
 
 class AppConnections;
+class GroupStore;
 
 class AppHub : public ShardExtension {
 public:
@@ -186,6 +193,9 @@ public:
 private:
     AppHubConfig _config;
     std::vector<std::unique_ptr<Shard>> _shards;
+    std::unique_ptr<GroupStore> _store;          // with a directory
+    uint64_t _nextStored = 1;                    // under _lock
+    uint64_t _restoredGroups = 0, _restoredMessages = 0;
     std::atomic<AppConnections*> _connections{nullptr};
     void groupsChanged(const std::string& connection);
     std::atomic<size_t> _nextShard{0};
@@ -219,7 +229,10 @@ private:
     std::atomic<uint64_t> _taken{0}, _delivered{0}, _acknowledged{0}, _redelivered{0}, _refused{0};
     std::atomic<uint64_t> _dropped{0}, _published{0};
 
-    bool take(Group& group, const std::shared_ptr<const AppMessage>& message);
+    // `change`: the GroupStore change that keeps it, 0 when not kept.
+    bool take(Group& group, const std::shared_ptr<const AppMessage>& message, uint64_t* change = nullptr);
+    void keepGroup(const Group& group);
+    void forgetGroup(const Group& group);
     void assign(Group& group, std::shared_ptr<Entry> entry);
     void pump(Group& group, Member& member);
     void leave(Group& group, Member& member);

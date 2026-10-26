@@ -456,6 +456,11 @@ int cmdServe(int argc, char** argv) {
         AppHubConfig h;
         h.maxQueued = (size_t)file.api.maxQueued;
         h.eventsEnabled = file.events.enabled;
+        // Named groups are kept wherever sessions are.
+        if (file.sessions.store == SessionStore::File) {
+            h.directory = file.sessions.directory;
+            h.syncFull = file.sessions.syncFull;
+        }
         hub.reset(new AppHub(h));
         extensions.add(hub.get());
         admin.reset(new AppAdmin());
@@ -540,6 +545,12 @@ int cmdServe(int argc, char** argv) {
 #if defined(MODBEE_HAVE_APP_API)
     for (const std::string& address : api.listening()) {
         std::printf("modbee serve: Application API (gRPC) on %s\n", address.c_str());
+    }
+    if (hub && file.sessions.store == SessionStore::File) {
+        const AppHubStatus h = hub->status();
+        std::printf("modbee serve: consumer groups kept in %s/groups.db: %llu restored, holding %llu message(s)\n",
+                    file.sessions.directory.c_str(), (unsigned long long)h.restoredGroups,
+                    (unsigned long long)h.restoredMessages);
     }
     if (authority) {
         std::printf("modbee serve: MQTT logins are decided by the application (authority), asked once "
