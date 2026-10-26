@@ -13,9 +13,23 @@ Today the server answers three of its services:
 | `Messages` | **Every device's messages, shared by your application's instances, and messages back to the devices** - [below](#messages) |
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 
-The others in the file (`Connections`, `Admin`, `System.Attach`) answer
-`UNIMPLEMENTED` for now; `Hello`'s `features` lists what a server serves, so
-an application asks rather than guesses.
+The others in the file (`Connections`, `Admin`) answer `UNIMPLEMENTED` for
+now; `Hello`'s `features` lists what a server serves, so an application asks
+rather than guesses.
+
+**`System.Attach`** is an instance's presence. Open it with the messages to
+publish should the instance vanish - its Wills, as an MQTT client has one:
+
+```js
+const attach = system.Attach(metadata());
+attach.write({ open: { instance: 'backend-1', wills: [
+  { topic: 'spBv1.0/STATE/host-1', payload: offline, qos: 1, retain: true } ] } });
+// ... and on a clean shutdown:
+attach.write({ close: {} }); attach.end();
+```
+
+A stream that ends without `close` - the process killed, the socket gone -
+has its Wills published, in order. One that closes first has none.
 
 ---
 

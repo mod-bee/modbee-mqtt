@@ -567,13 +567,97 @@ private:
 };
 
 // =============================================================================
+// System.Attach: an application instance's presence, and its Wills
+// =============================================================================
+//
+// Open with the Wills; Close first for a clean end. A stream that ends any
+// other way - the process killed, the socket gone - has its Wills published,
+// in order, as a device's would be.
+
+class AttachReactor : public grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown> {
+public:
+    AttachReactor(AppHub* hub, bool allowedIn) : _hub(hub) {
+        if (!allowedIn) {
+            _done = true;
+            Finish(refusedToken());
+            return;
+        }
+        StartRead(&_up);
+    }
+
+    void OnReadDone(bool ok) override {
+        if (!ok) {
+            // Gone without a Close: its Wills are owed.
+            if (!_closed && _hub) {
+                for (const AppPublish& will : _wills) _hub->publish(will, [](const AppPublishResult&) {});
+            }
+            finish(grpc::Status::OK);
+            return;
+        }
+        if (_up.has_open() && !_opened) {
+            _opened = true;
+            for (const v1::Message& will : _up.open().wills()) {
+                AppPublish one;
+                one.topic = will.topic();
+                one.payload = will.payload();
+                one.qos = (uint8_t)will.qos();
+                one.retain = will.retain();
+                one.properties = propertiesOf(will.properties());
+                one.origin = _up.open().instance();
+                _wills.push_back(one);
+            }
+            _reply.set_opened(true);
+            _writing = true;
+            StartWrite(&_reply);
+        } else if (_up.has_close()) {
+            _closed = true;
+        }
+        StartRead(&_up);
+    }
+
+    void OnWriteDone(bool) override {
+        std::lock_guard<std::mutex> guard(_lock);
+        _writing = false;
+        if (_ending && !_done) {
+            _done = true;
+            Finish(_status);
+        }
+    }
+
+    void OnDone() override { delete this; }
+
+private:
+    void finish(const grpc::Status& status) {
+        std::lock_guard<std::mutex> guard(_lock);
+        _ending = true;
+        _status = status;
+        if (!_writing && !_done) {
+            _done = true;
+            Finish(status);
+        }
+    }
+
+    AppHub* _hub;
+    v1::AttachUp _up;
+    v1::AttachDown _reply;
+    std::vector<AppPublish> _wills;
+    std::mutex _lock;
+    bool _opened = false, _closed = false, _writing = false, _ending = false, _done = false;
+    grpc::Status _status = grpc::Status::OK;
+};
+
+// =============================================================================
 // THE SERVICES
 // =============================================================================
 
 class SystemService final : public v1::System::CallbackService {
 public:
-    SystemService(const ApiServerConfig& config, bool authority, bool messages)
-        : _config(config), _authority(authority), _messages(messages) {}
+    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages)
+        : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr) {}
+
+    grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown>* Attach(grpc::CallbackServerContext* context) override {
+        return new AttachReactor(_hub, allowed(context, _config.token));
+    }
 
     grpc::ServerUnaryReactor* Hello(grpc::CallbackServerContext* context, const v1::HelloRequest*,
                                     v1::HelloReply* reply) override {
@@ -594,6 +678,7 @@ public:
 private:
     const ApiServerConfig& _config;
     bool _authority;
+    AppHub* _hub;
     bool _messages;
 };
 
@@ -776,7 +861,7 @@ bool ApiServer::start(const ApiServerConfig& config, Authority* authority, AppHu
                       std::string& error) {
     Impl& self = *_impl;
     self.config = config;
-    self.system.reset(new SystemService(self.config, authority != nullptr, messages != nullptr));
+    self.system.reset(new SystemService(self.config, authority != nullptr, messages));
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
 
