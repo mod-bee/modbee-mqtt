@@ -280,6 +280,7 @@ message Publisher {
 
 message ClientEvent {
   ClientEventKind kind = 1;
+  uint64 id = 10;                  // for Ack and Retry, as Delivery.id: events are kept and dealt like messages
   string client_id = 2;
   string login = 3;
   int64 time_ms = 4;

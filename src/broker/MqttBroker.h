@@ -240,6 +240,11 @@ struct MqttBrokerRouted {
     // injected it through publishMessage() tagged it - opaque here. A pipe
     // uses it so a message from Kafka topic T is never written back to T.
     const void* origin = nullptr;
+#if defined(MQTT_PLATFORM_HOST)
+    // The publisher session's context from its permission hook
+    // (MqttBrokerRequest::setContext), or null.
+    const void* context = nullptr;
+#endif
 };
 
 // Called for every message that ORIGINATED here - a client's PUBLISH, a Will,
@@ -800,7 +805,7 @@ private:
                     bool retain, const MqttProperties& properties,
                     const MqttSpan& clientId, size_t matched, size_t dropped,
                     uint64_t deferral, const void* origin = nullptr,
-                    const MqttSpan& userName = MqttSpan());
+                    const MqttSpan& userName = MqttSpan(), const void* context = nullptr);
     uint64_t openDeferred(MqttBrokerConnection& connection, uint16_t packetId,
                           uint8_t qos, size_t matched, size_t dropped, bool retainedFull);
     void closeDeferred(uint64_t deferral);

@@ -118,15 +118,15 @@ else()
     message(STATUS "modbee: no librdkafka - modbee serve runs without the Kafka pipe")
 endif()
 
-# --- logins decided by the application: authentication: authority: ---
-# No gRPC in it (server/api/Authority.h), so it builds - and is tested -
-# wherever the server does.
-add_library(modbee-authority STATIC api/Authority.cpp)
-target_link_libraries(modbee-authority PUBLIC modbee-server modbee-auth)
-target_include_directories(modbee-authority PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api)
-target_compile_features(modbee-authority PUBLIC cxx_std_17)
+# --- what the Application API serves, without gRPC: logins decided by the
+# application (Authority) and its messages (AppHub). Built - and tested -
+# wherever the server is.
+add_library(modbee-app STATIC api/Authority.cpp api/AppHub.cpp)
+target_link_libraries(modbee-app PUBLIC modbee-server modbee-auth)
+target_include_directories(modbee-app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api)
+target_compile_features(modbee-app PUBLIC cxx_std_17)
 if(NOT MSVC)
-    target_compile_options(modbee-authority PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+    target_compile_options(modbee-app PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
 endif()
 
 # --- the Application API (gRPC), where gRPC and protobuf are installed ---
@@ -162,7 +162,7 @@ if(MQTT_BUILD_APP_API)
         COMMENT "Generating the Application API from proto/modbee/app/v1/app.proto"
         VERBATIM)
     add_library(modbee-api STATIC api/ApiServer.cpp ${_modbee_app}.pb.cc ${_modbee_app}.grpc.pb.cc)
-    target_link_libraries(modbee-api PUBLIC modbee-authority gRPC::grpc++ protobuf::libprotobuf)
+    target_link_libraries(modbee-api PUBLIC modbee-app gRPC::grpc++ protobuf::libprotobuf)
     target_include_directories(modbee-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api ${_modbee_generated})
     target_compile_definitions(modbee-api PUBLIC MODBEE_HAVE_APP_API=1)
     target_compile_features(modbee-api PUBLIC cxx_std_17)

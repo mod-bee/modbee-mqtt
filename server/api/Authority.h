@@ -137,6 +137,10 @@ struct AuthorityChange {
     uint64_t forgotten = 0;      // kept decisions dropped
 };
 
+// The tag (AuthorityScope::tag) of the login a session's context belongs to -
+// MqttBrokerRouted::context, as Authority gave it - or "" for none.
+std::string authorityTagOf(const void* context);
+
 class Authority : public ShardExtension {
 public:
     explicit Authority(const AuthorityConfig& config);

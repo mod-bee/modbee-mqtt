@@ -176,6 +176,11 @@ std::shared_ptr<const void> regrantFor(void* context, const MqttBrokerSession& s
 
 } // namespace
 
+std::string authorityTagOf(const void* context) {
+    if (context == nullptr) return std::string();
+    return static_cast<const SessionGrant*>(context)->scope->tag;
+}
+
 void AuthorityScope::settle() {
     templated = false;
     for (const std::vector<std::string>* rules : {&publish, &subscribe, &subscribeWide, &deny}) {

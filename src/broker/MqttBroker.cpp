@@ -699,7 +699,8 @@ void MqttBroker::onPlace(MqttBrokerPlaceFn place, MqttBrokerHandOffFn handOff, v
 uint32_t MqttBroker::egress(const MqttSpan& topic, const MqttSpan& payload, uint8_t qos,
                             bool retain, const MqttProperties& properties,
                             const MqttSpan& clientId, size_t matched, size_t dropped,
-                            uint64_t deferral, const void* origin, const MqttSpan& userName) {
+                            uint64_t deferral, const void* origin, const MqttSpan& userName,
+                            const void* context) {
     if (_onEgress == nullptr) return 0;
     MqttBrokerRouted message;
     message.topic = topic;
@@ -712,6 +713,7 @@ uint32_t MqttBroker::egress(const MqttSpan& topic, const MqttSpan& payload, uint
     message.matched = matched;
     message.dropped = dropped;
     message.origin = origin;
+    message.context = context;
     return _onEgress(_egressContext, message, deferral);
 }
 
@@ -1930,7 +1932,8 @@ void MqttBroker::publishWill(MqttBrokerSession& session) {
                                  will.retain, properties, &session, &dropped);
 #if defined(MQTT_PLATFORM_HOST)
     egress(asSpan(will.topic), asSpan(will.payload), will.qos, will.retain, properties,
-           asSpan(session.clientId()), matched, dropped, 0, nullptr, asSpan(session.userName));
+           asSpan(session.clientId()), matched, dropped, 0, nullptr, asSpan(session.userName),
+           session.authContext.get());
 #else
     (void)matched;
 #endif
@@ -3599,7 +3602,8 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
             const uint32_t parties =
                 egress(topic, message.payload, message.qos, message.retain,
                        MQ_PROPERTIES(packet, message), asSpan(session->clientId()), matched,
-                       refusedByQueue, deferral, nullptr, asSpan(session->userName));
+                       refusedByQueue, deferral, nullptr, asSpan(session->userName),
+                       session->authContext.get());
             if (deferral != 0) {
                 if (parties == 0) {
                     closeDeferred(deferral);

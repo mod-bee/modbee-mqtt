@@ -275,6 +275,7 @@ struct ApiSection {
     std::vector<std::string> grpc;       // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
     std::string tlsCert, tlsKey, tlsClientCa;   // PEM files, for tcp://
     std::string tokenFile;               // a token every call must carry ("authorization: Bearer ...")
+    long long maxQueued = 100000;        // per consumer group: past it, the group refuses
 };
 
 struct ServerConfig {

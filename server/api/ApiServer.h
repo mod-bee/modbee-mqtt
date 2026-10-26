@@ -23,6 +23,7 @@
 #include <vector>
 
 class Authority;
+class AppHub;
 
 struct ApiServerConfig {
     std::vector<std::string> addresses;   // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
@@ -39,8 +40,9 @@ public:
     ~ApiServer();
 
     // `authority` may be null: logins are then the login database's, and the
-    // Authority service says so (FAILED_PRECONDITION). Not owned; outlives stop().
-    bool start(const ApiServerConfig& config, Authority* authority, std::string& error);
+    // Authority service says so (FAILED_PRECONDITION). `messages` serves the
+    // Messages service. Neither is owned; both outlive stop().
+    bool start(const ApiServerConfig& config, Authority* authority, AppHub* messages, std::string& error);
 
     // Every stream is ended and every call answered or cancelled, within a
     // couple of seconds. Safe to call twice.

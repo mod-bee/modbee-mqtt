@@ -1023,6 +1023,7 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     apiTls.text("client-ca", out.api.tlsClientCa);
     if (apiTls.present()) apiTls.finish();
     api.text("token-file", out.api.tokenFile);
+    api.integer("max-queued", out.api.maxQueued, 1, 100000000);
     if (api.present()) api.finish();
 
     Section events = top.child("events");

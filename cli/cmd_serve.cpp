@@ -29,6 +29,7 @@
 #if defined(MODBEE_HAVE_APP_API)
 #include "Authority.h"
 #include "ApiServer.h"
+#include "AppHub.h"
 #endif
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
@@ -437,6 +438,17 @@ int cmdServe(int argc, char** argv) {
         sessions.reset(new SessionKeeper(k));
         extensions.add(sessions.get());
     }
+#if defined(MODBEE_HAVE_APP_API)
+    // THE APPLICATION'S MESSAGES, wherever the Application API is served.
+    std::unique_ptr<AppHub> hub;
+    if (!file.api.grpc.empty()) {
+        AppHubConfig h;
+        h.maxQueued = (size_t)file.api.maxQueued;
+        h.eventsEnabled = file.events.enabled;
+        hub.reset(new AppHub(h));
+        extensions.add(hub.get());
+    }
+#endif
     if (!extensions.empty()) config.extension = &extensions;
 
     cliInstallSignalHandlers();
@@ -466,7 +478,7 @@ int cmdServe(int argc, char** argv) {
         }
         std::string why;
         if (!read) why = "api: a tls file or the token file could not be read, or the token is empty";
-        if (!read || !api.start(c, authority.get(), why)) {
+        if (!read || !api.start(c, authority.get(), hub.get(), why)) {
             std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
             server.stop();
             return 3;

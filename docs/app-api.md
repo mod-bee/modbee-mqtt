@@ -5,14 +5,15 @@ backend, a gateway's own software - can speak to it a different way: over
 the Application API, gRPC on a local socket, with no MQTT library at all.
 
 The contract is [`proto/modbee/app/v1/app.proto`](../proto/modbee/app/v1/app.proto).
-Today the server answers two of its services:
+Today the server answers three of its services:
 
 | Service | What it is for |
 | --- | --- |
 | `System.Hello` | What this server is, which API version it speaks, and what it can do (`features`) |
-| `Authority` | **Your application decides who may log in, and what each login may do** - below |
+| `Messages` | **Every device's messages, shared by your application's instances, and messages back to the devices** - [below](#messages) |
+| `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 
-The other services in the file (`Messages`, `Connections`, `Admin`) answer
+The others in the file (`Connections`, `Admin`, `System.Attach`) answer
 `UNIMPLEMENTED` for now; `Hello`'s `features` lists what a server serves, so
 an application asks rather than guesses.
 
@@ -57,6 +58,63 @@ modbee serve: Application API (gRPC) on unix:/run/modbee/api.sock
 - The server needs gRPC to serve it: a build where gRPC was not found says
   so and does not start with an `api:` section (Ubuntu/Debian:
   `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev`).
+
+---
+
+## Messages
+
+### Reading every device's messages: `Messages.Consume`
+
+Open a stream, send `open` with a **group** name and the topic filters it
+wants, and the messages arrive, one `Delivery` each. Acknowledge each one
+(`ack`, by its `id`) once you have handled it - stored it, acted on it - not
+before.
+
+```js
+call.write({ open: { group: 'platform', filters: ['#'], maxInFlight: 100 } });
+call.on('data', (down) => {
+  if (down.delivery) { handle(down.delivery); call.write({ ack: { ids: [down.delivery.id] } }); }
+});
+```
+
+**Run as many instances as you like with the same group: they share it.**
+
+| | |
+| --- | --- |
+| **One device, one instance, in order** | Every message is dealt to the instance its publisher's client id hashes to, so one device's messages reach one instance, in the order the server took them. An instance joining or leaving moves only its own share (`pick: PICK_ROUND_ROBIN` turns this off) |
+| **Nothing is lost when an instance stops** | What it had been sent and not acknowledged - killed, crashed, restarting - goes to the others, marked `redelivered`. A message can therefore arrive twice: handle it so a repeat is harmless (store it under the device and its own time) |
+| **The group outlives its instances** | With none connected, a named group keeps collecting, and what waited arrives marked `replay` when one is back. One nobody opens for `expiry_seconds` (a day by default) is dropped |
+| **The group must take it** | A group holding `api.max-queued` messages (100,000) refuses more: a device publishing at QoS 1 or 2 is told `0x97` Quota exceeded and keeps the message to send again; QoS 0 is dropped and counted. With `on_full: ON_FULL_DROP`, it is dropped instead |
+| **Flow** | An instance is given at most `max_in_flight` unacknowledged messages at once; acknowledge to get more |
+| **Not now** | `retry` with an `after_ms` sends one again later, to any instance |
+
+Each delivery says who published it, which a device cannot fake: its
+`publisher` (`client_id`, the `login` the server checked, and the login's
+`tag` from its [scope](#the-scope)), `broker_time_ms` - when the server took
+it, a clock you can trust - and the MQTT 5 properties it was published with.
+
+- **`$` topics** come only when a filter names them (`$modbee/provision/+/request`).
+- **`events: true`** adds client events - connected, disconnected, subscribed,
+  unsubscribed - dealt like the messages: to the instance that gets that
+  client's messages, in order with them, acknowledged by `id`. The server
+  needs `events: enabled` ([events.md](events.md)).
+- **`exclude_origins`** keeps messages your application published itself
+  (with that `origin`) out of the group.
+- **`group: ""`** is a stream of its own, gone when it ends.
+- `Messages.ListGroups` lists the groups; `Messages.DeleteGroup` removes one
+  nobody is connected to.
+
+[`examples/app-api/nodejs/consumer.js`](../examples/app-api/nodejs/consumer.js)
+is a whole member: start two, kill one mid-stream, and every message still
+arrives.
+
+### Sending to the devices: `Messages.Publish`
+
+`Publish` routes a message - topic, payload, QoS, retain, MQTT 5 properties -
+to the devices subscribed to it, and answers `PUBLISH_ACCEPTED` once the
+server has taken it. `PublishStream` does the same for a stream of them,
+each answered by its `request_id`. `origin` names who published it, for
+`exclude_origins` and for the `publisher.origin` a group sees.
 
 ---
 

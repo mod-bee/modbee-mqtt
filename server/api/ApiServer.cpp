@@ -5,6 +5,7 @@
 
 #include "ApiServer.h"
 #include "Authority.h"
+#include "AppHub.h"
 
 #include "modbee/app/v1/app.grpc.pb.h"
 
@@ -99,6 +100,111 @@ void questionTo(const AuthorityQuestion& question, v1::ConnectQuestion& wire) {
         wire.mutable_certificate()->set_common_name(question.certificateName);
         wire.mutable_certificate()->set_fingerprint(question.certificateFingerprint);
     }
+}
+
+// --- Messages: properties, deliveries, events -----------------------------------
+
+void propertiesTo(const MqttOwnedProperties& p, v1::Properties& wire) {
+    if (p.hasPayloadFormat) wire.set_payload_is_utf8(p.payloadFormat == 1);
+    if (p.hasContentType) wire.set_content_type(p.contentType);
+    if (p.hasResponseTopic) wire.set_response_topic(p.responseTopic);
+    if (p.hasCorrelationData) {
+        wire.set_correlation_data(std::string(p.correlationData.begin(), p.correlationData.end()));
+    }
+    if (p.hasExpiry) wire.set_message_expiry_seconds(p.expiryInterval);
+    for (const auto& user : p.user) {
+        v1::UserProperty* one = wire.add_user_properties();
+        one->set_name(user.key);
+        one->set_value(user.value);
+    }
+}
+
+MqttOwnedProperties propertiesOf(const v1::Properties& wire) {
+    MqttOwnedProperties p;
+    if (wire.has_payload_is_utf8()) p.setPayloadFormat(wire.payload_is_utf8());
+    if (!wire.content_type().empty()) p.setContentType(wire.content_type().c_str());
+    if (!wire.response_topic().empty()) p.setResponseTopic(wire.response_topic().c_str());
+    if (!wire.correlation_data().empty()) {
+        p.setCorrelationData((const uint8_t*)wire.correlation_data().data(), wire.correlation_data().size());
+    }
+    if (wire.has_message_expiry_seconds()) p.setMessageExpiry(wire.message_expiry_seconds());
+    for (const v1::UserProperty& user : wire.user_properties()) {
+        p.addUserProperty(user.name().c_str(), user.value().c_str());
+    }
+    return p;
+}
+
+void deliveryTo(uint64_t id, const AppMessage& m, bool replay, bool redelivered, v1::ConsumeDown& down) {
+    if (m.isEvent) {
+        v1::ClientEvent* event = down.mutable_event();
+        event->set_id(id);
+        switch (m.event.kind) {
+        case AppClientEvent::Connected: event->set_kind(v1::CLIENT_EVENT_CONNECTED); break;
+        case AppClientEvent::Disconnected: event->set_kind(v1::CLIENT_EVENT_DISCONNECTED); break;
+        case AppClientEvent::Subscribed: event->set_kind(v1::CLIENT_EVENT_SUBSCRIBED); break;
+        case AppClientEvent::Unsubscribed: event->set_kind(v1::CLIENT_EVENT_UNSUBSCRIBED); break;
+        case AppClientEvent::ServerStarted: event->set_kind(v1::CLIENT_EVENT_SERVER_STARTED); break;
+        default: event->set_kind(v1::CLIENT_EVENT_UNSPECIFIED); break;
+        }
+        event->set_client_id(m.event.clientId);
+        event->set_login(m.event.login);
+        event->set_time_ms(m.event.timeMs);
+        event->set_resumed(m.event.resumed);
+        event->set_reason_code(m.event.reasonCode);
+        event->set_filter(m.event.filter);
+        event->set_qos(m.event.qos);
+        event->set_address(m.event.address);
+        return;
+    }
+    v1::Delivery* d = down.mutable_delivery();
+    d->set_id(id);
+    d->set_topic(m.topic);
+    d->set_payload(m.payload);
+    d->set_qos(m.qos);
+    d->set_retain(m.retain);
+    propertiesTo(m.properties, *d->mutable_properties());
+    v1::Publisher* publisher = d->mutable_publisher();
+    publisher->set_client_id(m.clientId);
+    publisher->set_login(m.login);
+    publisher->set_tag(m.tag);
+    publisher->set_origin(m.origin);
+    d->set_broker_time_ms(m.brokerTimeMs);
+    d->set_replay(replay);
+    d->set_redelivered(redelivered);
+    d->set_connection(m.connection);
+}
+
+v1::PublishOutcome outcomeOf(AppPublishOutcome outcome) {
+    switch (outcome) {
+    case AppPublishOutcome::Accepted: return v1::PUBLISH_ACCEPTED;
+    case AppPublishOutcome::Delivered: return v1::PUBLISH_DELIVERED;
+    case AppPublishOutcome::NoSubscribers: return v1::PUBLISH_NO_SUBSCRIBERS;
+    case AppPublishOutcome::Partial: return v1::PUBLISH_PARTIAL;
+    case AppPublishOutcome::Refused: return v1::PUBLISH_REFUSED;
+    case AppPublishOutcome::NotConnected: return v1::PUBLISH_NOT_CONNECTED;
+    }
+    return v1::PUBLISH_OUTCOME_UNSPECIFIED;
+}
+
+void resultTo(const AppPublishResult& result, uint64_t requestId, v1::PublishReply& reply) {
+    reply.set_request_id(requestId);
+    reply.set_outcome(outcomeOf(result.outcome));
+    reply.set_reason_code(result.reasonCode);
+    reply.set_matched(result.matched);
+    reply.set_acknowledged(result.acknowledged);
+    reply.set_pending(result.pending);
+}
+
+AppPublish publishOf(const v1::PublishRequest& request) {
+    AppPublish message;
+    message.topic = request.message().topic();
+    message.payload = request.message().payload();
+    message.qos = (uint8_t)request.message().qos();
+    message.retain = request.message().retain();
+    message.properties = propertiesOf(request.message().properties());
+    message.connection = request.connection();
+    message.origin = request.origin();
+    return message;
 }
 
 // =============================================================================
@@ -203,12 +309,258 @@ private:
 };
 
 // =============================================================================
+// Messages.Consume: one member of a consumer group
+// =============================================================================
+//
+// The first message up is the open. Deliveries come down as the hub deals
+// them, in-flight bounded by max_in_flight; acks and retries go up. While the
+// open is answered, deliveries wait behind the `opened` reply: it is first.
+
+class ConsumeReactor : public grpc::ServerBidiReactor<v1::ConsumeUp, v1::ConsumeDown>, public AppConsumer {
+public:
+    ConsumeReactor(AppHub& hub, bool allowedIn) : _hub(hub) {
+        if (!allowedIn) {
+            _finished = true;
+            Finish(refusedToken());
+            return;
+        }
+        StartRead(&_up);
+    }
+
+    void deliver(uint64_t id, const AppMessage& message, bool replay, bool redelivered) override {
+        v1::ConsumeDown* next = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            if (_ending) return;
+            _queue.emplace_back();
+            deliveryTo(id, message, replay, redelivered, _queue.back());
+            if (_writing || _holding) return;
+            _writing = true;
+            next = &_queue.front();
+        }
+        StartWrite(next);
+    }
+
+    void OnReadDone(bool ok) override {
+        if (!ok) {
+            end(grpc::Status::OK);
+            return;
+        }
+        if (_member == nullptr) {
+            if (!_up.has_open()) {
+                end(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "the first message on a Consume stream is open"));
+                return;
+            }
+            if (!open(_up.open())) return;
+        } else if (_up.has_ack()) {
+            _hub.ack(_member, std::vector<uint64_t>(_up.ack().ids().begin(), _up.ack().ids().end()));
+        } else if (_up.has_retry()) {
+            _hub.retry(_member, std::vector<uint64_t>(_up.retry().ids().begin(), _up.retry().ids().end()),
+                       _up.retry().after_ms());
+        }
+        StartRead(&_up);
+    }
+
+    void OnWriteDone(bool ok) override {
+        v1::ConsumeDown* next = nullptr;
+        bool finish = false;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _queue.pop_front();
+            if (!ok) _ending = true;
+            if (!_ending && !_queue.empty()) {
+                next = &_queue.front();
+            } else {
+                _writing = false;
+                if (_ending && !_finished) {
+                    _finished = true;
+                    finish = true;
+                }
+            }
+        }
+        if (!ok) leave();
+        if (next) StartWrite(next);
+        if (finish) Finish(_status);
+    }
+
+    void OnDone() override {
+        leave();
+        delete this;
+    }
+
+private:
+    bool open(const v1::ConsumeOpen& wire) {
+        AppConsumeOptions options;
+        options.group = wire.group();
+        options.filters.assign(wire.filters().begin(), wire.filters().end());
+        options.connection = wire.connection();
+        options.maxInFlight = wire.max_in_flight() ? wire.max_in_flight() : 100;
+        options.pick = wire.pick() == v1::PICK_ROUND_ROBIN ? AppPick::RoundRobin : AppPick::Publisher;
+        options.events = wire.events();
+        options.expirySeconds = wire.expiry_seconds() ? wire.expiry_seconds() : 86400;
+        options.onFull = wire.on_full() == v1::ON_FULL_DROP ? AppOnFull::Drop : AppOnFull::Refuse;
+        options.excludeOrigins.assign(wire.exclude_origins().begin(), wire.exclude_origins().end());
+        v1::ConsumeDown* opened = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _holding = true;
+            _queue.emplace_back();
+            opened = &_queue.back();
+        }
+        std::string error;
+        uint32_t members = 0;
+        uint64_t queued = 0;
+        AppHub::Member* member = _hub.open(options, this, error, &members, &queued);
+        v1::ConsumeDown* next = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _member = member;
+            _holding = false;
+            if (member != nullptr) {
+                opened->mutable_opened()->set_members(members);
+                opened->mutable_opened()->set_queued(queued);
+                _writing = true;
+                next = &_queue.front();
+            }
+        }
+        if (member == nullptr) {
+            end(grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error));
+            return false;
+        }
+        StartWrite(next);
+        return true;
+    }
+
+    // The member leaves the group - what it held goes to the others - and the
+    // stream ends once its last write has.
+    void end(const grpc::Status& status) {
+        leave();
+        bool finish = false;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _ending = true;
+            _status = status;
+            if (!_writing && !_finished) {
+                _finished = true;
+                finish = true;
+            }
+        }
+        if (finish) Finish(status);
+    }
+
+    void leave() {
+        AppHub::Member* member = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            member = _member;
+            _member = nullptr;
+            _ending = true;
+        }
+        if (member) _hub.close(member);
+    }
+
+    AppHub& _hub;
+    AppHub::Member* _member = nullptr;
+    v1::ConsumeUp _up;
+    std::mutex _lock;
+    std::deque<v1::ConsumeDown> _queue;
+    bool _writing = false;
+    bool _holding = false;
+    bool _ending = false;
+    bool _finished = false;
+    grpc::Status _status = grpc::Status::OK;
+};
+
+// Messages.PublishStream: each request answered as it is routed (in the order
+// they are routed, which need not be the order they were sent).
+class PublishStreamReactor : public grpc::ServerBidiReactor<v1::PublishRequest, v1::PublishReply> {
+public:
+    PublishStreamReactor(AppHub& hub, bool allowedIn) : _hub(hub) {
+        if (!allowedIn) {
+            _finished = true;
+            Finish(refusedToken());
+            return;
+        }
+        StartRead(&_request);
+    }
+
+    void OnReadDone(bool ok) override {
+        if (!ok) {
+            std::lock_guard<std::mutex> guard(_lock);
+            _readsDone = true;
+            finishIfDone();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _outstanding++;
+        }
+        const uint64_t requestId = _request.request_id();
+        _hub.publish(publishOf(_request), [this, requestId](const AppPublishResult& result) {
+            v1::PublishReply reply;
+            resultTo(result, requestId, reply);
+            reply_(reply);
+        });
+        StartRead(&_request);
+    }
+
+    void OnWriteDone(bool) override {
+        v1::PublishReply* next = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _queue.pop_front();
+            if (!_queue.empty()) {
+                next = &_queue.front();
+            } else {
+                _writing = false;
+                finishIfDone();
+            }
+        }
+        if (next) StartWrite(next);
+    }
+
+    void OnDone() override { delete this; }
+
+private:
+    void reply_(const v1::PublishReply& reply) {
+        v1::PublishReply* next = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _outstanding--;
+            _queue.push_back(reply);
+            if (_writing || _finished) return;
+            _writing = true;
+            next = &_queue.front();
+        }
+        StartWrite(next);
+    }
+
+    // With the lock held.
+    void finishIfDone() {
+        if (_readsDone && _outstanding == 0 && !_writing && !_finished) {
+            _finished = true;
+            Finish(grpc::Status::OK);
+        }
+    }
+
+    AppHub& _hub;
+    v1::PublishRequest _request;
+    std::mutex _lock;
+    std::deque<v1::PublishReply> _queue;
+    size_t _outstanding = 0;
+    bool _writing = false;
+    bool _readsDone = false;
+    bool _finished = false;
+};
+
+// =============================================================================
 // THE SERVICES
 // =============================================================================
 
 class SystemService final : public v1::System::CallbackService {
 public:
-    SystemService(const ApiServerConfig& config, bool authority) : _config(config), _authority(authority) {}
+    SystemService(const ApiServerConfig& config, bool authority, bool messages)
+        : _config(config), _authority(authority), _messages(messages) {}
 
     grpc::ServerUnaryReactor* Hello(grpc::CallbackServerContext* context, const v1::HelloRequest*,
                                     v1::HelloReply* reply) override {
@@ -221,6 +573,7 @@ public:
         reply->set_server_version(_config.serverVersion);
         reply->set_server_id(_config.serverId);
         if (_authority) reply->add_features("authority");
+        if (_messages) reply->add_features("messages");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -228,6 +581,83 @@ public:
 private:
     const ApiServerConfig& _config;
     bool _authority;
+    bool _messages;
+};
+
+class MessagesService final : public v1::Messages::CallbackService {
+public:
+    MessagesService(const ApiServerConfig& config, AppHub& hub) : _config(config), _hub(hub) {}
+
+    grpc::ServerBidiReactor<v1::ConsumeUp, v1::ConsumeDown>* Consume(grpc::CallbackServerContext* context) override {
+        return new ConsumeReactor(_hub, allowed(context, _config.token));
+    }
+
+    grpc::ServerUnaryReactor* Publish(grpc::CallbackServerContext* context, const v1::PublishRequest* request,
+                                      v1::PublishReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        if (request->confirm() == v1::CONFIRM_DELIVERED) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "CONFIRM_DELIVERED is not served yet"));
+            return reactor;
+        }
+        const uint64_t requestId = request->request_id();
+        _hub.publish(publishOf(*request), [reactor, reply, requestId](const AppPublishResult& result) {
+            resultTo(result, requestId, *reply);
+            reactor->Finish(grpc::Status::OK);
+        });
+        return reactor;
+    }
+
+    grpc::ServerBidiReactor<v1::PublishRequest, v1::PublishReply>* PublishStream(
+        grpc::CallbackServerContext* context) override {
+        return new PublishStreamReactor(_hub, allowed(context, _config.token));
+    }
+
+    grpc::ServerUnaryReactor* ListGroups(grpc::CallbackServerContext* context, const v1::ListGroupsRequest*,
+                                         v1::ListGroupsReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        for (const AppGroupInfo& info : _hub.groups()) {
+            v1::GroupInfo* group = reply->add_groups();
+            group->set_group(info.group);
+            group->set_connection(info.connection);
+            for (const std::string& filter : info.filters) group->add_filters(filter);
+            group->set_members(info.members);
+            group->set_queued(info.queued);
+            group->set_in_flight(info.inFlight);
+            group->set_refused(info.refused);
+        }
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* DeleteGroup(grpc::CallbackServerContext* context, const v1::DeleteGroupRequest* request,
+                                          v1::DeleteGroupReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        uint64_t discarded = 0;
+        std::string why;
+        if (!_hub.deleteGroup(request->group(), request->connection(), &discarded, &why)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, why));
+            return reactor;
+        }
+        reply->set_discarded(discarded);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+private:
+    const ApiServerConfig& _config;
+    AppHub& _hub;
 };
 
 class AuthorityService final : public v1::Authority::CallbackService {
@@ -321,6 +751,7 @@ struct ApiServer::Impl {
     ApiServerConfig config;
     std::unique_ptr<SystemService> system;
     std::unique_ptr<AuthorityService> authority;
+    std::unique_ptr<MessagesService> messages;
     std::unique_ptr<grpc::Server> server;
     std::vector<std::string> listening;
     std::vector<std::string> sockets;      // Unix socket files, removed at stop
@@ -330,11 +761,13 @@ ApiServer::ApiServer() : _impl(new Impl()) {}
 
 ApiServer::~ApiServer() { stop(); }
 
-bool ApiServer::start(const ApiServerConfig& config, Authority* authority, std::string& error) {
+bool ApiServer::start(const ApiServerConfig& config, Authority* authority, AppHub* messages,
+                      std::string& error) {
     Impl& self = *_impl;
     self.config = config;
-    self.system.reset(new SystemService(self.config, authority != nullptr));
+    self.system.reset(new SystemService(self.config, authority != nullptr, messages != nullptr));
     self.authority.reset(new AuthorityService(self.config, authority));
+    if (messages) self.messages.reset(new MessagesService(self.config, *messages));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -367,6 +800,7 @@ bool ApiServer::start(const ApiServerConfig& config, Authority* authority, std::
     }
     builder.RegisterService(self.system.get());
     builder.RegisterService(self.authority.get());
+    if (self.messages) builder.RegisterService(self.messages.get());
     self.server = builder.BuildAndStart();
     if (!self.server) {
         error = "the Application API could not listen on every address (in use, or no permission?)";
