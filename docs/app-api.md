@@ -111,10 +111,24 @@ arrives.
 ### Sending to the devices: `Messages.Publish`
 
 `Publish` routes a message - topic, payload, QoS, retain, MQTT 5 properties -
-to the devices subscribed to it, and answers `PUBLISH_ACCEPTED` once the
-server has taken it. `PublishStream` does the same for a stream of them,
-each answered by its `request_id`. `origin` names who published it, for
-`exclude_origins` and for the `publisher.origin` a group sees.
+to the devices subscribed to it. `PublishStream` does the same for a stream
+of them, each answered by its `request_id`. `origin` names who published it,
+for `exclude_origins` and for the `publisher.origin` a group sees. When the
+answer comes is up to you (`confirm`):
+
+| `confirm` | Answered |
+| --- | --- |
+| `CONFIRM_ACCEPTED` (the default) | Once the server has taken it: `PUBLISH_ACCEPTED` |
+| `CONFIRM_DELIVERED` | Once **every subscriber it reached has acknowledged it** - PUBACK at QoS 1, PUBCOMP at QoS 2 - on whichever CPU core's share of the server each one is: `PUBLISH_DELIVERED`, with how many it `matched`. Nobody subscribed: `PUBLISH_NO_SUBSCRIBERS` at once |
+
+The wait is bounded by the call's gRPC deadline (ten seconds without one).
+When it comes first the answer is `PUBLISH_PARTIAL`, with how many
+`acknowledged` and how many are `pending` - a subscriber that is offline
+counts as pending, and its message waits in its session. A subscriber that
+never could have it (its queue full, the message expired or too large for
+it) also makes it `PARTIAL`. Use it for a command that must have reached its
+device before your application goes on; a store-and-forward outbox deletes
+only what came back `PUBLISH_DELIVERED`.
 
 ---
 

@@ -195,8 +195,18 @@ void resultTo(const AppPublishResult& result, uint64_t requestId, v1::PublishRep
     reply.set_pending(result.pending);
 }
 
+// CONFIRM_DELIVERED waits as long as the call may: its gRPC deadline, or ten
+// seconds for one with none.
+uint32_t deadlineMsOf(grpc::CallbackServerContext* context) {
+    const auto deadline = context->deadline();
+    const auto now = std::chrono::system_clock::now();
+    if (deadline <= now || deadline - now > std::chrono::hours(24)) return 10000;
+    return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+}
+
 AppPublish publishOf(const v1::PublishRequest& request) {
     AppPublish message;
+    message.confirmDelivered = request.confirm() == v1::CONFIRM_DELIVERED;
     message.topic = request.message().topic();
     message.payload = request.message().payload();
     message.qos = (uint8_t)request.message().qos();
@@ -475,7 +485,7 @@ private:
 // they are routed, which need not be the order they were sent).
 class PublishStreamReactor : public grpc::ServerBidiReactor<v1::PublishRequest, v1::PublishReply> {
 public:
-    PublishStreamReactor(AppHub& hub, bool allowedIn) : _hub(hub) {
+    PublishStreamReactor(AppHub& hub, bool allowedIn, uint32_t deadlineMs) : _hub(hub), _deadlineMs(deadlineMs) {
         if (!allowedIn) {
             _finished = true;
             Finish(refusedToken());
@@ -496,7 +506,9 @@ public:
             _outstanding++;
         }
         const uint64_t requestId = _request.request_id();
-        _hub.publish(publishOf(_request), [this, requestId](const AppPublishResult& result) {
+        AppPublish message = publishOf(_request);
+        message.deadlineMs = _deadlineMs;
+        _hub.publish(message, [this, requestId](const AppPublishResult& result) {
             v1::PublishReply reply;
             resultTo(result, requestId, reply);
             reply_(reply);
@@ -544,6 +556,7 @@ private:
     }
 
     AppHub& _hub;
+    uint32_t _deadlineMs;
     v1::PublishRequest _request;
     std::mutex _lock;
     std::deque<v1::PublishReply> _queue;
@@ -599,12 +612,10 @@ public:
             reactor->Finish(refusedToken());
             return reactor;
         }
-        if (request->confirm() == v1::CONFIRM_DELIVERED) {
-            reactor->Finish(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "CONFIRM_DELIVERED is not served yet"));
-            return reactor;
-        }
         const uint64_t requestId = request->request_id();
-        _hub.publish(publishOf(*request), [reactor, reply, requestId](const AppPublishResult& result) {
+        AppPublish message = publishOf(*request);
+        message.deadlineMs = deadlineMsOf(context);
+        _hub.publish(message, [reactor, reply, requestId](const AppPublishResult& result) {
             resultTo(result, requestId, *reply);
             reactor->Finish(grpc::Status::OK);
         });
@@ -613,7 +624,7 @@ public:
 
     grpc::ServerBidiReactor<v1::PublishRequest, v1::PublishReply>* PublishStream(
         grpc::CallbackServerContext* context) override {
-        return new PublishStreamReactor(_hub, allowed(context, _config.token));
+        return new PublishStreamReactor(_hub, allowed(context, _config.token), deadlineMsOf(context));
     }
 
     grpc::ServerUnaryReactor* ListGroups(grpc::CallbackServerContext* context, const v1::ListGroupsRequest*,

@@ -100,6 +100,11 @@ struct AppPublish {
     MqttOwnedProperties properties;
     std::string connection;
     std::string origin;
+    // CONFIRM_DELIVERED: answered once every subscriber it reached has
+    // acknowledged it (QoS 1/2), or at the deadline with what is still owed.
+    bool confirmDelivered = false;
+    uint32_t deadlineMs = 10000;
+    uint64_t confirmId = 0;          // the hub's own, as it routes it
 };
 
 enum class AppPublishOutcome : uint8_t { Accepted, Delivered, NoSubscribers, Partial, Refused, NotConnected };
@@ -183,6 +188,22 @@ private:
     std::condition_variable _tick;
     bool _quit = false;
     std::thread _timer;
+
+    // --- Publishes followed to their subscribers (CONFIRM_DELIVERED) ---
+    typedef std::chrono::steady_clock Clock;
+    struct Followed {
+        size_t reports = 0, expected = 0;     // shards that have routed it, of how many
+        uint32_t matched = 0, awaited = 0, acknowledged = 0, lost = 0;
+        Clock::time_point deadline;
+        std::function<void(const AppPublishResult&)> done;
+    };
+    std::mutex _followLock;
+    std::unordered_map<uint64_t, Followed> _followed;
+    std::atomic<uint64_t> _nextConfirm{1};
+    static void confirmed(void* context, uint64_t confirm, MqttBrokerConfirm what, uint32_t matched,
+                          uint32_t awaited);
+    static AppPublishResult resultOf(const Followed& followed, bool timedOut);
+    void expireFollowed();
 
     std::atomic<uint64_t> _taken{0}, _delivered{0}, _acknowledged{0}, _redelivered{0}, _refused{0};
     std::atomic<uint64_t> _dropped{0}, _published{0};

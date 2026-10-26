@@ -52,6 +52,7 @@ struct SharedMessage {
     uint8_t qos = MQ_QOS_0;
     bool retain = false;
     MqttOwnedProperties properties;
+    uint64_t confirm = 0;          // followed to its subscribers (MqttBrokerConfirm.h)
 };
 
 void unref(SharedMessage* message) {
@@ -578,7 +579,10 @@ uint32_t ShardedBroker::Shard::forwardToShards(const MqttBrokerRouted& routed, u
     targets.reserve(shards);
     for (uint32_t to = 0; to < shards; to++) {
         if (to == shard.index) continue;
-        if (routed.retain || groupsFor[to] != nullptr ||
+        // A followed message goes everywhere: each shard says how many of its
+        // subscribers there are, even none, so its publisher knows when it
+        // has heard from them all.
+        if (routed.retain || routed.confirm != 0 || groupsFor[to] != nullptr ||
             shard.server->_shards[to]->mightWant(shard.topicKeys)) {
             targets.push_back(to);
         } else {
@@ -595,6 +599,7 @@ uint32_t ShardedBroker::Shard::forwardToShards(const MqttBrokerRouted& routed, u
     }
     message->qos = routed.qos;
     message->retain = routed.retain;
+    message->confirm = routed.confirm;
     if (routed.properties != nullptr) message->properties.copyForForwarding(*routed.properties);
     message->refs.store((uint32_t)targets.size(), std::memory_order_relaxed);
 
@@ -652,6 +657,7 @@ void ShardedBroker::Shard::drain(bool stopping) {
                     routed.qos = message->qos;
                     routed.retain = message->retain;
                     routed.properties = &properties;
+                    routed.confirm = message->confirm;
                     size_t dropped = 0;
                     forwarding = true;
                     forwarded = envelope.groups;

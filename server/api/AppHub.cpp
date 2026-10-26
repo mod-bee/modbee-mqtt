@@ -156,6 +156,7 @@ bool AppHub::begin(size_t shards, std::string& error) {
 
 void AppHub::prepare(uint32_t shard, MqttBroker& broker) {
     if (shard < _shards.size()) _shards[shard]->broker = &broker;
+    broker.onConfirm(&AppHub::confirmed, this);
 }
 
 int AppHub::waitHandle(uint32_t shard) {
@@ -420,6 +421,9 @@ void AppHub::timers() {
     while (!_quit) {
         _tick.wait_for(guard, std::chrono::milliseconds(50));
         if (_quit) break;
+        guard.unlock();
+        expireFollowed();
+        guard.lock();
         const Clock::time_point now = Clock::now();
         for (auto at = _groups.begin(); at != _groups.end();) {
             Group& group = *at->second;
@@ -461,11 +465,91 @@ void AppHub::publish(const AppPublish& message, std::function<void(const AppPubl
         return;
     }
     Shard& shard = *_shards[_nextShard++ % _shards.size()];
+    AppPublish routed = message;
+    if (message.confirmDelivered) {
+        // Followed: every shard reports how many of its subscribers it reached,
+        // and each of those deliveries how it ended.
+        const uint64_t confirm = _nextConfirm++;
+        {
+            std::lock_guard<std::mutex> guard(_followLock);
+            Followed& followed = _followed[confirm];
+            followed.expected = _shards.size();
+            followed.deadline = Clock::now() + std::chrono::milliseconds(message.deadlineMs);
+            followed.done = std::move(done);
+        }
+        routed.confirmId = confirm;
+        done = nullptr;
+    }
     {
         std::lock_guard<std::mutex> guard(shard.lock);
-        shard.publishes.emplace_back(message, std::move(done));
+        shard.publishes.emplace_back(routed, std::move(done));
     }
     shard.wake();
+}
+
+AppPublishResult AppHub::resultOf(const Followed& followed, bool timedOut) {
+    AppPublishResult result;
+    result.matched = followed.matched;
+    result.acknowledged = followed.acknowledged;
+    const uint32_t ended = followed.acknowledged + followed.lost;
+    result.pending = followed.awaited > ended ? followed.awaited - ended : 0;
+    if (followed.matched == 0 && !timedOut) {
+        result.outcome = AppPublishOutcome::NoSubscribers;
+    } else if (timedOut || followed.lost > 0) {
+        result.outcome = AppPublishOutcome::Partial;
+    } else {
+        result.outcome = AppPublishOutcome::Delivered;
+    }
+    return result;
+}
+
+void AppHub::confirmed(void* context, uint64_t confirm, MqttBrokerConfirm what, uint32_t matched,
+                       uint32_t awaited) {
+    AppHub& self = *static_cast<AppHub*>(context);
+    std::function<void(const AppPublishResult&)> done;
+    AppPublishResult result;
+    {
+        std::lock_guard<std::mutex> guard(self._followLock);
+        auto found = self._followed.find(confirm);
+        if (found == self._followed.end()) return;      // answered already, at its deadline
+        Followed& followed = found->second;
+        switch (what) {
+        case MqttBrokerConfirm::Routed:
+            followed.reports++;
+            followed.matched += matched;
+            followed.awaited += awaited;
+            break;
+        case MqttBrokerConfirm::Acknowledged: followed.acknowledged++; break;
+        case MqttBrokerConfirm::Lost: followed.lost++; break;
+        }
+        if (followed.reports < followed.expected ||
+            followed.acknowledged + followed.lost < followed.awaited) {
+            return;
+        }
+        result = resultOf(followed, false);
+        done = std::move(followed.done);
+        self._followed.erase(found);
+    }
+    if (done) done(result);
+}
+
+void AppHub::expireFollowed() {
+    std::vector<std::pair<std::function<void(const AppPublishResult&)>, AppPublishResult>> due;
+    {
+        std::lock_guard<std::mutex> guard(_followLock);
+        const Clock::time_point now = Clock::now();
+        for (auto at = _followed.begin(); at != _followed.end();) {
+            if (at->second.deadline <= now) {
+                due.emplace_back(std::move(at->second.done), resultOf(at->second, true));
+                at = _followed.erase(at);
+            } else {
+                ++at;
+            }
+        }
+    }
+    for (auto& one : due) {
+        if (one.first) one.first(one.second);
+    }
 }
 
 void AppHub::service(uint32_t index, MqttBroker& broker) {
@@ -490,6 +574,7 @@ void AppHub::service(uint32_t index, MqttBroker& broker) {
         routed.retain = message.retain;
         routed.properties = &properties;
         routed.origin = &shard.marker;
+        routed.confirm = message.confirmId;
         shard.publishingOrigin = &message.origin;
         const bool taken = broker.publishMessage(routed);
         shard.publishingOrigin = nullptr;
@@ -497,6 +582,21 @@ void AppHub::service(uint32_t index, MqttBroker& broker) {
         AppPublishResult result;
         result.outcome = taken ? AppPublishOutcome::Accepted : AppPublishOutcome::Refused;
         if (!taken) result.reasonCode = MQ_REASON_QUOTA_EXCEEDED;
+        if (message.confirmId != 0) {
+            // Followed: answered as its subscribers acknowledge - unless it
+            // was refused outright.
+            if (taken) continue;
+            std::function<void(const AppPublishResult&)> done;
+            {
+                std::lock_guard<std::mutex> guard(_followLock);
+                auto found = _followed.find(message.confirmId);
+                if (found == _followed.end()) continue;
+                done = std::move(found->second.done);
+                _followed.erase(found);
+            }
+            if (done) done(result);
+            continue;
+        }
         one.second(result);
     }
 }

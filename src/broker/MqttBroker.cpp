@@ -245,6 +245,7 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
         session.attachIndex(&_sessionIndex, (uint32_t)(&session - _sessions.data()));
         session.attachRoutes(&_routeIndex);
         session.attachJournal(_journal);
+        session.attachConfirm(_onConfirm, _confirmContext);
 #endif
     }
 
@@ -714,6 +715,7 @@ uint32_t MqttBroker::egress(const MqttSpan& topic, const MqttSpan& payload, uint
     message.dropped = dropped;
     message.origin = origin;
     message.context = context;
+    message.confirm = _routingConfirm;
     return _onEgress(_egressContext, message, deferral);
 }
 
@@ -730,8 +732,10 @@ size_t MqttBroker::publishForwarded(const MqttBrokerRouted& message, size_t* dro
                         message.userName);
     }
     size_t dropped = 0;
+    _routingConfirm = message.confirm;
     const size_t matched = route(message.topic, message.payload, message.qos,
                                  message.retain, properties, nullptr, &dropped);
+    _routingConfirm = 0;
     if (droppedOut) *droppedOut = dropped;
     return matched;
 }
@@ -851,6 +855,12 @@ void MqttBroker::handOff(MqttBrokerConnection& connection, int target) {
         _onHandOff(_placeContext, target, *transport, origin,
                    _handOffBytes.data(), _handOffBytes.size());
     }
+}
+
+void MqttBroker::onConfirm(MqttBrokerConfirmFn handler, void* context) {
+    _onConfirm = handler;
+    _confirmContext = context;
+    for (MqttBrokerSession& session : _sessions) session.attachConfirm(handler, context);
 }
 
 void MqttBroker::onJournal(MqttSessionJournal* journal) {
@@ -2862,6 +2872,21 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
                          const MqttProperties& properties,
                          const MqttBrokerSession* from, size_t* droppedOut) {
     size_t matched = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    // A followed message: its QoS 1/2 deliveries carry its confirm id, and are
+    // awaited (MqttBrokerConfirm.h).
+    uint32_t awaited = 0;
+    auto followLost = [&](uint8_t deliveredQos) {
+        if (_routingConfirm == 0 || deliveredQos == MQ_QOS_0) return;
+        awaited++;
+        if (_onConfirm) _onConfirm(_confirmContext, _routingConfirm, MqttBrokerConfirm::Lost, 0, 0);
+    };
+    auto follow = [&](MqttBrokerDelivery& delivery) {
+        if (_routingConfirm == 0 || delivery.qos == MQ_QOS_0) return;
+        delivery.confirm = _routingConfirm;
+        awaited++;
+    };
+#endif
     const mq_time_t now = mq_millis();
 
     // Shared subscriptions are collected first and resolved afterwards,
@@ -2994,6 +3019,9 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
             matched++;
             _status.dropped++;
             if (droppedOut) (*droppedOut)++;
+#if defined(MQTT_PLATFORM_HOST)
+            followLost(qos < (uint8_t)bestQos ? qos : (uint8_t)bestQos);
+#endif
             continue;
         }
         MqttBrokerDelivery& delivery = *slot;
@@ -3028,6 +3056,9 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
         // Reporting the second for the first would send somebody to check
         // their topic spelling for an afternoon.
         matched++;
+#if defined(MQTT_PLATFORM_HOST)
+        follow(delivery);
+#endif
         session.commitDelivery(delivery);
 #if defined(MQTT_PLATFORM_HOST)
         wake(session);
@@ -3058,6 +3089,9 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
             matched++;
             _status.dropped++;
             if (droppedOut) (*droppedOut)++;
+#if defined(MQTT_PLATFORM_HOST)
+            followLost(qos < member.subscription->qos() ? qos : member.subscription->qos());
+#endif
             continue;
         }
         MqttBrokerDelivery& delivery = *slot;
@@ -3075,12 +3109,20 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
         delivery.queuedAt = now;
 
         matched++;
+#if defined(MQTT_PLATFORM_HOST)
+        follow(delivery);
+#endif
         member.session->commitDelivery(delivery);
 #if defined(MQTT_PLATFORM_HOST)
         wake(*member.session);
 #endif
     }
 
+#if defined(MQTT_PLATFORM_HOST)
+    if (_routingConfirm != 0 && _onConfirm) {
+        _onConfirm(_confirmContext, _routingConfirm, MqttBrokerConfirm::Routed, (uint32_t)matched, awaited);
+    }
+#endif
     return matched;
 }
 
@@ -3702,6 +3744,9 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
         // packet". A failure is a conclusion, not a retry trigger.
         MqttBrokerDelivery* delivery = session->findByPacketId(packetId);
         if (delivery == nullptr) return;   // unknown identifier; nothing owed
+#if defined(MQTT_PLATFORM_HOST)
+        delivery->acknowledged = true;
+#endif
         session->discard(*delivery);
         connection.toPeer.returnOne();
         return;
@@ -3766,6 +3811,9 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
     case MQ_PKT_PUBCOMP: {
         MqttBrokerDelivery* delivery = session->findByPacketId(packetId);
         if (delivery == nullptr) return;
+#if defined(MQTT_PLATFORM_HOST)
+        delivery->acknowledged = true;
+#endif
         session->discard(*delivery);
         connection.toPeer.returnOne();
         return;
@@ -4129,10 +4177,12 @@ bool MqttBroker::publishMessage(const MqttBrokerRouted& message) {
                                message.userName);
     }
     size_t refusedByQueue = 0;
+    _routingConfirm = message.confirm;
     const size_t matched = route(message.topic, message.payload, message.qos, message.retain,
                                  properties, nullptr, &refusedByQueue);
     egress(message.topic, message.payload, message.qos, message.retain, properties,
            message.clientId, matched, refusedByQueue, 0, message.origin, message.userName);
+    _routingConfirm = 0;
     _status.published++;
     // The same answer as publish(), for the same reasons.
     if (!kept) return false;

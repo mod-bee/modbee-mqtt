@@ -315,6 +315,11 @@ void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
     if (_journal && entry.qos > MQ_QOS_0 && entry.sequence != 0) {
         _journal->deliveryRemoved(*this, entry.sequence);
     }
+    // However it ended, whoever follows it is told.
+    if (entry.confirm != 0 && _confirm) {
+        _confirm(_confirmContext, entry.confirm,
+                 entry.acknowledged ? MqttBrokerConfirm::Acknowledged : MqttBrokerConfirm::Lost, 0, 0);
+    }
 #endif
     if (entry.charged != 0) {
         _queuedBytes -= entry.charged < _queuedBytes ? entry.charged : _queuedBytes;

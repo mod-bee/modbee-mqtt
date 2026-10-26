@@ -53,6 +53,7 @@
 #include "MqttSessionIndex.h"
 #include "MqttRouteIndex.h"
 #include "MqttSessionJournal.h"
+#include "MqttBrokerConfirm.h"
 
 #include <string>
 #include <unordered_map>
@@ -149,6 +150,10 @@ struct MqttBrokerDelivery {
     // The journal's ticket for its last change: it goes on the wire only once
     // the journal has kept that far. 0: nothing to wait for.
     uint64_t keptAfter = 0;
+    // The confirm id of the message it carries (MqttBrokerRouted::confirm),
+    // and whether its subscriber acknowledged it - reported as it ends.
+    uint64_t confirm = 0;
+    bool acknowledged = false;
 #endif
 
     // Strictly increasing within the session, which is what ordering is
@@ -184,6 +189,8 @@ struct MqttBrokerDelivery {
         queuedAt = 0;
 #if defined(MQTT_PLATFORM_HOST)
         keptAfter = 0;
+        confirm = 0;
+        acknowledged = false;
 #endif
         sequence = 0;
     }
@@ -259,6 +266,12 @@ public:
     // A session store, told of every change from here on; see
     // MqttSessionJournal.h. Null: nobody is told.
     void attachJournal(MqttSessionJournal* journal) { _journal = journal; }
+
+    // Told when a delivery with a confirm id ends (MqttBrokerConfirmFn).
+    void attachConfirm(MqttBrokerConfirmFn handler, void* context) {
+        _confirm = handler;
+        _confirmContext = context;
+    }
 
     // What only the broker sees change: the record itself (connected or not,
     // expiry, Will), and a delivery's exchange moving on.
@@ -485,6 +498,8 @@ private:
     MqttRouteIndex* _routes = nullptr;
     uint32_t _self = 0;
     MqttSessionJournal* _journal = nullptr;
+    MqttBrokerConfirmFn _confirm = nullptr;
+    void* _confirmContext = nullptr;
 #endif
     void bumpRevision() { if (_revision) (*_revision)++; }
     std::vector<MqttBrokerDelivery> _queue;

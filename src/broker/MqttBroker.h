@@ -244,8 +244,13 @@ struct MqttBrokerRouted {
     // The publisher session's context from its permission hook
     // (MqttBrokerRequest::setContext), or null.
     const void* context = nullptr;
+    // Non-zero: its QoS 1/2 deliveries are followed to their end and reported
+    // (MqttBrokerConfirmFn), so whoever published it learns when every
+    // subscriber has it.
+    uint64_t confirm = 0;
 #endif
 };
+
 
 // Called for every message that ORIGINATED here - a client's PUBLISH, a Will,
 // MqttBroker::publish() - after local routing, and never for one that arrived
@@ -654,6 +659,10 @@ public:
     // waiting for it may go now. Called by the store, on the broker's thread.
     void journalKept();
 
+    // Told what happens to messages published with a confirm id
+    // (MqttBrokerRouted::confirm).
+    void onConfirm(MqttBrokerConfirmFn handler, void* context);
+
     // --- A permission hook that answers later ---
 
     // Runs a CONNECT the hook deferred again (MqttBrokerRequest::ticket).
@@ -747,6 +756,9 @@ private:
     MqttTimerWheel _wheel;
     mq_time_t _housekeptAt = 0;
     MqttSessionJournal* _journal = nullptr;
+    MqttBrokerConfirmFn _onConfirm = nullptr;
+    void* _confirmContext = nullptr;
+    uint64_t _routingConfirm = 0;              // the confirm id of the message being routed
     std::vector<uint32_t> _journalWaiting;    // connection slots with a delivery waiting for it
     void waitForJournal(MqttBrokerConnection& connection);
 
