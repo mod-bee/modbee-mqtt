@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "AuthGate.h"
+#include "TopicRules.h"
 #include "AdminReply.h"
 #include "AuthHash.h"
 #include "Json.h"
@@ -94,68 +95,6 @@ bool filtersOk(const std::vector<std::string>& filters) {
         if (f.find('\n') != std::string::npos || !mq_topicFilterIsValid(spanOf(f))) return false;
     }
     return true;
-}
-
-// ${username} and ${clientid}, or false if either would put a wildcard or a
-// level separator into a filter.
-//
-// ONE PASS OVER THE PATTERN: a value is copied in and never read again. The
-// two used to be replaced one after the other, the second searched for in the
-// result of the first - so a login named "t${clientid}" connecting as "ank-07"
-// had "plant/${username}/#" become "plant/tank-07/#", another device's.
-bool expand(const std::string& pattern, const std::string& username, const std::string& clientId,
-            std::string& out) {
-    static const char kUser[] = "${username}";
-    static const char kClient[] = "${clientid}";
-    out.clear();
-    size_t at = 0;
-    while (at < pattern.size()) {
-        const std::string* value = nullptr;
-        size_t length = 0;
-        if (pattern.compare(at, sizeof kUser - 1, kUser) == 0) {
-            value = &username;
-            length = sizeof kUser - 1;
-        } else if (pattern.compare(at, sizeof kClient - 1, kClient) == 0) {
-            value = &clientId;
-            length = sizeof kClient - 1;
-        }
-        if (value == nullptr) {
-            out.push_back(pattern[at++]);
-            continue;
-        }
-        if (!safeName(*value, 65535)) return false;
-        out += *value;
-        at += length;
-    }
-    return true;
-}
-
-std::vector<std::string> levels(const std::string& s) {
-    std::vector<std::string> out;
-    size_t from = 0;
-    for (;;) {
-        const size_t next = s.find('/', from);
-        out.push_back(s.substr(from, next - from));
-        if (next == std::string::npos) return out;
-        from = next + 1;
-    }
-}
-
-// Whether every topic `requested` can match is one `allowed` matches too - so
-// granting the subscription gives nothing the permission does not.
-bool covers(const std::string& allowed, const std::string& requested) {
-    const std::vector<std::string> a = levels(allowed), r = levels(requested);
-    for (size_t i = 0; i < r.size(); i++) {
-        if (i >= a.size()) return false;
-        if (a[i] == "#") return true;
-        if (a[i] == "+") {
-            if (r[i] == "#") return false;
-            continue;
-        }
-        if (r[i] == "+" || r[i] == "#" || a[i] != r[i]) return false;
-    }
-    // "a/#" also covers "a" itself [MQTT-4.7.1-2].
-    return a.size() == r.size() || (a.size() == r.size() + 1 && a.back() == "#");
 }
 
 // A certificate fingerprint as somebody pasted it - colons, spaces, upper

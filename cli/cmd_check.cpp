@@ -60,6 +60,9 @@ int cmdCheck(int argc, char** argv) {
                         config.authentication.database.c_str(),
                         config.authentication.accounts.empty() ? "?" : config.authentication.accounts[0].username.c_str(),
                         config.authentication.defaultTopics.c_str());
+        } else if (config.authentication.authority.enabled) {
+            std::printf("; MQTT: logins decided by the application (authority), %zu fixed",
+                        config.authentication.accounts.size());
         } else if (config.authentication.accounts.empty()) std::printf("; MQTT: no login");
         else std::printf("; MQTT: fixed logins (%zu)", config.authentication.accounts.size());
         std::printf("; retained: %s",
@@ -70,6 +73,10 @@ int cmdCheck(int argc, char** argv) {
                     config.sessions.store == SessionStore::File
                         ? ("file " + config.sessions.directory + (config.sessions.syncFull ? " (sync full)" : "")).c_str()
                         : "memory");
+        if (!config.api.grpc.empty()) {
+            std::printf("; Application API on");
+            for (const std::string& address : config.api.grpc) std::printf(" %s", address.c_str());
+        }
         std::printf("; kafka: %zu cluster(s), %zu mqtt-to-kafka, %zu kafka-to-mqtt mapping(s)\n",
                     config.clusters.size(), config.toKafka.size(), config.fromKafka.size());
     }

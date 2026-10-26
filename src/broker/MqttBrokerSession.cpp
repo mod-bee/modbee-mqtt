@@ -78,6 +78,9 @@ void MqttBrokerSession::adopt(const MqttSpan& clientId) {
 #endif
     _nextPacketId = 1;
     _nextSequence = 1;
+#if defined(MQTT_PLATFORM_HOST)
+    authContext.reset();
+#endif
     connected = false;
     expiryInterval = 0;
     offlineSince = 0;
@@ -110,6 +113,9 @@ void MqttBrokerSession::release() {
     connected = false;
     userName.clear();
     retainedLimit = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    authContext.reset();
+#endif
     connectionSlot = kNoConnection;
     will.clear();
     clearSubscriptions();
@@ -221,6 +227,13 @@ bool MqttBrokerSession::removeSubscription(const MqttSpan& filter) {
     _subscriptions[last] = MqttBrokerSubscription();
     return true;
 }
+
+#if defined(MQTT_PLATFORM_HOST)
+void MqttBrokerSession::setNarrowed(const MqttSpan& filter, bool narrowed) {
+    const int index = indexOfSubscription(filter);
+    if (index >= 0) _subscriptions[(size_t)index].narrowed = narrowed;
+}
+#endif
 
 size_t MqttBrokerSession::subscriptionCount() const {
     return _subscriptionsUsed;

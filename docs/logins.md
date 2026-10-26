@@ -18,6 +18,10 @@ be managed from the command line or from your own platform.
 This is how the [`docker/examples`](../docker/examples) ship. [Without Docker](#without-docker)
 is the same with one setting.
 
+**Or let your own application decide.** A platform that already keeps its
+devices' logins can answer for them itself, over the Application API -
+asked once per login, and kept: [app-api.md](app-api.md#logins-decided-by-your-application).
+
 ---
 
 ## The admin login

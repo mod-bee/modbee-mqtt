@@ -1,0 +1,649 @@
+// ModBee MQTT - the Application API, version 1.
+//
+// Licensed under the GNU Affero General Public License, Version 3, WITH
+// ADDITIONAL TERMS - see LICENSE.
+//
+// Devices speak MQTT to the broker. An APPLICATION speaks this: gRPC over a
+// local socket (or TCP with TLS), served by `modbee serve`. It needs no MQTT
+// library. internal/APP-API-SPEC.md is the behaviour behind every call.
+//
+// Compatibility: within v1 fields and calls are only ever ADDED. A field this
+// broker does not know is ignored; one it needs and did not get has its
+// default. A change that cannot be made that way is modbee.app.v2, served
+// beside v1. System.Hello says which optional features this broker has.
+
+syntax = "proto3";
+
+package modbee.app.v1;
+
+option go_package = "github.com/modbee/modbee-mqtt/proto/modbee/app/v1;appv1";
+
+// =============================================================================
+// SYSTEM - who is there, and what this broker can do
+// =============================================================================
+
+service System {
+  // The first call an application makes. Says which API version and features
+  // this broker serves; never refuses an older minor version.
+  rpc Hello(HelloRequest) returns (HelloReply);
+
+  // An application instance's presence, for as long as the stream is open.
+  // When it ends WITHOUT a Close first (the process died, the socket broke),
+  // its wills are published - a Sparkplug host's STATE "offline", say.
+  rpc Attach(stream AttachUp) returns (stream AttachDown);
+}
+
+message HelloRequest {
+  string api_version = 1;          // "1.0": the minor version the app was built against
+  string application = 2;          // "platform-backend", "gateway-core": for logs and stats
+  string instance = 3;             // this process: host name and pid, a pod name
+}
+
+message HelloReply {
+  string api_version = 1;          // the highest 1.x this broker serves
+  string server_version = 2;       // "modbee-mqtt 1.4.0"
+  repeated string features = 3;    // "authority", "consume", "connections", "admin.logins", ...
+  string server_id = 4;            // this server, stable across restarts (several in high availability)
+}
+
+message AttachUp {
+  oneof kind {
+    AttachOpen open = 1;           // first, once
+    AttachClose close = 2;         // a clean end: the wills are NOT published
+  }
+}
+message AttachOpen {
+  string instance = 1;
+  repeated Message wills = 2;      // published, in order, if the stream ends without a Close
+}
+message AttachClose {}
+message AttachDown {
+  bool opened = 1;
+}
+
+// =============================================================================
+// AUTHORITY - the broker asks, the application answers
+// =============================================================================
+//
+// Only a CONNECT is asked. The answer carries a Scope - the login's topic
+// rules and limits - which the broker applies to every PUBLISH, SUBSCRIBE,
+// Will and delivery by itself, so no message ever waits on the application.
+// Answers are cached (see Decision.ttl_seconds).
+
+service Authority {
+  // The application offers to answer. The broker sends questions down the
+  // stream; the application sends one Decision up per question, with its id.
+  // Several instances may serve at once: questions are spread across them,
+  // and one left unanswered on a stream that ends is asked of another.
+  rpc Serve(stream AuthorityUp) returns (stream AuthorityDown);
+
+  // Changes the application makes, at any time, from any instance.
+  rpc Revoke(RevokeRequest) returns (RevokeReply);      // forget a login and close its connections
+  rpc Regrant(RegrantRequest) returns (RegrantReply);   // live sessions take a new scope, and stay up
+  rpc Forget(ForgetRequest) returns (ForgetReply);      // the next CONNECT asks again
+}
+
+message AuthorityUp {
+  oneof kind {
+    AuthorityOpen open = 1;        // first, once
+    Decision decision = 2;
+  }
+}
+message AuthorityOpen {
+  string instance = 1;
+}
+
+message AuthorityDown {
+  oneof kind {
+    ConnectQuestion connect = 1;
+  }
+}
+
+message ConnectQuestion {
+  uint64 id = 1;
+  string client_id = 2;
+  optional string username = 3;    // absent: the CONNECT had none
+  optional bytes password = 4;
+  string address = 5;              // "10.0.4.7:51544"
+  Listener listener = 6;
+  uint32 protocol_version = 7;     // 4 (3.1.1) or 5
+  Certificate certificate = 8;     // set only for a certificate the TLS handshake VERIFIED
+}
+
+enum Listener {
+  LISTENER_UNSPECIFIED = 0;
+  LISTENER_PLAIN = 1;
+  LISTENER_TLS = 2;
+}
+
+message Certificate {
+  string common_name = 1;
+  string fingerprint = 2;          // SHA-256 of the DER, 64 lowercase hex
+}
+
+message Decision {
+  uint64 id = 1;
+  bool allow = 2;
+  Refusal refusal = 3;             // when allow is false
+  uint32 ttl_seconds = 4;          // reuse without asking for this long; 0: ask at every CONNECT
+  Scope scope = 5;                 // when allow is true
+  optional string login = 6;       // the session's login, when it is not the CONNECT's user name
+  bool replace_session = 7;        // may take over a session another login holds under this client id
+}
+
+// What the client is told. UNAVAILABLE means "could not check" (the
+// application's database is down) - never cached, a cached scope is used
+// instead where there is one, and the client is told to come back, not that
+// its password is wrong.
+enum Refusal {
+  REFUSAL_UNSPECIFIED = 0;         // = NOT_AUTHORIZED
+  REFUSAL_BAD_CREDENTIALS = 1;     // 0x86 (3.1.1: 4)
+  REFUSAL_NOT_AUTHORIZED = 2;      // 0x87 (3.1.1: 5)
+  REFUSAL_BANNED = 3;              // 0x8A (3.1.1: 5)
+  REFUSAL_QUOTA = 4;               // 0x97 (3.1.1: 3)
+  REFUSAL_UNAVAILABLE = 5;         // 0x88 (3.1.1: 3)
+}
+
+// A login's rights. Filters may hold ${username} and ${clientid}; a value
+// containing '/', '+' or '#' is never put into a filter (the rule then grants
+// nothing), so one Scope serves a whole fleet and is kept once.
+message Scope {
+  repeated string publish = 1;         // topics it may publish to, its Will included
+  repeated string subscribe = 2;       // what it may RECEIVE; a SUBSCRIBE inside one is granted
+  repeated string subscribe_wide = 3;  // it may also subscribe WITH these, receiving only what `subscribe` allows
+  repeated string deny = 4;            // never, whatever the above say: not published, not delivered
+  optional uint32 max_sessions = 5;    // absent: the server's default; 0: no limit
+  optional uint32 max_retained = 6;
+  bytes tag = 7;                       // <= 255 bytes, opaque; rides on every message this session publishes (Delivery.publisher.tag)
+}
+
+message RevokeRequest {
+  string login = 1;
+  Refusal reason = 2;              // what a 5.0 client is told; default NOT_AUTHORIZED
+}
+message RevokeReply {
+  uint32 closed = 1;               // connections closed, on every shard
+}
+
+message RegrantRequest {
+  string login = 1;
+  optional string client_id = 2;   // one session; absent: every session of the login
+  Scope scope = 3;
+  uint32 ttl_seconds = 4;          // also replaces the cached decision
+}
+message RegrantReply {
+  uint32 sessions = 1;
+  uint32 subscriptions_removed = 2; // subscriptions the new scope no longer allows
+}
+
+message ForgetRequest {
+  optional string login = 1;       // absent: every cached decision
+}
+message ForgetReply {
+  uint64 forgotten = 1;
+}
+
+// =============================================================================
+// MESSAGES - in and out
+// =============================================================================
+
+service Messages {
+  // Messages in. Open with a ConsumeOpen, then acknowledge what was handled.
+  // Instances that open the same `group` share its messages (consumer-group
+  // semantics, internal/APP-API-SPEC.md section 3.2).
+  rpc Consume(stream ConsumeUp) returns (stream ConsumeDown);
+
+  // Messages out, one at a time or as a stream (an outbox draining).
+  rpc Publish(PublishRequest) returns (PublishReply);
+  rpc PublishStream(stream PublishRequest) returns (stream PublishReply);
+
+  // Consumer groups that outlive their members.
+  rpc ListGroups(ListGroupsRequest) returns (ListGroupsReply);
+  rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupReply);
+}
+
+message ConsumeUp {
+  oneof kind {
+    ConsumeOpen open = 1;          // first, once
+    Ack ack = 2;                   // handled: never sent again
+    Retry retry = 3;               // not handled now: send again later, to any member
+  }
+}
+
+message ConsumeOpen {
+  // Members of one group share its messages; "" is a stream of its own that
+  // nothing outlives. A named group is DURABLE: it keeps collecting while no
+  // member is connected, until `expiry_seconds` pass with none.
+  string group = 1;
+  repeated string filters = 2;     // MQTT filters; a $ topic only when named ("$modbee/events/#")
+  string connection = 3;           // "" the broker's own clients; else a managed connection's id
+  uint32 max_in_flight = 4;        // unacknowledged deliveries this member holds at once (default 100)
+  Pick pick = 5;
+  bool events = 6;                 // also the client events of the clients whose messages it gets
+  uint32 expiry_seconds = 7;       // a named group with no member is kept this long (default 86400)
+  OnFull on_full = 8;
+  repeated string exclude_origins = 9; // skip messages published through this API with these origins
+}
+
+enum Pick {
+  PICK_PUBLISHER = 0;              // one publisher's messages to one member, in order (the default)
+  PICK_ROUND_ROBIN = 1;
+}
+
+enum OnFull {
+  ON_FULL_REFUSE = 0;              // the publisher is refused (QoS 1/2: 0x97) and keeps the message (the default)
+  ON_FULL_DROP = 1;                // dropped and counted
+}
+
+message Ack {
+  repeated uint64 ids = 1;
+}
+message Retry {
+  repeated uint64 ids = 1;
+  uint32 after_ms = 2;
+}
+
+message ConsumeDown {
+  oneof kind {
+    ConsumeOpened opened = 1;      // first, once
+    Delivery delivery = 2;
+    ClientEvent event = 3;
+  }
+}
+
+message ConsumeOpened {
+  uint32 members = 1;              // connected members of the group, this one included
+  uint64 queued = 2;               // what was waiting for the group when it opened
+}
+
+message Delivery {
+  uint64 id = 1;                   // for Ack and Retry; unique within the stream
+  string topic = 2;
+  bytes payload = 3;
+  uint32 qos = 4;
+  bool retain = 5;
+  Properties properties = 6;
+  Publisher publisher = 7;
+  int64 broker_time_ms = 8;        // when the broker accepted it (ms since 1970 UTC): a trusted clock
+  bool replay = 9;                 // it waited for the group while no member was connected
+  bool redelivered = 10;           // sent before, to a member that did not acknowledge it
+  bool will = 11;                  // a Will, published for a client that went
+  string connection = 12;          // the managed connection it came in on; "" for the broker's own clients
+}
+
+message Publisher {
+  string client_id = 1;            // "" for the broker's own messages
+  string login = 2;                // as the broker checked it (a certificate login: the login it named)
+  bytes tag = 3;                   // the publisher's Scope.tag
+  string origin = 4;               // published through this API: PublishRequest.origin
+}
+
+message ClientEvent {
+  ClientEventKind kind = 1;
+  string client_id = 2;
+  string login = 3;
+  int64 time_ms = 4;
+  bool resumed = 5;                // CONNECTED: picked up a session the broker held
+  uint32 reason_code = 6;          // DISCONNECTED: what the broker sent, or 0 when the client went itself
+  string filter = 7;               // SUBSCRIBED / UNSUBSCRIBED
+  uint32 qos = 8;                  // SUBSCRIBED: the QoS granted
+  string address = 9;              // CONNECTED
+}
+
+enum ClientEventKind {
+  CLIENT_EVENT_UNSPECIFIED = 0;
+  CLIENT_EVENT_CONNECTED = 1;
+  CLIENT_EVENT_DISCONNECTED = 2;
+  CLIENT_EVENT_SUBSCRIBED = 3;
+  CLIENT_EVENT_UNSUBSCRIBED = 4;
+  CLIENT_EVENT_SERVER_STARTED = 5; // every session from before is gone or resumed: rebuild from here
+}
+
+message PublishRequest {
+  uint64 request_id = 1;           // echoed in the reply (PublishStream)
+  string connection = 2;           // "" the broker's own clients; else a managed connection's id
+  Message message = 3;
+  Confirm confirm = 4;
+  string origin = 5;               // who published it, for exclude_origins and Publisher.origin
+}
+
+// When the reply comes. The call's gRPC deadline bounds the wait.
+enum Confirm {
+  CONFIRM_ACCEPTED = 0;            // the broker took it (routed, queued; with persistence, stored)
+  CONFIRM_DELIVERED = 1;           // QoS 1/2: every matching subscriber acknowledged it; on a connection, the remote broker did
+}
+
+message PublishReply {
+  uint64 request_id = 1;
+  PublishOutcome outcome = 2;
+  uint32 reason_code = 3;          // the MQTT reason code behind a REFUSED (the remote broker's, on a connection)
+  uint32 matched = 4;              // subscribers it matched (the broker's own clients)
+  uint32 acknowledged = 5;         // of those, how many acknowledged (CONFIRM_DELIVERED)
+  uint32 pending = 6;              // still owed when the deadline came, offline sessions included
+}
+
+enum PublishOutcome {
+  PUBLISH_OUTCOME_UNSPECIFIED = 0;
+  PUBLISH_ACCEPTED = 1;
+  PUBLISH_DELIVERED = 2;
+  PUBLISH_NO_SUBSCRIBERS = 3;      // taken, and nobody matched (a retained message is still kept)
+  PUBLISH_PARTIAL = 4;             // the deadline came with acknowledgements still pending
+  PUBLISH_REFUSED = 5;             // see reason_code
+  PUBLISH_NOT_CONNECTED = 6;       // the managed connection is down: nothing was sent
+}
+
+message Message {
+  string topic = 1;
+  bytes payload = 2;
+  uint32 qos = 3;
+  bool retain = 4;
+  Properties properties = 5;
+}
+
+// The MQTT 5 properties that belong to a message, not to one hop.
+message Properties {
+  optional bool payload_is_utf8 = 1;
+  string content_type = 2;
+  string response_topic = 3;
+  bytes correlation_data = 4;
+  optional uint32 message_expiry_seconds = 5;
+  repeated UserProperty user_properties = 6;   // in order, repeats kept
+}
+
+message UserProperty {
+  string name = 1;
+  string value = 2;
+}
+
+message ListGroupsRequest {}
+message ListGroupsReply {
+  repeated GroupInfo groups = 1;
+}
+message GroupInfo {
+  string group = 1;
+  string connection = 2;
+  repeated string filters = 3;
+  uint32 members = 4;
+  uint64 queued = 5;
+  uint64 in_flight = 6;
+  uint64 refused = 7;              // publishers refused because it was full
+}
+message DeleteGroupRequest {
+  string group = 1;
+  string connection = 2;
+}
+message DeleteGroupReply {
+  uint64 discarded = 1;            // messages it still held
+}
+
+// =============================================================================
+// CONNECTIONS - MQTT client connections the broker keeps for the application
+// =============================================================================
+//
+// Other brokers (a customer's, a Sparkplug host on a foreign broker), the
+// Sparkplug edge node, the gateway's uplink to the platform. The broker owns
+// them: they are kept in its data directory and stay up while the
+// application restarts. Messages in come through Messages.Consume with
+// `connection` set; messages out through Messages.Publish with it set.
+
+service Connections {
+  rpc Put(ConnectionSpec) returns (ConnectionInfo);   // create, or replace by id (unchanged: no reconnect)
+  rpc Get(ConnectionRef) returns (ConnectionInfo);
+  rpc List(ListConnectionsRequest) returns (ListConnectionsReply);
+  rpc Delete(ConnectionRef) returns (DeleteConnectionReply);
+  rpc Watch(WatchConnectionsRequest) returns (stream ConnectionInfo); // every change of state
+  rpc Reconnect(ReconnectRequest) returns (ConnectionInfo);
+}
+
+message ConnectionSpec {
+  string id = 1;
+  repeated Endpoint servers = 2;   // in priority order: failover down the list, back to the first when it is healthy
+  string client_id = 3;
+  optional string username = 4;
+  optional bytes password = 5;     // never read back
+  ClientTls tls = 6;
+  uint32 protocol_version = 7;     // 5 (default) or 4
+  uint32 keepalive_seconds = 8;    // default 30
+  bool clean_start = 9;
+  uint32 session_expiry_seconds = 10;
+  Message will = 11;
+  ReconnectMode reconnect = 12;
+  uint32 primary_check_seconds = 13; // how often a lower-priority connection checks the first server (default 60)
+}
+
+message Endpoint {
+  string host = 1;
+  uint32 port = 2;                 // default 1883, or 8883 with TLS
+}
+
+message ClientTls {
+  bool enabled = 1;
+  string ca_pem = 2;               // "" the system's trust store
+  string certificate_pem = 3;      // client certificate, for mutual TLS
+  string key_pem = 4;              // never read back
+  string server_name = 5;          // SNI and the name checked; "" the endpoint's host
+}
+
+enum ReconnectMode {
+  RECONNECT_AUTOMATIC = 0;
+  // After a drop, wait for Reconnect() - which can bring a new Will. A
+  // Sparkplug edge node needs this: each session's NDEATH carries a new bdSeq.
+  RECONNECT_WHEN_ASKED = 1;
+}
+
+message ConnectionRef {
+  string id = 1;
+}
+
+message ReconnectRequest {
+  string id = 1;
+  Message will = 2;                // replaces the Will from this connect on, when set
+}
+
+message ConnectionInfo {
+  ConnectionSpec spec = 1;         // as stored, secrets left out
+  ConnectionState state = 2;
+  uint32 server_index = 3;         // which of spec.servers it is on
+  bool session_present = 4;
+  string last_error = 5;
+  int64 since_ms = 6;
+  uint64 messages_in = 7;
+  uint64 messages_out = 8;
+}
+
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_CONNECTING = 1;
+  CONNECTION_CONNECTED = 2;
+  CONNECTION_WAITING = 3;          // RECONNECT_WHEN_ASKED, dropped, waiting for Reconnect()
+  CONNECTION_BACKING_OFF = 4;      // dropped or refused, trying again shortly
+  CONNECTION_REFUSED = 5;          // the server refused the login: not retried until Put or Reconnect
+}
+
+message ListConnectionsRequest {}
+message ListConnectionsReply {
+  repeated ConnectionInfo connections = 1;
+}
+message DeleteConnectionReply {}
+message WatchConnectionsRequest {
+  repeated string ids = 1;         // empty: all
+}
+
+// =============================================================================
+// ADMIN - the broker's own state. Also served as REST (internal/APP-API-SPEC.md section 5)
+// =============================================================================
+
+service Admin {
+  // Logins and site keys, where the broker keeps them (authentication:
+  // database). Where an authority decides logins they are the
+  // application's: these answer FAILED_PRECONDITION.
+  rpc ListLogins(ListRequest) returns (ListLoginsReply);
+  rpc GetLogin(NameRef) returns (Login);
+  rpc PutLogin(PutLoginRequest) returns (PutLoginReply);
+  rpc DeleteLogin(NameRef) returns (DeleteReply);
+  rpc ResetLogin(NameRef) returns (PutLoginReply);           // a new secret; its connections are closed
+  rpc ListKeys(ListRequest) returns (ListKeysReply);
+  rpc PutKey(SiteKey) returns (PutKeyReply);
+  rpc DeleteKey(NameRef) returns (DeleteReply);
+
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsReply);
+  rpc Kick(KickRequest) returns (KickReply);
+
+  rpc ListRetained(ListRetainedRequest) returns (ListRetainedReply);
+  rpc DeleteRetained(DeleteRetainedRequest) returns (DeleteReply);
+
+  rpc GetListeners(Empty) returns (Listeners);
+  rpc PutTls(ServerTls) returns (Listeners);                 // applied live: new handshakes use it
+
+  rpc Stats(Empty) returns (StatsReply);
+}
+
+message Empty {}
+
+message NameRef {
+  string name = 1;
+}
+
+message ListRequest {
+  string prefix = 1;
+  uint32 page_size = 2;            // default 100, at most 1000
+  string page_token = 3;
+}
+
+message Login {
+  string name = 1;
+  bool enabled = 2;
+  bool pending = 3;                // registered with a key that wants approval
+  bool admin = 4;
+  repeated string publish = 5;
+  repeated string subscribe = 6;
+  string fingerprint = 7;
+  string site = 8;
+  string made_by = 9;              // "hand", or the key it registered with
+  map<string, string> data = 10;
+}
+message ListLoginsReply {
+  repeated Login logins = 1;
+  uint64 total = 2;
+  string next_page_token = 3;
+}
+message PutLoginRequest {
+  Login login = 1;
+  optional bytes password = 2;     // absent on a new login: one is generated and returned
+  bool approve = 3;                // a pending login is let in
+}
+message PutLoginReply {
+  Login login = 1;
+  string password = 2;             // only when the broker generated it: shown once
+}
+
+message SiteKey {
+  string name = 1;
+  string site = 2;
+  bool manual_approval = 3;
+  uint32 uses = 4;                 // 0: no limit
+  int64 expires_ms = 5;            // 0: never
+  string device = 6;               // may register only this device
+  repeated string publish = 7;
+  repeated string subscribe = 8;
+  map<string, string> data = 9;
+  uint32 used = 10;                // read only
+}
+message ListKeysReply {
+  repeated SiteKey keys = 1;
+  string next_page_token = 2;
+}
+message PutKeyReply {
+  SiteKey key = 1;
+  string secret = 2;               // a new key's "<name>.<secret>": shown once
+}
+
+message DeleteReply {
+  uint64 removed = 1;
+}
+
+message ListSessionsRequest {
+  string client_id_prefix = 1;
+  string login = 2;
+  bool connected_only = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+message Session {
+  string client_id = 1;
+  string login = 2;
+  bool connected = 3;
+  string address = 4;
+  uint32 protocol_version = 5;
+  int64 connected_since_ms = 6;
+  uint32 expiry_seconds = 7;
+  repeated string subscriptions = 8;
+  uint64 queued = 9;
+  uint64 in_flight = 10;
+}
+message ListSessionsReply {
+  repeated Session sessions = 1;
+  string next_page_token = 2;
+}
+message KickRequest {
+  oneof target {
+    string client_id = 1;
+    string login = 2;
+  }
+  bool discard_session = 3;        // also end the session, not only the connection
+}
+message KickReply {
+  uint32 closed = 1;
+}
+
+message ListRetainedRequest {
+  string filter = 1;               // default "#"
+  bool payloads = 2;               // include payloads (default: topics and sizes only)
+  uint32 page_size = 3;
+  string page_token = 4;
+}
+message RetainedMessage {
+  Message message = 1;
+  uint32 size = 2;
+  int64 stored_ms = 3;
+}
+message ListRetainedReply {
+  repeated RetainedMessage messages = 1;
+  string next_page_token = 2;
+}
+message DeleteRetainedRequest {
+  string filter = 1;               // a topic, or a filter for several
+}
+
+message ServerTls {
+  string certificate_pem = 1;
+  string key_pem = 2;              // never read back
+  string client_ca_pem = 3;
+  bool client_certificate_optional = 4;
+}
+message Listeners {
+  repeated ListenerInfo listeners = 1;
+}
+message ListenerInfo {
+  Listener kind = 1;
+  string address = 2;
+  uint32 port = 3;
+  string certificate_subject = 4;  // TLS
+  int64 certificate_expires_ms = 5;
+}
+
+message StatsReply {
+  uint64 connections = 1;
+  uint64 sessions = 2;
+  uint64 subscriptions = 3;
+  uint64 retained = 4;
+  uint64 messages_in = 5;
+  uint64 messages_out = 6;
+  uint64 dropped = 7;
+  uint64 refused_connects = 8;
+  uint64 authority_asked = 9;
+  uint64 authority_cached = 10;
+  uint64 authority_stale = 11;     // answered from an expired decision while the authority was away
+  uint32 shards = 12;
+  int64 started_ms = 13;
+}

@@ -146,6 +146,8 @@ void MqttBrokerConnection::recycle() {
     generation++;
     watchedHandle = -1;
     watchingWrite = false;
+    parked = false;
+    parkedConnect.clear();
 #endif
 }
 
@@ -854,6 +856,62 @@ void MqttBroker::onJournal(MqttSessionJournal* journal) {
     for (MqttBrokerSession& session : _sessions) session.attachJournal(journal);
 }
 
+void MqttBroker::parkConnect(MqttBrokerConnection& connection) {
+    // As if it had not arrived: when it runs again it is the first CONNECT.
+    connection.parked = true;
+    connection.connectSeen = false;
+}
+
+bool MqttBroker::retryConnect(uint64_t ticket) {
+    const uint32_t slot = (uint32_t)ticket;
+    if (slot >= _connections.size()) return false;
+    MqttBrokerConnection& connection = _connections[slot];
+    if (!connection.inUse() || connection.closing || !connection.parked ||
+        connection.generation != (uint32_t)(ticket >> 32)) {
+        return false;
+    }
+    connection.parked = false;
+
+    // Decoded from the bytes it kept, which stay until this CONNECT is done
+    // with - the hook may defer it again.
+    std::vector<uint8_t> bytes;
+    bytes.swap(connection.parkedConnect);
+    MqttFixedHeader header;
+    MqttPacket packet;
+    const MqttCodec& codec = codecFor(connection.version);
+    if (bytes.empty() || mq_decodeFixedHeader(bytes.data(), bytes.size(), header) != MqttError::None ||
+        codec.decode(header, bytes.data() + header.headerLength, header.remainingLength, packet) !=
+            MqttError::None) {
+        _status.protocolErrors++;
+        closeConnection(connection, MQ_REASON_MALFORMED_PACKET, false, false);
+        return false;
+    }
+    connection.lastPacketAt = mq_millis();
+    handleConnect(connection, packet);
+    if (connection.parked && connection.inUse()) connection.parkedConnect.swap(bytes);
+    // Whatever arrived behind the CONNECT is read now.
+    if (connection.inUse() && !connection.closing) queueWork(connection);
+    return true;
+}
+
+size_t MqttBroker::regrant(const MqttSpan& login, const MqttSpan& clientId, MqttContextFactory make,
+                           void* makeContext, size_t* removed) {
+    size_t sessions = 0;
+    size_t taken = 0;
+    for (MqttBrokerSession& session : _sessions) {
+        if (!session.inUse() || session.userName.size() != login.length ||
+            memcmp(session.userName.data(), login.data, login.length) != 0) {
+            continue;
+        }
+        if (clientId.length != 0 && !session.matchesClientId(clientId)) continue;
+        session.authContext = make(makeContext, session);
+        taken += recheckSession(session);
+        sessions++;
+    }
+    if (removed) *removed = taken;
+    return sessions;
+}
+
 void MqttBroker::waitForJournal(MqttBrokerConnection& connection) {
     if (connection.waitingForJournal) return;
     connection.waitingForJournal = true;
@@ -1262,6 +1320,20 @@ void MqttBroker::serviceConnection(MqttBrokerConnection& connection) {
     // buffer without touching the socket again.
     if (mayRead) connection.link.fill();
 
+#if defined(MQTT_PLATFORM_HOST)
+    // ITS CONNECT IS WITH THE PERMISSION HOOK (parkConnect). Nothing behind it
+    // is a packet yet; a client that goes meanwhile is closed, and one that
+    // waits too long meets the connect timeout as any other would.
+    if (connection.parked) {
+        if (connection.link.peerGone()) {
+            closeConnection(connection, 0, false, false);
+            return;
+        }
+        checkDeadlines(connection, now);
+        return;
+    }
+#endif
+
     for (size_t packets = 0; packets < kPacketsPerPoll; packets++) {
         if (!connection.inUse() || connection.closing) break;
 
@@ -1343,6 +1415,11 @@ void MqttBroker::serviceConnection(MqttBrokerConnection& connection) {
         if (placing) {
             _handOffBytes.assign(connection.link.rawPacket(),
                                  connection.link.rawPacket() + connection.link.buffered());
+        }
+        // Kept, should the permission hook want to answer it later.
+        if (!connection.connectSeen && header.type == MQ_PKT_CONNECT) {
+            connection.parkedConnect.assign(connection.link.rawPacket(),
+                                            connection.link.rawPacket() + header.packetSize());
         }
 #endif
 
@@ -1895,7 +1972,11 @@ bool MqttBroker::authorise(MqttBrokerConnection& connection, MqttBrokerAction ac
                            const MqttSpan& clientId, const MqttSpan& userName,
                            const MqttSpan& password, uint8_t& reasonCode,
                            std::string* login, bool* replaceSession,
-                           uint32_t* sessionLimit, uint32_t* retainedLimit) {
+                           uint32_t* sessionLimit, uint32_t* retainedLimit
+#if defined(MQTT_PLATFORM_HOST)
+                           , const AuthoriseExtras* extras
+#endif
+                           ) {
     reasonCode = MQ_REASON_NOT_AUTHORIZED;
 
     const char* certificateName =
@@ -1934,12 +2015,29 @@ bool MqttBroker::authorise(MqttBrokerConnection& connection, MqttBrokerAction ac
     request.replaceSession = action == MqttBrokerAction::Connect ? replaceSession : nullptr;
     request.sessionLimit = action == MqttBrokerAction::Connect ? sessionLimit : nullptr;
     request.retainedLimit = action == MqttBrokerAction::Connect ? retainedLimit : nullptr;
+#if defined(MQTT_PLATFORM_HOST)
+    if (extras != nullptr && extras->hasContext) {
+        request.context = extras->context;
+    } else if (action != MqttBrokerAction::Connect && connection.session != nullptr) {
+        request.context = connection.session->authContext.get();
+    }
+    if (extras != nullptr && action == MqttBrokerAction::Connect) {
+        request.setContext = extras->setContext;
+        request.defer = extras->defer;
+        request.ticket = extras->ticket;
+    }
+    if (extras != nullptr && action == MqttBrokerAction::Subscribe) request.narrow = extras->narrow;
+#endif
 
     return _onAuthorise(_authoriseContext, request, reasonCode);
 }
 
 bool MqttBroker::stillPermitted(const MqttBrokerSession& session, MqttBrokerAction action,
-                                const std::string& topic, uint8_t qos, bool retain) {
+                                const std::string& topic, uint8_t qos, bool retain
+#if defined(MQTT_PLATFORM_HOST)
+                                , bool* narrow
+#endif
+                                ) {
     if (_onAuthorise == nullptr) return true;
     MqttBrokerRequest request;
     request.action = action;
@@ -1952,9 +2050,31 @@ bool MqttBroker::stillPermitted(const MqttBrokerSession& session, MqttBrokerActi
     request.peerName = "";
     request.certificateName = "";
     request.certificateFingerprint = "";
+#if defined(MQTT_PLATFORM_HOST)
+    request.context = session.authContext.get();
+    if (action == MqttBrokerAction::Subscribe) request.narrow = narrow;
+#endif
     uint8_t reasonCode = MQ_REASON_NOT_AUTHORIZED;
     return _onAuthorise(_authoriseContext, request, reasonCode);
 }
+
+#if defined(MQTT_PLATFORM_HOST)
+bool MqttBroker::mayDeliver(const MqttBrokerSession& session, const MqttSpan& topic) {
+    if (_onAuthorise == nullptr) return true;
+    MqttBrokerRequest request;
+    request.action = MqttBrokerAction::Deliver;
+    request.clientId = asSpan(session.clientId());
+    request.userName = asSpan(session.userName);
+    request.topic = topic;
+    request.version = session.version;
+    request.peerName = "";
+    request.certificateName = "";
+    request.certificateFingerprint = "";
+    request.context = session.authContext.get();
+    uint8_t reasonCode = MQ_REASON_NOT_AUTHORIZED;
+    return _onAuthorise(_authoriseContext, request, reasonCode);
+}
+#endif
 
 // A RESUMED SESSION IS HELD TO TODAY'S RIGHTS. Its subscriptions were granted
 // under whatever its login could read when it subscribed, and an admin may
@@ -1962,16 +2082,27 @@ bool MqttBroker::stillPermitted(const MqttBrokerSession& session, MqttBrokerActi
 // Start 0 and carried on with every subscription it had, and everything
 // queued for it while it was away. Each subscription is asked for again, and
 // each queued message is held to its own topic.
-void MqttBroker::recheckSession(MqttBrokerSession& session) {
-    if (_onAuthorise == nullptr) return;
+size_t MqttBroker::recheckSession(MqttBrokerSession& session) {
+    if (_onAuthorise == nullptr) return 0;
     std::vector<std::string> refused;
     for (size_t index = 0; index < session.subscriptionCount(); index++) {
         const MqttBrokerSubscription* subscription = session.subscriptionAt(index);
         if (subscription == nullptr || !subscription->inUse()) continue;
+#if defined(MQTT_PLATFORM_HOST)
+        bool narrow = false;
+        if (!stillPermitted(session, MqttBrokerAction::Subscribe, subscription->filter,
+                            subscription->qos(), false, &narrow)) {
+            refused.push_back(subscription->filter);
+        } else {
+            // Granted again, perhaps narrower or wider than before.
+            session.setNarrowed(asSpan(subscription->filter), narrow);
+        }
+#else
         if (!stillPermitted(session, MqttBrokerAction::Subscribe, subscription->filter,
                             subscription->qos(), false)) {
             refused.push_back(subscription->filter);
         }
+#endif
     }
     for (const std::string& filter : refused) {
         if (session.removeSubscription(asSpan(filter))) {
@@ -1982,11 +2113,20 @@ void MqttBroker::recheckSession(MqttBrokerSession& session) {
         MqttBrokerDelivery* entry = session.deliveryAt(index);
         // A QoS 2 exchange waiting on its PUBREL has been delivered already.
         if (entry == nullptr || !entry->inUse() || entry->topic.empty() || entry->pubrelOwed) continue;
-        if (!stillPermitted(session, MqttBrokerAction::Subscribe, entry->topic, entry->qos, false)) {
+#if defined(MQTT_PLATFORM_HOST)
+        // A hook that keeps a context per session is asked the question it
+        // answers per message; any other, the one it always was.
+        const MqttBrokerAction asking = session.authContext ? MqttBrokerAction::Deliver
+                                                            : MqttBrokerAction::Subscribe;
+#else
+        const MqttBrokerAction asking = MqttBrokerAction::Subscribe;
+#endif
+        if (!stillPermitted(session, asking, entry->topic, entry->qos, false)) {
             session.discard(*entry);
             session.messagesDropped++;
         }
     }
+    return refused.size();
 }
 
 // =============================================================================
@@ -2160,19 +2300,44 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
             }
         }
     }
-    if (!authorise(connection, MqttBrokerAction::Connect, noTopic, 0, false,
-                   clientId, request.hasUserName ? request.userName : MqttSpan(),
-                   request.hasPassword ? request.password : MqttSpan(), refusal,
-                   &login, &mayReplace, &sessionLimit, &retainedLimit)) {
+#if defined(MQTT_PLATFORM_HOST)
+    // What the hook decides about this login, kept by its session; and the
+    // hook's way to say "later".
+    AuthoriseExtras connectExtras;
+    std::shared_ptr<const void> decided;
+    bool deferred = false;
+    connectExtras.setContext = &decided;
+    connectExtras.defer = &deferred;
+    connectExtras.ticket = ((uint64_t)connection.generation << 32) |
+                           (uint32_t)(&connection - _connections.data());
+    const bool admitted = authorise(connection, MqttBrokerAction::Connect, noTopic, 0, false,
+                                    clientId, request.hasUserName ? request.userName : MqttSpan(),
+                                    request.hasPassword ? request.password : MqttSpan(), refusal,
+                                    &login, &mayReplace, &sessionLimit, &retainedLimit, &connectExtras);
+#else
+    const bool admitted = authorise(connection, MqttBrokerAction::Connect, noTopic, 0, false,
+                                    clientId, request.hasUserName ? request.userName : MqttSpan(),
+                                    request.hasPassword ? request.password : MqttSpan(), refusal,
+                                    &login, &mayReplace, &sessionLimit, &retainedLimit);
+#endif
+    if (!admitted) {
+#if defined(MQTT_PLATFORM_HOST)
+        if (deferred) {
+            parkConnect(connection);
+            return;
+        }
+#endif
         if (!isV5) {
             // 3.1.1's value space is different and much smaller. Mapping 0x87
             // to 0x05 rather than sending it raw matters: 0x87 is "Granted
             // QoS 2" in no version at all, but a 3.1.1 client reading a byte
             // it does not recognise has no defined behaviour.
-            // A hook that is busy (0x89, 0x97) means "come back", and 3.1.1
-            // says that only as 0x03 Server unavailable.
+            // A hook that is busy or cannot check (0x88, 0x89, 0x97) means
+            // "come back", and 3.1.1 says that only as 0x03 Server
+            // unavailable - never 0x05, which a client takes as final.
             refusal = (refusal == MQ_REASON_BAD_USER_NAME_OR_PASSWORD) ? MQ_RETURN_BAD_CREDENTIALS
-                      : (refusal == MQ_REASON_SERVER_BUSY || refusal == MQ_REASON_QUOTA_EXCEEDED)
+                      : (refusal == MQ_REASON_SERVER_UNAVAILABLE || refusal == MQ_REASON_SERVER_BUSY ||
+                         refusal == MQ_REASON_QUOTA_EXCEEDED)
                           ? MQ_RETURN_SERVER_UNAVAILABLE
                           : MQ_RETURN_NOT_AUTHORIZED;
         }
@@ -2216,8 +2381,21 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         const MqttSpan willUser = !login.empty() ? asSpan(login)
                                   : request.hasUserName ? request.userName : MqttSpan();
         MqttSpan none;
-        if (!authorise(connection, MqttBrokerAction::Publish, request.will.topic, request.will.qos,
-                       request.will.retain, clientId, willUser, none, willRefusal)) {
+#if defined(MQTT_PLATFORM_HOST)
+        // Judged by what was just decided, not by a session it may be resuming.
+        AuthoriseExtras willExtras;
+        willExtras.context = decided.get();
+        willExtras.hasContext = true;
+        const bool willAllowed = authorise(connection, MqttBrokerAction::Publish, request.will.topic,
+                                           request.will.qos, request.will.retain, clientId, willUser,
+                                           none, willRefusal, nullptr, nullptr, nullptr, nullptr,
+                                           &willExtras);
+#else
+        const bool willAllowed = authorise(connection, MqttBrokerAction::Publish, request.will.topic,
+                                           request.will.qos, request.will.retain, clientId, willUser,
+                                           none, willRefusal);
+#endif
+        if (!willAllowed) {
             const uint8_t code = isV5 ? MQ_REASON_NOT_AUTHORIZED : MQ_RETURN_NOT_AUTHORIZED;
             sendConnAck(connection, code, false, nullptr);
             _status.refused++;
@@ -2426,6 +2604,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // [V5:MQTT-3.1.2-8], and an attached session does not expire.
     _wheel.cancel(session->willTimer);
     _wheel.cancel(session->expiryTimer);
+    session->authContext = decided;
     session->journalChanged();
 #endif
     connection.session = session;
@@ -2747,6 +2926,10 @@ size_t MqttBroker::route(const MqttSpan& topic, const MqttSpan& payload,
             // session - a client with one No Local subscription and one
             // ordinary one still gets its own message through the second.
             if (subscription->noLocal() && from == &session) continue;
+#if defined(MQTT_PLATFORM_HOST)
+            // Granted wider than the session may receive: this message is asked about.
+            if (subscription->narrowed && !mayDeliver(session, topic)) continue;
+#endif
 
             if (subscription->shared()) {
                 std::string key = subscription->shareName;
@@ -3602,6 +3785,10 @@ bool MqttBroker::visitRetained(void* context, const MqttRetainedMessage& message
 
     // Full: stop here, and pick this message up again when the queue drains.
     if (session->queueFull()) return false;
+#if defined(MQTT_PLATFORM_HOST)
+    // Through a narrowed subscription, only what the session may receive.
+    if (subscription.narrowed && !broker.mayDeliver(*session, asSpan(message.topic))) return true;
+#endif
 
     MqttBrokerDelivery delivery;
     delivery.topic = message.topic;
@@ -3750,9 +3937,20 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
         } else {
             uint8_t refusal = MQ_REASON_NOT_AUTHORIZED;
             MqttSpan none;
-            if (!authorise(connection, MqttBrokerAction::Subscribe, filter.filter,
-                           filter.qos(), false, asSpan(session->clientId()),
-                           asSpan(session->userName), none, refusal)) {
+#if defined(MQTT_PLATFORM_HOST)
+            bool narrow = false;
+            AuthoriseExtras subscribeExtras;
+            subscribeExtras.narrow = &narrow;
+            const bool subscribeAllowed = authorise(connection, MqttBrokerAction::Subscribe, filter.filter,
+                                                    filter.qos(), false, asSpan(session->clientId()),
+                                                    asSpan(session->userName), none, refusal,
+                                                    nullptr, nullptr, nullptr, nullptr, &subscribeExtras);
+#else
+            const bool subscribeAllowed = authorise(connection, MqttBrokerAction::Subscribe, filter.filter,
+                                                    filter.qos(), false, asSpan(session->clientId()),
+                                                    asSpan(session->userName), none, refusal);
+#endif
+            if (!subscribeAllowed) {
                 granted = isV5 ? refusal : 0x80;
             } else {
                 // [V5:MQTT-3.8.4-6] The granted QoS may be lower than the one
@@ -3768,6 +3966,9 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
 
                 if (session->addSubscription(filter.filter, options,
                                              subscriptionId, replaced)) {
+#if defined(MQTT_PLATFORM_HOST)
+                    session->setNarrowed(filter.filter, narrow);
+#endif
                     granted = qos;
                     accepted[index] = true;
                     clientEvent(MqttBrokerClientEventKind::Subscribed, *session, filter.filter, qos, 0);

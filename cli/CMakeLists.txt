@@ -39,5 +39,10 @@ if(TARGET modbee-kafka)
     target_link_libraries(modbee PRIVATE modbee-kafka)
 endif()
 
+# The Application API, where gRPC was found (server/CMakeLists.txt).
+if(TARGET modbee-api)
+    target_link_libraries(modbee PRIVATE modbee-api)
+endif()
+
 # `cmake --install build` puts it in <prefix>/bin - /usr/local/bin by default.
 install(TARGETS modbee RUNTIME DESTINATION bin)

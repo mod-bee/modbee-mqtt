@@ -19,7 +19,7 @@ Measured 2026-10-04: buffer growth alone is about 1 kB of the long form.
 
 | | Flash |
 | --- | ---: |
-| the whole library - client, broker, bridge, typed layer, Sparkplug | 272807 |
+| the whole library - client, broker, bridge, typed layer, Sparkplug | 276022 |
 
 ## What this means
 

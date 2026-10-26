@@ -223,6 +223,19 @@ struct MqttAccount {
     std::string password;
 };
 
+// --- authentication: authority: ----------------------------------------------
+//
+// Logins decided by the APPLICATION, over the Application API (api:), instead
+// of a login database: every CONNECT not a fixed login is asked of it once and
+// the answer kept (server/api/Authority.h). An authority: section turns it on.
+struct AuthoritySection {
+    bool enabled = false;
+    long long timeoutMs = 2000;          // a CONNECT asked waits this long for an answer
+    long long staleForSeconds = 86400;   // an expired answer still serves this long while the application is away
+    long long cacheSize = 1000000;       // answers kept, whole server
+    long long maxPending = 10000;        // CONNECTs waiting for an answer at once, whole server
+};
+
 struct AuthenticationSection {
     // From `username`/`password` (MQTT_USERNAME / MQTT_PASSWORD in .env) and
     // `users:`. With a database they are fixed logins beside it, and the
@@ -249,6 +262,19 @@ struct AuthenticationSection {
     // identifiers), and retained topics. 0 = no limit. Per shard.
     long long maxSessionsPerLogin = 8;
     long long maxRetainedPerLogin = 1000;
+
+    AuthoritySection authority;
+};
+
+// --- api: ---------------------------------------------------------------------
+//
+// The Application API (proto/modbee/app/v1/app.proto): how an application -
+// not a device - talks to the server. gRPC on a local socket, and optionally on
+// TCP, which must have TLS and a token.
+struct ApiSection {
+    std::vector<std::string> grpc;       // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
+    std::string tlsCert, tlsKey, tlsClientCa;   // PEM files, for tcp://
+    std::string tokenFile;               // a token every call must carry ("authorization: Bearer ...")
 };
 
 struct ServerConfig {
@@ -258,6 +284,7 @@ struct ServerConfig {
     RetainedSection retained;
     SessionsSection sessions;
     AuthenticationSection authentication;
+    ApiSection api;
     std::vector<KafkaClusterConfig> clusters;
     std::vector<MqttToKafkaConfig> toKafka;
     std::vector<KafkaToMqttConfig> fromKafka;

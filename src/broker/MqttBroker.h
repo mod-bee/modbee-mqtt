@@ -73,6 +73,7 @@
 #include <vector>
 
 #if defined(MQTT_PLATFORM_HOST)
+#include <memory>
 #include "../transport/MqttPollSet.h"
 #endif
 
@@ -82,6 +83,10 @@ enum class MqttBrokerAction : uint8_t {
     Connect = 0,
     Publish,
     Subscribe,
+    // A message about to be delivered through a subscription the hook marked
+    // narrowed at SUBSCRIBE (MqttBrokerRequest::narrow), or one still queued
+    // when a session's rights are checked again. `topic` is the message's.
+    Deliver,
 };
 
 // Everything known about the request being authorised.
@@ -135,6 +140,31 @@ struct MqttBrokerRequest {
     // every other action.
     uint32_t* sessionLimit = nullptr;
     uint32_t* retainedLimit = nullptr;
+
+#if defined(MQTT_PLATFORM_HOST)
+    // --- For a hook that decides somewhere else (host only) ---
+
+    // What the hook gave this session at its CONNECT (setContext), for every
+    // later request about it. Null when it gave none.
+    const void* context = nullptr;
+
+    // Connect only. The hook's own record of what it decided - a login's
+    // compiled rights - kept by the session for as long as it lives and
+    // handed back as `context`.
+    std::shared_ptr<const void>* setContext = nullptr;
+
+    // Connect only. Set true (and return false) to answer LATER: the broker
+    // keeps the CONNECT, reads nothing more from that connection, and runs it
+    // again when retryConnect(ticket) is called - when the hook will have its
+    // answer. The connect timeout still applies. Nothing waits meanwhile.
+    bool* defer = nullptr;
+    uint64_t ticket = 0;
+
+    // Subscribe only. Set true to grant a subscription WIDER than what the
+    // session may receive: each message through it is then asked about
+    // first (Deliver), and one refused is not delivered.
+    bool* narrow = nullptr;
+#endif
 
     MqttVersion version = MqttVersion::V5;
 };
@@ -426,6 +456,12 @@ struct MqttBrokerConnection {
     // (MqttBroker::journalKept). Like `queued`, it belongs to the slot, not
     // its occupant, so recycle() leaves it.
     bool waitingForJournal = false;
+
+    // Its CONNECT waits for the permission hook's answer (MqttBrokerRequest::
+    // defer): its bytes, to run again, and nothing behind it read as a packet
+    // until retryConnect().
+    bool parked = false;
+    std::vector<uint8_t> parkedConnect;
 #endif
 
     bool inUse() const { return transport != nullptr; }
@@ -612,6 +648,22 @@ public:
     // The journal has kept further (MqttSessionJournal::kept()): deliveries
     // waiting for it may go now. Called by the store, on the broker's thread.
     void journalKept();
+
+    // --- A permission hook that answers later ---
+
+    // Runs a CONNECT the hook deferred again (MqttBrokerRequest::ticket).
+    // False when that connection has gone, or is not waiting.
+    bool retryConnect(uint64_t ticket);
+
+    // Gives every session of `login` - or only the one named `clientId`, when
+    // it is not empty - a new context, made for it by `make`, and checks its
+    // subscriptions and queue against it at once: what it may no longer have
+    // is removed, and the session stays up. How many sessions; `removed` the
+    // subscriptions taken.
+    typedef std::shared_ptr<const void> (*MqttContextFactory)(void* context,
+                                                               const MqttBrokerSession& session);
+    size_t regrant(const MqttSpan& login, const MqttSpan& clientId, MqttContextFactory make,
+                   void* makeContext, size_t* removed = nullptr);
 #endif
 
     // --- Polled state ---
@@ -906,18 +958,45 @@ private:
     void serviceWills(mq_time_t now);
     void publishWill(MqttBrokerSession& session);
 
+#if defined(MQTT_PLATFORM_HOST)
+    // What a request carries for a hook that decides elsewhere; see
+    // MqttBrokerRequest. A board has none of it, not even the parameter.
+    struct AuthoriseExtras {
+        const void* context = nullptr;
+        bool hasContext = false;      // `context` given, rather than the session's
+        std::shared_ptr<const void>* setContext = nullptr;
+        bool* defer = nullptr;
+        uint64_t ticket = 0;
+        bool* narrow = nullptr;
+    };
+#endif
     bool authorise(MqttBrokerConnection& connection, MqttBrokerAction action,
                    const MqttSpan& topic, uint8_t qos, bool retain,
                    const MqttSpan& clientId, const MqttSpan& userName,
                    const MqttSpan& password, uint8_t& reasonCode,
                    std::string* login = nullptr, bool* replaceSession = nullptr,
-                   uint32_t* sessionLimit = nullptr, uint32_t* retainedLimit = nullptr);
+                   uint32_t* sessionLimit = nullptr, uint32_t* retainedLimit = nullptr
+#if defined(MQTT_PLATFORM_HOST)
+                   , const AuthoriseExtras* extras = nullptr
+#endif
+                   );
     // The hook asked again on a session's own login, with no connection: for
     // what was granted earlier and is about to be used now (a Will, a resumed
     // session's subscriptions and queue).
     bool stillPermitted(const MqttBrokerSession& session, MqttBrokerAction action,
-                        const std::string& topic, uint8_t qos, bool retain);
-    void recheckSession(MqttBrokerSession& session);
+                        const std::string& topic, uint8_t qos, bool retain
+#if defined(MQTT_PLATFORM_HOST)
+                        , bool* narrow = nullptr
+#endif
+                        );
+    // Subscriptions and queued messages it may no longer have are removed;
+    // how many subscriptions.
+    size_t recheckSession(MqttBrokerSession& session);
+#if defined(MQTT_PLATFORM_HOST)
+    // Whether a message on `topic` may go through a narrowed subscription.
+    bool mayDeliver(const MqttBrokerSession& session, const MqttSpan& topic);
+    void parkConnect(MqttBrokerConnection& connection);
+#endif
 
     // The static trampoline the retained store visits through, and what it
     // needs to know. A file-static would be process-wide state, which R5

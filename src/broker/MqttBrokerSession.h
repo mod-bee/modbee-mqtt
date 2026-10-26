@@ -56,6 +56,9 @@
 
 #include <string>
 #include <unordered_map>
+#if defined(MQTT_PLATFORM_HOST)
+#include <memory>
+#endif
 #include <vector>
 
 // One of a client's subscriptions.
@@ -85,6 +88,12 @@ struct MqttBrokerSubscription {
     // queue's depth, which [MQTT-3.3.1-9] does not allow.
     bool retainedOwed = false;
     uint32_t retainedNext = 0;
+
+#if defined(MQTT_PLATFORM_HOST)
+    // Granted wider than the session may receive (MqttBrokerRequest::narrow):
+    // each message through it is asked about first.
+    bool narrowed = false;
+#endif
 
     bool inUse() const { return !filter.empty(); }
 
@@ -238,6 +247,14 @@ public:
     // The broker's routing index, which this session tells about every filter
     // it gains and loses. See MqttRouteIndex.h.
     void attachRoutes(MqttRouteIndex* routes) { _routes = routes; }
+
+    // What the permission hook gave this session at its CONNECT, handed back
+    // with every request about it (MqttBrokerRequest::context). Ends with
+    // the session.
+    std::shared_ptr<const void> authContext;
+
+    // Marks a subscription narrowed, or not (MqttBrokerRequest::narrow).
+    void setNarrowed(const MqttSpan& filter, bool narrowed);
 
     // A session store, told of every change from here on; see
     // MqttSessionJournal.h. Null: nobody is told.

@@ -26,6 +26,10 @@
 #include "TlsSettings.h"
 #include "BrokerEvents.h"
 #include "SessionKeeper.h"
+#if defined(MODBEE_HAVE_APP_API)
+#include "Authority.h"
+#include "ApiServer.h"
+#endif
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
 #include "KafkaRetained.h"
@@ -361,7 +365,37 @@ int cmdServe(int argc, char** argv) {
     // is: config.* reports what its TLS listeners serve and changes their
     // certificate while it runs.
     ShardedBroker server;
-    if (!file.authentication.database.empty()) {
+#if defined(MODBEE_HAVE_APP_API)
+    // LOGINS DECIDED BY THE APPLICATION, over the Application API: the fixed
+    // logins from the file are still decided here - the application and the
+    // modbee command log in with them - and every other is asked of it.
+    std::unique_ptr<Authority> authority;
+#else
+    if (file.authentication.authority.enabled || !file.api.grpc.empty()) {
+        std::fprintf(stderr, "modbee serve: the file uses the Application API (api:, authentication: "
+                             "authority:), but this build has none (gRPC was not found when it was built)\n");
+        return 2;
+    }
+#endif
+    if (file.authentication.authority.enabled) {
+#if defined(MODBEE_HAVE_APP_API)
+        AuthorityConfig a;
+        for (size_t i = 0; i < file.authentication.accounts.size(); i++) {
+            const MqttAccount& account = file.authentication.accounts[i];
+            (i == 0 && file.authentication.hasAdmin ? a.admins : a.logins)
+                .push_back(std::make_pair(account.username, account.password));
+        }
+        const AuthoritySection& s = file.authentication.authority;
+        a.timeoutMs = (uint32_t)s.timeoutMs;
+        a.staleForSeconds = (uint32_t)s.staleForSeconds;
+        a.cacheSize = (size_t)s.cacheSize;
+        a.maxPending = (size_t)s.maxPending;
+        config.broker.maxSessionsPerLogin = (uint32_t)file.authentication.maxSessionsPerLogin;
+        config.broker.maxRetainedPerLogin = (uint32_t)file.authentication.maxRetainedPerLogin;
+        authority.reset(new Authority(a));
+        extensions.add(authority.get());
+#endif
+    } else if (!file.authentication.database.empty()) {
         AuthGateConfig g;
         g.database = file.authentication.database;
         g.configFile = args.has("config") ? args.get("config") : std::string();
@@ -410,6 +444,35 @@ int cmdServe(int argc, char** argv) {
         std::fprintf(stderr, "modbee serve: %s\n", server.lastError().c_str());
         return 3;
     }
+#if defined(MODBEE_HAVE_APP_API)
+    // THE APPLICATION API, once every shard is running: its calls reach them.
+    ApiServer api;
+    if (!file.api.grpc.empty()) {
+        ApiServerConfig c;
+        c.addresses = file.api.grpc;
+        c.serverVersion = std::string("modbee-mqtt ") + MODBEE_VERSION;
+        char host[256] = {0};
+        c.serverId = ::gethostname(host, sizeof host - 1) == 0 ? host : "modbee";
+        bool read = true;
+        if (!file.api.tlsCert.empty()) read = readWholeFile(file.api.tlsCert, c.tlsCertPem) && read;
+        if (!file.api.tlsKey.empty()) read = readWholeFile(file.api.tlsKey, c.tlsKeyPem) && read;
+        if (!file.api.tlsClientCa.empty()) read = readWholeFile(file.api.tlsClientCa, c.tlsClientCaPem) && read;
+        if (!file.api.tokenFile.empty()) {
+            read = readWholeFile(file.api.tokenFile, c.token) && read;
+            while (!c.token.empty() && (c.token.back() == '\n' || c.token.back() == '\r' || c.token.back() == ' ')) {
+                c.token.pop_back();
+            }
+            if (c.token.empty()) read = false;
+        }
+        std::string why;
+        if (!read) why = "api: a tls file or the token file could not be read, or the token is empty";
+        if (!read || !api.start(c, authority.get(), why)) {
+            std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
+            server.stop();
+            return 3;
+        }
+    }
+#endif
     std::printf("modbee serve: %zu shard(s) on %s", server.shardCount(), config.address.c_str());
     if (config.plain) std::printf(" port %u", server.port());
     if (config.tls.enabled) {
@@ -427,6 +490,8 @@ int cmdServe(int argc, char** argv) {
                                                                 : "every topic (default-topics: all)");
     } else if (accounts.count() > 0) {
         std::printf("modbee serve: MQTT clients must log in (%zu user name(s))\n", accounts.count());
+    } else if (file.authentication.authority.enabled) {
+        // Said below, with the Application API.
     } else {
         std::printf("modbee serve: MQTT clients need no user name or password\n");
     }
@@ -435,6 +500,15 @@ int cmdServe(int argc, char** argv) {
                     "names, without a password (certificate-login)\n");
     }
     if (events) std::printf("modbee serve: client events published on $modbee/events/...\n");
+#if defined(MODBEE_HAVE_APP_API)
+    for (const std::string& address : api.listening()) {
+        std::printf("modbee serve: Application API (gRPC) on %s\n", address.c_str());
+    }
+    if (authority) {
+        std::printf("modbee serve: MQTT logins are decided by the application (authority), asked once "
+                    "and kept; fixed logins: %zu\n", file.authentication.accounts.size());
+    }
+#endif
     if (keeper) {
         std::printf("modbee serve: retained messages kept in %s: %zu restored",
                     keeper->where().c_str(), keeper->loaded() - (size_t)keeper->expired() -
@@ -530,6 +604,14 @@ int cmdServe(int argc, char** argv) {
                 std::printf(" | retained store failures %llu",
                             (unsigned long long)keeper->failures());
             }
+#if defined(MODBEE_HAVE_APP_API)
+            if (authority) {
+                const AuthorityStatus a = authority->status();
+                std::printf(" | authority: %zu instance(s), asked %llu cached %llu stale %llu unavailable %llu",
+                            a.streams, (unsigned long long)a.asked, (unsigned long long)a.cached,
+                            (unsigned long long)a.stale, (unsigned long long)a.unavailable);
+            }
+#endif
             if (sessions) {
                 const SessionKeeperStatus k = sessions->status();
                 std::printf(" | sessions kept %llu", (unsigned long long)k.kept);
@@ -539,6 +621,9 @@ int cmdServe(int argc, char** argv) {
         }
     }
     std::printf("modbee serve: stopping\n");
+#if defined(MODBEE_HAVE_APP_API)
+    api.stop();          // before the shards: its calls reach them
+#endif
     metrics.stop();
     server.stop();
     return 0;

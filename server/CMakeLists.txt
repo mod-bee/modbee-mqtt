@@ -64,7 +64,7 @@ target_include_directories(modbee-server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(modbee-server PUBLIC cxx_std_17)
 
 # --- device logins, live: authentication: database: (server/auth/) ---
-add_library(modbee-auth STATIC auth/AuthHash.cpp auth/Json.cpp auth/AuthStore.cpp auth/AuthGate.cpp
+add_library(modbee-auth STATIC auth/AuthHash.cpp auth/Json.cpp auth/AuthStore.cpp auth/AuthGate.cpp auth/TopicRules.cpp
     auth/AuthGateSettings.cpp auth/TlsSettings.cpp)
 target_link_libraries(modbee-auth PUBLIC modbee-server modbee-sqlite modbee-config)
 target_include_directories(modbee-auth PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/auth)
@@ -116,4 +116,60 @@ if(RDKAFKA_FOUND)
     message(STATUS "modbee: librdkafka ${RDKAFKA_VERSION} found - the Kafka pipe is built")
 else()
     message(STATUS "modbee: no librdkafka - modbee serve runs without the Kafka pipe")
+endif()
+
+# --- logins decided by the application: authentication: authority: ---
+# No gRPC in it (server/api/Authority.h), so it builds - and is tested -
+# wherever the server does.
+add_library(modbee-authority STATIC api/Authority.cpp)
+target_link_libraries(modbee-authority PUBLIC modbee-server modbee-auth)
+target_include_directories(modbee-authority PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api)
+target_compile_features(modbee-authority PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(modbee-authority PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+endif()
+
+# --- the Application API (gRPC), where gRPC and protobuf are installed ---
+#
+# THE ONE PLACE gRPC IS BUILT, and the one target allowed exceptions and RTTI,
+# which gRPC and protobuf need. The code is generated from proto/ at build
+# time. Packages give it in seconds (Ubuntu: libgrpc++-dev
+# protobuf-compiler-grpc libprotobuf-dev); written for gRPC 1.51 and later.
+find_package(Protobuf QUIET)
+find_package(gRPC CONFIG QUIET)
+if(gRPC_FOUND AND Protobuf_FOUND)
+    set(_modbee_api_default ON)
+else()
+    set(_modbee_api_default OFF)
+endif()
+option(MQTT_BUILD_APP_API "the Application API (gRPC): needs gRPC and protobuf" ${_modbee_api_default})
+if(MQTT_BUILD_APP_API)
+    if(NOT (gRPC_FOUND AND Protobuf_FOUND))
+        message(FATAL_ERROR "MQTT_BUILD_APP_API needs gRPC and protobuf "
+                            "(Ubuntu: libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev)")
+    endif()
+    set(_modbee_proto ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
+    set(_modbee_generated ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    set(_modbee_app ${_modbee_generated}/modbee/app/v1/app)
+    add_custom_command(
+        OUTPUT ${_modbee_app}.pb.cc ${_modbee_app}.pb.h ${_modbee_app}.grpc.pb.cc ${_modbee_app}.grpc.pb.h
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_modbee_generated}
+        COMMAND protobuf::protoc --proto_path=${_modbee_proto}
+                --cpp_out=${_modbee_generated} --grpc_out=${_modbee_generated}
+                --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+                modbee/app/v1/app.proto
+        DEPENDS ${_modbee_proto}/modbee/app/v1/app.proto
+        COMMENT "Generating the Application API from proto/modbee/app/v1/app.proto"
+        VERBATIM)
+    add_library(modbee-api STATIC api/ApiServer.cpp ${_modbee_app}.pb.cc ${_modbee_app}.grpc.pb.cc)
+    target_link_libraries(modbee-api PUBLIC modbee-authority gRPC::grpc++ protobuf::libprotobuf)
+    target_include_directories(modbee-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api ${_modbee_generated})
+    target_compile_definitions(modbee-api PUBLIC MODBEE_HAVE_APP_API=1)
+    target_compile_features(modbee-api PUBLIC cxx_std_17)
+    if(NOT MSVC)
+        set_source_files_properties(api/ApiServer.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
+    endif()
+    message(STATUS "modbee: gRPC ${gRPC_VERSION} found - the Application API is built")
+else()
+    message(STATUS "modbee: no gRPC - modbee serve runs without the Application API")
 endif()

@@ -837,6 +837,33 @@ void crossCheck(Loader& loader, ServerConfig& config) {
                        "(broker.tls.client-ca or client-ca-pem); without one none is asked for",
                        true);
     }
+    const AuthoritySection& authority = config.authentication.authority;
+    if (authority.enabled && !config.authentication.database.empty()) {
+        loader.problem(nullptr, "authentication.authority",
+                       "logins come from a database or from an authority, not both");
+    }
+    if (authority.enabled && config.api.grpc.empty()) {
+        loader.problem(nullptr, "api.grpc",
+                       "the authority answers over the Application API: it needs an address "
+                       "(unix:/run/modbee/api.sock)");
+    }
+    for (const std::string& address : config.api.grpc) {
+        if (address.compare(0, 5, "unix:") == 0) {
+            // sun_path: 108 bytes with the terminating zero, on Linux.
+            if (address.size() - 5 > 107) {
+                loader.problem(nullptr, "api.grpc", "\"" + address + "\": a Unix socket's path is at most "
+                               "107 bytes (this one is " + std::to_string(address.size() - 5) + ")");
+            }
+            continue;
+        }
+        if (address.compare(0, 6, "tcp://") != 0) {
+            loader.problem(nullptr, "api.grpc", "\"" + address + "\" is neither unix:<path> nor tcp://<host>:<port>");
+        } else if (config.api.tlsCert.empty() || config.api.tlsKey.empty() || config.api.tokenFile.empty()) {
+            loader.problem(nullptr, "api.grpc",
+                           "\"" + address + "\" is reachable from other hosts: it needs api.tls (cert, key) "
+                           "and api.token-file");
+        }
+    }
     if (config.sessions.store == SessionStore::File && config.sessions.directory.empty()) {
         loader.problem(nullptr, "sessions.directory", "store: file needs a directory to keep them in");
     }
@@ -988,6 +1015,16 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     }
     // Read whether or not the section is there, so MODBEE_EVENTS_ENABLED alone
     // turns it on.
+    Section api = top.child("api");
+    api.list("grpc", out.api.grpc);
+    Section apiTls = api.child("tls");
+    apiTls.text("cert", out.api.tlsCert);
+    apiTls.text("key", out.api.tlsKey);
+    apiTls.text("client-ca", out.api.tlsClientCa);
+    if (apiTls.present()) apiTls.finish();
+    api.text("token-file", out.api.tokenFile);
+    if (api.present()) api.finish();
+
     Section events = top.child("events");
     if (events.present()) out.events.enabled = true;
     events.flag("enabled", out.events.enabled);
@@ -1019,6 +1056,15 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
         auth.choice("default-topics", out.authentication.defaultTopics, kDefaultTopics);
         auth.integer("max-sessions-per-login", out.authentication.maxSessionsPerLogin, 0, 1000000);
         auth.integer("max-retained-per-login", out.authentication.maxRetainedPerLogin, 0, 10000000);
+        Section authority = auth.child("authority");
+        AuthoritySection& a = out.authentication.authority;
+        if (authority.present()) a.enabled = true;
+        authority.flag("enabled", a.enabled);
+        authority.integer("timeout-ms", a.timeoutMs, 50, 60000);
+        authority.integer("stale-for", a.staleForSeconds, 0, 31536000);
+        authority.integer("cache-size", a.cacheSize, 0, 100000000);
+        authority.integer("max-pending", a.maxPending, 1, 10000000);
+        if (authority.present()) authority.finish();
         const size_t users = auth.count("users");
         for (size_t i = 0; i < users; i++) {
             Section user = auth.item("users", i);

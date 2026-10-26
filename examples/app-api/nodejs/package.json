@@ -1,0 +1,14 @@
+{
+  "name": "modbee-app-api-authority",
+  "version": "1.0.0",
+  "description": "A Node.js application deciding modbee's MQTT logins over the Application API (gRPC)",
+  "main": "authority.js",
+  "private": true,
+  "scripts": {
+    "start": "node authority.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.6",
+    "@grpc/proto-loader": "^0.8.1"
+  }
+}

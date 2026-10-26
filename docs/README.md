@@ -38,6 +38,7 @@ Arduino library.
 | --- | --- |
 | [docker.md](docker.md) | **Running it**: one command, a stack with a Let's Encrypt certificate, or that stack with Kafka included |
 | [kafka.md](kafka.md) | `modbee.yaml`, and the Kafka pipe: MQTT to Kafka and back, untouched, and exactly what an acknowledgement means |
+| [app-api.md](app-api.md) | The Application API: your application talks to the server over gRPC - and decides who may log in |
 | [kafka-apps.md](kafka-apps.md) | **Your own app on Kafka**: read your devices' MQTT messages and send them commands, from Node.js, Python or any language - with a working example |
 | [logins.md](logins.md) | **Device logins**: a login per device, managed live; devices that register themselves with a key; what each may publish and subscribe to; backups |
 | [settings.md](settings.md) | **Settings over MQTT**: the server's settings kept beside the logins, read and changed with `modbee config` or from your own platform, applied at a restart it can ask for |
