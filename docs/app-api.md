@@ -5,16 +5,16 @@ backend, a gateway's own software - can speak to it a different way: over
 the Application API, gRPC on a local socket, with no MQTT library at all.
 
 The contract is [`proto/modbee/app/v1/app.proto`](../proto/modbee/app/v1/app.proto).
-Today the server answers three of its services:
+Today the server answers four of its services:
 
 | Service | What it is for |
 | --- | --- |
 | `System.Hello` | What this server is, which API version it speaks, and what it can do (`features`) |
 | `Messages` | **Every device's messages, shared by your application's instances, and messages back to the devices** - [below](#messages) |
+| `Connections` | **MQTT connections the server keeps to other brokers for your application** - [below](#connections-to-other-brokers) |
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 
-The others in the file (`Connections`, `Admin`) answer `UNIMPLEMENTED` for
-now; `Hello`'s `features` lists what a server serves, so an application asks
+`Admin` answers `UNIMPLEMENTED` for now; `Hello`'s `features` lists what a server serves, so an application asks
 rather than guesses.
 
 **`System.Attach`** is an instance's presence. Open it with the messages to
@@ -143,6 +143,35 @@ never could have it (its queue full, the message expired or too large for
 it) also makes it `PARTIAL`. Use it for a command that must have reached its
 device before your application goes on; a store-and-forward outbox deletes
 only what came back `PUBLISH_DELIVERED`.
+
+---
+
+## Connections to other brokers
+
+Your application can have the server hold an MQTT connection to another
+broker for it - a customer's, the platform's (a gateway's uplink), one a
+Sparkplug host or edge node lives on - with no MQTT library of its own. The
+server's own client does it, so the connection stays up while your
+application restarts.
+
+`Connections.Put` with a `ConnectionSpec`: an `id`, the `servers` in order of
+preference, the client id, login, TLS, keep-alive, session, Will.
+
+| | |
+| --- | --- |
+| **Failover** | An attempt that fails moves to the next server. Connected to any but the first, it checks the first every `primary_check_seconds` (60) and goes back to it once it answers |
+| **Kept** | Written to `connections.json` in `api.state-directory` (`/var/lib/modbee`), readable by the server's user only, and opened again when the server starts. `Put` again with a change reconnects; with none, nothing happens. `Delete` closes and forgets it |
+| **Messages in** | A `Consume` stream with `connection` set to its id: the group's filters become the connection's subscriptions, and what the other broker sends arrives as any delivery does, its `connection` set |
+| **Messages out** | `Publish` with `connection` set. `CONFIRM_DELIVERED` answers when **the other broker** has acknowledged it (PUBACK, PUBCOMP); `PUBLISH_NOT_CONNECTED` when the connection is down - nothing was sent |
+| **`RECONNECT_WHEN_ASKED`** | A connection that drops stays down (`CONNECTION_WAITING`) until `Connections.Reconnect`, which can bring a new Will for the next session - what a Sparkplug edge node needs, its NDEATH carrying a new `bdSeq` each time |
+| **A refused login** | `CONNECTION_REFUSED`, with what the other broker said in `last_error`, and not tried again until `Put` or `Reconnect`: a wrong password sent every second gets a site banned |
+
+`Get` and `List` say each one's state, which server it is on, and its counts -
+never its password or key. `Watch` streams every change of state.
+
+TLS: `ca_pem` (empty: the system's trust store), and `certificate_pem` and
+`key_pem` for mutual TLS, written beside `connections.json`. The name checked
+is the server's `host`; `server_name` is not used yet.
 
 ---
 

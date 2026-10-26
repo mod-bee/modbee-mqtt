@@ -133,6 +133,8 @@ struct AppHubStatus {
     uint64_t published = 0;
 };
 
+class AppConnections;
+
 class AppHub : public ShardExtension {
 public:
     explicit AppHub(const AppHubConfig& config);
@@ -162,6 +164,13 @@ public:
 
     void publish(const AppPublish& message, std::function<void(const AppPublishResult&)> done);
 
+    // --- Managed connections (AppConnections) ---
+    void attachConnections(AppConnections* connections);
+    // The filters every group opened on `connection` asks for, together.
+    std::vector<std::string> filtersFor(const std::string& connection) const;
+    // A message a managed connection received, for its groups.
+    void connectionMessage(const std::string& connection, const std::shared_ptr<const AppMessage>& message);
+
     std::vector<AppGroupInfo> groups() const;
     // False, with `why`, when there is no such group or it has members;
     // `discarded` what it still held.
@@ -177,6 +186,8 @@ public:
 private:
     AppHubConfig _config;
     std::vector<std::unique_ptr<Shard>> _shards;
+    std::atomic<AppConnections*> _connections{nullptr};
+    void groupsChanged(const std::string& connection);
     std::atomic<size_t> _nextShard{0};
 
     // The groups, and their members: one lock for them all - a member's stream,

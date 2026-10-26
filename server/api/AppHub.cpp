@@ -6,6 +6,7 @@
 #include "AppHub.h"
 
 #include "Authority.h"
+#include "AppConnections.h"
 #include "Json.h"
 #include "MqttTopic.h"
 
@@ -368,6 +369,7 @@ AppHub::Member* AppHub::open(const AppConsumeOptions& options, AppConsumer* cons
     std::deque<std::shared_ptr<Entry>> waiting;
     waiting.swap(group.waiting);
     for (std::shared_ptr<Entry>& entry : waiting) assign(group, std::move(entry));
+    if (!options.connection.empty()) groupsChanged(options.connection);
     return member;
 }
 
@@ -407,6 +409,7 @@ void AppHub::close(Member* member) {
     leave(group, *member);
     delete member;
     if (!group.durable && group.members.empty()) {
+        if (!group.connection.empty()) groupsChanged(group.connection);
         for (auto at = _groups.begin(); at != _groups.end(); ++at) {
             if (at->second.get() == &group) {
                 _groups.erase(at);
@@ -459,7 +462,17 @@ void AppHub::publish(const AppPublish& message, std::function<void(const AppPubl
         done(result);
         return;
     }
-    if (!message.connection.empty() || _shards.empty()) {
+    if (!message.connection.empty()) {
+        AppConnections* connections = _connections.load();
+        if (connections) {
+            connections->publish(message, std::move(done));
+        } else {
+            result.outcome = AppPublishOutcome::NotConnected;
+            done(result);
+        }
+        return;
+    }
+    if (_shards.empty()) {
         result.outcome = AppPublishOutcome::NotConnected;
         done(result);
         return;
@@ -601,6 +614,42 @@ void AppHub::service(uint32_t index, MqttBroker& broker) {
     }
 }
 
+// --- Managed connections ---------------------------------------------------
+
+void AppHub::attachConnections(AppConnections* connections) { _connections = connections; }
+
+void AppHub::groupsChanged(const std::string& connection) {
+    if (AppConnections* connections = _connections.load()) connections->groupsChanged(connection);
+}
+
+std::vector<std::string> AppHub::filtersFor(const std::string& connection) const {
+    std::lock_guard<std::mutex> guard(_lock);
+    std::vector<std::string> out;
+    for (const auto& named : _groups) {
+        if (named.second->connection != connection) continue;
+        for (const std::string& filter : named.second->options.filters) {
+            if (std::find(out.begin(), out.end(), filter) == out.end()) out.push_back(filter);
+        }
+    }
+    return out;
+}
+
+void AppHub::connectionMessage(const std::string& connection, const std::shared_ptr<const AppMessage>& message) {
+    std::lock_guard<std::mutex> guard(_lock);
+    const MqttSpan topic = spanOf(message->topic);
+    for (auto& named : _groups) {
+        Group& group = *named.second;
+        if (group.connection != connection) continue;
+        for (const std::string& filter : group.options.filters) {
+            if (mq_topicMatches(spanOf(filter), topic)) {
+                // Nobody to refuse it to: the remote broker had its answer.
+                take(group, message);
+                break;
+            }
+        }
+    }
+}
+
 // --- Looking at it -----------------------------------------------------------
 
 std::vector<AppGroupInfo> AppHub::groups() const {
@@ -638,7 +687,9 @@ bool AppHub::deleteGroup(const std::string& name, const std::string& connection,
         return false;
     }
     if (discarded) *discarded = found->second->queued;
+    const std::string onConnection = found->second->connection;
     _groups.erase(found);
+    if (!onConnection.empty()) groupsChanged(onConnection);
     return true;
 }
 

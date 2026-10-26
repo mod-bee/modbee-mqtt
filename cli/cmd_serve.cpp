@@ -30,6 +30,7 @@
 #include "Authority.h"
 #include "ApiServer.h"
 #include "AppHub.h"
+#include "AppConnections.h"
 #endif
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
@@ -457,7 +458,10 @@ int cmdServe(int argc, char** argv) {
         return 3;
     }
 #if defined(MODBEE_HAVE_APP_API)
-    // THE APPLICATION API, once every shard is running: its calls reach them.
+    // THE APPLICATION API, once every shard is running: its calls reach them -
+    // and the MQTT connections it keeps for the application, opened again from
+    // what was kept.
+    std::unique_ptr<AppConnections> connections;
     ApiServer api;
     if (!file.api.grpc.empty()) {
         ApiServerConfig c;
@@ -478,7 +482,9 @@ int cmdServe(int argc, char** argv) {
         }
         std::string why;
         if (!read) why = "api: a tls file or the token file could not be read, or the token is empty";
-        if (!read || !api.start(c, authority.get(), hub.get(), why)) {
+        connections.reset(new AppConnections(*hub, file.api.stateDirectory));
+        if (read && !connections->start(why)) read = false;
+        if (!read || !api.start(c, authority.get(), hub.get(), why, connections.get())) {
             std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
             server.stop();
             return 3;
@@ -635,6 +641,7 @@ int cmdServe(int argc, char** argv) {
     std::printf("modbee serve: stopping\n");
 #if defined(MODBEE_HAVE_APP_API)
     api.stop();          // before the shards: its calls reach them
+    if (connections) connections->stop();
 #endif
     metrics.stop();
     server.stop();

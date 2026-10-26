@@ -121,7 +121,7 @@ endif()
 # --- what the Application API serves, without gRPC: logins decided by the
 # application (Authority) and its messages (AppHub). Built - and tested -
 # wherever the server is.
-add_library(modbee-app STATIC api/Authority.cpp api/AppHub.cpp)
+add_library(modbee-app STATIC api/Authority.cpp api/AppHub.cpp api/AppConnections.cpp)
 target_link_libraries(modbee-app PUBLIC modbee-server modbee-auth)
 target_include_directories(modbee-app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api)
 target_compile_features(modbee-app PUBLIC cxx_std_17)

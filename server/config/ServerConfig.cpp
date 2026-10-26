@@ -1024,6 +1024,7 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     if (apiTls.present()) apiTls.finish();
     api.text("token-file", out.api.tokenFile);
     api.integer("max-queued", out.api.maxQueued, 1, 100000000);
+    api.text("state-directory", out.api.stateDirectory);
     if (api.present()) api.finish();
 
     Section events = top.child("events");

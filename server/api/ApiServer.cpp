@@ -6,6 +6,7 @@
 #include "ApiServer.h"
 #include "Authority.h"
 #include "AppHub.h"
+#include "AppConnections.h"
 
 #include "modbee/app/v1/app.grpc.pb.h"
 
@@ -215,6 +216,85 @@ AppPublish publishOf(const v1::PublishRequest& request) {
     message.connection = request.connection();
     message.origin = request.origin();
     return message;
+}
+
+// --- Connections -------------------------------------------------------------------
+
+AppPublish messageOf(const v1::Message& wire) {
+    AppPublish m;
+    m.topic = wire.topic();
+    m.payload = wire.payload();
+    m.qos = (uint8_t)wire.qos();
+    m.retain = wire.retain();
+    m.properties = propertiesOf(wire.properties());
+    return m;
+}
+
+AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
+    AppConnectionSpec s;
+    s.id = wire.id();
+    for (const v1::Endpoint& e : wire.servers()) s.servers.push_back(AppEndpoint{e.host(), (uint16_t)e.port()});
+    s.clientId = wire.client_id();
+    s.hasUsername = wire.has_username();
+    s.username = wire.username();
+    s.hasPassword = wire.has_password();
+    s.password = wire.password();
+    s.tls = wire.tls().enabled();
+    s.caPem = wire.tls().ca_pem();
+    s.certificatePem = wire.tls().certificate_pem();
+    s.keyPem = wire.tls().key_pem();
+    s.protocol = wire.protocol_version() == 4 ? 4 : 5;
+    s.keepaliveSeconds = wire.keepalive_seconds() ? wire.keepalive_seconds() : 30;
+    s.cleanStart = wire.clean_start();
+    s.sessionExpirySeconds = wire.session_expiry_seconds();
+    if (wire.has_will() && !wire.will().topic().empty()) {
+        s.hasWill = true;
+        s.will = messageOf(wire.will());
+    }
+    s.reconnectWhenAsked = wire.reconnect() == v1::RECONNECT_WHEN_ASKED;
+    s.primaryCheckSeconds = wire.primary_check_seconds() ? wire.primary_check_seconds() : 60;
+    return s;
+}
+
+void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
+    v1::ConnectionSpec* s = wire.mutable_spec();
+    s->set_id(info.spec.id);
+    for (const AppEndpoint& e : info.spec.servers) {
+        v1::Endpoint* endpoint = s->add_servers();
+        endpoint->set_host(e.host);
+        endpoint->set_port(e.port);
+    }
+    s->set_client_id(info.spec.clientId);
+    if (info.spec.hasUsername) s->set_username(info.spec.username);
+    s->mutable_tls()->set_enabled(info.spec.tls);
+    s->mutable_tls()->set_ca_pem(info.spec.caPem);
+    s->mutable_tls()->set_certificate_pem(info.spec.certificatePem);
+    s->set_protocol_version(info.spec.protocol);
+    s->set_keepalive_seconds(info.spec.keepaliveSeconds);
+    s->set_clean_start(info.spec.cleanStart);
+    s->set_session_expiry_seconds(info.spec.sessionExpirySeconds);
+    if (info.spec.hasWill) {
+        v1::Message* will = s->mutable_will();
+        will->set_topic(info.spec.will.topic);
+        will->set_payload(info.spec.will.payload);
+        will->set_qos(info.spec.will.qos);
+        will->set_retain(info.spec.will.retain);
+    }
+    s->set_reconnect(info.spec.reconnectWhenAsked ? v1::RECONNECT_WHEN_ASKED : v1::RECONNECT_AUTOMATIC);
+    s->set_primary_check_seconds(info.spec.primaryCheckSeconds);
+    switch (info.state) {
+    case AppConnectionState::Connecting: wire.set_state(v1::CONNECTION_CONNECTING); break;
+    case AppConnectionState::Connected: wire.set_state(v1::CONNECTION_CONNECTED); break;
+    case AppConnectionState::Waiting: wire.set_state(v1::CONNECTION_WAITING); break;
+    case AppConnectionState::BackingOff: wire.set_state(v1::CONNECTION_BACKING_OFF); break;
+    case AppConnectionState::Refused: wire.set_state(v1::CONNECTION_REFUSED); break;
+    }
+    wire.set_server_index(info.serverIndex);
+    wire.set_session_present(info.sessionPresent);
+    wire.set_last_error(info.lastError);
+    wire.set_since_ms(info.sinceMs);
+    wire.set_messages_in(info.messagesIn);
+    wire.set_messages_out(info.messagesOut);
 }
 
 // =============================================================================
@@ -646,14 +726,78 @@ private:
     grpc::Status _status = grpc::Status::OK;
 };
 
+// Connections.Watch: every change of state, as it happens. A server stream:
+// it ends when the caller cancels it.
+class WatchReactor : public grpc::ServerWriteReactor<v1::ConnectionInfo> {
+public:
+    WatchReactor(AppConnections& connections, const std::vector<std::string>& ids, bool allowedIn)
+        : _connections(connections) {
+        if (!allowedIn) {
+            _finished = true;
+            Finish(refusedToken());
+            return;
+        }
+        _watcher = _connections.watch(ids, [this](const AppConnectionInfo& info) {
+            v1::ConnectionInfo* next = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(_lock);
+                if (_ending) return;
+                _queue.emplace_back();
+                infoTo(info, _queue.back());
+                if (_writing) return;
+                _writing = true;
+                next = &_queue.front();
+            }
+            StartWrite(next);
+        });
+    }
+
+    void OnWriteDone(bool ok) override {
+        v1::ConnectionInfo* next = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            _queue.pop_front();
+            if (ok && !_ending && !_queue.empty()) {
+                next = &_queue.front();
+            } else {
+                _writing = false;
+            }
+        }
+        if (next) StartWrite(next);
+    }
+
+    void OnCancel() override {
+        _connections.unwatch(_watcher);
+        std::lock_guard<std::mutex> guard(_lock);
+        _ending = true;
+        if (!_finished) {
+            _finished = true;
+            Finish(grpc::Status::OK);
+        }
+    }
+
+    void OnDone() override {
+        _connections.unwatch(_watcher);
+        delete this;
+    }
+
+private:
+    AppConnections& _connections;
+    uint64_t _watcher = 0;
+    std::mutex _lock;
+    std::deque<v1::ConnectionInfo> _queue;
+    bool _writing = false, _ending = false, _finished = false;
+};
+
 // =============================================================================
 // THE SERVICES
 // =============================================================================
 
 class SystemService final : public v1::System::CallbackService {
 public:
-    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages)
-        : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr) {}
+    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections)
+        : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr),
+          _connections(connections) {}
 
     grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown>* Attach(grpc::CallbackServerContext* context) override {
         return new AttachReactor(_hub, allowed(context, _config.token));
@@ -671,6 +815,7 @@ public:
         reply->set_server_id(_config.serverId);
         if (_authority) reply->add_features("authority");
         if (_messages) reply->add_features("messages");
+        if (_connections) reply->add_features("connections");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -680,6 +825,106 @@ private:
     bool _authority;
     AppHub* _hub;
     bool _messages;
+    bool _connections;
+};
+
+class ConnectionsService final : public v1::Connections::CallbackService {
+public:
+    ConnectionsService(const ApiServerConfig& config, AppConnections& connections)
+        : _config(config), _connections(connections) {}
+
+    grpc::ServerUnaryReactor* Put(grpc::CallbackServerContext* context, const v1::ConnectionSpec* spec,
+                                  v1::ConnectionInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        AppConnectionInfo info;
+        std::string error;
+        if (!_connections.put(specOf(*spec), &info, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
+        infoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* Get(grpc::CallbackServerContext* context, const v1::ConnectionRef* ref,
+                                  v1::ConnectionInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        AppConnectionInfo info;
+        if (!_connections.get(ref->id(), info)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, "no connection \"" + ref->id() + "\""));
+            return reactor;
+        }
+        infoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* List(grpc::CallbackServerContext* context, const v1::ListConnectionsRequest*,
+                                   v1::ListConnectionsReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        for (const AppConnectionInfo& info : _connections.list()) infoTo(info, *reply->add_connections());
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* Delete(grpc::CallbackServerContext* context, const v1::ConnectionRef* ref,
+                                     v1::DeleteConnectionReply*) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        if (!_connections.remove(ref->id())) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, "no connection \"" + ref->id() + "\""));
+            return reactor;
+        }
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerWriteReactor<v1::ConnectionInfo>* Watch(grpc::CallbackServerContext* context,
+                                                        const v1::WatchConnectionsRequest* request) override {
+        return new WatchReactor(_connections, std::vector<std::string>(request->ids().begin(), request->ids().end()),
+                                allowed(context, _config.token));
+    }
+
+    grpc::ServerUnaryReactor* Reconnect(grpc::CallbackServerContext* context, const v1::ReconnectRequest* request,
+                                        v1::ConnectionInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        AppPublish will;
+        const bool hasWill = request->has_will() && !request->will().topic().empty();
+        if (hasWill) will = messageOf(request->will());
+        AppConnectionInfo info;
+        std::string error;
+        if (!_connections.reconnect(request->id(), hasWill ? &will : nullptr, &info, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, error));
+            return reactor;
+        }
+        infoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+private:
+    const ApiServerConfig& _config;
+    AppConnections& _connections;
 };
 
 class MessagesService final : public v1::Messages::CallbackService {
@@ -848,6 +1093,7 @@ struct ApiServer::Impl {
     std::unique_ptr<SystemService> system;
     std::unique_ptr<AuthorityService> authority;
     std::unique_ptr<MessagesService> messages;
+    std::unique_ptr<ConnectionsService> connections;
     std::unique_ptr<grpc::Server> server;
     std::vector<std::string> listening;
     std::vector<std::string> sockets;      // Unix socket files, removed at stop
@@ -858,12 +1104,13 @@ ApiServer::ApiServer() : _impl(new Impl()) {}
 ApiServer::~ApiServer() { stop(); }
 
 bool ApiServer::start(const ApiServerConfig& config, Authority* authority, AppHub* messages,
-                      std::string& error) {
+                      std::string& error, AppConnections* connections) {
     Impl& self = *_impl;
     self.config = config;
-    self.system.reset(new SystemService(self.config, authority != nullptr, messages));
+    self.system.reset(new SystemService(self.config, authority != nullptr, messages, connections != nullptr));
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
+    if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -897,6 +1144,7 @@ bool ApiServer::start(const ApiServerConfig& config, Authority* authority, AppHu
     builder.RegisterService(self.system.get());
     builder.RegisterService(self.authority.get());
     if (self.messages) builder.RegisterService(self.messages.get());
+    if (self.connections) builder.RegisterService(self.connections.get());
     self.server = builder.BuildAndStart();
     if (!self.server) {
         error = "the Application API could not listen on every address (in use, or no permission?)";
