@@ -138,10 +138,10 @@ set(MQTT_SOURCES
     src/transport/MqttCertificate.cpp
     # A board's TLS over its own channel, by the ESP32 core's mbedTLS. Empty
     # on a host (MQTT_CHANNEL_TLS is 0 there); the test suite builds it
-    # against an ESP32-shaped mbedTLS - see test/CMakeLists.txt.
+    # against an ESP32-shaped mbedTLS (the development suite).
     src/transport/MqttChannelTls.cpp
     # A board's connect on a task of its own (ESP32). Empty on a host unless a
-    # test asks for it: test/wire/connect_task.sh.
+    # test asks for it (the development suite).
     src/transport/MqttConnectTask.cpp
     src/codec/MqttCodecV5.cpp
     src/codec/MqttCodecV311.cpp
@@ -249,7 +249,16 @@ endif()
 # TESTS
 # =============================================================================
 
-if(MQTT_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt)
+# test/ is the published suite: self-contained, what GitHub runs on Linux,
+# macOS and Windows. internal/test/ is the development suite - sanitizers,
+# fuzzing, soak, the interoperability helpers - which is not published and is
+# built when it is there.
+if(MQTT_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(test)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt)
+        add_subdirectory(test)
+    endif()
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/internal/test/CMakeLists.txt)
+        add_subdirectory(internal/test)
+    endif()
 endif()

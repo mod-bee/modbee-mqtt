@@ -1,0 +1,39 @@
+# THE PUBLISHED TEST SUITE.
+#
+# Self-contained: a compiler and this repository, nothing else - no network
+# beyond loopback, no Docker, no tools installed on somebody's machine. GitHub
+# runs it on Linux, macOS and Windows (.github/workflows/ci.yml); `ctest`
+# runs it anywhere. The development suite (internal/test/, not published) is
+# where the sanitizers, the fuzzers, the soak and the interoperability rigs
+# live.
+#
+# Listed explicitly, so adding one is a deliberate act.
+
+set(MODBEE_TESTS codec_tests broker_tests)
+
+foreach(name IN LISTS MODBEE_TESTS)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name} PRIVATE modbee-mqtt)
+    target_compile_features(${name} PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4 /utf-8)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 300)
+endforeach()
+
+# The server tier, where it is built (Linux; Windows with wepoll).
+if(TARGET modbee-server AND TARGET modbee-sessions AND TARGET modbee-retained)
+    add_executable(server_tests server_tests.cpp)
+    target_link_libraries(server_tests PRIVATE modbee-server modbee-sessions modbee-retained)
+    target_compile_features(server_tests PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(server_tests PRIVATE /W4 /utf-8)
+    else()
+        target_compile_options(server_tests PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME server_tests COMMAND server_tests)
+    set_tests_properties(server_tests PROPERTIES TIMEOUT 300)
+endif()

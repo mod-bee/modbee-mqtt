@@ -1,10 +1,10 @@
-# What GitHub runs on every push: the published tree builds.
+# What GitHub runs on every push: the published tree builds, and the
+# published test suite (test/) passes - on Linux, macOS and Windows.
 #
-# The development checks (the test suite, sanitizers, fuzzing, TLS, the
-# Arduino sketches, footprint ...) need test/, scripts/, internal/ and
-# docker/testing/, which are not published. They run before a push with
-# internal/ci-local.sh, so this file only has jobs that really test something
-# on a public clone.
+# The development checks (sanitizers over the whole development suite,
+# fuzzing, the soak, TLS, the Arduino sketches, footprint ...) need
+# internal/, scripts/ and docker/testing/, which are not published. They run
+# before a push with internal/ci-local.sh.
 #
 # This one builds the published tree three ways - default, -Werror, and the
 # -fno-exceptions build a microcontroller gets - with every C++ example, on
@@ -54,3 +54,35 @@ jobs:
           cmake -S . -B build-client -DMQTT_BUILD_TESTS=OFF \
                 -DMQTT_NO_EXCEPTIONS=ON -DCMAKE_CXX_FLAGS="-Werror"
           cmake --build build-client -j
+
+  # THE PUBLISHED TEST SUITE: the wire format, the broker and client end to
+  # end over loopback, and - where the server is built - the server across
+  # shards and restarts. Nothing but a compiler and this repository.
+  tests:
+    name: the published tests pass
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j 4 --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # The same suite under the address and undefined-behaviour sanitizers.
+  tests-sanitized:
+    name: the published tests pass under ASan and UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DMQTT_SANITIZE=ON
+          cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

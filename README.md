@@ -244,7 +244,10 @@ ctest --test-dir build
 ```
 
 That builds the library, the examples and the tests, and, on a host, the
-`modbee` command (`build/cli/modbee`) and the server. TLS is used if wolfSSL or
+`modbee` command (`build/cli/modbee`) and the server. The tests (`test/`) need
+nothing but a compiler - the wire format, the broker and client end to end over
+loopback, the server across shards and restarts - and GitHub runs them on
+Linux, macOS and Windows. TLS is used if wolfSSL or
 OpenSSL is installed. The Kafka pipe is built if the librdkafka development
 package (`librdkafka-dev`) is installed. Neither is required.
 
