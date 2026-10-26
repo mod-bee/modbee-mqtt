@@ -470,7 +470,7 @@ named `kafka-password`.
 | --- | --- | --- |
 | **Retained messages** | memory, and where `retained: store` says | **Yes**, with `store: kafka` or `store: file` |
 | **Sessions**, and messages queued for a device that is away | memory, and where `sessions: store` says | **Yes**, with `store: file` |
-| **Consumer groups** of the Application API, and what they hold | memory, and beside the sessions | **Yes**, with `sessions: store: file` |
+| **Consumer groups** of the Application API, and what they hold (a build with gRPC; not this image yet) | memory, and beside the sessions | **Yes**, with `sessions: store: file` |
 | **Everything sent to Kafka** | Kafka, on disk (the `kafka-data` volume in the `*-kafka` examples) | Yes |
 
 ### Retained messages
