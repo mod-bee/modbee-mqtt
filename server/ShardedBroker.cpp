@@ -254,6 +254,18 @@ struct ShardedBroker::Shard {
     // pass. A forwarded MESSAGE is never parked here: a full ring is reported
     // as that shard refusing it.
     std::deque<std::pair<uint32_t, Envelope>> overflow;
+    // Reports to a publishing shard that wait for this shard's extension -
+    // a session store committing what the message queued - in the order they
+    // were made, with the hold each waits for.
+    struct Held {
+        uint32_t to;
+        Envelope reply;
+        uint64_t hold;
+    };
+    // Not work of the shard's own: the extension's wait handle wakes the
+    // shard when a hold is released.
+    std::deque<Held> held;
+    void releaseHeld(bool all);
 
     std::atomic<uint64_t> mailboxFull{0};
     std::atomic<uint64_t> skipped{0};       // messages not sent because nobody there could want them
@@ -653,7 +665,16 @@ void ShardedBroker::Shard::drain(bool stopping) {
                         reply.deferral = envelope.deferral;
                         reply.matched = matched;
                         reply.dropped = dropped;
-                        postReliably(envelope.from, reply);
+                        // Reported once what it changed here is kept, so the
+                        // publisher's PUBACK is a promise every shard made.
+                        const uint64_t hold =
+                            server->_extension ? server->_extension->forwardedHold(index) : 0;
+                        if (hold == 0 && held.empty()) {
+                            postReliably(envelope.from, reply);
+                        } else {
+                            // In order: a report behind a held one waits too.
+                            held.push_back(Held{envelope.from, reply, hold});
+                        }
                     }
                 }
                 delete envelope.groups;
@@ -697,6 +718,18 @@ void ShardedBroker::Shard::drain(bool stopping) {
     }
 }
 
+void ShardedBroker::Shard::releaseHeld(bool all) {
+    while (!held.empty()) {
+        const Held& front = held.front();
+        if (!all && front.hold != 0 && server->_extension &&
+            !server->_extension->forwardedSettled(index, front.hold)) {
+            break;
+        }
+        postReliably(front.to, front.reply);
+        held.pop_front();
+    }
+}
+
 void ShardedBroker::Shard::refreshSnapshot(mq_time_t now) {
     if (snapshotAt != 0 && mq_elapsed(snapshotAt, now) < 100) return;
     snapshotAt = now;
@@ -726,6 +759,7 @@ void ShardedBroker::run(Shard& shard) {
         shard.broker.poll();
         shard.drain(false);
         if (_extension) _extension->service(shard.index, shard.broker);
+        shard.releaseHeld(false);
         shard.flushWakes();
         shard.refreshSnapshot(mq_millis());
         // The daemon may sleep - poll() never does - but not while there is
@@ -746,12 +780,14 @@ void ShardedBroker::run(Shard& shard) {
     // The extension first, while clients are still connected: a held PUBACK
     // that its party can still conclude goes out rather than being lost.
     if (_extension) _extension->stop(shard.index, shard.broker);
+    shard.releaseHeld(true);
     shard.endListeners();
     shard.broker.end();
     shard.flushWakes();
     _ended.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
         shard.drain(true);
+        shard.releaseHeld(true);
         shard.flushWakes();
         if (_ended.load(std::memory_order_acquire) == _shards.size() &&
             _inFlight.load(std::memory_order_acquire) == 0 && shard.overflow.empty()) {
@@ -899,7 +935,6 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
 #endif
 
         s.broker.begin(s.config);
-        if (_extension != nullptr) _extension->prepare(s.index, s.broker);
         if (config.plain) s.broker.addListener(s.listener);
 #if MQTT_TLS_SOCKETS
         if (config.tls.enabled) s.broker.addListener(s.tlsListener);
@@ -921,6 +956,10 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
             s.broker.onShareMember(&Shard::onShareMember, &s);
             s.broker.onShareGate(&Shard::onShareGate, &s);
         }
+        // AFTER the hooks: what an extension puts back - a session store's
+        // subscriptions - must reach the other shards' view of who wants
+        // what, or a message published elsewhere would never be sent here.
+        if (_extension != nullptr) _extension->prepare(s.index, s.broker);
     }
     _port = config.plain ? port : 0;
     _tlsPort = config.tls.enabled ? tlsPort : 0;

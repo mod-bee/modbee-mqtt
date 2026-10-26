@@ -52,6 +52,7 @@
 #include "../MqttTimerWheel.h"
 #include "MqttSessionIndex.h"
 #include "MqttRouteIndex.h"
+#include "MqttSessionJournal.h"
 
 #include <string>
 #include <unordered_map>
@@ -115,6 +116,12 @@ struct MqttBrokerDelivery {
     // completes so a reconnect can replay it.
     uint16_t packetId = MQ_PACKET_ID_NONE;
     bool sent = false;
+    // It has been on the wire - this session's connection, or the one before
+    // it. A resend carries DUP [MQTT-3.3.1-1]; `sent` cannot say so, because
+    // a reconnect clears it so the message goes again, and the identifier
+    // cannot either, because a kept session is given its identifier before
+    // the send (MqttSessionJournal).
+    bool onWire = false;
 
     // The PUBREC has arrived and a PUBREL is owed. The QoS 2 exchange is now
     // half done and what must be replayed after a reconnect is the PUBREL, not
@@ -129,6 +136,11 @@ struct MqttBrokerDelivery {
     bool pubrelOwed = false;
 
     mq_time_t queuedAt = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    // The journal's ticket for its last change: it goes on the wire only once
+    // the journal has kept that far. 0: nothing to wait for.
+    uint64_t keptAfter = 0;
+#endif
 
     // Strictly increasing within the session, which is what ordering is
     // actually decided on. A millisecond timestamp will not do it: two
@@ -157,9 +169,13 @@ struct MqttBrokerDelivery {
         subscriptionIdCount = 0;
         packetId = MQ_PACKET_ID_NONE;
         sent = false;
+        onWire = false;
         awaitingPubcomp = false;
         pubrelOwed = false;
         queuedAt = 0;
+#if defined(MQTT_PLATFORM_HOST)
+        keptAfter = 0;
+#endif
         sequence = 0;
     }
 };
@@ -222,6 +238,28 @@ public:
     // The broker's routing index, which this session tells about every filter
     // it gains and loses. See MqttRouteIndex.h.
     void attachRoutes(MqttRouteIndex* routes) { _routes = routes; }
+
+    // A session store, told of every change from here on; see
+    // MqttSessionJournal.h. Null: nobody is told.
+    void attachJournal(MqttSessionJournal* journal) { _journal = journal; }
+
+    // What only the broker sees change: the record itself (connected or not,
+    // expiry, Will), and a delivery's exchange moving on.
+    void journalChanged() { if (_journal && _inUse) _journal->sessionChanged(*this); }
+    void journalDelivery(MqttBrokerDelivery& entry) {
+        if (_journal && _inUse && entry.qos > MQ_QOS_0) entry.keptAfter = _journal->deliveryChanged(*this, entry);
+    }
+    bool journaling() const { return _journal != nullptr; }
+    // Whether the journal has kept the entry's last change, so it may go out.
+    bool journalKept(const MqttBrokerDelivery& entry) const {
+        return _journal == nullptr || entry.keptAfter == 0 || entry.keptAfter <= _journal->kept();
+    }
+
+    // RESTORING a session a store kept: a message put back under the sequence
+    // it had, so the store and the queue go on naming it the same way, and a
+    // QoS 2 identifier held again. Told to nobody - it is what the store has.
+    bool restoreDelivery(const MqttBrokerDelivery& message);
+    void restoreInbound(uint16_t packetId);
 #endif
 
     void adopt(const MqttSpan& clientId);
@@ -429,6 +467,7 @@ private:
     MqttSessionIndex* _index = nullptr;
     MqttRouteIndex* _routes = nullptr;
     uint32_t _self = 0;
+    MqttSessionJournal* _journal = nullptr;
 #endif
     void bumpRevision() { if (_revision) (*_revision)++; }
     std::vector<MqttBrokerDelivery> _queue;

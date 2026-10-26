@@ -62,6 +62,11 @@ void MqttBrokerSession::adopt(const MqttSpan& clientId) {
     // An identity being replaced leaves the index first, or the old name
     // would go on finding this slot.
     if (_inUse && _index) _index->erase(_self);
+    // Its session has ended. What is cleared below went with it, so a store
+    // is told once, not item by item.
+    if (_inUse && _journal) _journal->sessionEnded(_clientId);
+    MqttSessionJournal* const journal = _journal;
+    _journal = nullptr;
 #endif
     _inUse = true;
     _clientId = toString(clientId);
@@ -83,6 +88,9 @@ void MqttBrokerSession::adopt(const MqttSpan& clientId) {
     clearInbound();
     for (MqttBrokerDelivery& entry : _queue) discard(entry);
     _queueExtent = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    _journal = journal;
+#endif
 }
 
 void MqttBrokerSession::release() {
@@ -92,6 +100,9 @@ void MqttBrokerSession::release() {
         _index->erase(_self);
         _index->giveBack(_self);
     }
+    if (_inUse && _journal) _journal->sessionEnded(_clientId);
+    MqttSessionJournal* const journal = _journal;
+    _journal = nullptr;
 #endif
     if (_inUse) setOwner(std::string());
     _inUse = false;
@@ -105,6 +116,9 @@ void MqttBrokerSession::release() {
     clearInbound();
     for (MqttBrokerDelivery& entry : _queue) discard(entry);
     _queueExtent = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    _journal = journal;
+#endif
 }
 
 bool MqttBrokerSession::matchesClientId(const MqttSpan& clientId) const {
@@ -178,6 +192,7 @@ bool MqttBrokerSession::addSubscription(const MqttSpan& filter, uint8_t options,
         _routes->add(_self, entry.effective);
         if (entry.shared()) _routes->shareMembership(entry.shareName, entry.effective, +1);
     }
+    if (_journal) _journal->subscriptionAdded(*this, entry);
 #endif
     return true;
 }
@@ -196,6 +211,9 @@ bool MqttBrokerSession::removeSubscription(const MqttSpan& filter) {
         _routes->remove(_self, leaving.effective);
         if (leaving.shared()) _routes->shareMembership(leaving.shareName, leaving.effective, -1);
     }
+#endif
+#if defined(MQTT_PLATFORM_HOST)
+    if (_journal) _journal->subscriptionRemoved(*this, _subscriptions[(size_t)index].filter);
 #endif
     if (_subscriptions[(size_t)index].retainedOwed) _retainedOwed--;
     const size_t last = --_subscriptionsUsed;
@@ -280,6 +298,11 @@ void MqttBrokerSession::charge(MqttBrokerDelivery& entry) {
 }
 
 void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
+#if defined(MQTT_PLATFORM_HOST)
+    if (_journal && entry.qos > MQ_QOS_0 && entry.sequence != 0) {
+        _journal->deliveryRemoved(*this, entry.sequence);
+    }
+#endif
     if (entry.charged != 0) {
         _queuedBytes -= entry.charged < _queuedBytes ? entry.charged : _queuedBytes;
         if (_queuedBytesTotal) {
@@ -312,6 +335,9 @@ MqttBrokerDelivery* MqttBrokerSession::reserveDelivery(size_t bytes) {
 void MqttBrokerSession::commitDelivery(MqttBrokerDelivery& entry) {
     entry.sequence = _nextSequence++;
     charge(entry);
+#if defined(MQTT_PLATFORM_HOST)
+    journalDelivery(entry);
+#endif
 }
 
 bool MqttBrokerSession::enqueue(const MqttBrokerDelivery& message) {
@@ -327,6 +353,9 @@ bool MqttBrokerSession::enqueue(const MqttBrokerDelivery& message) {
             entry.sequence = _nextSequence++;
             charge(entry);
             if (index + 1 > _queueExtent) _queueExtent = index + 1;
+#if defined(MQTT_PLATFORM_HOST)
+            journalDelivery(entry);
+#endif
             return true;
         }
     }
@@ -450,6 +479,9 @@ bool MqttBrokerSession::rememberInbound(uint16_t packetId) {
     if (inboundKnown(packetId)) return false;
     if (_inbound.size() >= _maxQueued) return false;
     _inbound.push_back(packetId);
+#if defined(MQTT_PLATFORM_HOST)
+    if (_journal) _journal->inboundChanged(*this, packetId, true);
+#endif
     return true;
 }
 
@@ -464,10 +496,46 @@ void MqttBrokerSession::forgetInbound(uint16_t packetId) {
     for (size_t index = 0; index < _inbound.size(); index++) {
         if (_inbound[index] == packetId) {
             _inbound.erase(_inbound.begin() + (long)index);
+#if defined(MQTT_PLATFORM_HOST)
+            if (_journal) _journal->inboundChanged(*this, packetId, false);
+#endif
             return;
         }
     }
 }
 
 void MqttBrokerSession::clearInbound() { _inbound.clear(); }
+
+#if defined(MQTT_PLATFORM_HOST)
+// =============================================================================
+// RESTORING WHAT A STORE KEPT
+// =============================================================================
+
+bool MqttBrokerSession::restoreDelivery(const MqttBrokerDelivery& message) {
+    reserveQueue();
+    if (!withinBudget(bytesOf(message))) {
+        messagesDropped++;
+        return false;
+    }
+    for (size_t index = 0; index < _queue.size(); index++) {
+        MqttBrokerDelivery& entry = _queue[index];
+        if (entry.inUse()) continue;
+        entry = message;
+        entry.charged = 0;
+        charge(entry);
+        // Later messages are numbered after every one restored, whatever
+        // order the store hands them over in.
+        if (entry.sequence >= _nextSequence) _nextSequence = entry.sequence + 1;
+        if (index + 1 > _queueExtent) _queueExtent = index + 1;
+        return true;
+    }
+    messagesDropped++;
+    return false;
+}
+
+void MqttBrokerSession::restoreInbound(uint16_t packetId) {
+    if (inboundKnown(packetId) || _inbound.size() >= _maxQueued) return;
+    _inbound.push_back(packetId);
+}
+#endif
 

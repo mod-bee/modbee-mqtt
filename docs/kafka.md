@@ -321,6 +321,7 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
 | `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca, client-certificates, cert-pem, key-pem, client-ca-pem}` ([below](#tls-for-mqtt)), `shards`, `max-connections`, `max-sessions`, `max-session-expiry`, `connect-timeout`, `max-keepalive`, `max-packet`, `queue-bytes`, `queue-bytes-total`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
 | `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required. `certificate-login`: a verified client certificate logs in as the login its CN names ([logins.md](logins.md#logging-in-with-a-certificate)). `default-topics`: `all` (default) or `none` - what a database login with no rules may use ([logins.md](logins.md#what-a-device-may-do)) |
 | `retained:` | `store` (`memory`, `file` or `kafka`), `file` (default `/var/lib/modbee/retained.db`), `topic` (default `modbee-retained`), `cluster` |
+| `sessions:` | `store` (`memory` or `file`), `directory` (default `/var/lib/modbee/sessions`), `sync` (`normal` or `full`) ([docker.md](docker.md#sessions)) |
 | `metrics:` | `enabled`, `address`, `port` (default 9464) |
 | `events:` | `enabled`: publish what clients do on `$modbee/events/...` ([events.md](events.md)) |
 | `kafka.clusters[]` | `id`, `bootstrap-servers`, `tls`, `authentication`, `properties` |
@@ -331,7 +332,7 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
   the messages queued for it, is kept: in seconds, whatever an MQTT 5 client
   asks for, and for an MQTT 3.1.1 persistent session too; 3600 by default.
   `4294967295` keeps it until the broker restarts, since sessions are held in
-  memory.
+  memory - or for good, with `sessions: store: file`.
 - **`broker: queue-bytes`** and **`queue-bytes-total`** bound the memory queued
   messages hold - each is its own copy of topic and payload, and a session
   that is offline queues as well: 1 MB for one session, 64 MB for all of them

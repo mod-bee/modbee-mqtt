@@ -16,6 +16,7 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include <unistd.h>
 
 namespace {
@@ -417,7 +418,14 @@ void RetainedKeeper::stop(uint32_t, MqttBroker&) {
 // THE CHAIN
 // =============================================================================
 
+ShardExtensionChain::~ShardExtensionChain() {
+    for (PerShard& shard : _perShard) {
+        if (shard.epoll >= 0) ::close(shard.epoll);
+    }
+}
+
 bool ShardExtensionChain::begin(size_t shards, std::string& error) {
+    _perShard.assign(shards, PerShard());
     for (ShardExtension* extension : _chain) {
         if (!extension->begin(shards, error)) return false;
     }
@@ -429,11 +437,29 @@ void ShardExtensionChain::prepare(uint32_t shard, MqttBroker& broker) {
 }
 
 int ShardExtensionChain::waitHandle(uint32_t shard) {
+    std::vector<int> handles;
     for (ShardExtension* extension : _chain) {
         const int handle = extension->waitHandle(shard);
-        if (handle >= 0) return handle;
+        if (handle >= 0) handles.push_back(handle);
     }
-    return -1;
+    if (handles.size() <= 1) return handles.empty() ? -1 : handles[0];
+    // More than one: an epoll descriptor is itself readable while any of its
+    // members is, so it fills the shard's one slot for all of them. Each
+    // member drains its own descriptor in its service().
+    if (shard >= _perShard.size()) return handles[0];
+    PerShard& own = _perShard[shard];
+    if (own.epoll < 0) {
+        own.epoll = ::epoll_create1(EPOLL_CLOEXEC);
+        if (own.epoll < 0) return handles[0];
+        for (int handle : handles) {
+            epoll_event event;
+            std::memset(&event, 0, sizeof event);
+            event.events = EPOLLIN;
+            event.data.fd = handle;
+            ::epoll_ctl(own.epoll, EPOLL_CTL_ADD, handle, &event);
+        }
+    }
+    return own.epoll;
 }
 
 uint32_t ShardExtensionChain::offer(uint32_t shard, MqttBroker& broker,
@@ -458,4 +484,31 @@ bool ShardExtensionChain::hasPendingWork(uint32_t shard) {
 
 void ShardExtensionChain::stop(uint32_t shard, MqttBroker& broker) {
     for (ShardExtension* extension : _chain) extension->stop(shard, broker);
+}
+
+uint64_t ShardExtensionChain::forwardedHold(uint32_t shard) {
+    std::vector<std::pair<size_t, uint64_t>> members;
+    for (size_t index = 0; index < _chain.size(); index++) {
+        const uint64_t hold = _chain[index]->forwardedHold(shard);
+        if (hold != 0) members.emplace_back(index, hold);
+    }
+    if (members.empty() || shard >= _perShard.size()) return 0;
+    PerShard& own = _perShard[shard];
+    const uint64_t hold = own.nextHold++;
+    own.holds.emplace_back(hold, std::move(members));
+    return hold;
+}
+
+bool ShardExtensionChain::forwardedSettled(uint32_t shard, uint64_t hold) {
+    if (shard >= _perShard.size()) return true;
+    PerShard& own = _perShard[shard];
+    for (size_t at = 0; at < own.holds.size(); at++) {
+        if (own.holds[at].first != hold) continue;
+        for (const std::pair<size_t, uint64_t>& member : own.holds[at].second) {
+            if (!_chain[member.first]->forwardedSettled(shard, member.second)) return false;
+        }
+        own.holds.erase(own.holds.begin() + (long)at);
+        return true;
+    }
+    return true;
 }

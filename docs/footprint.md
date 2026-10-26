@@ -2,7 +2,7 @@
 
 What this library costs in flash and in RAM, measured rather than claimed.
 
-Measured on 2026-10-04, by the footprint script in the
+Measured on 2026-10-26, by the footprint script in the
 development tree - never typed in by hand.
 Compiler: c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0.
 
@@ -19,7 +19,7 @@ Measured 2026-10-04: buffer growth alone is about 1 kB of the long form.
 
 | | Flash |
 | --- | ---: |
-| the whole library - client, broker, bridge, typed layer, Sparkplug | 230079 |
+| the whole library - client, broker, bridge, typed layer, Sparkplug | 272807 |
 
 ## What this means
 
@@ -51,10 +51,10 @@ is meaningfully smaller**, because every `std::string` and
 
 | | |
 | --- | ---: |
-| `MqttClient` | 13080 bytes |
-| `MqttDevice` | 22160 bytes |
-| `MqttOperations (the send queue)` | 3648 bytes |
-| `MqttSession` | 1336 bytes |
+| `MqttClient` | 2296 bytes |
+| `MqttDevice` | 11328 bytes |
+| `MqttOperations (the send queue)` | 80 bytes |
+| `MqttSession` | 584 bytes |
 | `one queue slot (MqttOperation)` | 112 bytes |
 | `one property set (MqttOwnedProperties)` | 144 bytes |
 
@@ -86,9 +86,9 @@ Measured rather than asserted: two programs, one written against
 
 | | |
 | --- | ---: |
-| `MqttClient`, long form | 48616 bytes |
-| `MqttDevice`, short form | 64320 bytes |
-| **the facade costs** | **15704 bytes** |
+| `MqttClient`, long form | 48854 bytes |
+| `MqttDevice`, short form | 65430 bytes |
+| **the facade costs** | **16576 bytes** |
 
 That buys the subscription table, per-filter routing, the change
 reporter, the NUL-terminated payload copy, the conversions on it -

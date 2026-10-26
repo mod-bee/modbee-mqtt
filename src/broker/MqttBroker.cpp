@@ -242,6 +242,7 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
 #if defined(MQTT_PLATFORM_HOST)
         session.attachIndex(&_sessionIndex, (uint32_t)(&session - _sessions.data()));
         session.attachRoutes(&_routeIndex);
+        session.attachJournal(_journal);
 #endif
     }
 
@@ -300,6 +301,13 @@ void MqttBroker::end() {
         connection.recycle();
     }
 
+#if defined(MQTT_PLATFORM_HOST)
+    // THE SERVER STOPPING IS NOT EVERY SESSION ENDING. The connections above
+    // were closed, and a store was told each session went offline; releasing
+    // the memory below is not the sessions ending, and a store told so would
+    // throw away exactly what it exists to keep.
+    onJournal(nullptr);
+#endif
     for (MqttBrokerSession& session : _sessions) session.release();
     _listeners.clear();
 #if defined(MQTT_PLATFORM_HOST)
@@ -841,6 +849,102 @@ void MqttBroker::handOff(MqttBrokerConnection& connection, int target) {
     }
 }
 
+void MqttBroker::onJournal(MqttSessionJournal* journal) {
+    _journal = journal;
+    for (MqttBrokerSession& session : _sessions) session.attachJournal(journal);
+}
+
+void MqttBroker::waitForJournal(MqttBrokerConnection& connection) {
+    if (connection.waitingForJournal) return;
+    connection.waitingForJournal = true;
+    _journalWaiting.push_back((uint32_t)(&connection - _connections.data()));
+}
+
+void MqttBroker::journalKept() {
+    if (_journalWaiting.empty()) return;
+    std::vector<uint32_t> waiting;
+    waiting.swap(_journalWaiting);
+    for (uint32_t slot : waiting) {
+        if (slot >= _connections.size()) continue;
+        MqttBrokerConnection& connection = _connections[slot];
+        connection.waitingForJournal = false;
+        if (connection.inUse() && !connection.closing) queueWork(connection);
+    }
+}
+
+bool MqttBroker::restoreSession(const MqttBrokerSessionImage& image) {
+    if (image.clientId.empty() || image.expiryInterval == 0) return false;
+    const MqttSpan clientId = asSpan(image.clientId);
+    if (sessionFor(clientId) != nullptr) return false;
+    MqttBrokerSession* session = freeSession();
+    if (session == nullptr) return false;
+
+    // What the store already has is not news to it.
+    session->attachJournal(nullptr);
+    session->adopt(clientId);
+    session->version = image.version;
+    session->expiryInterval = image.expiryInterval;
+    session->setOwner(image.owner);
+    session->connected = false;
+
+    const mq_time_t now = mq_millis();
+    // Gone this long already. A 32-bit millisecond clock cannot look back
+    // further than ~24 days, so a longer absence counts as that: the session
+    // lasts a little longer than it would have, never less.
+    const uint32_t offline = image.offlineMs < 0x7FFFFFFFu ? image.offlineMs : 0x7FFFFFFFu;
+    session->offlineSince = (mq_time_t)(now - offline);
+
+    session->will = image.will;
+    session->will.scheduled = false;
+    if (image.willDue && session->will.present) {
+        session->will.scheduled = true;
+        session->will.scheduledAt = now;
+    }
+
+    for (const MqttBrokerSubscription& subscription : image.subscriptions) {
+        bool replaced = false;
+        session->addSubscription(asSpan(subscription.filter), subscription.options,
+                                 subscription.subscriptionId, replaced);
+    }
+    for (const MqttBrokerRestoredDelivery& restored : image.deliveries) {
+        MqttBrokerDelivery message = restored.message;
+        // An identifier is kept only before a send, so one may have gone out
+        // under it: it goes again with DUP ("might be a re-delivery" [V5:3.3.1.1]).
+        message.sent = false;
+        message.onWire = message.packetId != MQ_PACKET_ID_NONE;
+        message.pubrelOwed = false;
+        message.keptAfter = 0;
+        message.queuedAt = (mq_time_t)(now - restored.ageMs);
+        if (!session->restoreDelivery(message)) _status.dropped++;
+    }
+    for (uint16_t packetId : image.inbound) session->restoreInbound(packetId);
+
+    session->attachJournal(_journal);
+    if (_eventDriven) {
+        if (session->will.scheduled) armWill(*session, now);
+        armExpiry(*session, now);
+    }
+    return true;
+}
+
+void MqttBroker::restoreWill(const MqttBrokerSessionImage& image) {
+    if (!image.will.present || image.clientId.empty()) return;
+    // A session held under its identifier now is a newer one: the store's is
+    // over, and so is the connection whose Will this was.
+    if (sessionFor(asSpan(image.clientId)) != nullptr) return;
+    MqttBrokerSession* session = freeSession();
+    if (session == nullptr) return;
+    // Borrowed for the publish, so the Will goes through the one path every
+    // Will takes - its login's rights, the retained store, the egress hook -
+    // and then released, which tells the store this session is over.
+    session->adopt(asSpan(image.clientId));
+    session->version = image.version;
+    session->setOwner(image.owner);
+    session->will = image.will;
+    publishWill(*session);
+    session->release();
+}
+
 bool MqttBroker::adopt(MqttTransport& transport, MqttListener* origin,
                        const uint8_t* bytes, size_t length) {
     if (_connections.empty()) return false;
@@ -1367,6 +1471,9 @@ void MqttBroker::closeConnection(MqttBrokerConnection& connection,
             session->will.scheduled = true;
             session->will.scheduledAt = mq_millis();
         }
+#if defined(MQTT_PLATFORM_HOST)
+        session->journalChanged();
+#endif
 
         if (_onConnection) {
             _onConnection(_connectionContext, asSpan(session->clientId()), false,
@@ -1724,6 +1831,9 @@ void MqttBroker::publishWill(MqttBrokerSession& session) {
     // delivery path, and a Will still marked scheduled at that moment would be
     // published a second time by the very next poll.
     session.will.clear();
+#if defined(MQTT_PLATFORM_HOST)
+    session.journalChanged();
+#endif
 
     if (!will.present || will.topic.empty()) return;
     // Its topic was allowed at CONNECT; the login's rights may have narrowed
@@ -2316,6 +2426,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // [V5:MQTT-3.1.2-8], and an attached session does not expire.
     _wheel.cancel(session->willTimer);
     _wheel.cancel(session->expiryTimer);
+    session->journalChanged();
 #endif
     connection.session = session;
 
@@ -2825,6 +2936,14 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
             if (candidate && candidate->inUse() && candidate->pubrelOwed) owed = candidate;
         }
         if (owed != nullptr) {
+#if defined(MQTT_PLATFORM_HOST)
+            // As for a PUBLISH: once its PUBREC is kept, so a server killed
+            // after it never sends the PUBLISH again over a finished exchange.
+            if (!session->journalKept(*owed)) {
+                waitForJournal(connection);
+                return;
+            }
+#endif
             MqttPacket pubrel;
             pubrel.header.type = MQ_PKT_PUBREL;
             pubrel.ack.packetId = owed->packetId;
@@ -2863,6 +2982,20 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
             packetId = next->packetId != MQ_PACKET_ID_NONE
                            ? next->packetId : session->allocatePacketId();
             if (packetId == MQ_PACKET_ID_NONE) return;   // try again next poll
+#if defined(MQTT_PLATFORM_HOST)
+            // A KEPT SESSION'S IDENTIFIER IS ON DISK BEFORE THE PUBLISH IS ON
+            // THE WIRE, so a server killed after sending it sends it again
+            // under the same identifier, with DUP [MQTT-4.4.0-1]. It waits
+            // here, in order, until the journal has it (journalKept()).
+            if (next->packetId == MQ_PACKET_ID_NONE && session->journaling()) {
+                next->packetId = packetId;
+                session->journalDelivery(*next);
+            }
+            if (!session->journalKept(*next)) {
+                waitForJournal(connection);
+                return;
+            }
+#endif
         }
 
         MqttPacket packet;
@@ -2877,7 +3010,11 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         // only when this exact message has already been on the wire once - a
         // message queued while the client was offline is NOT a redelivery,
         // however long it waited.
-        packet.publish.dup = next->packetId != MQ_PACKET_ID_NONE && next->sent;
+        //
+        // `onWire` is that proof. `sent` is not - a reconnect clears it so the
+        // message goes out again (markAllUnsent), and reading it here sent
+        // every redelivery after a reconnect without DUP.
+        packet.publish.dup = next->onWire;
 
         if (isV5) {
             restoreProperties(next->properties, MQ_PROPERTIES(packet, packet.publish));
@@ -2986,6 +3123,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         } else {
             next->packetId = packetId;
             next->sent = true;
+            next->onWire = true;
             connection.toPeer.takeOne();
         }
     }
@@ -3405,6 +3543,9 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
 
         delivery->awaitingPubcomp = true;
         delivery->pubrelOwed = true;
+#if defined(MQTT_PLATFORM_HOST)
+        session->journalDelivery(*delivery);
+#endif
         // Sent on this pass rather than the next: the peer is holding the
         // identifier open until it arrives.
         deliverQueued(connection);

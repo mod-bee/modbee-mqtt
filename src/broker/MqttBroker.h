@@ -240,6 +240,39 @@ typedef void (*MqttBrokerHandOffFn)(void* context, int target, MqttTransport& tr
 typedef bool (*MqttBrokerShareGateFn)(void* context, const MqttSpan& shareName,
                                       const MqttSpan& filter);
 
+#if defined(MQTT_PLATFORM_HOST)
+// --- A session a store kept, to put back (host only) ---
+//
+// What MqttBroker::restoreSession() is handed at start-up: everything
+// MqttSessionJournal was told about one session, as the store has it.
+struct MqttBrokerRestoredDelivery {
+    // As it was queued, under the sequence it had. A packet identifier means
+    // it had gone out: it goes again with DUP set, under the same identifier.
+    MqttBrokerDelivery message;
+    // How long ago it was queued, so a Message Expiry Interval kept counting
+    // while the server was down.
+    uint32_t ageMs = 0;
+};
+
+struct MqttBrokerSessionImage {
+    std::string clientId;
+    std::string owner;                 // the login that holds it
+    MqttVersion version = MqttVersion::V5;
+    uint32_t expiryInterval = 0;
+    // How long it has been without a connection: since it went, or since the
+    // server stopped for one that was connected then.
+    uint32_t offlineMs = 0;
+    // Its Will is owed: it was connected when the server stopped, whose end
+    // was no DISCONNECT, or its Will Delay was running [V5:3.1.3.2.2]. It
+    // goes out from now, after its delay, unless the client is back first.
+    bool willDue = false;
+    MqttBrokerWill will;
+    std::vector<MqttBrokerSubscription> subscriptions;   // filter, options, subscriptionId
+    std::vector<MqttBrokerRestoredDelivery> deliveries;
+    std::vector<uint16_t> inbound;                       // QoS 2 identifiers awaiting PUBREL
+};
+#endif
+
 // --- Counters ---
 //
 // Running totals, never flags, for the same reason the client's are: two
@@ -388,6 +421,11 @@ struct MqttBrokerConnection {
     // read is worth a system call. A connection woken only because a message
     // was queued for it has nothing to read, and asking would be an EAGAIN.
     bool readable = false;
+
+    // On the list of slots with a delivery waiting for the session journal
+    // (MqttBroker::journalKept). Like `queued`, it belongs to the slot, not
+    // its occupant, so recycle() leaves it.
+    bool waitingForJournal = false;
 #endif
 
     bool inUse() const { return transport != nullptr; }
@@ -548,6 +586,32 @@ public:
     // caller still owns the transport.
     bool adopt(MqttTransport& transport, MqttListener* origin,
                const uint8_t* bytes, size_t length);
+
+    // --- Sessions that outlive the process (server/sessions/) ---
+
+    // Tells `journal` of every change to every session from now on; see
+    // MqttSessionJournal.h. After begin(). Null stops it. end() tells it
+    // nothing: a server stopping is not every session ending.
+    void onJournal(MqttSessionJournal* journal);
+
+    // Puts back a session a store kept, offline, before clients are accepted:
+    // its subscriptions in the routing index, its queue in order, its expiry
+    // counting from when it went. Told to no journal. False when its client
+    // identifier is taken, there is no free session slot, or its expiry
+    // interval is zero (such a session ends with its connection - see
+    // restoreWill()). Messages its queue cannot hold are counted as dropped.
+    bool restoreSession(const MqttBrokerSessionImage& image);
+
+    // The Will of a session that ended as the server stopped - connected,
+    // with an expiry of zero - published now, as its connection's end would
+    // have [V5:3.1.3.2.2]. Its login's rights apply as for any Will. Call it
+    // where publishing is safe: on the broker's own thread, not before the
+    // other brokers of a server are running.
+    void restoreWill(const MqttBrokerSessionImage& image);
+
+    // The journal has kept further (MqttSessionJournal::kept()): deliveries
+    // waiting for it may go now. Called by the store, on the broker's thread.
+    void journalKept();
 #endif
 
     // --- Polled state ---
@@ -625,6 +689,9 @@ private:
     // second instead of every poll: both are measured in whole seconds.
     MqttTimerWheel _wheel;
     mq_time_t _housekeptAt = 0;
+    MqttSessionJournal* _journal = nullptr;
+    std::vector<uint32_t> _journalWaiting;    // connection slots with a delivery waiting for it
+    void waitForJournal(MqttBrokerConnection& connection);
 
     // Sessions by Client Identifier, and the free session slots: what every
     // CONNECT used to find by walking the whole session table (L11).

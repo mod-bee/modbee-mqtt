@@ -25,6 +25,7 @@
 #include "AuthGate.h"
 #include "TlsSettings.h"
 #include "BrokerEvents.h"
+#include "SessionKeeper.h"
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
 #include "KafkaRetained.h"
@@ -61,6 +62,8 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"password", 0, true, "the password for --username"},
         {"retained-store", 0, true, "where retained messages are kept as well: memory (default), file, kafka"},
         {"retained-file", 0, true, "the file for --retained-store file (default /var/lib/modbee/retained.db)"},
+        {"sessions-store", 0, true, "where persistent sessions are kept as well: memory (default), file"},
+        {"sessions-directory", 0, true, "the directory for --sessions-store file (default /var/lib/modbee/sessions)"},
         {"reserve-up-front", 0, false, "reserve every slot at start instead of on use"},
         {"pin", 0, false, "pin each shard's thread to a core"},
         {"status-every", 0, true, "seconds between status lines (default 5, 0 off)"},
@@ -230,6 +233,20 @@ int cmdServe(int argc, char** argv) {
         file.retained.file = args.get("retained-file");
         if (!args.has("retained-store")) file.retained.store = RetainedStore::File;
     }
+    if (args.has("sessions-store")) {
+        const std::string store = args.get("sessions-store");
+        if (store == "memory") file.sessions.store = SessionStore::Memory;
+        else if (store == "file") file.sessions.store = SessionStore::File;
+        else {
+            std::fprintf(stderr, "modbee serve: --sessions-store is memory or file, not \"%s\"\n",
+                         store.c_str());
+            return 2;
+        }
+    }
+    if (args.has("sessions-directory")) {
+        file.sessions.directory = args.get("sessions-directory");
+        if (!args.has("sessions-store")) file.sessions.store = SessionStore::File;
+    }
     if (args.has("address")) b.address = args.get("address");
     if (args.has("no-plain")) b.plain = false;
     if (args.has("pin")) b.pinThreads = true;
@@ -376,6 +393,16 @@ int cmdServe(int argc, char** argv) {
         }
         if (accounts.count() > 0) extensions.add(&accounts);
     }
+    // SESSIONS, last: the logins are in place before a restored Will is
+    // published, and it is told of every change the others cause.
+    std::unique_ptr<SessionKeeper> sessions;
+    if (file.sessions.store == SessionStore::File) {
+        SessionKeeperConfig k;
+        k.directory = file.sessions.directory;
+        k.syncFull = file.sessions.syncFull;
+        sessions.reset(new SessionKeeper(k));
+        extensions.add(sessions.get());
+    }
     if (!extensions.empty()) config.extension = &extensions;
 
     cliInstallSignalHandlers();
@@ -416,6 +443,16 @@ int cmdServe(int argc, char** argv) {
                                                (unsigned long long)keeper->expired());
         if (keeper->refused() > 0) std::printf(", %llu over max-retained and not restored",
                                                (unsigned long long)keeper->refused());
+        std::printf("\n");
+    }
+    if (sessions) {
+        const SessionKeeperStatus k = sessions->status();
+        std::printf("modbee serve: sessions kept in %s (sync %s): %llu restored",
+                    sessions->directory().c_str(), file.sessions.syncFull ? "full" : "normal",
+                    (unsigned long long)k.restored);
+        if (k.expired > 0) std::printf(", %llu expired while stopped", (unsigned long long)k.expired);
+        if (k.refused > 0) std::printf(", %llu over max-sessions and not restored", (unsigned long long)k.refused);
+        if (k.willsDue > 0) std::printf(", %llu Wills owed", (unsigned long long)k.willsDue);
         std::printf("\n");
     }
     MetricsSources sources;
@@ -492,6 +529,11 @@ int cmdServe(int argc, char** argv) {
             if (keeper && keeper->failures() > 0) {
                 std::printf(" | retained store failures %llu",
                             (unsigned long long)keeper->failures());
+            }
+            if (sessions) {
+                const SessionKeeperStatus k = sessions->status();
+                std::printf(" | sessions kept %llu", (unsigned long long)k.kept);
+                if (k.failures > 0) std::printf(" failures %llu", (unsigned long long)k.failures);
             }
             std::printf("\n");
         }

@@ -66,6 +66,10 @@ int cmdCheck(int argc, char** argv) {
                     config.retained.store == RetainedStore::File  ? ("file " + config.retained.file).c_str()
                   : config.retained.store == RetainedStore::Kafka ? ("kafka topic " + config.retained.topic).c_str()
                                                                   : "memory");
+        std::printf("; sessions: %s",
+                    config.sessions.store == SessionStore::File
+                        ? ("file " + config.sessions.directory + (config.sessions.syncFull ? " (sync full)" : "")).c_str()
+                        : "memory");
         std::printf("; kafka: %zu cluster(s), %zu mqtt-to-kafka, %zu kafka-to-mqtt mapping(s)\n",
                     config.clusters.size(), config.toKafka.size(), config.fromKafka.size());
     }

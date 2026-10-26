@@ -21,3 +21,9 @@ metrics:
 # a restart or an upgrade keeps them.
 retained:
   store: file
+
+# So are sessions, and the messages queued for a device that is away: a device
+# that reconnects after a restart - or after modbee was killed - is sent what
+# it missed (docs/docker.md "Sessions").
+sessions:
+  store: file

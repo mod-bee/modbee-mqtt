@@ -179,6 +179,9 @@ modbee serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca devi
   well, so they survive a restart; `--retained-store kafka` keeps them in
   Kafka (with a `kafka:` section in the file). Memory only is the default.
   [docker.md](docker.md#where-messages-are-kept) compares the three.
+- **`--sessions-directory /var/lib/modbee/sessions`** keeps persistent sessions
+  and the messages queued for them on disk as well, so they survive a restart,
+  or the server being killed ([docker.md](docker.md#sessions)).
 - **TLS** listens beside plain TCP on `--tls-port`, or alone with
   `--no-plain`. On OpenSSL the shards share one TLS context, so a session
   ticket from one is honoured by all of them; on wolfSSL each shard has its

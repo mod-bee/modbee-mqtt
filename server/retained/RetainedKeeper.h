@@ -126,10 +126,12 @@ private:
 };
 
 // Several extensions on one server, in order: each is offered every message,
-// and the PUBACK waits for every party any of them reports. At most one may
-// have a wait handle - the shard has one slot for it.
+// and the PUBACK waits for every party any of them reports. Their wait handles
+// are gathered into one epoll descriptor per shard, the shard's one slot; a
+// forwarded message's report waits for every member's hold.
 class ShardExtensionChain : public ShardExtension {
 public:
+    ~ShardExtensionChain() override;
     void add(ShardExtension* extension) { _chain.push_back(extension); }
     bool empty() const { return _chain.empty(); }
 
@@ -141,7 +143,17 @@ public:
     void service(uint32_t shard, MqttBroker& broker) override;
     bool hasPendingWork(uint32_t shard) override;
     void stop(uint32_t shard, MqttBroker& broker) override;
+    uint64_t forwardedHold(uint32_t shard) override;
+    bool forwardedSettled(uint32_t shard, uint64_t hold) override;
 
 private:
     std::vector<ShardExtension*> _chain;
+    // Per shard, touched only on that shard's thread once it runs.
+    struct PerShard {
+        int epoll = -1;
+        uint64_t nextHold = 1;
+        // A hold of the chain's own, and the members' holds behind it.
+        std::vector<std::pair<uint64_t, std::vector<std::pair<size_t, uint64_t>>>> holds;
+    };
+    std::vector<PerShard> _perShard;
 };

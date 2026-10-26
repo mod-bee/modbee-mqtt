@@ -61,10 +61,12 @@ modbee serve: client events published on $modbee/events/...
   start, or a session that had expired. A new session has no subscriptions
   until it makes them again.
 - **`started`** is published once each time the server starts, before any
-  client can be served. Sessions live in memory, so every client and
-  subscription from before it is gone: a reader keeping who is connected and
-  what they listen on starts over from here. It has no client, so through the
-  pipe it is a record with no key.
+  client can be served. Nobody is connected any more. Without
+  `sessions: store: file` every subscription from before it is gone too: a
+  reader keeping who is connected and what they listen on starts over from
+  here. With it, the sessions are back - a client that returns is
+  `resumed: true` and keeps the subscriptions it had. It has no client, so
+  through the pipe it is a record with no key.
 - **One event per filter.** A SUBSCRIBE with three filters is three
   `subscribed` events. A filter that was refused has none, and an UNSUBSCRIBE
   of a filter the client did not have has none.

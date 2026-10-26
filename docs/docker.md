@@ -469,7 +469,7 @@ named `kafka-password`.
 | | Kept in | Survives a restart or upgrade of modbee |
 | --- | --- | --- |
 | **Retained messages** | memory, and where `retained: store` says | **Yes**, with `store: kafka` or `store: file` |
-| **Sessions**, and messages queued for a device that is away | memory | No |
+| **Sessions**, and messages queued for a device that is away | memory, and where `sessions: store` says | **Yes**, with `store: file` |
 | **Everything sent to Kafka** | Kafka, on disk (the `kafka-data` volume in the `*-kafka` examples) | Yes |
 
 ### Retained messages
@@ -525,10 +525,41 @@ is sent what it missed. `4294967295` keeps sessions until modbee restarts. (A
 kept until the restart.) `broker: queue` (64 by default) is how many messages
 are held for one device.
 
-A restart ends every session, so devices subscribe again. This library's
-client does that by itself; with another client, subscribe in its on-connect
-handler, as its documentation advises. Messages that were queued for a device
-while it was away are lost.
+**With `sessions: store: file`, they survive a restart** - an upgrade, a
+reboot, or modbee being killed outright:
+
+```yaml
+sessions:
+  store: file                          # memory (default) or file
+  directory: /var/lib/modbee/sessions  # one small database per CPU core
+  sync: normal                         # or full
+```
+
+- **What is kept:** every session that outlives its connection - its
+  subscriptions, every QoS 1 and 2 message queued for it, and where each one
+  had got to. A device that reconnects after the restart finds its session
+  (`session present`), and is sent what it missed, in order; a message that
+  had gone out unacknowledged comes again marked as a resend, under the same
+  packet identifier, as MQTT requires. QoS 0 messages are not kept.
+- **A publisher is told only what is kept.** The acknowledgement of a QoS 1 or
+  2 message that was queued for a kept session waits until it is written, so
+  a device told "taken" can forget it: it reaches the session even if modbee is
+  killed the next moment.
+- **Wills are kept too.** A device that was connected when modbee was killed
+  never sent its DISCONNECT, so its Will is published when modbee is back -
+  after its Will delay, unless the device reconnects first. A device that
+  disconnects properly, or a modbee that is stopped, deletes it, as MQTT says.
+- **`sync: normal`** survives modbee being killed or crashing. **`sync: full`**
+  also survives the power going, by waiting for the disk on every write.
+- **A session whose expiry ran out while modbee was stopped is gone** when it
+  starts, as if it had been running.
+- With `MODBEE_SESSIONS_STORE=file` in the environment instead, or
+  `--sessions-directory` on the command line.
+
+Without it, a restart ends every session, so devices subscribe again. This
+library's client does that by itself; with another client, subscribe in its
+on-connect handler, as its documentation advises. Messages that were queued
+for a device while it was away are lost.
 
 ### Kafka
 

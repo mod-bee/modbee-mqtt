@@ -41,7 +41,8 @@ messages.
   [V5:4.1] permits that, and this broker takes the permission. A program that
   keeps its retained messages elsewhere puts them back after `begin()` with
   `restoreRetained()`, which stores without publishing; `modbee serve` does
-  that with a file or Kafka ([docker.md](docker.md#where-messages-are-kept)).
+  that with a file or Kafka, and keeps sessions and their queued messages too
+  ([docker.md](docker.md#where-messages-are-kept)).
 - **No clustering.** One process, one box.
 - **No enhanced authentication.** AUTH is decoded and refused with `0x8C`. A
   client that asks for SCRAM is told no rather than told nothing.

@@ -837,6 +837,9 @@ void crossCheck(Loader& loader, ServerConfig& config) {
                        "(broker.tls.client-ca or client-ca-pem); without one none is asked for",
                        true);
     }
+    if (config.sessions.store == SessionStore::File && config.sessions.directory.empty()) {
+        loader.problem(nullptr, "sessions.directory", "store: file needs a directory to keep them in");
+    }
     RetainedSection& retained = config.retained;
     if (retained.store == RetainedStore::File && retained.file.empty()) {
         loader.problem(nullptr, "retained.file", "store: file needs a file to keep them in");
@@ -1054,6 +1057,20 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     retained.text("topic", out.retained.topic);
     retained.text("cluster", out.retained.cluster);
     retained.finish();
+
+    // Read whether or not the section is there, so MODBEE_SESSIONS_STORE=file
+    // alone turns it on.
+    Section sessions = top.child("sessions");
+    static const char* const kSessionStores[] = {"memory", "file", nullptr};
+    std::string sessionStore;
+    if (sessions.choice("store", sessionStore, kSessionStores)) {
+        out.sessions.store = sessionStore == "file" ? SessionStore::File : SessionStore::Memory;
+    }
+    sessions.text("directory", out.sessions.directory);
+    static const char* const kSyncs[] = {"normal", "full", nullptr};
+    std::string sync;
+    if (sessions.choice("sync", sync, kSyncs)) out.sessions.syncFull = sync == "full";
+    sessions.finish();
 
     Section kafka = top.child("kafka");
     const size_t clusters = kafka.count("clusters");

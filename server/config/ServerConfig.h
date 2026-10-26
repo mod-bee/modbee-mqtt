@@ -193,6 +193,26 @@ struct RetainedSection {
     std::string cluster;               // empty: the only cluster
 };
 
+// --- sessions: ----------------------------------------------------------------
+//
+// Where persistent sessions are kept AS WELL AS memory - their subscriptions,
+// the QoS 1 and 2 messages owed to them, and the Wills of connected clients -
+// so a restart, or the process being killed, loses none of them
+// (server/sessions/SessionKeeper.h). Memory alone is the default.
+enum class SessionStore : uint8_t {
+    Memory,     // nothing outlives the process
+    File,       // one SQLite file per shard, written as each change happens
+};
+
+struct SessionsSection {
+    SessionStore store = SessionStore::Memory;
+    std::string directory = "/var/lib/modbee/sessions";
+    // sync: full - every commit reaches the disk before the PUBACK, which
+    // survives the power going; normal (the default) survives the process
+    // being killed.
+    bool syncFull = false;
+};
+
 // --- authentication: ---------------------------------------------------------
 //
 // Who may connect over MQTT. Empty: anyone - right on a closed network, and
@@ -236,6 +256,7 @@ struct ServerConfig {
     MetricsSection metrics;
     EventsSection events;
     RetainedSection retained;
+    SessionsSection sessions;
     AuthenticationSection authentication;
     std::vector<KafkaClusterConfig> clusters;
     std::vector<MqttToKafkaConfig> toKafka;

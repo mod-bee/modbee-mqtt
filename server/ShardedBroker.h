@@ -103,6 +103,20 @@ public:
     // Shutting down, while the broker still has its clients: finish what can
     // be finished, within a bound.
     virtual void stop(uint32_t shard, MqttBroker& broker) = 0;
+
+    // A QoS 1 or 2 message another shard forwarded has just been routed here,
+    // and that shard's PUBACK waits for this one's report. Return a hold the
+    // report must wait for - what the routing changed is not on disk yet,
+    // say - or 0 to report now.
+    virtual uint64_t forwardedHold(uint32_t shard) { (void)shard; return 0; }
+
+    // Whether a hold is released. Asked every pass until it is; a shard that
+    // is stopping reports regardless.
+    virtual bool forwardedSettled(uint32_t shard, uint64_t hold) {
+        (void)shard;
+        (void)hold;
+        return true;
+    }
 };
 
 // A TLS listener on every shard. Needs a build with a TLS engine (OpenSSL);

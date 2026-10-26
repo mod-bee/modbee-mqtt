@@ -74,6 +74,14 @@ if(NOT MSVC)
 endif()
 
 # --- what clients do, as messages: events: (server/events/) ---
+add_library(modbee-sessions STATIC sessions/SessionKeeper.cpp)
+target_link_libraries(modbee-sessions PUBLIC modbee-server modbee-sqlite)
+target_include_directories(modbee-sessions PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/sessions)
+target_compile_features(modbee-sessions PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(modbee-sessions PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+endif()
+
 add_library(modbee-events STATIC events/BrokerEvents.cpp)
 target_link_libraries(modbee-events PUBLIC modbee-server)
 target_include_directories(modbee-events PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/events)
