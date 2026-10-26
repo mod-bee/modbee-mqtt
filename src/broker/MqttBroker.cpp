@@ -618,8 +618,11 @@ void MqttBroker::pollEvents(mq_time_t now) {
     }
     _working.clear();
 
-    // Session deadlines from the wheel: only the due ones are visited.
-    _wheel.advance(now, &MqttBroker::onTimer, this);
+    // Session deadlines from the wheel: only the due ones are visited. Against
+    // a fresh clock, as poll() does: a session that ended in the pass above
+    // stamped offlineSince after `now`, and its older timer would read that
+    // as 49 days gone.
+    _wheel.advance(mq_millis(), &MqttBroker::onTimer, this);
 
     // The retained store's message expiry, and the session count, once a
     // second rather than every poll. Both are whole-second quantities, and
@@ -1203,9 +1206,16 @@ void MqttBroker::poll() {
     // Wills and session expiry are checked after the connections, because a
     // connection serviced in this same pass may have just ended and scheduled
     // one.
-    serviceWills(now);
-    _status.sessions = expireSessions(now);
-    _retained.sweep(now, &_status.retained);
+    //
+    // AGAINST THE CLOCK AS IT IS NOW, not as it was when this pass began. A
+    // connection that ended during the sweep stamped offlineSince (and a
+    // Will's scheduledAt) with mq_millis() then, and `now` predates it: the
+    // elapsed time wrapped to 49 days and a session kept for 300 s expired in
+    // the same pass, whenever the sweep took a millisecond or more.
+    const mq_time_t swept = mq_millis();
+    serviceWills(swept);
+    _status.sessions = expireSessions(swept);
+    _retained.sweep(swept, &_status.retained);
 
     // COUNTED WHILE SWEEPING, not by sweeping again.
     //
