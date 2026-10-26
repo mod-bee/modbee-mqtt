@@ -492,15 +492,10 @@ int cmdServe(int argc, char** argv) {
         if (!file.api.tlsCert.empty()) read = readWholeFile(file.api.tlsCert, c.tlsCertPem) && read;
         if (!file.api.tlsKey.empty()) read = readWholeFile(file.api.tlsKey, c.tlsKeyPem) && read;
         if (!file.api.tlsClientCa.empty()) read = readWholeFile(file.api.tlsClientCa, c.tlsClientCaPem) && read;
-        if (!file.api.tokenFile.empty()) {
-            read = readWholeFile(file.api.tokenFile, c.token) && read;
-            while (!c.token.empty() && (c.token.back() == '\n' || c.token.back() == '\r' || c.token.back() == ' ')) {
-                c.token.pop_back();
-            }
-            if (c.token.empty()) read = false;
-        }
+        c.token = file.api.token;
+        c.plainTcp = file.api.plain;
         std::string why;
-        if (!read) why = "api: a tls file or the token file could not be read, or the token is empty";
+        if (!read) why = "api: a tls file could not be read";
         connections.reset(new AppConnections(*hub, file.api.stateDirectory));
         if (read && !connections->start(why)) read = false;
         ApiServer::Services s;

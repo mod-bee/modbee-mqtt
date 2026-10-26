@@ -60,7 +60,7 @@ modbee serve: Application API (gRPC) on unix:/run/modbee/api.sock
       cert: /etc/modbee/api.pem
       key: /etc/modbee/api.key
       client-ca: /etc/modbee/apps-ca.pem    # optional: callers present a certificate it signed
-    token-file: /run/secrets/modbee-api
+    token-file: /run/secrets/modbee-api     # or token: <the token itself>
   ```
 
   Every call then carries the token as gRPC metadata,
@@ -72,9 +72,8 @@ modbee serve: Application API (gRPC) on unix:/run/modbee/api.sock
   answers too, for a supervisor's health check.
 - The server needs gRPC to serve it: a build where gRPC was not found says
   so and does not start with an `api:` section (Ubuntu/Debian:
-  `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev`). **The published
-  Docker image does not have it yet**: build `modbee` from source with those
-  packages installed until it does.
+  `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev`). The Docker image
+  and the Windows build have it.
 - **An application on the same machine, on Windows as on Linux**, can use TCP
   on loopback with the token alone - no TLS, since nothing off the machine
   reaches it:
@@ -87,6 +86,25 @@ modbee serve: Application API (gRPC) on unix:/run/modbee/api.sock
 
   That is how it is reached on Windows ([windows.md](windows.md)); the
   server refuses a loopback address without a token.
+- **The server in Docker, your application beside it** (on the host, or in
+  another container): TCP inside the container with `plain: true` - no TLS,
+  the token still required - and the port published on `127.0.0.1` only, or
+  kept on the Docker network. Every setting comes from the environment as
+  well ([docker.md](docker.md#the-application-api)):
+
+  ```yaml
+  environment:
+    MODBEE_API_GRPC: tcp://0.0.0.0:7660
+    MODBEE_API_PLAIN: "true"
+    MODBEE_API_TOKEN: ${MODBEE_API_TOKEN}     # or MODBEE_API_TOKEN_FILE: /run/secrets/...
+  ports:
+    - "127.0.0.1:7660:7660"
+  ```
+
+  `api.plain` is a promise that nothing else reaches the port; the server
+  cannot check it, so it is never the default.
+- **The token**: `api.token` (the token itself) or `api.token-file` (a file
+  holding it) - or `MODBEE_API_TOKEN` / `MODBEE_API_TOKEN_FILE`.
 
 ---
 
@@ -256,7 +274,7 @@ curl -X POST localhost:9464/v1/sessions/pump-1:kick
 - **Errors** are the gRPC status as HTTP - `400` invalid, `401` no token,
   `404` not found, `409` exists, `503` unavailable - with
   `{"code": 404, "message": "..."}`.
-- **Who may call.** With `api.token-file`, every request carries
+- **Who may call.** With a token (`api.token`), every request carries
   `Authorization: Bearer <token>`. Without one, REST must be on a loopback
   address (`metrics.address: 127.x`); the server refuses to start otherwise.
   The listener has no TLS: reach it from another host through a proxy that

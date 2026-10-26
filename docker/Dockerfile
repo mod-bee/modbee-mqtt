@@ -40,9 +40,11 @@ RUN case "${TLS_ENGINE}" in wolfssl|openssl) ;; \
         *) echo "TLS_ENGINE must be wolfssl or openssl, not '${TLS_ENGINE}'" >&2; exit 1 ;; esac
 # autoconf, automake and libtool are for wolfSSL: a tag's tarball carries no
 # generated configure script.
+# gRPC and protobuf are the Application API's (docs/app-api.md): Debian's own.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ make cmake pkg-config ca-certificates curl autoconf automake libtool \
         libssl-dev libsasl2-dev libzstd-dev liblz4-dev zlib1g-dev \
+        libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL -o /tmp/rdkafka.tgz \
         https://github.com/confluentinc/librdkafka/archive/refs/tags/v${RDKAFKA_VERSION}.tar.gz \
@@ -111,15 +113,21 @@ RUN if [ "${TLS_ENGINE}" = wolfssl ]; then \
     fi \
     && cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release -DMQTT_BUILD_CLI=ON -DMQTT_BUILD_SERVER=ON \
         "$find" > /tmp/configure.log \
-    && grep "modbee-mqtt: .* TLS engine\|modbee: librdkafka" /tmp/configure.log \
+    && grep "modbee-mqtt: .* TLS engine\|modbee: librdkafka\|modbee: gRPC" /tmp/configure.log \
     && grep -q "modbee-mqtt: ${engine} found - it is the TLS engine" /tmp/configure.log \
+    && grep -q "modbee: librdkafka .* found" /tmp/configure.log \
+    && grep -q "modbee: gRPC .* found - the Application API is built" /tmp/configure.log \
     && cmake --build /build --target modbee -j"$(nproc)" \
     && strip /build/cli/modbee \
     && mkdir -p /out/lib \
     && ldd /build/cli/modbee | awk '$3 ~ /^\/usr\/local\/lib\// { print $3 }' \
         | xargs -r cp -L -t /out/lib/ \
     && strip --strip-unneeded /out/lib/* \
-    && ls -l /out/lib
+    && ls -l /out/lib \
+    && ldd /build/cli/modbee | awk '$3 ~ /^\/(usr\/)?lib\// { print $3 }' | xargs -r readlink -f \
+        | xargs -r dpkg -S | cut -d: -f1 | sort -u > /out/packages \
+    && test -s /out/packages \
+    && echo "runtime packages:" $(cat /out/packages)
 
 FROM debian:${DEBIAN}
 ARG TLS_ENGINE=wolfssl
@@ -127,9 +135,13 @@ LABEL org.opencontainers.image.title="modbee-mqtt" \
       org.opencontainers.image.description="MQTT 5.0/3.1.1 broker, one shard per core, with a pass-through Kafka pipe" \
       org.opencontainers.image.source="https://github.com/mod-bee/modbee-mqtt" \
       io.modbee.tls-engine="${TLS_ENGINE}"
-# libssl3t64 is librdkafka's (TLS to Kafka), whichever engine serves MQTT.
+# Exactly the packages the binary loads from Debian - gRPC's and protobuf's
+# with the rest, listed by the build stage from the binary itself rather than
+# named here by hand. libssl3t64 is librdkafka's (TLS to Kafka), whichever
+# engine serves MQTT.
+COPY --from=build /out/packages /tmp/packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3t64 libsasl2-2 libzstd1 liblz4-1 zlib1g \
+        ca-certificates libssl3t64 libsasl2-2 libzstd1 liblz4-1 zlib1g $(cat /tmp/packages) \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --shell /usr/sbin/nologin modbee \
     && mkdir -p /etc/modbee && touch /etc/modbee/modbee.yaml \
@@ -139,7 +151,7 @@ COPY --from=build /build/cli/modbee /usr/local/bin/modbee
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/modbee-entrypoint
 RUN ldconfig && modbee check -C /etc/modbee/modbee.yaml -q
 USER modbee
-EXPOSE 1883 8883 9464
+EXPOSE 1883 8883 9464 7660
 # A TCP check of the MQTT ports: healthy once EITHER listener accepts a
 # connection - the plain one or the TLS one - so a broker with plain MQTT
 # turned off (broker: plain: false) is not reported unhealthy. Ports moved

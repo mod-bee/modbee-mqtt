@@ -283,7 +283,13 @@ inline bool apiAddressIsLoopback(const std::string& address) {
 struct ApiSection {
     std::vector<std::string> grpc;       // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
     std::string tlsCert, tlsKey, tlsClientCa;   // PEM files, for tcp://
-    std::string tokenFile;               // a token every call must carry ("authorization: Bearer ...")
+    // A token every call must carry ("authorization: Bearer ..."): api.token,
+    // or api.token-file - and MODBEE_API_TOKEN or MODBEE_API_TOKEN_FILE.
+    std::string token;
+    // TCP without TLS on an address other machines could reach, the token
+    // still required: for a port only published on 127.0.0.1, or a private
+    // network (a Docker network beside the platform).
+    bool plain = false;
     long long maxQueued = 100000;        // per consumer group: past it, the group refuses
     std::string stateDirectory = "/var/lib/modbee";   // managed connections are kept here
     // The REST surface, /v1/..., on the metrics listener: off a loopback

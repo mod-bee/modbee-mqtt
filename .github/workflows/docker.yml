@@ -116,6 +116,39 @@ jobs:
           docker logs under-test | tail -3
           docker rm under-test
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # THE APPLICATION API, the way the platform reaches it: switched on by
+      # the environment, its port published on 127.0.0.1 only, the token the
+      # lock - and a Node application (@grpc/grpc-js) given what devices
+      # publish, in a consumer group.
+      - name: Test the Application API
+        run: |
+          set -euo pipefail
+          docker run -d --name api-test -p 127.0.0.1:17660:7660 \
+            -e MODBEE_API_GRPC=tcp://0.0.0.0:7660 -e MODBEE_API_PLAIN=true -e MODBEE_API_TOKEN=ci-token \
+            modbee-under-test
+          for _ in $(seq 1 30); do docker logs api-test 2>&1 | grep -q "Application API (gRPC)" && break; sleep 1; done
+          docker logs api-test
+          cd examples/app-api/nodejs && npm install --no-audit --no-fund --silent
+          MODBEE_API=127.0.0.1:17660 MODBEE_API_TOKEN=ci-token MODBEE_GROUP=platform MODBEE_FILTERS='plant/#' \
+            timeout 20 node consumer.js > consumer.txt 2>&1 &
+          sleep 3
+          for n in 1 2 3; do
+            docker run --rm --network container:api-test modbee-under-test \
+              pub -h 127.0.0.1 -i "device-$n" -t "plant/line-$n/pressure" -m "3.$n" -q 1
+          done
+          for _ in $(seq 1 15); do test "$(grep -c '"topic":"plant/' consumer.txt || true)" = 3 && break; sleep 1; done
+          cat consumer.txt
+          test "$(grep -c '"topic":"plant/' consumer.txt)" = 3
+          # Without the token: refused.
+          refused=$(MODBEE_API=127.0.0.1:17660 MODBEE_GROUP=x timeout 5 node consumer.js 2>&1 || true)
+          echo "$refused" | head -1
+          echo "$refused" | grep -q UNAUTHENTICATED
+          docker rm -f api-test
+
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3

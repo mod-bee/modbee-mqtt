@@ -34,6 +34,7 @@ struct ApiServerConfig {
     std::string tlsCertPem, tlsKeyPem;    // for tcp://
     std::string tlsClientCaPem;           // set: callers must present a certificate it signed
     std::string token;                    // set: every call carries "authorization: Bearer <token>"
+    bool plainTcp = false;                // tcp:// without TLS anywhere (api.plain), not only on loopback
     std::string serverVersion;            // "modbee-mqtt 0.1.0"
     std::string serverId;                 // this server, stable across restarts
 };

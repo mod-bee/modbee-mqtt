@@ -56,7 +56,7 @@ bool allowed(grpc::CallbackServerContext* context, const std::string& token) {
 
 grpc::Status refusedToken() {
     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
-                        "this call needs \"authorization: Bearer <token>\" (api.token-file)");
+                        "this call needs \"authorization: Bearer <token>\" (api.token)");
 }
 
 grpc::Status noAuthority() {
@@ -1625,7 +1625,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
             self.sockets.push_back(path);
             self.listening.push_back(address);
             ports.emplace_back();
-        } else if (address.compare(0, 6, "tcp://") == 0 && apiAddressIsLoopback(address) &&
+        } else if (address.compare(0, 6, "tcp://") == 0 && (apiAddressIsLoopback(address) || config.plainTcp) &&
                    config.tlsCertPem.empty()) {
             // This machine only, the token the lock: how an application
             // beside the server reaches it on Windows (and may on Linux).
@@ -1815,7 +1815,7 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
         return 503;
     }
     if (!self.config.token.empty() && authorization != "Bearer " + self.config.token) {
-        response = errorBody(401, "this call needs \"Authorization: Bearer <token>\" (api.token-file)");
+        response = errorBody(401, "this call needs \"Authorization: Bearer <token>\" (api.token)");
         return 401;
     }
     const size_t mark = target.find('?');

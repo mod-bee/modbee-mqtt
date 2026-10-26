@@ -377,6 +377,39 @@ admin login, so `docker compose exec modbee modbee pub ...` needs no `-u` or
 
 ---
 
+## The Application API
+
+The image has the [Application API](app-api.md) - how an application, rather
+than a device, uses the broker: every device's messages in consumer groups,
+messages back to the devices, logins decided by your application, managed
+connections, admin. It is off until it is given an address and a token. For an
+application on the same machine (the platform, say), or in another container
+on the same Docker network:
+
+```yaml
+services:
+  modbee:
+    image: ghcr.io/mod-bee/modbee-mqtt
+    environment:
+      MODBEE_API_GRPC: tcp://0.0.0.0:7660
+      MODBEE_API_PLAIN: "true"                 # no TLS: only this machine reaches the port
+      MODBEE_API_TOKEN: ${MODBEE_API_TOKEN}    # every call: authorization: Bearer <token>
+    ports:
+      - "127.0.0.1:7660:7660"                  # this machine only
+```
+
+```
+modbee serve: Application API (gRPC) on tcp://0.0.0.0:7660
+```
+
+Your application connects to `127.0.0.1:7660` (from another container on the
+network: `modbee:7660`, and no `ports:` needed) with any gRPC library and the
+contract, [`proto/modbee/app/v1/app.proto`](../proto/modbee/app/v1/app.proto).
+A call without the token is refused. To reach it from other machines, give it
+TLS instead of `plain` ([app-api.md](app-api.md#turning-it-on)).
+
+---
+
 ## Configuration
 
 modbee reads `/etc/modbee/modbee.yaml`. Every key is in [kafka.md](kafka.md);
@@ -470,7 +503,7 @@ named `kafka-password`.
 | --- | --- | --- |
 | **Retained messages** | memory, and where `retained: store` says | **Yes**, with `store: kafka` or `store: file` |
 | **Sessions**, and messages queued for a device that is away | memory, and where `sessions: store` says | **Yes**, with `store: file` |
-| **Consumer groups** of the Application API, and what they hold (a build with gRPC; not this image yet) | memory, and beside the sessions | **Yes**, with `sessions: store: file` |
+| **Consumer groups** of the Application API, and what they hold | memory, and beside the sessions | **Yes**, with `sessions: store: file` |
 | **Everything sent to Kafka** | Kafka, on disk (the `kafka-data` volume in the `*-kafka` examples) | Yes |
 
 ### Retained messages

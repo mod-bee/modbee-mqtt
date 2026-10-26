@@ -861,14 +861,20 @@ void crossCheck(Loader& loader, ServerConfig& config) {
         } else if (apiAddressIsLoopback(address)) {
             // This machine only - an application beside the server, on
             // Windows as on Linux: the token is the lock.
-            if (config.api.tokenFile.empty()) {
-                loader.problem(nullptr, "api.grpc", "\"" + address + "\" needs api.token-file: any program on "
-                               "this machine can reach it");
+            if (config.api.token.empty()) {
+                loader.problem(nullptr, "api.grpc", "\"" + address + "\" needs api.token (or token-file): any "
+                               "program on this machine can reach it");
             }
-        } else if (config.api.tlsCert.empty() || config.api.tlsKey.empty() || config.api.tokenFile.empty()) {
+        } else if (config.api.plain) {
+            // Without TLS, by choice: a port only published on 127.0.0.1, or a
+            // private network. The token is still the lock.
+            if (config.api.token.empty()) {
+                loader.problem(nullptr, "api.grpc", "\"" + address + "\" with api.plain needs api.token (or token-file)");
+            }
+        } else if (config.api.tlsCert.empty() || config.api.tlsKey.empty() || config.api.token.empty()) {
             loader.problem(nullptr, "api.grpc",
                            "\"" + address + "\" is reachable from other hosts: it needs api.tls (cert, key) "
-                           "and api.token-file");
+                           "and api.token - or api.plain, where only this machine or a private network reaches it");
         }
     }
     if (config.api.rest) {
@@ -876,11 +882,11 @@ void crossCheck(Loader& loader, ServerConfig& config) {
             loader.problem(nullptr, "api.rest", "REST is the Application API's: it needs api.grpc");
         } else if (!config.metrics.enabled) {
             loader.problem(nullptr, "api.rest", "REST is served on the metrics listener: it needs a metrics: section");
-        } else if (config.metrics.address.compare(0, 4, "127.") != 0 && config.api.tokenFile.empty()) {
+        } else if (config.metrics.address.compare(0, 4, "127.") != 0 && config.api.token.empty()) {
             // The metrics listener has no TLS: off loopback, a proxy in front
             // of it should add some.
             loader.problem(nullptr, "api.rest", "metrics.address " + config.metrics.address +
-                           " is reachable from other hosts: REST there needs api.token-file");
+                           " is reachable from other hosts: REST there needs api.token");
         }
     }
     if (config.sessions.store == SessionStore::File && config.sessions.directory.empty()) {
@@ -1041,7 +1047,8 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     apiTls.text("key", out.api.tlsKey);
     apiTls.text("client-ca", out.api.tlsClientCa);
     if (apiTls.present()) apiTls.finish();
-    api.text("token-file", out.api.tokenFile);
+    api.secret("token", out.api.token);
+    api.flag("plain", out.api.plain);
     api.integer("max-queued", out.api.maxQueued, 1, 100000000);
     api.text("state-directory", out.api.stateDirectory);
     api.flag("rest", out.api.rest);
