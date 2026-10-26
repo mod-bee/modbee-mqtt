@@ -1,0 +1,1 @@
+grpc protobuf librdkafka[ssl,zlib,zstd] openssl

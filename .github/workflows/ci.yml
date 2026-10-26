@@ -115,7 +115,10 @@ jobs:
           New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
           # One triplet for the target and the host, release only, built on
           # the work drive and cleaned as it goes: C: is too small for gRPC.
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install grpc protobuf librdkafka openssl `
+          # The release's packages (.github/vcpkg-packages.txt): librdkafka
+          # with TLS and compression, or no cloud Kafka cluster would take it.
+          $packages = (Get-Content .github/vcpkg-packages.txt | Where-Object { $_ -notmatch '^#' }) -join ' ' -split '\s+' | Where-Object { $_ }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install @packages `
             --overlay-triplets=.github/vcpkg-triplets --triplet $env:TRIPLET --host-triplet $env:TRIPLET `
             --x-buildtrees-root=D:\vcpkg-bt --x-packages-root=D:\vcpkg-pk --clean-after-build
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -143,7 +146,10 @@ jobs:
           }
           cmake --build build --config Release -j 4
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & build\cli\Release\modbee.exe --version
+          & build\cli\Release\modbee.exe --version | Tee-Object -FilePath version.txt
+          foreach ($part in 'Kafka pipe: librdkafka.*ssl', 'sasl_scram', 'zstd', 'Application API: gRPC') {
+            if (-not (Select-String -Path version.txt -Pattern $part)) { Write-Error "--version lacks: $part"; exit 1 }
+          }
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
       - name: The Windows service
