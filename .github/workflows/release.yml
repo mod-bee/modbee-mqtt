@@ -1,0 +1,265 @@
+# THE RELEASE: push a tag v1.2.3 and this builds modbee for Linux (x64, arm64)
+# and Windows (x64), tests each build, signs every file, and publishes a
+# GitHub release with the notes from CHANGELOG.md and the files to download.
+#
+#   modbee-<v>-linux-x86_64.tar.gz    one static binary, any Linux (musl)
+#   modbee-<v>-linux-arm64.tar.gz     the same for ARM (a Raspberry Pi 4/5, an ARM server)
+#   modbee-<v>-windows-x86_64.zip     modbee.exe, one file, also a Windows service
+#   *.cdx.json                        each one's CycloneDX SBOM
+#   *.sigstore.json                   each file's Sigstore signature (cosign, keyless)
+#   SHA256SUMS                        the checksums of all of them
+#
+# plus a GitHub build-provenance attestation for every file, so anyone can
+# check a download came from this workflow and this commit (docs/releases.md).
+# Every binary carries the broker, the Kafka pipe and the Application API -
+# a build missing any of them stops the release.
+#
+# REFUSED, before anything is built: a tag that is not the version in
+# CMakeLists.txt and library.properties, and a version with no section in
+# CHANGELOG.md.
+#
+# Run by hand (Actions > release > Run workflow) it does everything except
+# publish: the files are left on the run to download. That is how a release
+# is tried before it is tagged - and it warms the build caches, which take
+# most of an hour to fill the first time.
+#
+# The Docker image is released by docker.yml from the same tag.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: the tag, the version and the notes agree
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          version=$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -1)
+          library=$(sed -n 's/^version=//p' library.properties)
+          echo "CMakeLists.txt: $version, library.properties: $library"
+          test "$version" = "$library" || { echo "::error::CMakeLists.txt says $version, library.properties $library"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "$GITHUB_REF_NAME" = "v$version" || { echo "::error::tag $GITHUB_REF_NAME, but the version is $version - tag v$version"; exit 1; }
+          fi
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## [$version]' section"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest, triplet: x64-linux-static-release }
+          - { arch: arm64, runner: ubuntu-24.04-arm, triplet: arm64-linux-static-release }
+    steps:
+      - uses: actions/checkout@v4
+      - name: vcpkg packages, restored
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ matrix.triplet }}-${{ github.run_id }}
+          restore-keys: vcpkg-${{ matrix.triplet }}-
+      # In Alpine, for musl: the same script anyone can run (scripts/release/build-linux.sh).
+      - name: Build, test and package
+        run: |
+          mkdir -p vcpkg-cache
+          docker run --rm -v "$PWD":/src -w /src -v "$PWD/vcpkg-cache":/cache \
+            -e VCPKG_DEFAULT_BINARY_CACHE=/cache alpine:3.22 sh scripts/release/build-linux.sh
+      # Saved even when a later step fails: an hour of gRPC is never thrown away.
+      - name: vcpkg packages, saved
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ matrix.triplet }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    needs: version
+    runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+      TRIPLET: x64-windows-static-release
+    steps:
+      - uses: actions/checkout@v4
+      - name: vcpkg packages, restored
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ env.TRIPLET }}-${{ github.run_id }}
+          restore-keys: vcpkg-${{ env.TRIPLET }}-
+      - name: Dependencies (vcpkg)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+          $packages = (Get-Content .github/vcpkg-packages.txt | Where-Object { $_ -notmatch '^#' }) -join ' ' -split '\s+' | Where-Object { $_ }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install @packages `
+            --overlay-triplets=.github/vcpkg-triplets --triplet $env:TRIPLET --host-triplet $env:TRIPLET `
+            --x-buildtrees-root=D:\vcpkg-bt --x-packages-root=D:\vcpkg-pk --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: vcpkg packages, saved
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ env.TRIPLET }}-${{ github.run_id }}
+      - name: Build and test
+        shell: pwsh
+        run: |
+          # Each -D quoted whole: PowerShell passes -DNAME=$env:X unexpanded.
+          cmake -S . -B build `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            "-DVCPKG_OVERLAY_TRIPLETS=$env:GITHUB_WORKSPACE/.github/vcpkg-triplets" `
+            "-DVCPKG_TARGET_TRIPLET=$env:TRIPLET" "-DVCPKG_HOST_TRIPLET=$env:TRIPLET" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DMQTT_BUILD_APP_API=ON `
+            -DMQTT_BUILD_EXAMPLES=OFF -DMQTT_BUILD_DEV_TESTS=OFF | Tee-Object -FilePath configure.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($part in 'librdkafka .* found', 'gRPC .* found', 'OpenSSL found') {
+            if (-not (Select-String -Path configure.txt -Pattern $part)) { Write-Error "not found: $part"; exit 1 }
+          }
+          cmake --build build --config Release -j 4
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Check and package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          $exe = "build\cli\Release\modbee.exe"
+          & $exe --version | Tee-Object -FilePath version.txt
+          foreach ($part in 'Kafka pipe: librdkafka.*ssl', 'sasl_scram', 'zstd', 'Application API: gRPC') {
+            if (-not (Select-String -Path version.txt -Pattern $part)) { Write-Error "--version lacks: $part"; exit 1 }
+          }
+          # One file: it needs only what every Windows has - no C++ runtime,
+          # no library DLL beside it.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $dlls = & $dumpbin.FullName /dependents $exe | Where-Object { $_ -match '^\s+\S+\.dll$' } | ForEach-Object { $_.Trim() }
+          Write-Host "needs: $($dlls -join ', ')"
+          $foreign = $dlls | Where-Object {
+            $_ -match '^(VCRUNTIME|MSVCP|ucrtbase|api-ms-win-crt)' -or -not (Test-Path "$env:SystemRoot\System32\$_") }
+          if ($foreign) { Write-Error "modbee.exe needs DLLs not part of Windows: $($foreign -join ', ')"; exit 1 }
+          $name = "modbee-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Force "dist\$name" | Out-Null
+          Copy-Item $exe, LICENSE, README.md "dist\$name\"
+          Compress-Archive -Path "dist\$name\*" -DestinationPath "dist\$name.zip"
+          Remove-Item -Recurse "dist\$name"
+          python scripts/release/sbom.py --installed "$env:VCPKG_INSTALLATION_ROOT\installed\$env:TRIPLET" `
+            --version $env:VERSION --platform windows-x86_64 --out "dist\$name.cdx.json"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  # Everything built and tested: signed, summed, attested - and, for a tag,
+  # published.
+  publish:
+    name: sign and publish
+    needs: [version, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # the release
+      id-token: write        # Sigstore's keyless signing, and the attestations
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum modbee-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/modbee-*
+            dist/SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign
+        working-directory: dist
+        run: |
+          for f in modbee-* SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" >/dev/null
+          done
+          # Each signature checked as a user would check it, before it ships.
+          for f in modbee-* SHA256SUMS; do
+            case "$f" in *.sigstore.json) continue ;; esac
+            cosign verify-blob --bundle "$f.sigstore.json" \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
+          done
+          ls -l
+      - name: The notes
+        run: |
+          # This version's section of CHANGELOG.md, then how to check a download.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[[^]]*\]: / { next }
+            on { print }' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## Downloads
+
+          | File | For |
+          |---|---|
+          | \`modbee-$VERSION-linux-x86_64.tar.gz\` | Linux, x86-64 - one static binary, any distribution |
+          | \`modbee-$VERSION-linux-arm64.tar.gz\` | Linux, ARM 64-bit - Raspberry Pi 4/5, ARM servers |
+          | \`modbee-$VERSION-windows-x86_64.zip\` | Windows, x86-64 - \`modbee.exe\`, also a Windows service |
+          | \`*.cdx.json\` | the CycloneDX SBOM of each: every library inside, with its version and licence |
+          | \`*.sigstore.json\`, \`SHA256SUMS\` | signatures and checksums |
+
+          Each binary is the broker, the Kafka pipe, the Application API and the CLI;
+          \`modbee --version\` lists them. Docker: \`ghcr.io/mod-bee/modbee-mqtt:$VERSION\`.
+
+          ## Checking a download
+
+          \`\`\`sh
+          gh attestation verify modbee-$VERSION-linux-x86_64.tar.gz --repo ${GITHUB_REPOSITORY}
+          \`\`\`
+
+          or with cosign, or by checksum - [docs/releases.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/releases.md).
+          EOF
+          cat notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ env.VERSION }}
+          path: |
+            dist/*
+            notes.md
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+            --title "modbee-mqtt $VERSION" --notes-file notes.md

@@ -37,6 +37,7 @@ Windows service; none of it is part of the Arduino library.
 | | |
 | --- | --- |
 | [docker.md](docker.md) | **Running it**: one command, a stack with a Let's Encrypt certificate, or that stack with Kafka included |
+| [releases.md](releases.md) | **Downloads**: `modbee` for Linux and Windows, ready to run - installing it, and checking a download is genuine |
 | [windows.md](windows.md) | **On Windows**: `modbee.exe serve`, and `modbee service` to run it as a Windows service |
 | [kafka.md](kafka.md) | `modbee.yaml`, and the Kafka pipe: MQTT to Kafka and back, untouched, and exactly what an acknowledgement means |
 | [app-api.md](app-api.md) | The Application API: your application talks to the server over gRPC - and decides who may log in |

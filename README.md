@@ -10,7 +10,7 @@ not start. Those two constraints shaped everything else in it.
 
 ```
  library:  esp32 · esp8266 · mbed (Portenta, Opta, Nano 33) · rp2040 · stm32 · Linux · macOS
- server:   Linux on x86-64 and ARM64, as a Docker image
+ server:   Linux (x86-64, ARM64) and Windows (x86-64), as a download or a Docker image
 ```
 
 ---
@@ -52,7 +52,9 @@ a Windows service too), and not part of the Arduino library.
 | **Kafka pipe** | MQTT to Apache Kafka and back, with messages passed through untouched. A publisher's PUBACK comes back only once Kafka has the message |
 | **Device logins** | A login per device, added, reset and removed while it runs - or devices that register themselves with a provisioning key for their site - with per-device topic permissions (strict, or open to every topic for a login without rules: `authentication.default-topics`) |
 | **Retained messages that survive a restart** | Kept in memory as always, and in a file or a compacted Kafka topic as well, with one setting |
+| **Application API** | Your application beside the server, over gRPC (and REST for admin): consumer groups sharing devices' messages, publishing to devices, and managing connections, sessions and logins ([app-api.md](docs/app-api.md)) |
 | **`modbee` command** | Publish, subscribe, request/response and benchmark from a terminal |
+| **Downloads** | `modbee` for Linux (x86-64, ARM64) as one static binary, and `modbee.exe` for Windows - signed, with an SBOM ([releases.md](docs/releases.md)) |
 | **Docker image** | `ghcr.io/mod-bee/modbee-mqtt`: the server and the `modbee` command, for amd64 and arm64 |
 
 ---

@@ -29,7 +29,9 @@ build2/
 #               docker/ itself IS published: the image and the example stacks.
 #   scripts/    the checks that hold the documentation and the layering to
 #               account, the footprint measurement, and the Arduino shim the
-#               first two compile against
+#               first two compile against. scripts/release/ IS published:
+#               the release workflow runs it, and anyone can build the Linux
+#               release with it
 #
 # WHAT THIS COSTS, so it is a decision rather than a surprise:
 #
@@ -46,7 +48,12 @@ build2/
 # library.properties - is published.
 internal/
 docker/testing/
-scripts/
+scripts/*
+!scripts/release/
 
 # An example app's installed packages (npm install).
 node_modules/
+
+# The release scripts (scripts/release/): what they leave behind.
+dist/
+build-release-*.txt
