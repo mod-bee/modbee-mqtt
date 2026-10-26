@@ -15,9 +15,7 @@
 #include <sstream>
 #include <thread>
 
-#include <fcntl.h>
-#include <sys/epoll.h>
-#include <unistd.h>
+#include "ServerOs.h"
 
 namespace {
 
@@ -213,15 +211,12 @@ public:
     bool load(RetainedSet& into, std::string& error) override {
         // Writable first: a store that cannot be written is one that would
         // fail silently at the first change and lose everything at restart.
-        const std::string probe = _path + ".new";
-        const int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd < 0) {
-            error = "cannot write retained messages to " + _path + ": " + std::strerror(errno) +
+        std::string why;
+        if (!server_os::canWrite(_path + ".new", why)) {
+            error = "cannot write retained messages to " + _path + ": " + why +
                     " (in Docker, mount a volume at its folder - docs/docker.md)";
             return false;
         }
-        ::close(fd);
-        ::unlink(probe.c_str());
 
         std::ifstream file(_path, std::ios::binary);
         if (file) {
@@ -233,7 +228,7 @@ public:
                 // want to look. The server starts with an empty store rather
                 // than not at all.
                 const std::string aside = _path + ".unreadable";
-                ::rename(_path.c_str(), aside.c_str());
+                server_os::replaceFile(_path, aside);
                 std::fprintf(stderr, "modbee serve: %s is not a retained-message file this "
                                      "version can read; moved it to %s and starting empty\n",
                              _path.c_str(), aside.c_str());
@@ -314,27 +309,14 @@ private:
         _dirty = false;
         lock.unlock();
 
-        const std::string temporary = _path + ".new";
-        bool ok = false;
-        const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd >= 0) {
-            size_t written = 0;
-            while (written < data.size()) {
-                const ssize_t n = ::write(fd, data.data() + written, data.size() - written);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) break;
-                written += (size_t)n;
-            }
-            ok = written == data.size() && ::fsync(fd) == 0;
-            ok = ::close(fd) == 0 && ok;
-            ok = ok && ::rename(temporary.c_str(), _path.c_str()) == 0;
-        }
+        std::string why;
+        const bool ok = server_os::writeFileAtomically(_path, data, why);
         lock.lock();
         if (!ok) {
             if (_failures.fetch_add(1) == 0) {
                 std::fprintf(stderr, "modbee serve: could not save retained messages to %s: %s "
                                      "(retrying; counted in the status line)\n",
-                             _path.c_str(), std::strerror(errno));
+                             _path.c_str(), why.c_str());
             }
             // Try again after the usual delay rather than spinning.
             if (!_dirty) {
@@ -418,11 +400,7 @@ void RetainedKeeper::stop(uint32_t, MqttBroker&) {
 // THE CHAIN
 // =============================================================================
 
-ShardExtensionChain::~ShardExtensionChain() {
-    for (PerShard& shard : _perShard) {
-        if (shard.epoll >= 0) ::close(shard.epoll);
-    }
-}
+ShardExtensionChain::~ShardExtensionChain() {}
 
 bool ShardExtensionChain::begin(size_t shards, std::string& error) {
     _perShard.assign(shards, PerShard());
@@ -436,30 +414,15 @@ void ShardExtensionChain::prepare(uint32_t shard, MqttBroker& broker) {
     for (ShardExtension* extension : _chain) extension->prepare(shard, broker);
 }
 
+// One only when exactly one member has one; a shard asks waitHandles().
 int ShardExtensionChain::waitHandle(uint32_t shard) {
     std::vector<int> handles;
-    for (ShardExtension* extension : _chain) {
-        const int handle = extension->waitHandle(shard);
-        if (handle >= 0) handles.push_back(handle);
-    }
-    if (handles.size() <= 1) return handles.empty() ? -1 : handles[0];
-    // More than one: an epoll descriptor is itself readable while any of its
-    // members is, so it fills the shard's one slot for all of them. Each
-    // member drains its own descriptor in its service().
-    if (shard >= _perShard.size()) return handles[0];
-    PerShard& own = _perShard[shard];
-    if (own.epoll < 0) {
-        own.epoll = ::epoll_create1(EPOLL_CLOEXEC);
-        if (own.epoll < 0) return handles[0];
-        for (int handle : handles) {
-            epoll_event event;
-            std::memset(&event, 0, sizeof event);
-            event.events = EPOLLIN;
-            event.data.fd = handle;
-            ::epoll_ctl(own.epoll, EPOLL_CTL_ADD, handle, &event);
-        }
-    }
-    return own.epoll;
+    waitHandles(shard, handles);
+    return handles.size() == 1 ? handles[0] : -1;
+}
+
+void ShardExtensionChain::waitHandles(uint32_t shard, std::vector<int>& out) {
+    for (ShardExtension* extension : _chain) extension->waitHandles(shard, out);
 }
 
 uint32_t ShardExtensionChain::offer(uint32_t shard, MqttBroker& broker,

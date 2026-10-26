@@ -16,23 +16,21 @@
 #include <map>
 #include <unordered_map>
 
+#include "WakeSignal.h"
+
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
 #endif
 
 namespace {
 
-#if defined(__linux__)
-// The token the wake-up eventfd is registered under in a shard's readiness
+// The token the wake-up signal is registered under in a shard's readiness
 // set. The broker ignores tokens that name no connection slot, and this one
-// cannot: no slot index is 0xFFFFFFFE. (Only Linux runs shards.)
+// cannot: no slot index is 0xFFFFFFFE.
 const uint64_t kWakeToken = 0xFFFFFFFFFFFFFFFEull;
 // And the extension's (ShardExtension::waitHandle), for the same reason.
 const uint64_t kExtensionToken = 0xFFFFFFFFFFFFFFFDull;
-#endif
 
 // Counters per shard for "might anybody here want this topic": one slot per
 // routing-key hash, 256 kB a shard. Collisions only ever make a shard look
@@ -207,7 +205,7 @@ struct ShardedBroker::Shard {
     MqttTlsListener tlsListener;
 #endif
     MqttPollSet readiness;
-    int wakeFd = -1;
+    WakeSignal wake;
     std::thread thread;
 
     // A TLS context waiting to be swapped in (ShardedBroker::replaceTls), and
@@ -383,15 +381,11 @@ struct ShardedBroker::Shard {
     // went to it - a write per message would be a system call per message
     // per shard.
     void flushWakes() {
-#if defined(__linux__)
         for (size_t to = 0; to < wakePending.size(); to++) {
             if (!wakePending[to]) continue;
             wakePending[to] = 0;
-            const uint64_t one = 1;
-            const ssize_t ignored = ::write(server->_shards[to]->wakeFd, &one, sizeof one);
-            (void)ignored;
+            server->_shards[to]->wake.signal();
         }
-#endif
     }
 
     bool inboxEmpty() const {
@@ -632,11 +626,7 @@ uint32_t ShardedBroker::Shard::forwardToShards(const MqttBrokerRouted& routed, u
 }
 
 void ShardedBroker::Shard::drain(bool stopping) {
-#if defined(__linux__)
-    uint64_t counter = 0;
-    const ssize_t ignored = ::read(wakeFd, &counter, sizeof counter);   // non-blocking
-    (void)ignored;
-#endif
+    wake.drain();
     retryOverflow();
 
     size_t handled = 0;
@@ -813,11 +803,6 @@ ShardedBroker::ShardedBroker() {}
 ShardedBroker::~ShardedBroker() { stop(); }
 
 bool ShardedBroker::start(const ShardedBrokerConfig& config) {
-#if !defined(__linux__)
-    _lastError = "the sharded broker needs Linux (SO_REUSEPORT, epoll, eventfd)";
-    (void)config;
-    return false;
-#else
     if (_running) return false;
     size_t count = config.shards;
     if (count == 0) count = std::thread::hardware_concurrency();
@@ -877,8 +862,7 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
             other->endListeners();
             // Each shard's wake-up descriptor, too: a server that failed to
             // start and was asked again leaked one per shard per attempt.
-            if (other->wakeFd >= 0) ::close(other->wakeFd);
-            other->wakeFd = -1;
+            other->wake.close();
         }
         _shards.clear();
         return false;
@@ -894,6 +878,16 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
     // Listeners first, on the calling thread, so a port that cannot be had
     // is reported here rather than discovered by a thread. The first binds
     // (an ephemeral port, if 0 was asked for); the rest join it.
+    //
+    // WHERE THE KERNEL CANNOT SHARE A PORT between listeners (SO_REUSEPORT
+    // balancing is Linux's; Windows has nothing like it) shard 0 alone
+    // listens, and the hand-off every shard already does at CONNECT - to the
+    // shard that owns the client identifier - spreads the connections.
+#if defined(__linux__)
+    const bool everyShardListens = true;
+#else
+    const bool everyShardListens = false;
+#endif
     uint16_t port = config.port;
     uint16_t tlsPort = config.tls.port;
     for (std::unique_ptr<Shard>& shard : _shards) {
@@ -902,7 +896,8 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
         std::snprintf(s.prefix, sizeof s.prefix, "auto-s%u-", s.index);
         s.config.assignedIdPrefix = s.prefix;
 
-        if (config.plain) {
+        const bool listens = everyShardListens || s.index == 0;
+        if (config.plain && listens) {
             s.listener.configure(config.address.c_str(), port, s.config.maxConnections);
             s.listener.setReusePort(count > 1);
             if (!s.listener.begin()) {
@@ -911,7 +906,7 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
             if (port == 0) port = s.listener.boundPort();
         }
 #if MQTT_TLS_SOCKETS
-        if (config.tls.enabled) {
+        if (config.tls.enabled && listens) {
             const ShardedTlsConfig& tls = config.tls;
             const std::string& address = tls.address.empty() ? config.address : tls.address;
             s.tlsListener.configure(address.c_str(), tlsPort, s.config.maxConnections);
@@ -941,18 +936,18 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
 #endif
 
         s.broker.begin(s.config);
-        if (config.plain) s.broker.addListener(s.listener);
+        if (config.plain && listens) s.broker.addListener(s.listener);
 #if MQTT_TLS_SOCKETS
-        if (config.tls.enabled) s.broker.addListener(s.tlsListener);
+        if (config.tls.enabled && listens) s.broker.addListener(s.tlsListener);
 #endif
         if (!s.readiness.beginPersistent()) return abandon("could not create an epoll set");
         s.broker.useReadiness(s.readiness);
-        s.wakeFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (s.wakeFd < 0) return abandon("could not create a wake-up descriptor");
-        s.readiness.add(s.wakeFd, kWakeToken, false);
+        if (!s.wake.open()) return abandon("could not create a wake-up descriptor");
+        s.readiness.add(s.wake.handle(), kWakeToken, false);
         if (_extension != nullptr) {
-            const int handle = _extension->waitHandle(s.index);
-            if (handle >= 0) s.readiness.add(handle, kExtensionToken, false);
+            std::vector<int> handles;
+            _extension->waitHandles(s.index, handles);
+            for (int handle : handles) s.readiness.add(handle, kExtensionToken, false);
             s.broker.onEgress(&Shard::onEgress, &s);   // one shard or many
         }
         if (count > 1) {
@@ -978,37 +973,27 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
     for (std::unique_ptr<Shard>& shard : _shards) {
         Shard* s = shard.get();
         s->thread = std::thread([this, s] { run(*s); });
+#if defined(__linux__)
         if (config.pinThreads) {
             cpu_set_t set;
             CPU_ZERO(&set);
             CPU_SET(s->index % std::thread::hardware_concurrency(), &set);
             pthread_setaffinity_np(s->thread.native_handle(), sizeof set, &set);
         }
+#endif
     }
     _running = true;
     return true;
-#endif
 }
 
 void ShardedBroker::stop() {
     if (!_running) return;
     _stopping.store(true, std::memory_order_release);
-#if defined(__linux__)
-    for (std::unique_ptr<Shard>& shard : _shards) {
-        const uint64_t one = 1;
-        const ssize_t ignored = ::write(shard->wakeFd, &one, sizeof one);
-        (void)ignored;
-    }
-#endif
+    for (std::unique_ptr<Shard>& shard : _shards) shard->wake.signal();
     for (std::unique_ptr<Shard>& shard : _shards) {
         if (shard->thread.joinable()) shard->thread.join();
     }
-#if defined(__linux__)
-    for (std::unique_ptr<Shard>& shard : _shards) {
-        if (shard->wakeFd >= 0) ::close(shard->wakeFd);
-        shard->wakeFd = -1;
-    }
-#endif
+    for (std::unique_ptr<Shard>& shard : _shards) shard->wake.close();
 #if MQTT_TLS_SOCKETS
     // A context replaceTls() delivered after the last pass took one.
     for (std::unique_ptr<Shard>& shard : _shards) {
@@ -1072,9 +1057,7 @@ bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) 
             shard.tlsPending = contexts[i];
             shard.tlsSwap.store(true, std::memory_order_release);
         }
-        const uint64_t one = 1;
-        const ssize_t ignored = ::write(shard.wakeFd, &one, sizeof one);
-        (void)ignored;
+        shard.wake.signal();
     }
     std::lock_guard<std::mutex> guard(_tlsLock);
     const std::string address = _tlsServed.address;

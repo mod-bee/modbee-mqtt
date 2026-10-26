@@ -12,7 +12,7 @@
 #include <cstring>
 #include <list>
 
-#include <sys/eventfd.h>
+#include "WakeSignal.h"
 #include <unistd.h>
 
 namespace {
@@ -211,7 +211,7 @@ struct Authority::Shard {
     Authority* owner = nullptr;
     uint32_t index = 0;
     MqttBroker* broker = nullptr;
-    int eventFd = -1;
+    WakeSignal waker;
 
     // --- The shard's own thread ---
     struct Kept {
@@ -239,9 +239,7 @@ struct Authority::Shard {
     std::vector<std::shared_ptr<Command>> commands;
 
     void wake() {
-        const uint64_t one = 1;
-        const ssize_t ignored = ::write(eventFd, &one, sizeof one);
-        (void)ignored;
+        waker.signal();
     }
 
     void keep(const std::string& key, const std::string& login, const AuthorityDecision& decision,
@@ -309,7 +307,7 @@ Authority::~Authority() {
     _tick.notify_all();
     if (_timer.joinable()) _timer.join();
     for (std::unique_ptr<Shard>& shard : _shards) {
-        if (shard->eventFd >= 0) ::close(shard->eventFd);
+        shard->waker.close();
     }
 }
 
@@ -324,8 +322,7 @@ bool Authority::begin(size_t shards, std::string& error) {
         shard->owner = this;
         shard->index = (uint32_t)index;
         shard->capacity = shards ? (_config.cacheSize + shards - 1) / shards : 0;
-        shard->eventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (shard->eventFd < 0) {
+        if (!shard->waker.open()) {
             error = "authority: could not create a wake-up descriptor";
             return false;
         }
@@ -342,7 +339,7 @@ void Authority::prepare(uint32_t shard, MqttBroker& broker) {
 }
 
 int Authority::waitHandle(uint32_t shard) {
-    return shard < _shards.size() ? _shards[shard]->eventFd : -1;
+    return shard < _shards.size() ? _shards[shard]->waker.handle() : -1;
 }
 
 void Authority::stop(uint32_t, MqttBroker&) {}
@@ -617,9 +614,7 @@ void Authority::timeouts() {
 void Authority::service(uint32_t index, MqttBroker& broker) {
     if (index >= _shards.size()) return;
     Shard& shard = *_shards[index];
-    uint64_t counter = 0;
-    const ssize_t ignored = ::read(shard.eventFd, &counter, sizeof counter);
-    (void)ignored;
+    shard.waker.drain();
 
     std::vector<std::pair<uint64_t, Shard::Outcome>> arrivals;
     std::vector<std::shared_ptr<Command>> commands;

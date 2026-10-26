@@ -48,6 +48,29 @@
     #include <sys/epoll.h>
     #include <unistd.h>
     #define MQ_HAVE_EPOLL 1
+    namespace {
+    typedef int MqEpoll;
+    MqEpoll epollOf(intptr_t stored) { return (MqEpoll)stored; }
+    intptr_t createEpoll() {
+        const int made = epoll_create1(EPOLL_CLOEXEC);
+        return made < 0 ? -1 : (intptr_t)made;
+    }
+    void closeEpoll(intptr_t stored) { ::close((int)stored); }
+    }
+#elif defined(_WIN32) && defined(MQTT_HAVE_WEPOLL)
+    // Windows: the same calls, by wepoll (third_party/wepoll), which a CMake
+    // build on Windows compiles in.
+    #include "wepoll.h"
+    #define MQ_HAVE_EPOLL 1
+    namespace {
+    typedef HANDLE MqEpoll;
+    MqEpoll epollOf(intptr_t stored) { return (MqEpoll)stored; }
+    intptr_t createEpoll() {
+        const HANDLE made = epoll_create1(0);
+        return made == nullptr ? -1 : (intptr_t)made;
+    }
+    void closeEpoll(intptr_t stored) { epoll_close((HANDLE)stored); }
+    }
 #endif
 
 #if defined(MQ_HAVE_EPOLL)
@@ -71,17 +94,17 @@ void MqttPollSet::end() {
     _watched.clear();
     _ready.clear();
 #if defined(MQ_HAVE_EPOLL)
-    if (_epoll >= 0) ::close(_epoll);
+    if (_epoll != kNoEpoll) closeEpoll(_epoll);
 #endif
-    _epoll = -1;
+    _epoll = kNoEpoll;
     _open = false;
 }
 
 bool MqttPollSet::beginPersistent() {
 #if defined(MQ_HAVE_EPOLL)
     end();
-    _epoll = epoll_create1(EPOLL_CLOEXEC);
-    if (_epoll < 0) return false;
+    _epoll = createEpoll();
+    if (_epoll == kNoEpoll) return false;
     _events.resize(kEventsPerWait * sizeof(struct epoll_event));
     _ready.reserve(kEventsPerWait);
     _open = true;
@@ -93,12 +116,12 @@ bool MqttPollSet::beginPersistent() {
 
 bool MqttPollSet::add(int handle, uint64_t token, bool wantWrite) {
 #if defined(MQ_HAVE_EPOLL)
-    if (_epoll < 0 || handle < 0) return false;
+    if (_epoll == kNoEpoll || handle < 0) return false;
     struct epoll_event event;
     std::memset(&event, 0, sizeof event);
     event.events = EPOLLIN | EPOLLRDHUP | (wantWrite ? (uint32_t)EPOLLOUT : 0u);
     event.data.u64 = token;
-    return epoll_ctl(_epoll, EPOLL_CTL_ADD, handle, &event) == 0;
+    return epoll_ctl(epollOf(_epoll), EPOLL_CTL_ADD, handle, &event) == 0;
 #else
     (void)handle; (void)token; (void)wantWrite;
     return false;
@@ -107,12 +130,12 @@ bool MqttPollSet::add(int handle, uint64_t token, bool wantWrite) {
 
 bool MqttPollSet::update(int handle, uint64_t token, bool wantWrite) {
 #if defined(MQ_HAVE_EPOLL)
-    if (_epoll < 0 || handle < 0) return false;
+    if (_epoll == kNoEpoll || handle < 0) return false;
     struct epoll_event event;
     std::memset(&event, 0, sizeof event);
     event.events = EPOLLIN | EPOLLRDHUP | (wantWrite ? (uint32_t)EPOLLOUT : 0u);
     event.data.u64 = token;
-    return epoll_ctl(_epoll, EPOLL_CTL_MOD, handle, &event) == 0;
+    return epoll_ctl(epollOf(_epoll), EPOLL_CTL_MOD, handle, &event) == 0;
 #else
     (void)handle; (void)token; (void)wantWrite;
     return false;
@@ -121,12 +144,12 @@ bool MqttPollSet::update(int handle, uint64_t token, bool wantWrite) {
 
 void MqttPollSet::remove(int handle) {
 #if defined(MQ_HAVE_EPOLL)
-    if (_epoll < 0 || handle < 0) return;
+    if (_epoll == kNoEpoll || handle < 0) return;
     // The event argument is ignored for DEL but must be non-null before
     // Linux 2.6.9; passing one costs nothing.
     struct epoll_event event;
     std::memset(&event, 0, sizeof event);
-    epoll_ctl(_epoll, EPOLL_CTL_DEL, handle, &event);
+    epoll_ctl(epollOf(_epoll), EPOLL_CTL_DEL, handle, &event);
 #else
     (void)handle;
 #endif
@@ -147,11 +170,11 @@ void MqttPollSet::watch(int handle, bool forWriting) {
 
 int MqttPollSet::wait(int timeoutMs) {
 #if defined(MQ_HAVE_EPOLL)
-    if (_epoll >= 0) {
+    if (_epoll != kNoEpoll) {
         _ready.clear();
         _fresh = true;
         struct epoll_event* events = (struct epoll_event*)_events.data();
-        const int count = epoll_wait(_epoll, events, (int)kEventsPerWait, timeoutMs);
+        const int count = epoll_wait(epollOf(_epoll), events, (int)kEventsPerWait, timeoutMs);
         if (count <= 0) return 0;
         for (int index = 0; index < count; index++) {
             // EPOLLERR and EPOLLHUP are readiness, for the same reason POLLERR
@@ -191,7 +214,7 @@ int MqttPollSet::wait(int timeoutMs) {
 bool MqttPollSet::isReady(int handle) const {
     // Persistent mode answers by token, not by descriptor; a caller asking
     // this question there gets the safe answer.
-    if (_epoll >= 0) return true;
+    if (_epoll != kNoEpoll) return true;
     if (handle < 0) return false;
     for (size_t index = 0; index < _watched.size(); index++) {
         if (_watched[index].handle == handle) return _watched[index].ready;

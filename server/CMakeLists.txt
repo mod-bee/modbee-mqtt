@@ -57,9 +57,14 @@ target_compile_features(modbee-config PUBLIC cxx_std_17)
 # --- the sharded broker ---
 add_library(modbee-server STATIC
     ShardedBroker.cpp
+    WakeSignal.cpp
+    ServerOs.cpp
     MetricsEndpoint.cpp
 )
 target_link_libraries(modbee-server PUBLIC modbee-mqtt Threads::Threads)
+if(WIN32)
+    target_link_libraries(modbee-server PUBLIC bcrypt)   # BCryptGenRandom (ServerOs.cpp)
+endif()
 target_include_directories(modbee-server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(modbee-server PUBLIC cxx_std_17)
 

@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "GroupStore.h"
+#include "ServerOs.h"
 
 #include "sqlite3.h"
 #include "MqttProperties.h"
@@ -13,7 +14,6 @@
 #include <cstring>
 #include <map>
 
-#include <sys/stat.h>
 
 struct GroupStore::Change {
     enum Kind : uint8_t { PutGroup, DropGroup, PutMessage, DropMessage } kind = PutGroup;
@@ -206,7 +206,7 @@ std::string GroupStore::path() const {
 
 bool GroupStore::open(std::vector<StoredGroup>& groups, uint64_t& nextId, std::function<void()> committed,
                       std::string& error) {
-    ::mkdir(_config.directory.c_str(), 0700);
+    server_os::makeDirectory(_config.directory, 0700);
     const std::string file = path();
     if (sqlite3_open_v2(file.c_str(), &_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
         error = file + ": " + (_db ? sqlite3_errmsg(_db) : "cannot open");

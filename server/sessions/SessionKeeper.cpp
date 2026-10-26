@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "SessionKeeper.h"
+#include "ServerOs.h"
 
 #include "sqlite3.h"
 #include "MqttProperties.h"
@@ -16,10 +17,8 @@
 #include <cstring>
 #include <map>
 
-#include <dirent.h>
-#include <sys/eventfd.h>
+#include "WakeSignal.h"
 #include <sys/stat.h>
-#include <unistd.h>
 
 namespace {
 
@@ -95,9 +94,9 @@ std::string fileFor(const std::string& directory, size_t shards, size_t shard) {
 }
 
 void removeFile(const std::string& path) {
-    ::unlink(path.c_str());
-    ::unlink((path + "-wal").c_str());
-    ::unlink((path + "-shm").c_str());
+    std::remove(path.c_str());
+    std::remove((path + "-wal").c_str());
+    std::remove((path + "-shm").c_str());
 }
 
 // One file's statements: what a writer applies, and what a rewrite uses to
@@ -422,7 +421,7 @@ struct SessionKeeper::Shard : public MqttSessionJournal {
     std::deque<std::pair<uint64_t, std::vector<Change>>> handed;
     bool quit = false;
     std::atomic<uint64_t> done{0};     // the last batch committed (or given up on)
-    int eventFd = -1;
+    WakeSignal waker;
     std::thread writer;
     std::atomic<uint64_t> commits{0}, changes{0}, failures{0}, keptCount{0};
 
@@ -636,9 +635,7 @@ struct SessionKeeper::Shard : public MqttSessionJournal {
             }
             apply(batch.second);
             done.store(batch.first, std::memory_order_release);
-            const uint64_t one = 1;
-            const ssize_t ignored = ::write(eventFd, &one, sizeof one);
-            (void)ignored;
+            waker.signal();
         }
     }
 
@@ -762,7 +759,7 @@ SessionKeeper::~SessionKeeper() {
         if (shard->writer.joinable()) shard->writer.join();
         shard->statements.finalize();
         if (shard->db) sqlite3_close(shard->db);
-        if (shard->eventFd >= 0) ::close(shard->eventFd);
+        shard->waker.close();
     }
 }
 
@@ -770,16 +767,13 @@ bool SessionKeeper::load(size_t shards, std::vector<std::vector<MqttBrokerSessio
                          std::string& error) {
     // Every file there, grouped by the shard count it was written for.
     std::map<size_t, std::map<size_t, std::string>> sets;
-    if (DIR* dir = ::opendir(_config.directory.c_str())) {
-        while (dirent* entry = ::readdir(dir)) {
-            size_t count = 0, shard = 0;
-            char tail[8] = {0};
-            if (std::sscanf(entry->d_name, "sessions-%zu-%zu.d%2s", &count, &shard, tail) == 3 &&
-                std::strcmp(tail, "b") == 0 && shard < count) {
-                sets[count][shard] = _config.directory + "/" + entry->d_name;
-            }
+    for (const std::string& name : server_os::listDirectory(_config.directory)) {
+        size_t count = 0, shard = 0;
+        char tail[8] = {0};
+        if (std::sscanf(name.c_str(), "sessions-%zu-%zu.d%2s", &count, &shard, tail) == 3 &&
+            std::strcmp(tail, "b") == 0 && shard < count) {
+            sets[count][shard] = _config.directory + "/" + name;
         }
-        ::closedir(dir);
     }
 
     // A set is used only if every file of it was finished: a rewrite cut short
@@ -916,8 +910,8 @@ bool SessionKeeper::begin(size_t shards, std::string& error) {
         error = "sessions: store: file needs a directory";
         return false;
     }
-    if (::mkdir(_config.directory.c_str(), 0700) != 0 && errno != EEXIST) {
-        error = "sessions.directory " + _config.directory + ": " + std::strerror(errno);
+    if (!server_os::makeDirectory(_config.directory, 0700)) {
+        error = "sessions.directory " + _config.directory + ": " + server_os::lastError();
         return false;
     }
     std::vector<std::vector<MqttBrokerSessionImage>> images;
@@ -937,8 +931,7 @@ bool SessionKeeper::begin(size_t shards, std::string& error) {
             if (error.empty()) error = path + ": " + sqlite3_errmsg(shard->db);
             return false;
         }
-        shard->eventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (shard->eventFd < 0) {
+        if (!shard->waker.open()) {
             error = "sessions: could not create a wake-up descriptor";
             return false;
         }
@@ -982,7 +975,7 @@ void SessionKeeper::prepare(uint32_t shard, MqttBroker& broker) {
 }
 
 int SessionKeeper::waitHandle(uint32_t shard) {
-    return shard < _shards.size() ? _shards[shard]->eventFd : -1;
+    return shard < _shards.size() ? _shards[shard]->waker.handle() : -1;
 }
 
 uint32_t SessionKeeper::offer(uint32_t shard, MqttBroker&, const MqttBrokerRouted&, uint64_t deferral) {
@@ -1016,9 +1009,7 @@ void SessionKeeper::service(uint32_t shard, MqttBroker& broker) {
         wills.swap(own.wills);
         for (const MqttBrokerSessionImage& image : wills) broker.restoreWill(image);
     }
-    uint64_t counter = 0;
-    const ssize_t ignored = ::read(own.eventFd, &counter, sizeof counter);
-    (void)ignored;
+    own.waker.drain();
     own.seal();
     own.conclude(broker, false);
     const uint64_t committed = own.done.load(std::memory_order_acquire);

@@ -10,8 +10,20 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
-#include <poll.h>
+#include <chrono>
+#include <thread>
+
+#include "transport/MqttSocketSupport.h"   // poll, or WSAPoll
+
+#if defined(_WIN32)
+#include <process.h>
+#define MQ_CLI_POLL WSAPoll
+typedef WSAPOLLFD MqCliPollFd;
+#else
 #include <unistd.h>
+#define MQ_CLI_POLL ::poll
+typedef struct pollfd MqCliPollFd;
+#endif
 
 namespace {
 
@@ -27,14 +39,14 @@ void onSignal(int) { g_stop = 1; }
 void cliIdle(MqttTransport* transport, int ms) {
     const int fd = transport ? transport->waitHandle() : -1;
     if (fd < 0 || (transport && transport->hasBufferedInput())) {
-        if (fd < 0) usleep(1000);
+        if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         return;
     }
-    struct pollfd p;
+    MqCliPollFd p;
+    std::memset(&p, 0, sizeof p);
     p.fd = fd;
     p.events = POLLIN;
-    p.revents = 0;
-    ::poll(&p, 1, ms);
+    MQ_CLI_POLL(&p, 1, ms);
 }
 
 bool cliStopRequested() { return g_stop != 0; }
@@ -42,7 +54,9 @@ bool cliStopRequested() { return g_stop != 0; }
 void cliInstallSignalHandlers() {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
+#if defined(SIGPIPE)
     std::signal(SIGPIPE, SIG_IGN);
+#endif
 }
 
 std::vector<ArgSpec> connectionSpecs() {
@@ -108,7 +122,13 @@ bool CliClient::configure(Args& args, const char* defaultClientIdPrefix, std::st
 
     connection.clientId = args.has("id")
         ? args.get("id")
-        : std::string(defaultClientIdPrefix) + "-" + std::to_string((long)getpid());
+        : std::string(defaultClientIdPrefix) + "-" + std::to_string((long)
+#if defined(_WIN32)
+                                                                                _getpid()
+#else
+                                                                                getpid()
+#endif
+                                                                                );
 
     // -u and -P, or else the server's own login from the environment - so
     // `docker compose exec modbee modbee pub ...` logs in to the server it

@@ -19,8 +19,7 @@
 #include <set>
 #include <sstream>
 
-#include <sys/stat.h>
-#include <unistd.h>
+#include "ServerOs.h"
 
 namespace {
 
@@ -65,15 +64,8 @@ AppPublishResult resultOf(MqttResult result, bool confirmDelivered) {
 }
 
 bool writePrivate(const std::string& path, const std::string& text) {
-    const std::string temporary = path + ".new";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out << text;
-        if (!out) return false;
-    }
-    ::chmod(temporary.c_str(), 0600);
-    return ::rename(temporary.c_str(), path.c_str()) == 0;
+    std::string ignored;
+    return server_os::writeFileAtomically(path, text, ignored, 0600);
 }
 
 std::string toJson(const AppConnectionSpec& s) {
@@ -236,7 +228,7 @@ AppConnections::~AppConnections() { stop(); }
 
 bool AppConnections::start(std::string& error) {
     if (!_directory.empty()) {
-        ::mkdir(_directory.c_str(), 0700);
+        server_os::makeDirectory(_directory, 0700);
         if (!load(error)) return false;
     }
     _hub.attachConnections(this);

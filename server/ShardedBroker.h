@@ -86,6 +86,13 @@ public:
     // wait wakes for it. -1 for none.
     virtual int waitHandle(uint32_t shard) = 0;
 
+    // Every descriptor the shard should wait on for this extension: the one
+    // above, or - a chain of extensions - each member's.
+    virtual void waitHandles(uint32_t shard, std::vector<int>& out) {
+        const int handle = waitHandle(shard);
+        if (handle >= 0) out.push_back(handle);
+    }
+
     // Every message that ORIGINATED on this shard (a client's PUBLISH, a
     // Will, publishMessage()), after local routing and cross-shard
     // forwarding. `deferral` as for MqttBrokerEgressFn: return how many

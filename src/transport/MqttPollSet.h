@@ -81,7 +81,7 @@ public:
     //
     // False where there is no epoll; the caller then uses begin() instead.
     bool beginPersistent();
-    bool persistent() const { return _epoll >= 0; }
+    bool persistent() const { return _epoll != kNoEpoll; }
 
     // Level-triggered: a descriptor that still has data is reported again on
     // the next wait, so a caller that reads only some of it loses nothing.
@@ -145,8 +145,10 @@ private:
 
     // Persistent mode. The event array is raw bytes for the same reason _fds
     // is: so this header does not pull <sys/epoll.h> into everything that
-    // includes the broker.
-    int _epoll = -1;
+    // includes the broker. The set itself is a descriptor on Linux and a
+    // HANDLE on Windows (wepoll): kept in an integer that holds either.
+    static constexpr intptr_t kNoEpoll = -1;
+    intptr_t _epoll = kNoEpoll;
     std::vector<unsigned char> _events;
     std::vector<uint64_t> _ready;
     bool _fresh = false;

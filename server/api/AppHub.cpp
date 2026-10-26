@@ -14,7 +14,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include <sys/eventfd.h>
+#include "WakeSignal.h"
 #include <unistd.h>
 
 namespace {
@@ -110,7 +110,7 @@ struct AppHub::Group {
 struct AppHub::Shard {
     uint32_t index = 0;
     MqttBroker* broker = nullptr;
-    int eventFd = -1;
+    WakeSignal waker;
     std::mutex lock;
     std::deque<std::pair<AppPublish, std::function<void(const AppPublishResult&)>>> publishes;
     // While this hub's own publish is routed: its offer() knows it by this.
@@ -121,9 +121,7 @@ struct AppHub::Shard {
     std::deque<std::pair<uint64_t, uint64_t>> holds;
 
     void wake() {
-        const uint64_t one = 1;
-        const ssize_t ignored = ::write(eventFd, &one, sizeof one);
-        (void)ignored;
+        waker.signal();
     }
 };
 
@@ -141,7 +139,7 @@ AppHub::~AppHub() {
         for (Member* member : group.second->members) delete member;
     }
     for (std::unique_ptr<Shard>& shard : _shards) {
-        if (shard->eventFd >= 0) ::close(shard->eventFd);
+        shard->waker.close();
     }
 }
 
@@ -150,8 +148,7 @@ bool AppHub::begin(size_t shards, std::string& error) {
     for (size_t index = 0; index < shards; index++) {
         std::unique_ptr<Shard> shard(new Shard());
         shard->index = (uint32_t)index;
-        shard->eventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (shard->eventFd < 0) {
+        if (!shard->waker.open()) {
             error = "messages: could not create a wake-up descriptor";
             return false;
         }
@@ -215,7 +212,7 @@ void AppHub::prepare(uint32_t shard, MqttBroker& broker) {
 }
 
 int AppHub::waitHandle(uint32_t shard) {
-    return shard < _shards.size() ? _shards[shard]->eventFd : -1;
+    return shard < _shards.size() ? _shards[shard]->waker.handle() : -1;
 }
 
 void AppHub::stop(uint32_t index, MqttBroker& broker) {
@@ -647,9 +644,7 @@ void AppHub::expireFollowed() {
 void AppHub::service(uint32_t index, MqttBroker& broker) {
     if (index >= _shards.size()) return;
     Shard& shard = *_shards[index];
-    uint64_t counter = 0;
-    const ssize_t ignored = ::read(shard.eventFd, &counter, sizeof counter);
-    (void)ignored;
+    shard.waker.drain();
     // PUBACKs whose messages are now on disk.
     if (_store) {
         const uint64_t written = _store->committed();

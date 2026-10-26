@@ -137,7 +137,9 @@ public:
 
     bool begin(size_t shards, std::string& error) override;
     void prepare(uint32_t shard, MqttBroker& broker) override;
+    // Each member's descriptor, for the shard to wait on itself.
     int waitHandle(uint32_t shard) override;
+    void waitHandles(uint32_t shard, std::vector<int>& out) override;
     uint32_t offer(uint32_t shard, MqttBroker& broker, const MqttBrokerRouted& message,
                    uint64_t deferral) override;
     void service(uint32_t shard, MqttBroker& broker) override;
@@ -150,7 +152,6 @@ private:
     std::vector<ShardExtension*> _chain;
     // Per shard, touched only on that shard's thread once it runs.
     struct PerShard {
-        int epoll = -1;
         uint64_t nextHold = 1;
         // A hold of the chain's own, and the members' holds behind it.
         std::vector<std::pair<uint64_t, std::vector<std::pair<size_t, uint64_t>>>> holds;

@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "AuthGate.h"
+#include "ServerOs.h"
 #include "TopicRules.h"
 #include "AdminReply.h"
 #include "AuthHash.h"
@@ -16,8 +17,6 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <algorithm>
 
 using admin_reply::failure;
@@ -182,9 +181,7 @@ std::string describeKey(const AuthKey& k) {
 }
 
 std::string stamp() {
-    const std::time_t t = std::time(nullptr);
-    std::tm utc;
-    gmtime_r(&t, &utc);
+    const std::tm utc = server_os::utcTime(std::time(nullptr));
     char out[32];
     std::strftime(out, sizeof out, "%Y%m%d-%H%M%S", &utc);
     return out;
@@ -906,19 +903,15 @@ std::string AuthGate::admin(const std::string& requestText) {
 // --- Backups -----------------------------------------------------------------
 
 bool AuthGate::backupNow(std::string& path, std::string& error) {
-    ::mkdir(_config.backupDirectory.c_str(), 0750);
+    server_os::makeDirectory(_config.backupDirectory, 0750);
     path = _config.backupDirectory + "/auth-" + stamp() + ".db";
     if (!_store.backup(path, error)) return false;
     // Keep the newest few. The names sort by time.
     std::vector<std::string> files;
-    if (DIR* dir = ::opendir(_config.backupDirectory.c_str())) {
-        while (dirent* entry = ::readdir(dir)) {
-            const std::string name = entry->d_name;
-            if (startsWith(name, "auth-") && name.size() > 3 && name.compare(name.size() - 3, 3, ".db") == 0) {
-                files.push_back(name);
-            }
+    for (const std::string& name : server_os::listDirectory(_config.backupDirectory)) {
+        if (startsWith(name, "auth-") && name.size() > 3 && name.compare(name.size() - 3, 3, ".db") == 0) {
+            files.push_back(name);
         }
-        ::closedir(dir);
     }
     std::sort(files.begin(), files.end());
     for (size_t i = 0; _config.backupsKept > 0 && i + (size_t)_config.backupsKept < files.size(); i++) {

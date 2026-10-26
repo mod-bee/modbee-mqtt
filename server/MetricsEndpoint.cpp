@@ -5,12 +5,18 @@
 
 #include "MetricsEndpoint.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "transport/MqttSocketSupport.h"   // POSIX sockets, or Winsock
+
+#if defined(_WIN32)
+    #define MQ_POLL WSAPoll
+    typedef WSAPOLLFD MqPollFd;
+    #define MQ_SEND_FLAGS 0
+    #define SOCK_CLOEXEC 0
+#else
+    #define MQ_POLL ::poll
+    typedef struct pollfd MqPollFd;
+    #define MQ_SEND_FLAGS MSG_NOSIGNAL
+#endif
 
 #include <cctype>
 #include <cstdio>
@@ -21,28 +27,29 @@ bool MetricsEndpoint::start(const std::string& address, uint16_t port, RenderFn 
                             void* context, std::string& error) {
     _render = render;
     _context = context;
-    _listen = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    mq_socket::ensureWinsock();
+    _listen = (int)::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (_listen < 0) { error = "metrics: no socket"; return false; }
     const int one = 1;
-    setsockopt(_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(_listen, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
     sockaddr_in at;
     std::memset(&at, 0, sizeof at);
     at.sin_family = AF_INET;
     at.sin_port = htons(port);
     if (inet_pton(AF_INET, address.empty() ? "0.0.0.0" : address.c_str(), &at.sin_addr) != 1) {
         error = "metrics: " + address + " is not an IPv4 address";
-        ::close(_listen); _listen = -1;
+        MQ_CLOSE(_listen); _listen = -1;
         return false;
     }
     if (::bind(_listen, (sockaddr*)&at, sizeof at) != 0 || ::listen(_listen, 16) != 0) {
         error = "metrics: port " + std::to_string(port) + " is already in use";
-        ::close(_listen); _listen = -1;
+        MQ_CLOSE(_listen); _listen = -1;
         return false;
     }
     socklen_t length = sizeof at;
     getsockname(_listen, (sockaddr*)&at, &length);
     _port = ntohs(at.sin_port);
-    _wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    _wake.open();
     _stopping = false;
     _thread = std::thread([this] { serve(); });
     return true;
@@ -51,12 +58,10 @@ bool MetricsEndpoint::start(const std::string& address, uint16_t port, RenderFn 
 void MetricsEndpoint::stop() {
     if (!_thread.joinable()) return;
     _stopping = true;
-    const uint64_t one = 1;
-    const ssize_t ignored = ::write(_wake, &one, sizeof one);
-    (void)ignored;
+    _wake.signal();
     _thread.join();
-    ::close(_listen); _listen = -1;
-    ::close(_wake); _wake = -1;
+    MQ_CLOSE(_listen); _listen = -1;
+    _wake.close();
 }
 
 namespace {
@@ -80,7 +85,7 @@ bool readRequest(int client, Request& request) {
     char chunk[4096];
     size_t headEnd = std::string::npos;
     while (headEnd == std::string::npos) {
-        const ssize_t got = ::recv(client, chunk, sizeof chunk, 0);
+        const int got = (int)::recv(client, chunk, (int)sizeof chunk, 0);
         if (got <= 0) return false;
         data.append(chunk, (size_t)got);
         headEnd = data.find("\r\n\r\n");
@@ -116,7 +121,7 @@ bool readRequest(int client, Request& request) {
     }
     request.body = data.substr(headEnd + 4);
     while (request.body.size() < length) {
-        const ssize_t got = ::recv(client, chunk, sizeof chunk, 0);
+        const int got = (int)::recv(client, chunk, (int)sizeof chunk, 0);
         if (got <= 0) return false;
         request.body.append(chunk, (size_t)got);
     }
@@ -128,15 +133,24 @@ bool readRequest(int client, Request& request) {
 
 void MetricsEndpoint::serve() {
     while (!_stopping.load()) {
-        pollfd fds[2] = {{_listen, POLLIN, 0}, {_wake, POLLIN, 0}};
-        if (::poll(fds, 2, 1000) <= 0 || !(fds[0].revents & POLLIN)) continue;
-        const int client = ::accept4(_listen, nullptr, nullptr, SOCK_CLOEXEC);
+        MqPollFd fds[2];
+        std::memset(fds, 0, sizeof fds);
+        fds[0].fd = _listen;
+        fds[0].events = POLLIN;
+        fds[1].fd = _wake.handle();
+        fds[1].events = POLLIN;
+        if (MQ_POLL(fds, 2, 1000) <= 0 || !(fds[0].revents & POLLIN)) continue;
+        const int client = (int)::accept(_listen, nullptr, nullptr);
         if (client < 0) continue;
         // A client that dribbles its request gets two seconds a read, then
         // the door.
+#if defined(_WIN32)
+        const DWORD timeout = 2000;
+#else
         timeval timeout = {2, 0};
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+#endif
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof timeout);
         Request request;
         const bool got = readRequest(client, request);
         const std::string& target = request.target;
@@ -184,11 +198,11 @@ void MetricsEndpoint::serve() {
         const std::string response = head + body;
         size_t sent = 0;
         while (sent < response.size()) {
-            const ssize_t n = ::send(client, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+            const int n = (int)::send(client, response.data() + sent, (int)(response.size() - sent), MQ_SEND_FLAGS);
             if (n <= 0) break;
             sent += (size_t)n;
         }
-        ::close(client);
+        MQ_CLOSE(client);
     }
 }
 

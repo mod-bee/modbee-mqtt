@@ -17,6 +17,7 @@
 // to `rest` whole (ApiServer::rest).
 
 #include "ShardedBroker.h"
+#include "WakeSignal.h"
 
 #include <atomic>
 #include <cstdint>
@@ -50,7 +51,7 @@ public:
 
 private:
     int _listen = -1;
-    int _wake = -1;
+    WakeSignal _wake;
     uint16_t _port = 0;
     RenderFn _render = nullptr;
     ReadyFn _ready = nullptr;

@@ -40,13 +40,13 @@ else()
     set(_mqtt_top_level OFF)
 endif()
 
-if(_mqtt_top_level AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(_mqtt_top_level AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32))
     option(MQTT_BUILD_SERVER "Build the multi-core server tier" ON)
 else()
     option(MQTT_BUILD_SERVER "Build the multi-core server tier" OFF)
 endif()
 
-if(_mqtt_top_level AND UNIX)
+if(_mqtt_top_level AND (UNIX OR WIN32))
     option(MQTT_BUILD_CLI "Build the modbee command-line tool" ON)
 else()
     option(MQTT_BUILD_CLI "Build the modbee command-line tool" OFF)
@@ -188,6 +188,13 @@ target_include_directories(modbee-mqtt PUBLIC
 )
 
 if(WIN32)
+    # epoll on Windows, for the broker's persistent readiness set
+    # (MqttPollSet): wepoll, a BSD-licensed C file vendored in third_party/.
+    # Built only here - an Arduino build never sees it.
+    enable_language(C)
+    target_sources(modbee-mqtt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wepoll/wepoll.c)
+    target_include_directories(modbee-mqtt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wepoll)
+    target_compile_definitions(modbee-mqtt PRIVATE MQTT_HAVE_WEPOLL=1)
     target_link_libraries(modbee-mqtt PUBLIC ws2_32)
 else()
     target_link_libraries(modbee-mqtt PUBLIC Threads::Threads)

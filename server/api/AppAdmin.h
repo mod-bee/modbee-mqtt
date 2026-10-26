@@ -12,7 +12,7 @@
 // A broker is single-threaded: what an administrator asks of the sessions or
 // the retained messages is done on each shard's own thread, between two passes
 // of its loop, and gathered. A ShardExtension that offers nothing and holds
-// nothing: a queue per shard and the eventfd that wakes it.
+// nothing: a queue per shard and the WakeSignal that wakes it.
 
 #include "ShardedBroker.h"
 

@@ -9,7 +9,7 @@
 #include <cstring>
 #include <vector>
 
-#include <sys/random.h>
+#include "ServerOs.h"
 
 namespace auth {
 
@@ -186,13 +186,7 @@ void pbkdf2Sha256(const uint8_t* password, size_t passwordLength, const uint8_t*
 }
 
 bool randomBytes(uint8_t* out, size_t length) {
-    size_t got = 0;
-    while (got < length) {
-        const ssize_t n = getrandom(out + got, length - got, 0);
-        if (n <= 0) return false;
-        got += (size_t)n;
-    }
-    return true;
+    return server_os::randomBytes(out, length);
 }
 
 std::string generateSecret(size_t length) {
