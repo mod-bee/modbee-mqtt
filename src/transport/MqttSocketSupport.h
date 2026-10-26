@@ -70,6 +70,7 @@
     // A non-blocking connect() that has not finished yet. Not an error: the
     // caller comes back and asks again rather than waiting.
     #define MQ_IN_PROGRESS (WSAGetLastError() == WSAEWOULDBLOCK)
+    #define MQ_SHUT_WR SD_SEND
 #else
     #include <sys/types.h>
     #include <sys/socket.h>
@@ -84,9 +85,44 @@
     #define MQ_CLOSE ::close
     #define MQ_WOULD_BLOCK (errno == EAGAIN || errno == EWOULDBLOCK)
     #define MQ_IN_PROGRESS (errno == EINPROGRESS)
+    #define MQ_SHUT_WR SHUT_WR
 #endif
 
 namespace mq_socket {
+
+/** How a non-blocking connect() stands, without waiting: still going, done,
+ *  or failed. A socket becomes writable both when it connects and when it
+ *  fails, so the error queue is what actually says which - skipping it reports
+ *  a refused connection as an established one, and the first write then fails
+ *  for a reason that looks nothing like the cause. */
+enum class ConnectOutcome { Pending, Connected, Failed };
+
+inline ConnectOutcome connectOutcome(int socketHandle) {
+#if defined(_WIN32)
+    fd_set writable;
+    fd_set failed;
+    FD_ZERO(&writable); FD_SET((SOCKET)socketHandle, &writable);
+    FD_ZERO(&failed);   FD_SET((SOCKET)socketHandle, &failed);
+    timeval immediately = { 0, 0 };
+    const int ready = select(0, nullptr, &writable, &failed, &immediately);
+    if (ready <= 0) return ConnectOutcome::Pending;
+    const bool bad = FD_ISSET((SOCKET)socketHandle, &failed) != 0;
+#else
+    struct pollfd watch;
+    watch.fd = socketHandle;
+    watch.events = POLLOUT;
+    watch.revents = 0;
+    const int ready = ::poll(&watch, 1, 0);    // zero timeout: never waits
+    if (ready <= 0) return ConnectOutcome::Pending;
+    const bool bad = (watch.revents & (POLLERR | POLLHUP)) != 0;
+#endif
+    int error = 0;
+    socklen_t length = sizeof error;
+    if (bad || getsockopt(socketHandle, SOL_SOCKET, SO_ERROR, (char*)&error, &length) != 0 || error != 0) {
+        return ConnectOutcome::Failed;
+    }
+    return ConnectOutcome::Connected;
+}
 
 #if defined(_WIN32)
 struct WinsockGuard {

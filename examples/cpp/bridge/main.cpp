@@ -30,7 +30,7 @@ static volatile sig_atomic_t g_running = 1;
 static void stop(int) { g_running = 0; }
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);   // a size: Windows aborts on 0
     std::signal(SIGINT, stop);
     std::signal(SIGTERM, stop);
 

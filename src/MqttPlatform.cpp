@@ -32,8 +32,11 @@
     #define MQ_BOARD_HAS_PSRAM_HEAP 0
 #endif
 
-#if defined(MQTT_PLATFORM_HOST) || MQ_BOARD_HAS_SYSTEM_CLOCK
-// gettimeofday, for mq_epochMillis(); settimeofday on a board.
+#if defined(MQTT_PLATFORM_HOST)
+// The system clock, for mq_epochMillis(): std::chrono, which Windows has too.
+#include <chrono>
+#elif MQ_BOARD_HAS_SYSTEM_CLOCK
+// gettimeofday and settimeofday, the board's own clock.
 #include <sys/time.h>
 #include <time.h>
 #endif
@@ -119,9 +122,8 @@ void mq_resetClockSource() {
 // legitimate answer rather than a failure.
 uint64_t mq_epochMillis() {
 #if defined(MQTT_PLATFORM_HOST)
-    struct timeval now;
-    if (gettimeofday(&now, nullptr) != 0) return 0;
-    return (uint64_t)now.tv_sec * 1000ull + (uint64_t)(now.tv_usec / 1000);
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
 #elif MQ_BOARD_HAS_SYSTEM_CLOCK
     // The board's own clock, which counts from boot until somebody sets it -
     // SNTP, a modem's network time, an RTC. A reading before 2024 is that boot

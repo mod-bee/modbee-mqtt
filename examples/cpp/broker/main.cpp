@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     // Line buffered on purpose: output to a pipe - a service manager, a
     // container log - is block buffered by default, so a process killed before
     // its buffer fills appears to have said nothing at all.
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);   // a size: Windows aborts on 0
     std::signal(SIGINT, stop);
     std::signal(SIGTERM, stop);
 

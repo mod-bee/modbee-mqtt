@@ -30,7 +30,7 @@ namespace {
 //
 // Bounded, so a peer that keeps sending cannot hold the socket open.
 void drainBeforeClose(int socketHandle) {
-    ::shutdown(socketHandle, SHUT_WR);
+    ::shutdown(socketHandle, MQ_SHUT_WR);
 
     uint8_t discard[1024];
     for (int pass = 0; pass < 16; pass++) {
@@ -155,33 +155,9 @@ bool MqttTcpTransport::finishConnecting() {
     }
     if (!_connecting || _socket < 0) return _connected;
 
-#if defined(_WIN32)
-    fd_set writable;
-    fd_set failed;
-    FD_ZERO(&writable); FD_SET((SOCKET)_socket, &writable);
-    FD_ZERO(&failed);   FD_SET((SOCKET)_socket, &failed);
-    timeval immediately = { 0, 0 };
-    const int ready = select(0, nullptr, &writable, &failed, &immediately);
-    if (ready <= 0) return false;
-    const bool bad = FD_ISSET((SOCKET)_socket, &failed) != 0;
-#else
-    struct pollfd watch;
-    watch.fd = _socket;
-    watch.events = POLLOUT;
-    watch.revents = 0;
-    const int ready = poll(&watch, 1, 0);      // zero timeout: never waits
-    if (ready <= 0) return false;
-    const bool bad = (watch.revents & (POLLERR | POLLHUP)) != 0;
-#endif
-
-    // A socket becomes writable both when it connects and when it fails, so
-    // the error queue is what actually says which. Skipping this reports a
-    // refused connection as an established one, and the first write then fails
-    // for a reason that looks nothing like the cause.
-    int error = 0;
-    socklen_t length = sizeof error;
-    if (bad || getsockopt(_socket, SOL_SOCKET, SO_ERROR, (char*)&error, &length) != 0
-            || error != 0) {
+    const mq_socket::ConnectOutcome outcome = mq_socket::connectOutcome(_socket);
+    if (outcome == mq_socket::ConnectOutcome::Pending) return false;
+    if (outcome == mq_socket::ConnectOutcome::Failed) {
         // THIS ADDRESS failed, not the host. Take the next one; nextAddress()
         // is what finally gives up, and only once every candidate is spent.
         MQ_CLOSE(_socket);

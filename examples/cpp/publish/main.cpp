@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
     // killed before its buffer fills appears to have said nothing at all. On a
     // device diagnosed from its log that is the difference between a fault you
     // can see and one you cannot.
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);   // a size: Windows aborts on 0
     std::signal(SIGINT, stop);
     std::signal(SIGTERM, stop);
 

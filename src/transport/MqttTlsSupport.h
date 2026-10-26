@@ -209,7 +209,9 @@ inline std::string keyFingerprint(X509* certificate) {
         return std::string();
     }
 #else
-    X509_PUBKEY* spki = X509_get_X509_PUBKEY(certificate);
+    // auto*: OpenSSL 4 returns it const, 1.1 and 3 do not, and
+    // i2d_X509_PUBKEY takes whichever its version hands out.
+    auto* spki = X509_get_X509_PUBKEY(certificate);
     if (spki == nullptr) return std::string();
 
     unsigned char* der = nullptr;
@@ -820,8 +822,17 @@ inline HostnameCheck expectHostname(SSL* ssl, const char* host) {
     // No partial wildcards: *.example.com is a certificate for a domain,
     // while w*.example.com is a certificate for an argument.
     SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    return SSL_set1_host(ssl, host) == 1 ? HostnameCheckArmed
-                                         : HostnameCheckFailed;
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+    // OpenSSL 4 splits SSL_set1_host() in two: an address is checked against
+    // the certificate's IP addresses, a name against its DNS names.
+    ASN1_OCTET_STRING* address = a2i_IPADDRESS(host);
+    const bool isAddress = address != nullptr;
+    ASN1_OCTET_STRING_free(address);
+    const int armed = isAddress ? SSL_set1_ipaddr(ssl, host) : SSL_set1_dnsname(ssl, host);
+#else
+    const int armed = SSL_set1_host(ssl, host);
+#endif
+    return armed == 1 ? HostnameCheckArmed : HostnameCheckFailed;
 #endif
 }
 

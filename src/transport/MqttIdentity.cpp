@@ -427,10 +427,14 @@ bool MqttIdentity::generate(uint32_t validDays) {
 
     if (X509_set_pubkey(cert, key) != 1) { clear(); return fail("the public key would not attach"); }
 
-    X509_NAME* name = X509_get_subject_name(cert);
-    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+    // A name of its own, set as the subject: OpenSSL 4 hands out the
+    // certificate's own one read-only.
+    X509_NAME* name = X509_NAME_new();
+    if (name == nullptr ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                    (const unsigned char*)_commonName.c_str(),
                                    -1, -1, 0) != 1) {
+        X509_NAME_free(name);
         clear();
         return fail("the common name would not be set");
     }
@@ -438,7 +442,9 @@ bool MqttIdentity::generate(uint32_t validDays) {
                                (const unsigned char*)"ModBee", -1, -1, 0);
 
     // Self-signed: the issuer IS the subject.
-    if (X509_set_issuer_name(cert, name) != 1) { clear(); return fail("the issuer would not be set"); }
+    const bool named = X509_set_subject_name(cert, name) == 1 && X509_set_issuer_name(cert, name) == 1;
+    X509_NAME_free(name);
+    if (!named) { clear(); return fail("the subject and issuer would not be set"); }
 
     // CA:TRUE because this certificate is also the only trust anchor there is.
     // A client that would rather validate a chain than pin a key loads this

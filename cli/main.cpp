@@ -57,7 +57,7 @@ void usage() {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);   // a size: Windows aborts on 0
 
     if (argc < 2 || std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "help") == 0) {
         usage();

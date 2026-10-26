@@ -18,15 +18,6 @@
 #include <string.h>
 #include <errno.h>
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-
 
 
 MqttTlsTransport::~MqttTlsTransport() { closeAll(); }
@@ -76,7 +67,7 @@ void MqttTlsTransport::closeAll() {
         _context = nullptr;
     }
     if (_socket >= 0) {
-        ::close(_socket);
+        MQ_CLOSE(_socket);
         _socket = -1;
     }
     _addresses.reset();          // candidates belong to one attempt
@@ -274,16 +265,9 @@ bool MqttTlsTransport::finishTcp() {
         }
     }
 
-    struct pollfd watch;
-    watch.fd = _socket;
-    watch.events = POLLOUT;
-    watch.revents = 0;
-    if (poll(&watch, 1, 0) <= 0) return false;
-
-    int error = 0;
-    socklen_t length = sizeof error;
-    if ((watch.revents & (POLLERR | POLLHUP)) != 0 ||
-        getsockopt(_socket, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
+    const mq_socket::ConnectOutcome outcome = mq_socket::connectOutcome(_socket);
+    if (outcome == mq_socket::ConnectOutcome::Pending) return false;
+    if (outcome == mq_socket::ConnectOutcome::Failed) {
         // THIS ADDRESS failed - not the host. Close it and try the next one;
         // nextAddress() is what finally gives up, and only once every
         // candidate has been tried.

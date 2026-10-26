@@ -24,7 +24,7 @@ namespace {
 void drainBeforeClose(int socketHandle) {
     // Tell the peer we are done writing. Our own outbound data is flushed by
     // the stack first, so anything already queued still goes.
-    ::shutdown(socketHandle, SHUT_WR);
+    ::shutdown(socketHandle, MQ_SHUT_WR);
 
     // Then swallow whatever is still coming, so close() has no unread data to
     // reset over. A few kilobytes and a few passes: enough for the packets a
