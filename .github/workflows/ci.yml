@@ -128,10 +128,12 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
+          # Each -D quoted whole: PowerShell passes -DNAME=$env:X unexpanded,
+          # and vcpkg then looks for a triplet literally named "$env:X".
           cmake -S . -B build `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_OVERLAY_TRIPLETS="${{ github.workspace }}/.github/vcpkg-triplets" `
-            -DVCPKG_TARGET_TRIPLET=$env:TRIPLET -DVCPKG_HOST_TRIPLET=$env:TRIPLET `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            "-DVCPKG_OVERLAY_TRIPLETS=$env:GITHUB_WORKSPACE/.github/vcpkg-triplets" `
+            "-DVCPKG_TARGET_TRIPLET=$env:TRIPLET" "-DVCPKG_HOST_TRIPLET=$env:TRIPLET" `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DMQTT_BUILD_APP_API=ON | Tee-Object -FilePath configure.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
           # Everything, or a red build: a modbee.exe without Kafka or the API
