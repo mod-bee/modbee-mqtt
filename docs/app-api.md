@@ -73,9 +73,20 @@ modbee serve: Application API (gRPC) on unix:/run/modbee/api.sock
 - The server needs gRPC to serve it: a build where gRPC was not found says
   so and does not start with an `api:` section (Ubuntu/Debian:
   `libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev`). **The published
-  Docker image does not have it yet**, nor is there a Windows build of the
-  server: for now, build `modbee` from source on Linux with those packages
-  installed.
+  Docker image does not have it yet**: build `modbee` from source with those
+  packages installed until it does.
+- **An application on the same machine, on Windows as on Linux**, can use TCP
+  on loopback with the token alone - no TLS, since nothing off the machine
+  reaches it:
+
+  ```yaml
+  api:
+    grpc: ["tcp://127.0.0.1:7660"]
+    token-file: /run/secrets/modbee-api
+  ```
+
+  That is how it is reached on Windows ([windows.md](windows.md)); the
+  server refuses a loopback address without a token.
 
 ---
 

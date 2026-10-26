@@ -16,7 +16,7 @@
 // like any local message - and committed only once the broker has taken them.
 //
 // librdkafka's background threads never touch broker state: they only write to
-// an eventfd in the shard's epoll set, and the shard runs every callback from
+// a WakeSignal in the shard's readiness set, and the shard runs every callback from
 // its own loop.
 
 #include "ShardedBroker.h"

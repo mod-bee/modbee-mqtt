@@ -29,10 +29,9 @@ void WakeSignal::signal() {
     (void)ignored;
 }
 
-void WakeSignal::drain() {
+bool WakeSignal::drain() {
     uint64_t counter = 0;
-    const ssize_t ignored = ::read(_handle, &counter, sizeof counter);   // non-blocking
-    (void)ignored;
+    return ::read(_handle, &counter, sizeof counter) == (ssize_t)sizeof counter;   // non-blocking
 }
 
 #else
@@ -73,9 +72,11 @@ void WakeSignal::signal() {
     ::send(_handle, &one, 1, 0);
 }
 
-void WakeSignal::drain() {
+bool WakeSignal::drain() {
     char discard[64];
-    while (::recv(_handle, discard, (int)sizeof discard, 0) > 0) {}
+    bool signalled = false;
+    while (::recv(_handle, discard, (int)sizeof discard, 0) > 0) signalled = true;
+    return signalled;
 }
 
 #endif

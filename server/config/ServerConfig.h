@@ -271,6 +271,15 @@ struct AuthenticationSection {
 // The Application API (proto/modbee/app/v1/app.proto): how an application -
 // not a device - talks to the server. gRPC on a local socket, and optionally on
 // TCP, which must have TLS and a token.
+// tcp://127.0.0.1:7660, tcp://localhost:..., tcp://[::1]:...: reachable from
+// this machine only.
+inline bool apiAddressIsLoopback(const std::string& address) {
+    if (address.compare(0, 6, "tcp://") != 0) return false;
+    const std::string host = address.substr(6, address.rfind(':') == std::string::npos ? std::string::npos
+                                                                                      : address.rfind(':') - 6);
+    return host.compare(0, 4, "127.") == 0 || host == "localhost" || host == "[::1]";
+}
+
 struct ApiSection {
     std::vector<std::string> grpc;       // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
     std::string tlsCert, tlsKey, tlsClientCa;   // PEM files, for tcp://

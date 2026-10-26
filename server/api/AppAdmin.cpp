@@ -6,7 +6,6 @@
 #include "AppAdmin.h"
 
 #include "WakeSignal.h"
-#include <unistd.h>
 
 struct AppAdmin::Shard {
     WakeSignal wake;

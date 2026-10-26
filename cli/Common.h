@@ -61,9 +61,18 @@ struct CliClient {
     void shutdown();
 };
 
-// Set by SIGINT/SIGTERM; commands that run until stopped poll it.
+// Set by SIGINT/SIGTERM - or, on Windows, by the service manager asking
+// the service to stop (cliRequestStop) - and polled by commands that run
+// until they are stopped.
 bool cliStopRequested();
+void cliRequestStop();
+// Stop, to be started again: serve applying a setting that needs a restart.
+void cliRequestRestart();
+bool cliRestartRequested();
 void cliInstallSignalHandlers();
+
+// This process's id, for a unique client id.
+long cliProcessId();
 
 // --- Output ---
 

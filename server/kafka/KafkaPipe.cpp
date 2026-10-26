@@ -15,10 +15,26 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <sys/eventfd.h>
-#include <unistd.h>
+#include "WakeSignal.h"
 
 namespace {
+
+// librdkafka wakes the shard when a queue has something: on Linux by
+// writing to the shard's eventfd itself, elsewhere through a callback (its
+// descriptor event needs a POSIX descriptor or, on Windows, its own kind of
+// socket).
+#if defined(_WIN32)
+void signalShard(rd_kafka_t*, void* wake) { static_cast<WakeSignal*>(wake)->signal(); }
+#endif
+
+void wakeOnEvents(rd_kafka_queue_t* queue, WakeSignal& wake) {
+#if defined(_WIN32)
+    rd_kafka_queue_cb_event_enable(queue, &signalShard, &wake);
+#else
+    static const uint64_t kOne = 1;
+    rd_kafka_queue_io_event_enable(queue, wake.handle(), &kOne, sizeof kOne);
+#endif
+}
 
 // MQTT 5 reason codes the pipe answers a held PUBACK/PUBREC with.
 const uint8_t kQuotaExceeded = 0x97;          // Kafka could not take it now
@@ -143,7 +159,7 @@ struct KafkaPipe::FromKafka {
 struct KafkaPipe::Shard {
     KafkaPipe* pipe = nullptr;
     uint32_t index = 0;
-    int wakeFd = -1;
+    WakeSignal wake;
     MqttBroker* broker = nullptr;          // set on every call from the shard's thread
     mq_time_t servedAt = 0;
     bool backlog = false;                  // a consumer had more than its budget
@@ -224,7 +240,7 @@ KafkaPipe::~KafkaPipe() {
         for (auto& consumer : shard->consumers) rd_kafka_destroy(consumer.second);
         for (rd_kafka_topic_t* topic : shard->topics) if (topic) rd_kafka_topic_destroy(topic);
         for (rd_kafka_t* producer : shard->producers) if (producer) rd_kafka_destroy(producer);
-        if (shard->wakeFd >= 0) ::close(shard->wakeFd);
+        shard->wake.close();
     }
 }
 
@@ -253,12 +269,10 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
         std::unique_ptr<Shard> shard(new Shard());
         shard->pipe = this;
         shard->index = (uint32_t)s;
-        shard->wakeFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (shard->wakeFd < 0) {
-            error = "kafka: no eventfd for shard " + std::to_string(s);
+        if (!shard->wake.open()) {
+            error = "kafka: no wake-up descriptor for shard " + std::to_string(s);
             return false;
         }
-        static const uint64_t kOne = 1;
 
         // PRODUCERS: one per cluster that something is produced to.
         shard->producers.assign(_config.clusters.size(), nullptr);
@@ -320,7 +334,7 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
                 return false;
             }
             rd_kafka_queue_t* queue = rd_kafka_queue_get_main(producer);
-            rd_kafka_queue_io_event_enable(queue, shard->wakeFd, &kOne, sizeof kOne);
+            wakeOnEvents(queue, shard->wake);
             rd_kafka_queue_destroy(queue);
             shard->producers[c] = producer;
 
@@ -382,7 +396,7 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
             }
             rd_kafka_poll_set_consumer(consumer);
             rd_kafka_queue_t* queue = rd_kafka_queue_get_consumer(consumer);
-            rd_kafka_queue_io_event_enable(queue, shard->wakeFd, &kOne, sizeof kOne);
+            wakeOnEvents(queue, shard->wake);
             rd_kafka_queue_destroy(queue);
 
             const bool pattern = !from.config.kafkaTopicPattern.empty();
@@ -411,7 +425,7 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
 }
 
 int KafkaPipe::waitHandle(uint32_t shard) {
-    return shard < _shards.size() ? _shards[shard]->wakeFd : -1;
+    return shard < _shards.size() ? _shards[shard]->wake.handle() : -1;
 }
 
 // --- MQTT -> Kafka -----------------------------------------------------------
@@ -692,8 +706,7 @@ void KafkaPipe::Shard::consume(size_t mappingIndex, rd_kafka_t* consumer) {
 void KafkaPipe::service(uint32_t shardIndex, MqttBroker& broker) {
     Shard& shard = *_shards[shardIndex];
     shard.broker = &broker;
-    uint64_t wakes = 0;
-    const bool woken = ::read(shard.wakeFd, &wakes, sizeof wakes) == (ssize_t)sizeof wakes;
+    const bool woken = shard.wake.drain();
     const mq_time_t now = mq_millis();
     if (!woken && !shard.backlog && mq_elapsed(shard.servedAt, now) < kServiceIntervalMs) return;
     shard.servedAt = now;

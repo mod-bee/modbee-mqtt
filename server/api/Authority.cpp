@@ -13,7 +13,6 @@
 #include <list>
 
 #include "WakeSignal.h"
-#include <unistd.h>
 
 namespace {
 

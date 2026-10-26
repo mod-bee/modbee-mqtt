@@ -33,8 +33,10 @@ cmake -S . -B build && cmake --build build -j
 sudo cmake --install build          # optional: puts modbee in /usr/local/bin
 ```
 
-On Linux every command is built. On macOS, `pub`, `sub` and `req` are, and
-`bench`, `serve` and `check` are not, because the broker tier is Linux only.
+On Linux every command is built; on Windows every one but `bench`
+([windows.md](windows.md), with `modbee service` to run `serve` as a Windows
+service). On macOS, `pub`, `sub` and `req` are, and `bench`, `serve` and
+`check` are not.
 `serve` includes the [Kafka pipe](kafka.md) when the librdkafka development
 package (`librdkafka-dev`) is installed. Without it, `serve` is the broker
 alone, and refuses to start on a `modbee.yaml` that has Kafka mappings rather
@@ -52,7 +54,8 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee sub` | Subscribe, print what the broker granted, then print what arrives |
 | `modbee req` | MQTT 5 request/response: publish with a response topic and correlation data, wait for the matching reply |
 | `modbee bench` | Load generator, Linux only: `conn`, `pub`, `sub` |
-| `modbee serve` | The broker, Linux only: one `MqttBroker` per core behind one port, with the Kafka pipe |
+| `modbee serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe |
+| `modbee service` | Windows: `serve` as a Windows service - `install`, `start`, `stop`, `status`, `uninstall` ([windows.md](windows.md)) |
 | `modbee check` | Validate a `modbee.yaml` and report every problem with its line |
 | `modbee user` | Device logins on a broker: `list`, `show`, `add`, `set`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart. `add` and `set` take `--fingerprint`, binding a login to one client certificate ([logins.md](logins.md#logging-in-with-a-certificate)) |
 | `modbee key` | Provisioning keys, with which devices register themselves: `create`, `list`, `remove` |

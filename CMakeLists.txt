@@ -195,6 +195,9 @@ if(WIN32)
     target_sources(modbee-mqtt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wepoll/wepoll.c)
     target_include_directories(modbee-mqtt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wepoll)
     target_compile_definitions(modbee-mqtt PRIVATE MQTT_HAVE_WEPOLL=1)
+    # <windows.h> defines min and max as macros, which break std::min and
+    # std::max in everything that includes it after them.
+    target_compile_definitions(modbee-mqtt PUBLIC NOMINMAX)
     target_link_libraries(modbee-mqtt PUBLIC ws2_32)
 else()
     target_link_libraries(modbee-mqtt PUBLIC Threads::Threads)

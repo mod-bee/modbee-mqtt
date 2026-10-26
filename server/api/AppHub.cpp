@@ -15,7 +15,6 @@
 #include <cstring>
 
 #include "WakeSignal.h"
-#include <unistd.h>
 
 namespace {
 

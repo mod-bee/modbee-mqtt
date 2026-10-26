@@ -858,6 +858,13 @@ void crossCheck(Loader& loader, ServerConfig& config) {
         }
         if (address.compare(0, 6, "tcp://") != 0) {
             loader.problem(nullptr, "api.grpc", "\"" + address + "\" is neither unix:<path> nor tcp://<host>:<port>");
+        } else if (apiAddressIsLoopback(address)) {
+            // This machine only - an application beside the server, on
+            // Windows as on Linux: the token is the lock.
+            if (config.api.tokenFile.empty()) {
+                loader.problem(nullptr, "api.grpc", "\"" + address + "\" needs api.token-file: any program on "
+                               "this machine can reach it");
+            }
         } else if (config.api.tlsCert.empty() || config.api.tlsKey.empty() || config.api.tokenFile.empty()) {
             loader.problem(nullptr, "api.grpc",
                            "\"" + address + "\" is reachable from other hosts: it needs api.tls (cert, key) "

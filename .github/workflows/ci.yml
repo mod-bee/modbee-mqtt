@@ -86,3 +86,69 @@ jobs:
           cmake --build build -j 4
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  # THE SERVER ON WINDOWS, AS IT SHIPS: modbee.exe with everything - the CLI,
+  # the server, the Kafka pipe and the Application API (librdkafka, gRPC and
+  # protobuf from vcpkg, statically linked, cached between runs) - built by
+  # MSVC; the published tests; and the Windows service installed, used,
+  # stopped and removed on a real Service Control Manager.
+  windows-server:
+    name: Windows - modbee.exe with Kafka and the API, and the service
+    runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: vcpkg packages, cached
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-x64-windows-static-grpc-rdkafka-v1
+      - name: Dependencies (vcpkg)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install grpc protobuf librdkafka openssl --triplet x64-windows-static
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DMQTT_BUILD_APP_API=ON | Tee-Object -FilePath configure.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # Everything, or a red build: a modbee.exe without Kafka or the API
+          # would pass every test below and still not be what ships.
+          foreach ($part in 'librdkafka .* found', 'gRPC .* found', 'OpenSSL found') {
+            if (-not (Select-String -Path configure.txt -Pattern $part)) { Write-Error "not found: $part"; exit 1 }
+          }
+          cmake --build build --config Release -j 4
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & build\cli\Release\modbee.exe --version
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: The Windows service
+        shell: pwsh
+        run: |
+          $m = "build\cli\Release\modbee.exe"
+          & $m service install --name modbee-ci -- --port 18850 --shards 2
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $m service start --name modbee-ci
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\ModBee\modbee-ci.log"; exit 1 }
+          $sub = Start-Process -FilePath $m -ArgumentList 'sub','-p','18850','-t','ci/#','-q','1','-C','5' `
+                   -RedirectStandardOutput sub.txt -PassThru -NoNewWindow
+          Start-Sleep -Seconds 2
+          1..5 | ForEach-Object { & $m pub -p 18850 -t ci/x -m "message-$_" -q 1 }
+          $sub.WaitForExit(15000) | Out-Null
+          $got = (Select-String -Path sub.txt -Pattern '^message-[0-9]$').Count
+          Write-Host "received through the service: $got of 5"
+          & $m service stop --name modbee-ci
+          Start-Sleep -Seconds 10
+          & $m service status --name modbee-ci
+          $stillStopped = $LASTEXITCODE -eq 1
+          & $m service uninstall --name modbee-ci
+          Write-Host "--- the service's log"
+          Get-Content "$env:ProgramData\ModBee\modbee-ci.log"
+          if ($got -ne 5) { Write-Error "the service passed $got of 5 messages"; exit 1 }
+          if (-not $stillStopped) { Write-Error "the service did not stay stopped"; exit 1 }

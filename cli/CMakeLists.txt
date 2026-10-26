@@ -15,11 +15,15 @@ add_executable(modbee
     cmd_serve.cpp
     cmd_check.cpp
     cmd_admin.cpp
+    cmd_service.cpp
     # The JSON the admin topics speak - plain C++, so the admin commands work
     # from any computer, not only where the server tier builds.
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/auth/Json.cpp
 )
 target_link_libraries(modbee PRIVATE modbee-mqtt Threads::Threads)
+if(WIN32)
+    target_link_libraries(modbee PRIVATE advapi32)   # the service (cmd_service.cpp)
+endif()
 target_include_directories(modbee PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../server/auth)
 # What `modbee --version` says it is.
 target_compile_definitions(modbee PRIVATE MODBEE_VERSION="${PROJECT_VERSION}")

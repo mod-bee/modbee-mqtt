@@ -43,8 +43,8 @@ on Wi-Fi, Ethernet and a modem, with key pinning); and `WiFiClientSecure` or
 
 ### The server: the broker at scale
 
-`server/`, `cli/` and `docker/`. Linux only, and not part of the Arduino
-library.
+`server/`, `cli/` and `docker/`. Linux and Windows ([windows.md](docs/windows.md),
+a Windows service too), and not part of the Arduino library.
 
 | | |
 | --- | --- |

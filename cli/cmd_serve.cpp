@@ -42,8 +42,9 @@
 
 #include <fstream>
 #include <sstream>
+#include <chrono>
 #include <thread>
-#include <unistd.h>
+#include "transport/MqttSocketSupport.h"   // gethostname, Winsock on Windows
 
 namespace {
 
@@ -413,7 +414,7 @@ int cmdServe(int argc, char** argv) {
         // config.* with "restart": true: the same graceful stop as a SIGTERM.
         // Under Docker the restart policy starts it again; without a supervisor
         // the server stays stopped, which config.set's reply says.
-        g.restart = [](void*) { std::raise(SIGTERM); };
+        g.restart = [](void*) { cliRequestRestart(); };
         g.certificateLogin = file.authentication.certificateLogin;
         g.noTopicsWithoutRules = file.authentication.defaultTopics == "none";
         // What one login may hold, set on every shard's broker; the fixed
@@ -485,6 +486,7 @@ int cmdServe(int argc, char** argv) {
         c.addresses = file.api.grpc;
         c.serverVersion = std::string("modbee-mqtt ") + MODBEE_VERSION;
         char host[256] = {0};
+        mq_socket::ensureWinsock();
         c.serverId = ::gethostname(host, sizeof host - 1) == 0 ? host : "modbee";
         bool read = true;
         if (!file.api.tlsCert.empty()) read = readWholeFile(file.api.tlsCert, c.tlsCertPem) && read;
@@ -615,7 +617,7 @@ int cmdServe(int argc, char** argv) {
     mq_time_t lastStatus = started;
     const long long every = b.statusEvery;
     while (!cliStopRequested()) {
-        usleep(200000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         if (every > 0 && mq_millis() - lastStatus >= (mq_time_t)every * 1000) {
             lastStatus = mq_millis();
             const ShardedBrokerStatus s = server.status();

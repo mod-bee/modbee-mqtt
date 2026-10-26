@@ -23,7 +23,6 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -56,7 +55,7 @@ void onMessage(void*, const MqttMessage& message) {
 int ask(CliClient& cli, const std::string& clientId, json::Object request, json::Value& reply,
         std::string& replyText) {
     AdminState state;
-    state.id = std::to_string((long)getpid()) + "-" + std::to_string((long)mq_millis());
+    state.id = std::to_string(cliProcessId()) + "-" + std::to_string((long)mq_millis());
     request.add("id", state.id);
     g_admin = &state;
     cli.client.onMessage(&onMessage, nullptr);

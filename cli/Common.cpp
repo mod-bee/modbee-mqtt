@@ -51,6 +51,27 @@ void cliIdle(MqttTransport* transport, int ms) {
 
 bool cliStopRequested() { return g_stop != 0; }
 
+long cliProcessId() {
+#if defined(_WIN32)
+    return (long)_getpid();
+#else
+    return (long)getpid();
+#endif
+}
+
+void cliRequestStop() { g_stop = 1; }
+
+namespace {
+volatile sig_atomic_t g_restart = 0;
+}
+
+void cliRequestRestart() {
+    g_restart = 1;
+    g_stop = 1;
+}
+
+bool cliRestartRequested() { return g_restart != 0; }
+
 void cliInstallSignalHandlers() {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
@@ -122,13 +143,7 @@ bool CliClient::configure(Args& args, const char* defaultClientIdPrefix, std::st
 
     connection.clientId = args.has("id")
         ? args.get("id")
-        : std::string(defaultClientIdPrefix) + "-" + std::to_string((long)
-#if defined(_WIN32)
-                                                                                _getpid()
-#else
-                                                                                getpid()
-#endif
-                                                                                );
+        : std::string(defaultClientIdPrefix) + "-" + std::to_string(cliProcessId());
 
     // -u and -P, or else the server's own login from the environment - so
     // `docker compose exec modbee modbee pub ...` logs in to the server it

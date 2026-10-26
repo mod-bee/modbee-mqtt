@@ -28,7 +28,8 @@ public:
     // For a readiness set (MqttPollSet::add); -1 when closed.
     int handle() const { return _handle; }
     void signal();
-    void drain();
+    // True when it had been signalled.
+    bool drain();
 
 private:
     int _handle = -1;

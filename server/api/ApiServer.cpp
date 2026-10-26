@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "ApiServer.h"
+#include "ServerConfig.h"   // apiAddressIsLoopback
 #include "Authority.h"
 #include "AppHub.h"
 #include "AppConnections.h"
@@ -31,8 +32,9 @@
 #include <mutex>
 #include <sstream>
 
-#include <sys/stat.h>
-#include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/stat.h>   // chmod: the local socket's permissions
+#endif
 
 namespace v1 = modbee::app::v1;
 
@@ -1617,11 +1619,18 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
                 error = "api.grpc: \"" + address + "\": a Unix socket's path is at most 107 bytes";
                 return false;
             }
-            ::unlink(path.c_str());       // one a server before this one left
+            std::remove(path.c_str());    // one a server before this one left
             builder.AddListeningPort(address, grpc::InsecureServerCredentials());
             self.sockets.push_back(path);
             self.listening.push_back(address);
             ports.emplace_back();
+        } else if (address.compare(0, 6, "tcp://") == 0 && apiAddressIsLoopback(address) &&
+                   config.tlsCertPem.empty()) {
+            // This machine only, the token the lock: how an application
+            // beside the server reaches it on Windows (and may on Linux).
+            ports.emplace_back(new int(0));
+            builder.AddListeningPort(address.substr(6), grpc::InsecureServerCredentials(), ports.back().get());
+            self.listening.push_back(address);
         } else if (address.compare(0, 6, "tcp://") == 0) {
             grpc::SslServerCredentialsOptions tls(
                 config.tlsClientCaPem.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
@@ -1658,7 +1667,9 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
         self.listening[index] = address.substr(0, colon + 1) + std::to_string(*ports[index]);
     }
     // Only its own user and group: the file is the lock on the local socket.
+#if !defined(_WIN32)
     for (const std::string& path : self.sockets) ::chmod(path.c_str(), 0660);
+#endif
     return true;
 }
 
@@ -1669,7 +1680,7 @@ void ApiServer::stop() {
         self.server->Wait();
         self.server.reset();
     }
-    for (const std::string& path : self.sockets) ::unlink(path.c_str());
+    for (const std::string& path : self.sockets) std::remove(path.c_str());
     self.sockets.clear();
 }
 
