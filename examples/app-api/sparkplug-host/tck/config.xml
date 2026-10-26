@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!--
+  HiveMQ CE configured exactly as the Sparkplug TCK User Guide describes: a TCP listener and a
+  websocket listener. The websocket one is not used by the headless driver, but the guide requires
+  it and a conformance run should differ from the documented setup in as few ways as possible.
+-->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+        <websocket-listener>
+            <port>8000</port>
+            <bind-address>0.0.0.0</bind-address>
+            <path>/mqtt</path>
+            <name>my-websocket-listener</name>
+            <subprotocols>
+                <subprotocol>mqttv3.1</subprotocol>
+                <subprotocol>mqtt</subprotocol>
+            </subprotocols>
+            <allow-extensions>true</allow-extensions>
+        </websocket-listener>
+    </listeners>
+    <anonymous-usage-statistics>
+        <enabled>false</enabled>
+    </anonymous-usage-statistics>
+</hivemq>

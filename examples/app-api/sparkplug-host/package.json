@@ -1,0 +1,22 @@
+{
+  "name": "modbee-app-api-sparkplug-host",
+  "version": "1.0.0",
+  "description": "A Sparkplug B Host Application on a broker it does not own, through modbee's Application API - and the Eclipse TCK's Host Application profile run against it",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "host": "tsx src/main.ts",
+    "tck": "tsx src/tck.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.6",
+    "@grpc/proto-loader": "^0.8.1",
+    "@modbee/sparkplug": "file:../../../../modbee-iot-platform/packages/sparkplug"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

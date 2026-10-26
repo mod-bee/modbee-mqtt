@@ -174,6 +174,12 @@ TLS: `ca_pem` (empty: the system's trust store), and `certificate_pem` and
 `key_pem` for mutual TLS, written beside `connections.json`. The name checked
 is the server's `host`; `server_name` is not used yet.
 
+**A Sparkplug host on a broker you do not own**, built on nothing but this:
+[`examples/app-api/sparkplug-host`](../examples/app-api/sparkplug-host/README.md),
+which passes the Eclipse Sparkplug TCK's Host Application profile through the
+API - its Will renewed on every connect with `RECONNECT_WHEN_ASKED`, its
+STATE birth answered by the other broker's PUBACK.
+
 ---
 
 ## Administration, and REST
