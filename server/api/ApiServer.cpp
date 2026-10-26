@@ -21,6 +21,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <google/protobuf/util/json_util.h>
+#include <google/protobuf/stubs/common.h>   // GOOGLE_PROTOBUF_VERSION
 
 #include <algorithm>
 #include <cctype>
@@ -1751,7 +1752,13 @@ std::string errorBody(int code, const std::string& message) {
 
 std::string jsonOf(const google::protobuf::Message& message) {
     google::protobuf::util::JsonPrintOptions options;
+    // Renamed in protobuf 26 (C++ 5.26): the same switch, every field shown.
+#if (defined(PROTOBUF_VERSION) && PROTOBUF_VERSION >= 5026000) || \
+    (defined(GOOGLE_PROTOBUF_VERSION) && GOOGLE_PROTOBUF_VERSION >= 5026000)
+    options.always_print_fields_with_no_presence = true;
+#else
     options.always_print_primitive_fields = true;
+#endif
     std::string out;
     google::protobuf::util::MessageToJsonString(message, &out, options);
     return out;

@@ -97,26 +97,42 @@ jobs:
     runs-on: windows-latest
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+      TRIPLET: x64-windows-static-release
     steps:
       - uses: actions/checkout@v4
-      - name: vcpkg packages, cached
-        uses: actions/cache@v4
+      # gRPC built from source is most of an hour on a Windows runner. Once,
+      # then cached - and saved even when a later step fails, so a red run
+      # never throws away what it built.
+      - name: vcpkg packages, restored
+        uses: actions/cache/restore@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-x64-windows-static-grpc-rdkafka-v1
+          key: vcpkg-${{ env.TRIPLET }}-${{ github.run_id }}
+          restore-keys: vcpkg-${{ env.TRIPLET }}-
       - name: Dependencies (vcpkg)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install grpc protobuf librdkafka openssl --triplet x64-windows-static
+          # One triplet for the target and the host, release only, built on
+          # the work drive and cleaned as it goes: C: is too small for gRPC.
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install grpc protobuf librdkafka openssl `
+            --overlay-triplets=.github/vcpkg-triplets --triplet $env:TRIPLET --host-triplet $env:TRIPLET `
+            --x-buildtrees-root=D:\vcpkg-bt --x-packages-root=D:\vcpkg-pk --clean-after-build
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: vcpkg packages, saved
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ env.TRIPLET }}-${{ github.run_id }}
       - name: Build
         shell: pwsh
         run: |
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
-            -DMQTT_BUILD_APP_API=ON | Tee-Object -FilePath configure.txt
+            -DVCPKG_OVERLAY_TRIPLETS="${{ github.workspace }}/.github/vcpkg-triplets" `
+            -DVCPKG_TARGET_TRIPLET=$env:TRIPLET -DVCPKG_HOST_TRIPLET=$env:TRIPLET `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DMQTT_BUILD_APP_API=ON | Tee-Object -FilePath configure.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
           # Everything, or a red build: a modbee.exe without Kafka or the API
           # would pass every test below and still not be what ships.
