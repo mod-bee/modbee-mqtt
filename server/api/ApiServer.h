@@ -71,6 +71,9 @@ public:
     // Where it listens, a TCP port resolved: "tcp://0.0.0.0:7660".
     const std::vector<std::string>& listening() const;
 
+    // The gRPC this was built with, for `modbee --version`.
+    static std::string libraryVersion();
+
     struct Impl;
 
 private:

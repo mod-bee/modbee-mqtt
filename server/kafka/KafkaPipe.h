@@ -83,6 +83,9 @@ public:
 
     // librdkafka's version string, for a log line.
     static const char* libraryVersion();
+    // What that librdkafka was built with ("ssl, sasl_scram, zstd, ..."):
+    // without ssl it cannot reach a cloud cluster at all.
+    static std::string libraryFeatures();
 
     struct Shard;
     struct ToKafka;

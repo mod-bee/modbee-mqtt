@@ -6,6 +6,12 @@
 // modbee - the command-line tool. One binary, subcommands.
 
 #include <MqttFeatures.h>    // MQTT_TLS_ENGINE_NAME
+#if defined(MODBEE_HAVE_KAFKA)
+#include "KafkaPipe.h"
+#endif
+#if defined(MODBEE_HAVE_APP_API)
+#include "ApiServer.h"
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -71,6 +77,19 @@ int main(int argc, char** argv) {
     // wolfSSL looks exactly like one built with it until a handshake differs.
     if (std::strcmp(command, "--version") == 0 || std::strcmp(command, "version") == 0) {
         std::printf("modbee %s (TLS: %s)\n", MODBEE_VERSION, MQTT_TLS_ENGINE_NAME);
+        // And what else is inside, so a binary can be checked rather than
+        // trusted: the release workflow refuses one without both.
+#if defined(MODBEE_HAVE_KAFKA)
+        std::printf("  Kafka pipe: librdkafka %s (%s)\n", KafkaPipe::libraryVersion(),
+                    KafkaPipe::libraryFeatures().c_str());
+#else
+        std::printf("  Kafka pipe: not built\n");
+#endif
+#if defined(MODBEE_HAVE_APP_API)
+        std::printf("  Application API: gRPC %s\n", ApiServer::libraryVersion().c_str());
+#else
+        std::printf("  Application API: not built\n");
+#endif
         return 0;
     }
     if (std::strcmp(command, "pub") == 0) return cmdPub(argc, argv);

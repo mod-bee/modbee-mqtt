@@ -1687,6 +1687,8 @@ void ApiServer::stop() {
 
 const std::vector<std::string>& ApiServer::listening() const { return _impl->listening; }
 
+std::string ApiServer::libraryVersion() { return grpc::Version(); }
+
 // =============================================================================
 // THE REST SURFACE: the same calls, as JSON over HTTP
 // =============================================================================

@@ -246,6 +246,17 @@ KafkaPipe::~KafkaPipe() {
 
 const char* KafkaPipe::libraryVersion() { return rd_kafka_version_str(); }
 
+std::string KafkaPipe::libraryFeatures() {
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    char features[512] = "";
+    size_t size = sizeof features;
+    if (rd_kafka_conf_get(conf, "builtin.features", features, &size) != RD_KAFKA_CONF_OK) features[0] = 0;
+    rd_kafka_conf_destroy(conf);
+    std::string out(features);
+    for (char& c : out) if (c == ',') c = ' ';
+    return out;
+}
+
 bool KafkaPipe::begin(size_t shards, std::string& error) {
     for (const MqttToKafkaConfig& m : _config.toKafka) {
         std::unique_ptr<ToKafka> to(new ToKafka());
