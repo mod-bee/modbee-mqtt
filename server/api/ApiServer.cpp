@@ -7,15 +7,29 @@
 #include "Authority.h"
 #include "AppHub.h"
 #include "AppConnections.h"
+#include "AppAdmin.h"
+#include "AuthGate.h"
+#include "Json.h"
+#include "ShardedBroker.h"
+#if MQTT_TLS_SOCKETS
+#include "transport/MqttCertificate.h"
+#endif
 
 #include "modbee/app/v1/app.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <google/protobuf/util/json_util.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <map>
 #include <deque>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -296,6 +310,433 @@ void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
     wire.set_messages_in(info.messagesIn);
     wire.set_messages_out(info.messagesOut);
 }
+
+
+// =============================================================================
+// ADMIN: one function per call, on proto types - the gRPC service and the REST
+// surface both call these, so the two cannot say different things
+// =============================================================================
+
+typedef std::function<void(const grpc::Status&)> Done;
+
+std::string dataJson(const google::protobuf::Map<std::string, std::string>& data) {
+    json::Object o;
+    for (const auto& pair : data) o.add(pair.first, pair.second);
+    return o.str();
+}
+
+void dataFrom(const json::Value& value, google::protobuf::Map<std::string, std::string>& into) {
+    for (const auto& field : value.fields) into[field.first] = field.second.text;
+}
+
+void loginFrom(const json::Value& u, v1::Login& login) {
+    login.set_name(u.str("username"));
+    login.set_enabled(u.flag("enabled"));
+    login.set_pending(u.flag("pending"));
+    login.set_admin(u.flag("admin"));
+    std::vector<std::string> publish, subscribe;
+    u.strings("publish", publish);
+    u.strings("subscribe", subscribe);
+    for (const std::string& f : publish) login.add_publish(f);
+    for (const std::string& f : subscribe) login.add_subscribe(f);
+    login.set_fingerprint(u.str("fingerprint"));
+    login.set_site(u.str("site"));
+    const std::string by = u.str("provisioned_by");
+    login.set_made_by(by.empty() ? "hand" : by);
+    dataFrom(u["data"], *login.mutable_data());
+}
+
+void keyFrom(const json::Value& k, v1::SiteKey& key) {
+    key.set_name(k.str("name"));
+    key.set_site(k.str("site"));
+    key.set_manual_approval(k.str("approval") == "manual");
+    const long long left = k.integer("uses_left", -1);
+    key.set_uses(left < 0 ? 0 : (uint32_t)left);
+    key.set_expires_ms(k.integer("expires") * 1000);
+    key.set_device(k.str("device"));
+    std::vector<std::string> publish, subscribe;
+    k.strings("publish", publish);
+    k.strings("subscribe", subscribe);
+    for (const std::string& f : publish) key.add_publish(f);
+    for (const std::string& f : subscribe) key.add_subscribe(f);
+    dataFrom(k["data"], *key.mutable_data());
+}
+
+class AdminCore {
+public:
+    AdminCore(const ApiServer::Services& services)
+        : _s(services),
+          _startedMs(std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count()) {}
+
+    // --- Logins and site keys: the login database's own requests ---
+
+    // A request to the login database; its answer, or false with `status`.
+    bool ask(const std::string& request, json::Value& reply, grpc::Status& status) {
+        if (_s.logins == nullptr) {
+            status = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                  "logins are not kept by this server (authentication: database)");
+            return false;
+        }
+        if (!json::parse(_s.logins->admin(request), reply) || !reply.flag("ok")) {
+            const std::string error = reply.str("error", "the login database did not answer");
+            const grpc::StatusCode code =
+                error.find("no user") != std::string::npos || error.find("no key") != std::string::npos
+                    ? grpc::StatusCode::NOT_FOUND
+                : error.find("exists") != std::string::npos ? grpc::StatusCode::ALREADY_EXISTS
+                                                            : grpc::StatusCode::INVALID_ARGUMENT;
+            status = grpc::Status(code, error);
+            return false;
+        }
+        return true;
+    }
+
+    void listLogins(const v1::ListRequest& request, v1::ListLoginsReply* reply, Done done) {
+        json::Object q;
+        q.add("command", "user.list").add("prefix", request.prefix()).add("after", request.page_token());
+        q.add("limit", (long long)(request.page_size() ? std::min(request.page_size(), 1000u) : 100u));
+        json::Value answer;
+        grpc::Status status;
+        if (!ask(q.str(), answer, status)) return done(status);
+        for (const json::Value& u : answer["users"].items) loginFrom(u, *reply->add_logins());
+        reply->set_total((uint64_t)answer.integer("total"));
+        reply->set_next_page_token(answer.str("next"));
+        done(grpc::Status::OK);
+    }
+
+    void getLogin(const std::string& name, v1::Login* reply, Done done) {
+        json::Object q;
+        q.add("command", "user.get").add("username", name);
+        json::Value answer;
+        grpc::Status status;
+        if (!ask(q.str(), answer, status)) return done(status);
+        loginFrom(answer["user"], *reply);
+        done(grpc::Status::OK);
+    }
+
+    void putLogin(const v1::PutLoginRequest& request, v1::PutLoginReply* reply, Done done) {
+        const v1::Login& login = request.login();
+        if (login.name().empty()) return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "the login needs a name"));
+        json::Value answer;
+        grpc::Status status;
+        json::Object exists;
+        exists.add("command", "user.get").add("username", login.name());
+        const bool known = ask(exists.str(), answer, status);
+        if (!known && status.error_code() != grpc::StatusCode::NOT_FOUND) return done(status);
+        std::vector<std::string> publish(login.publish().begin(), login.publish().end());
+        std::vector<std::string> subscribe(login.subscribe().begin(), login.subscribe().end());
+        json::Object q;
+        q.add("command", known ? "user.set" : "user.add").add("username", login.name());
+        q.raw("publish", json::array(publish)).raw("subscribe", json::array(subscribe));
+        q.add("admin", login.admin());
+        if (known) q.add("enabled", login.enabled());
+        if (!login.fingerprint().empty() || known) q.add("fingerprint", login.fingerprint());
+        q.raw("data", dataJson(login.data()));
+        if (request.has_password()) q.add("password", request.password());
+        if (!ask(q.str(), answer, status)) return done(status);
+        reply->set_password(answer.str("password"));
+        if (request.approve()) {
+            json::Object approve;
+            approve.add("command", "user.approve").add("username", login.name());
+            if (!ask(approve.str(), answer, status)) return done(status);
+        }
+        getLogin(login.name(), reply->mutable_login(), done);
+    }
+
+    void deleteLogin(const std::string& name, v1::DeleteReply* reply, Done done) {
+        json::Object q;
+        q.add("command", "user.remove").add("username", name);
+        json::Value answer;
+        grpc::Status status;
+        if (!ask(q.str(), answer, status)) return done(status);
+        reply->set_removed(1);
+        done(grpc::Status::OK);
+    }
+
+    void resetLogin(const std::string& name, v1::PutLoginReply* reply, Done done) {
+        json::Object q;
+        q.add("command", "user.reset").add("username", name);
+        json::Value answer;
+        grpc::Status status;
+        if (!ask(q.str(), answer, status)) return done(status);
+        reply->set_password(answer.str("password"));
+        getLogin(name, reply->mutable_login(), done);
+    }
+
+    void listKeys(v1::ListKeysReply* reply, Done done) {
+        json::Value answer;
+        grpc::Status status;
+        if (!ask("{\"command\":\"key.list\"}", answer, status)) return done(status);
+        for (const json::Value& k : answer["keys"].items) keyFrom(k, *reply->add_keys());
+        done(grpc::Status::OK);
+    }
+
+    void putKey(const v1::SiteKey& key, v1::PutKeyReply* reply, Done done) {
+        if (key.name().empty()) return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "the key needs a name"));
+        json::Value answer;
+        grpc::Status status;
+        if (!ask("{\"command\":\"key.list\"}", answer, status)) return done(status);
+        bool known = false;
+        for (const json::Value& k : answer["keys"].items) known = known || k.str("name") == key.name();
+        json::Object q;
+        if (known) {
+            // A key's rules are set when it is made; what it hands its devices may change.
+            q.add("command", "key.set").add("name", key.name()).raw("data", dataJson(key.data()));
+        } else {
+            std::vector<std::string> publish(key.publish().begin(), key.publish().end());
+            std::vector<std::string> subscribe(key.subscribe().begin(), key.subscribe().end());
+            q.add("command", "key.create").add("name", key.name()).add("site", key.site());
+            q.add("approval", key.manual_approval() ? "manual" : "auto");
+            if (key.uses() != 0) q.add("uses", (long long)key.uses());
+            if (key.expires_ms() != 0) q.add("expires", (long long)(key.expires_ms() / 1000));
+            if (!key.device().empty()) q.add("device", key.device());
+            q.raw("publish", json::array(publish)).raw("subscribe", json::array(subscribe));
+            q.raw("data", dataJson(key.data()));
+        }
+        if (!ask(q.str(), answer, status)) return done(status);
+        reply->set_secret(answer.str("key"));
+        v1::ListKeysReply keys;
+        listKeys(&keys, [&](const grpc::Status&) {});
+        for (const v1::SiteKey& k : keys.keys()) {
+            if (k.name() == key.name()) *reply->mutable_key() = k;
+        }
+        done(grpc::Status::OK);
+    }
+
+    void deleteKey(const std::string& name, v1::DeleteReply* reply, Done done) {
+        json::Object q;
+        q.add("command", "key.remove").add("name", name);
+        json::Value answer;
+        grpc::Status status;
+        if (!ask(q.str(), answer, status)) return done(status);
+        reply->set_removed(1);
+        done(grpc::Status::OK);
+    }
+
+    // --- Sessions, on every shard ---
+
+    void listSessions(const v1::ListSessionsRequest& request, v1::ListSessionsReply* reply, Done done) {
+        if (_s.admin == nullptr) return done(unavailable());
+        struct Gathered {
+            std::mutex lock;
+            std::vector<MqttBrokerSessionSummary> all;
+        };
+        std::shared_ptr<Gathered> gathered(new Gathered());
+        const v1::ListSessionsRequest filter = request;
+        _s.admin->everyShard(
+            [gathered](uint32_t, MqttBroker& broker) {
+                std::vector<MqttBrokerSessionSummary> mine;
+                broker.describeSessions([](void* context, const MqttBrokerSessionSummary& s) {
+                    static_cast<std::vector<MqttBrokerSessionSummary>*>(context)->push_back(s);
+                }, &mine);
+                std::lock_guard<std::mutex> guard(gathered->lock);
+                for (auto& s : mine) gathered->all.push_back(std::move(s));
+            },
+            [gathered, filter, reply, done]() {
+                std::vector<MqttBrokerSessionSummary>& all = gathered->all;
+                std::sort(all.begin(), all.end(), [](const MqttBrokerSessionSummary& a, const MqttBrokerSessionSummary& b) {
+                    return a.clientId < b.clientId;
+                });
+                const size_t limit = filter.page_size() ? std::min<size_t>(filter.page_size(), 1000) : 100;
+                const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch()).count();
+                for (const MqttBrokerSessionSummary& s : all) {
+                    if (!filter.page_token().empty() && s.clientId <= filter.page_token()) continue;
+                    if (s.clientId.compare(0, filter.client_id_prefix().size(), filter.client_id_prefix()) != 0) continue;
+                    if (!filter.login().empty() && s.login != filter.login()) continue;
+                    if (filter.connected_only() && !s.connected) continue;
+                    if ((size_t)reply->sessions_size() == limit) {
+                        reply->set_next_page_token(reply->sessions(reply->sessions_size() - 1).client_id());
+                        break;
+                    }
+                    v1::Session* out = reply->add_sessions();
+                    out->set_client_id(s.clientId);
+                    out->set_login(s.login);
+                    out->set_connected(s.connected);
+                    out->set_address(s.address);
+                    out->set_protocol_version(s.protocol);
+                    if (s.connected) out->set_connected_since_ms(now - s.connectedForMs);
+                    out->set_expiry_seconds(s.expiryInterval);
+                    for (const std::string& f : s.subscriptions) out->add_subscriptions(f);
+                    out->set_queued(s.queued);
+                    out->set_in_flight(s.inFlight);
+                }
+                done(grpc::Status::OK);
+            });
+    }
+
+    void kick(const v1::KickRequest& request, v1::KickReply* reply, Done done) {
+        if (_s.admin == nullptr) return done(unavailable());
+        if (request.client_id().empty() && request.login().empty()) {
+            return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "kick a client_id or a login"));
+        }
+        std::shared_ptr<std::atomic<uint32_t>> closed(new std::atomic<uint32_t>(0));
+        const v1::KickRequest asked = request;
+        _s.admin->everyShard(
+            [closed, asked](uint32_t, MqttBroker& broker) {
+                if (!asked.login().empty()) {
+                    MqttSpan login;
+                    login.data = (const uint8_t*)asked.login().data();
+                    login.length = (uint32_t)asked.login().size();
+                    *closed += (uint32_t)broker.disconnectUser(login, MQ_REASON_ADMINISTRATIVE_ACTION);
+                } else {
+                    MqttSpan id;
+                    id.data = (const uint8_t*)asked.client_id().data();
+                    id.length = (uint32_t)asked.client_id().size();
+                    *closed += (uint32_t)broker.disconnectClient(id, MQ_REASON_ADMINISTRATIVE_ACTION,
+                                                                 asked.discard_session());
+                }
+            },
+            [closed, reply, done]() {
+                reply->set_closed(closed->load());
+                done(grpc::Status::OK);
+            });
+    }
+
+    // --- Retained messages: every shard holds them all, so one is asked ---
+
+    void listRetained(const v1::ListRetainedRequest& request, v1::ListRetainedReply* reply, Done done) {
+        if (_s.admin == nullptr) return done(unavailable());
+        const v1::ListRetainedRequest asked = request;
+        _s.admin->oneShard(0, [asked, reply, done](MqttBroker& broker) {
+            struct Visit {
+                std::vector<const MqttRetainedMessage*> found;
+            } visit;
+            const std::string filter = asked.filter().empty() ? "#" : asked.filter();
+            MqttSpan span;
+            span.data = (const uint8_t*)filter.data();
+            span.length = (uint32_t)filter.size();
+            broker.retained().visitMatching(span, mq_millis(), [](void* context, const MqttRetainedMessage& m, uint32_t, bool) {
+                static_cast<Visit*>(context)->found.push_back(&m);
+            }, &visit);
+            std::sort(visit.found.begin(), visit.found.end(),
+                      [](const MqttRetainedMessage* a, const MqttRetainedMessage* b) { return a->topic < b->topic; });
+            const size_t limit = asked.page_size() ? std::min<size_t>(asked.page_size(), 1000) : 100;
+            const mq_time_t now = mq_millis();
+            const int64_t utc = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+            for (const MqttRetainedMessage* m : visit.found) {
+                if (!asked.page_token().empty() && m->topic <= asked.page_token()) continue;
+                if ((size_t)reply->messages_size() == limit) {
+                    reply->set_next_page_token(reply->messages(reply->messages_size() - 1).message().topic());
+                    break;
+                }
+                v1::RetainedMessage* out = reply->add_messages();
+                out->mutable_message()->set_topic(m->topic);
+                if (asked.payloads()) out->mutable_message()->set_payload(std::string(m->payload.begin(), m->payload.end()));
+                out->mutable_message()->set_qos(m->qos);
+                out->mutable_message()->set_retain(true);
+                propertiesTo(m->properties, *out->mutable_message()->mutable_properties());
+                out->set_size((uint32_t)m->payload.size());
+                out->set_stored_ms(utc - (int64_t)mq_elapsed(m->storedAt, now));
+            }
+            done(grpc::Status::OK);
+        });
+    }
+
+    // Cleared the way any MQTT client clears one - an empty retained message -
+    // so every shard, and wherever retained messages are kept, forgets it.
+    void deleteRetained(const v1::DeleteRetainedRequest& request, v1::DeleteReply* reply, Done done) {
+        if (_s.admin == nullptr || _s.messages == nullptr) return done(unavailable());
+        if (request.filter().empty()) return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "a topic or filter is required"));
+        AppHub* hub = _s.messages;
+        const std::string filter = request.filter();
+        _s.admin->oneShard(0, [hub, filter, reply, done](MqttBroker& broker) {
+            std::vector<std::string> topics;
+            MqttSpan span;
+            span.data = (const uint8_t*)filter.data();
+            span.length = (uint32_t)filter.size();
+            broker.retained().visitMatching(span, mq_millis(), [](void* context, const MqttRetainedMessage& m, uint32_t, bool) {
+                static_cast<std::vector<std::string>*>(context)->push_back(m.topic);
+            }, &topics);
+            for (const std::string& topic : topics) {
+                AppPublish clear;
+                clear.topic = topic;
+                clear.retain = true;
+                clear.origin = "admin";
+                hub->publish(clear, [](const AppPublishResult&) {});
+            }
+            reply->set_removed(topics.size());
+            done(grpc::Status::OK);
+        });
+    }
+
+    // --- Listeners, TLS, status ---
+
+    void listeners(v1::Listeners* reply, Done done) {
+        if (_s.server == nullptr) return done(unavailable());
+        if (_s.server->port() != 0) {
+            v1::ListenerInfo* plain = reply->add_listeners();
+            plain->set_kind(v1::LISTENER_PLAIN);
+            plain->set_port(_s.server->port());
+        }
+        const ShardedTlsConfig tls = _s.server->servedTls();
+        if (tls.enabled) {
+            v1::ListenerInfo* secure = reply->add_listeners();
+            secure->set_kind(v1::LISTENER_TLS);
+            secure->set_address(tls.address);
+            secure->set_port(_s.server->tlsPort());
+#if MQTT_TLS_SOCKETS
+            std::string pem = tls.certificatePem;
+            if (pem.empty() && !tls.certificateFile.empty()) {
+                std::ifstream in(tls.certificateFile, std::ios::binary);
+                std::ostringstream text;
+                text << in.rdbuf();
+                pem = text.str();
+            }
+            MqttCertificateFacts facts;
+            std::string error;
+            if (!pem.empty() && mqttReadCertificate(pem.c_str(), facts, error)) {
+                secure->set_certificate_subject(facts.subject);
+                secure->set_certificate_expires_ms(facts.notAfterSeconds * 1000);
+            }
+#endif
+        }
+        done(grpc::Status::OK);
+    }
+
+    void putTls(const v1::ServerTls& request, v1::Listeners* reply, Done done) {
+        if (_s.server == nullptr) return done(unavailable());
+        ShardedTlsConfig tls = _s.server->servedTls();
+        tls.certificateFile.clear();
+        tls.keyFile.clear();
+        tls.certificatePem = request.certificate_pem();
+        tls.keyPem = request.key_pem();
+        tls.clientCaPem = request.client_ca_pem();
+        tls.clientCertificateOptional = request.client_certificate_optional();
+        std::string error;
+        if (!_s.server->replaceTls(tls, error)) return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+        listeners(reply, done);
+    }
+
+    void stats(v1::StatsReply* reply, Done done) {
+        if (_s.server == nullptr) return done(unavailable());
+        const ShardedBrokerStatus status = _s.server->status();
+        reply->set_connections(status.total.connections);
+        reply->set_sessions(status.total.sessions);
+        reply->set_retained(status.total.retained / (status.shards ? status.shards : 1));
+        reply->set_messages_in(status.total.published);
+        reply->set_messages_out(status.total.delivered);
+        reply->set_dropped(status.total.dropped);
+        reply->set_refused_connects(status.total.refused);
+        reply->set_shards((uint32_t)status.shards);
+        reply->set_started_ms(_startedMs);
+        if (_s.authority) {
+            const AuthorityStatus a = _s.authority->status();
+            reply->set_authority_asked(a.asked);
+            reply->set_authority_cached(a.cached);
+            reply->set_authority_stale(a.stale);
+        }
+        done(grpc::Status::OK);
+    }
+
+private:
+    static grpc::Status unavailable() {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "the server is not running");
+    }
+    const ApiServer::Services& _s;
+    const int64_t _startedMs;     // the API starts with the server, once its shards run
+};
 
 // =============================================================================
 // Authority.Serve: one application instance answering
@@ -795,9 +1236,9 @@ private:
 
 class SystemService final : public v1::System::CallbackService {
 public:
-    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections)
+    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections, bool admin)
         : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr),
-          _connections(connections) {}
+          _connections(connections), _admin(admin) {}
 
     grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown>* Attach(grpc::CallbackServerContext* context) override {
         return new AttachReactor(_hub, allowed(context, _config.token));
@@ -816,6 +1257,7 @@ public:
         if (_authority) reply->add_features("authority");
         if (_messages) reply->add_features("messages");
         if (_connections) reply->add_features("connections");
+        if (_admin) reply->add_features("admin");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -826,6 +1268,50 @@ private:
     AppHub* _hub;
     bool _messages;
     bool _connections;
+    bool _admin;
+};
+
+
+class AdminService final : public v1::Admin::CallbackService {
+public:
+    AdminService(const ApiServerConfig& config, AdminCore& core) : _config(config), _core(core) {}
+
+#define MODBEE_ADMIN_CALL(Name, Request, Reply, call)                                                     \
+    grpc::ServerUnaryReactor* Name(grpc::CallbackServerContext* context, const Request* request,          \
+                                   Reply* reply) override {                                               \
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();                                    \
+        if (!allowed(context, _config.token)) {                                                           \
+            reactor->Finish(refusedToken());                                                              \
+            return reactor;                                                                               \
+        }                                                                                                 \
+        (void)request;                                                                                    \
+        call;                                                                                             \
+        return reactor;                                                                                   \
+    }
+#define MODBEE_FINISH [reactor](const grpc::Status& status) { reactor->Finish(status); }
+
+    MODBEE_ADMIN_CALL(ListLogins, v1::ListRequest, v1::ListLoginsReply, _core.listLogins(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(GetLogin, v1::NameRef, v1::Login, _core.getLogin(request->name(), reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(PutLogin, v1::PutLoginRequest, v1::PutLoginReply, _core.putLogin(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(DeleteLogin, v1::NameRef, v1::DeleteReply, _core.deleteLogin(request->name(), reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ResetLogin, v1::NameRef, v1::PutLoginReply, _core.resetLogin(request->name(), reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ListKeys, v1::ListRequest, v1::ListKeysReply, _core.listKeys(reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(PutKey, v1::SiteKey, v1::PutKeyReply, _core.putKey(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(DeleteKey, v1::NameRef, v1::DeleteReply, _core.deleteKey(request->name(), reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ListSessions, v1::ListSessionsRequest, v1::ListSessionsReply, _core.listSessions(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(Kick, v1::KickRequest, v1::KickReply, _core.kick(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ListRetained, v1::ListRetainedRequest, v1::ListRetainedReply, _core.listRetained(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(DeleteRetained, v1::DeleteRetainedRequest, v1::DeleteReply, _core.deleteRetained(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(GetListeners, v1::Empty, v1::Listeners, _core.listeners(reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(PutTls, v1::ServerTls, v1::Listeners, _core.putTls(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(Stats, v1::Empty, v1::StatsReply, _core.stats(reply, MODBEE_FINISH))
+
+#undef MODBEE_FINISH
+#undef MODBEE_ADMIN_CALL
+
+private:
+    const ApiServerConfig& _config;
+    AdminCore& _core;
 };
 
 class ConnectionsService final : public v1::Connections::CallbackService {
@@ -1090,6 +1576,9 @@ private:
 
 struct ApiServer::Impl {
     ApiServerConfig config;
+    ApiServer::Services services;
+    std::unique_ptr<AdminCore> core;
+    std::unique_ptr<AdminService> admin;
     std::unique_ptr<SystemService> system;
     std::unique_ptr<AuthorityService> authority;
     std::unique_ptr<MessagesService> messages;
@@ -1103,11 +1592,17 @@ ApiServer::ApiServer() : _impl(new Impl()) {}
 
 ApiServer::~ApiServer() { stop(); }
 
-bool ApiServer::start(const ApiServerConfig& config, Authority* authority, AppHub* messages,
-                      std::string& error, AppConnections* connections) {
+bool ApiServer::start(const ApiServerConfig& config, const Services& services, std::string& error) {
     Impl& self = *_impl;
     self.config = config;
-    self.system.reset(new SystemService(self.config, authority != nullptr, messages, connections != nullptr));
+    self.services = services;
+    Authority* authority = services.authority;
+    AppHub* messages = services.messages;
+    AppConnections* connections = services.connections;
+    self.core.reset(new AdminCore(self.services));
+    self.admin.reset(new AdminService(self.config, *self.core));
+    self.system.reset(new SystemService(self.config, authority != nullptr, messages, connections != nullptr,
+                                         services.admin != nullptr));
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
@@ -1145,6 +1640,7 @@ bool ApiServer::start(const ApiServerConfig& config, Authority* authority, AppHu
     builder.RegisterService(self.authority.get());
     if (self.messages) builder.RegisterService(self.messages.get());
     if (self.connections) builder.RegisterService(self.connections.get());
+    builder.RegisterService(self.admin.get());
     self.server = builder.BuildAndStart();
     if (!self.server) {
         error = "the Application API could not listen on every address (in use, or no permission?)";
@@ -1178,3 +1674,334 @@ void ApiServer::stop() {
 }
 
 const std::vector<std::string>& ApiServer::listening() const { return _impl->listening; }
+
+// =============================================================================
+// THE REST SURFACE: the same calls, as JSON over HTTP
+// =============================================================================
+
+namespace {
+
+std::string percentDecoded(const std::string& in) {
+    std::string out;
+    for (size_t i = 0; i < in.size(); i++) {
+        if (in[i] == '%' && i + 2 < in.size() && std::isxdigit((unsigned char)in[i + 1]) &&
+            std::isxdigit((unsigned char)in[i + 2])) {
+            out.push_back((char)std::stoi(in.substr(i + 1, 2), nullptr, 16));
+            i += 2;
+        } else if (in[i] == '+') {
+            out.push_back(' ');
+        } else {
+            out.push_back(in[i]);
+        }
+    }
+    return out;
+}
+
+std::map<std::string, std::string> queryOf(const std::string& query) {
+    std::map<std::string, std::string> out;
+    size_t at = 0;
+    while (at < query.size()) {
+        size_t end = query.find('&', at);
+        if (end == std::string::npos) end = query.size();
+        const std::string pair = query.substr(at, end - at);
+        const size_t equals = pair.find('=');
+        if (equals == std::string::npos) out[percentDecoded(pair)] = "true";
+        else out[percentDecoded(pair.substr(0, equals))] = percentDecoded(pair.substr(equals + 1));
+        at = end + 1;
+    }
+    return out;
+}
+
+// As grpc-gateway maps them.
+int httpOf(grpc::StatusCode code) {
+    switch (code) {
+    case grpc::StatusCode::OK: return 200;
+    case grpc::StatusCode::INVALID_ARGUMENT:
+    case grpc::StatusCode::FAILED_PRECONDITION:
+    case grpc::StatusCode::OUT_OF_RANGE: return 400;
+    case grpc::StatusCode::UNAUTHENTICATED: return 401;
+    case grpc::StatusCode::PERMISSION_DENIED: return 403;
+    case grpc::StatusCode::NOT_FOUND: return 404;
+    case grpc::StatusCode::ALREADY_EXISTS:
+    case grpc::StatusCode::ABORTED: return 409;
+    case grpc::StatusCode::RESOURCE_EXHAUSTED: return 429;
+    case grpc::StatusCode::UNIMPLEMENTED: return 501;
+    case grpc::StatusCode::UNAVAILABLE: return 503;
+    case grpc::StatusCode::DEADLINE_EXCEEDED: return 504;
+    default: return 500;
+    }
+}
+
+std::string errorBody(int code, const std::string& message) {
+    json::Object o;
+    o.add("code", (long long)code).add("message", message);
+    return o.str();
+}
+
+std::string jsonOf(const google::protobuf::Message& message) {
+    google::protobuf::util::JsonPrintOptions options;
+    options.always_print_primitive_fields = true;
+    std::string out;
+    google::protobuf::util::MessageToJsonString(message, &out, options);
+    return out;
+}
+
+bool parsed(const std::string& body, google::protobuf::Message& message, std::string& error) {
+    if (body.empty()) return true;
+    google::protobuf::util::JsonParseOptions options;
+    options.ignore_unknown_fields = false;
+    const auto status = google::protobuf::util::JsonStringToMessage(body, &message, options);
+    if (status.ok()) return true;
+    error = std::string(status.message());
+    return false;
+}
+
+// One call, waited for. The request and the answer are held by whoever lets go
+// last - this thread, or a call that answers after the wait gave up on it.
+struct RestCall {
+    std::mutex lock;
+    std::condition_variable answered;
+    bool finished = false;
+    grpc::Status status;
+    std::shared_ptr<google::protobuf::Message> request, reply;
+};
+
+grpc::Status waited(std::shared_ptr<google::protobuf::Message> request,
+                    std::shared_ptr<google::protobuf::Message> reply, std::function<void(Done)> call) {
+    std::shared_ptr<RestCall> state(new RestCall());
+    state->request = request;
+    state->reply = reply;
+    call([state](const grpc::Status& status) {
+        std::lock_guard<std::mutex> guard(state->lock);
+        state->status = status;
+        state->finished = true;
+        state->answered.notify_all();
+    });
+    std::unique_lock<std::mutex> guard(state->lock);
+    if (!state->answered.wait_for(guard, std::chrono::seconds(10), [&] { return state->finished; })) {
+        return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "no answer in time");
+    }
+    return state->status;
+}
+
+template <typename T>
+std::shared_ptr<T> made() { return std::make_shared<T>(); }
+
+} // namespace
+
+int ApiServer::rest(const std::string& method, const std::string& target, const std::string& authorization,
+                    const std::string& body, std::string& response) {
+    Impl& self = *_impl;
+    if (!self.core) {
+        response = errorBody(503, "the Application API is not running");
+        return 503;
+    }
+    if (!self.config.token.empty() && authorization != "Bearer " + self.config.token) {
+        response = errorBody(401, "this call needs \"Authorization: Bearer <token>\" (api.token-file)");
+        return 401;
+    }
+    const size_t mark = target.find('?');
+    const std::string path = target.substr(0, mark);
+    std::map<std::string, std::string> query = queryOf(mark == std::string::npos ? "" : target.substr(mark + 1));
+    auto number = [&](const char* key) { return (uint32_t)std::strtoul(query[key].c_str(), nullptr, 10); };
+    if (path.compare(0, 4, "/v1/") != 0) {
+        response = errorBody(404, "the REST surface is under /v1/");
+        return 404;
+    }
+    // "<collection>/<name>[:verb]", the name percent-decoded (a login may hold '/').
+    const std::string rest = path.substr(4);
+    const size_t slash = rest.find('/');
+    const std::string collection = rest.substr(0, slash);
+    std::string name = slash == std::string::npos ? "" : rest.substr(slash + 1);
+    std::string verb;
+    const size_t colon = name.rfind(':');
+    if (colon != std::string::npos) {
+        verb = name.substr(colon + 1);
+        name = name.substr(0, colon);
+    }
+    name = percentDecoded(name);
+    AdminCore* core = self.core.get();
+    std::string error;
+    grpc::Status status = grpc::Status(grpc::StatusCode::NOT_FOUND, "no such call: " + method + " " + path);
+    std::shared_ptr<google::protobuf::Message> reply;
+    // An answer made here, at once.
+    auto answer = [&](std::shared_ptr<google::protobuf::Message> out, const grpc::Status& result) {
+        reply = out;
+        status = result;
+    };
+    // An answer the core gives, perhaps on another thread.
+    auto run = [&](std::shared_ptr<google::protobuf::Message> request, std::shared_ptr<google::protobuf::Message> out,
+                   std::function<void(Done)> call) {
+        reply = out;
+        status = waited(request, out, call);
+    };
+    // A body parsed into `request`, or false with the status said.
+    auto read = [&](google::protobuf::Message& request) {
+        if (parsed(body, request, error)) return true;
+        status = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error);
+        return false;
+    };
+
+    if (collection == "logins") {
+        if (method == "GET" && name.empty()) {
+            auto r = made<v1::ListRequest>();
+            r->set_prefix(query["prefix"]);
+            r->set_page_size(number("pageSize"));
+            r->set_page_token(query["pageToken"]);
+            auto out = made<v1::ListLoginsReply>();
+            run(r, out, [=](Done done) { core->listLogins(*r, out.get(), done); });
+        } else if (method == "GET") {
+            auto out = made<v1::Login>();
+            run(nullptr, out, [=](Done done) { core->getLogin(name, out.get(), done); });
+        } else if (method == "PUT") {
+            auto r = made<v1::PutLoginRequest>();
+            if (read(*r)) {
+                r->mutable_login()->set_name(name);
+                auto out = made<v1::PutLoginReply>();
+                run(r, out, [=](Done done) { core->putLogin(*r, out.get(), done); });
+            }
+        } else if (method == "DELETE") {
+            auto out = made<v1::DeleteReply>();
+            run(nullptr, out, [=](Done done) { core->deleteLogin(name, out.get(), done); });
+        } else if (method == "POST" && verb == "reset") {
+            auto out = made<v1::PutLoginReply>();
+            run(nullptr, out, [=](Done done) { core->resetLogin(name, out.get(), done); });
+        } else if (method == "POST" && verb == "kick") {
+            auto r = made<v1::KickRequest>();
+            if (read(*r)) {
+                r->set_login(name);
+                auto out = made<v1::KickReply>();
+                run(r, out, [=](Done done) { core->kick(*r, out.get(), done); });
+            }
+        }
+    } else if (collection == "keys") {
+        if (method == "GET") {
+            auto out = made<v1::ListKeysReply>();
+            run(nullptr, out, [=](Done done) { core->listKeys(out.get(), done); });
+        } else if (method == "PUT") {
+            auto r = made<v1::SiteKey>();
+            if (read(*r)) {
+                r->set_name(name);
+                auto out = made<v1::PutKeyReply>();
+                run(r, out, [=](Done done) { core->putKey(*r, out.get(), done); });
+            }
+        } else if (method == "DELETE") {
+            auto out = made<v1::DeleteReply>();
+            run(nullptr, out, [=](Done done) { core->deleteKey(name, out.get(), done); });
+        }
+    } else if (collection == "sessions") {
+        if (method == "GET") {
+            auto r = made<v1::ListSessionsRequest>();
+            r->set_client_id_prefix(query["clientIdPrefix"]);
+            r->set_login(query["login"]);
+            r->set_connected_only(query["connectedOnly"] == "true");
+            r->set_page_size(number("pageSize"));
+            r->set_page_token(query["pageToken"]);
+            auto out = made<v1::ListSessionsReply>();
+            run(r, out, [=](Done done) { core->listSessions(*r, out.get(), done); });
+        } else if (method == "POST" && verb == "kick") {
+            auto r = made<v1::KickRequest>();
+            if (read(*r)) {
+                r->set_client_id(name);
+                auto out = made<v1::KickReply>();
+                run(r, out, [=](Done done) { core->kick(*r, out.get(), done); });
+            }
+        }
+    } else if (collection == "retained") {
+        if (method == "GET") {
+            auto r = made<v1::ListRetainedRequest>();
+            r->set_filter(query["filter"]);
+            r->set_payloads(query["payloads"] == "true");
+            r->set_page_size(number("pageSize"));
+            r->set_page_token(query["pageToken"]);
+            auto out = made<v1::ListRetainedReply>();
+            run(r, out, [=](Done done) { core->listRetained(*r, out.get(), done); });
+        } else if (method == "DELETE") {
+            auto r = made<v1::DeleteRetainedRequest>();
+            r->set_filter(query["filter"]);
+            auto out = made<v1::DeleteReply>();
+            run(r, out, [=](Done done) { core->deleteRetained(*r, out.get(), done); });
+        }
+    } else if (collection == "listeners") {
+        if (method == "GET" && name.empty()) {
+            auto out = made<v1::Listeners>();
+            run(nullptr, out, [=](Done done) { core->listeners(out.get(), done); });
+        } else if (method == "PUT" && name == "tls") {
+            auto r = made<v1::ServerTls>();
+            if (read(*r)) {
+                auto out = made<v1::Listeners>();
+                run(r, out, [=](Done done) { core->putTls(*r, out.get(), done); });
+            }
+        }
+    } else if (collection == "stats" && method == "GET") {
+        auto out = made<v1::StatsReply>();
+        run(nullptr, out, [=](Done done) { core->stats(out.get(), done); });
+    } else if (collection == "health" && method == "GET") {
+        response = "{\"status\":\"SERVING\"}";
+        return 200;
+    } else if (collection == "connections" && self.services.connections) {
+        AppConnections& connections = *self.services.connections;
+        const grpc::Status missing(grpc::StatusCode::NOT_FOUND, "no connection \"" + name + "\"");
+        if (method == "GET" && name.empty()) {
+            auto out = made<v1::ListConnectionsReply>();
+            for (const AppConnectionInfo& info : connections.list()) infoTo(info, *out->add_connections());
+            answer(out, grpc::Status::OK);
+        } else if (method == "GET") {
+            AppConnectionInfo info;
+            auto out = made<v1::ConnectionInfo>();
+            const bool found = connections.get(name, info);
+            if (found) infoTo(info, *out);
+            answer(out, found ? grpc::Status::OK : missing);
+        } else if (method == "PUT") {
+            v1::ConnectionSpec r;
+            if (read(r)) {
+                r.set_id(name);
+                AppConnectionInfo info;
+                auto out = made<v1::ConnectionInfo>();
+                const bool put = connections.put(specOf(r), &info, error);
+                if (put) infoTo(info, *out);
+                answer(out, put ? grpc::Status::OK : grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            }
+        } else if (method == "DELETE") {
+            answer(made<v1::DeleteConnectionReply>(), connections.remove(name) ? grpc::Status::OK : missing);
+        }
+    } else if (collection == "groups" && self.services.messages) {
+        AppHub& hub = *self.services.messages;
+        if (method == "GET") {
+            auto out = made<v1::ListGroupsReply>();
+            for (const AppGroupInfo& info : hub.groups()) {
+                v1::GroupInfo* group = out->add_groups();
+                group->set_group(info.group);
+                group->set_connection(info.connection);
+                for (const std::string& f : info.filters) group->add_filters(f);
+                group->set_members(info.members);
+                group->set_queued(info.queued);
+                group->set_in_flight(info.inFlight);
+                group->set_refused(info.refused);
+            }
+            answer(out, grpc::Status::OK);
+        } else if (method == "DELETE") {
+            uint64_t discarded = 0;
+            auto out = made<v1::DeleteGroupReply>();
+            const bool deleted = hub.deleteGroup(name, query["connection"], &discarded, &error);
+            out->set_discarded(discarded);
+            answer(out, deleted ? grpc::Status::OK : grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error));
+        }
+    } else if (collection == "publish" && method == "POST" && self.services.messages) {
+        auto r = made<v1::PublishRequest>();
+        if (read(*r)) {
+            auto out = made<v1::PublishReply>();
+            AppHub* hub = self.services.messages;
+            run(r, out, [=](Done done) {
+                hub->publish(publishOf(*r), [r, out, done](const AppPublishResult& result) {
+                    resultTo(result, r->request_id(), *out);
+                    done(grpc::Status::OK);
+                });
+            });
+        }
+    }
+
+    const int code = httpOf(status.error_code());
+    response = status.ok() && reply ? jsonOf(*reply) : errorBody(code, status.error_message());
+    return code;
+}

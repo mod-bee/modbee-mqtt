@@ -31,6 +31,7 @@
 #include "ApiServer.h"
 #include "AppHub.h"
 #include "AppConnections.h"
+#include "AppAdmin.h"
 #endif
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
@@ -95,6 +96,14 @@ bool serverReady(void* context, std::string& why) {
 #endif
     return true;
 }
+
+#if defined(MODBEE_HAVE_APP_API)
+// /v1/... on the metrics listener: the Application API's REST surface.
+int restCall(void* context, const std::string& method, const std::string& target,
+             const std::string& authorization, const std::string& body, std::string& response) {
+    return static_cast<ApiServer*>(context)->rest(method, target, authorization, body, response);
+}
+#endif
 
 void renderMetrics(void* context, std::string& out) {
     MetricsSources& sources = *static_cast<MetricsSources*>(context);
@@ -442,12 +451,15 @@ int cmdServe(int argc, char** argv) {
 #if defined(MODBEE_HAVE_APP_API)
     // THE APPLICATION'S MESSAGES, wherever the Application API is served.
     std::unique_ptr<AppHub> hub;
+    std::unique_ptr<AppAdmin> admin;
     if (!file.api.grpc.empty()) {
         AppHubConfig h;
         h.maxQueued = (size_t)file.api.maxQueued;
         h.eventsEnabled = file.events.enabled;
         hub.reset(new AppHub(h));
         extensions.add(hub.get());
+        admin.reset(new AppAdmin());
+        extensions.add(admin.get());
     }
 #endif
     if (!extensions.empty()) config.extension = &extensions;
@@ -484,7 +496,14 @@ int cmdServe(int argc, char** argv) {
         if (!read) why = "api: a tls file or the token file could not be read, or the token is empty";
         connections.reset(new AppConnections(*hub, file.api.stateDirectory));
         if (read && !connections->start(why)) read = false;
-        if (!read || !api.start(c, authority.get(), hub.get(), why, connections.get())) {
+        ApiServer::Services s;
+        s.authority = authority.get();
+        s.messages = hub.get();
+        s.connections = connections.get();
+        s.admin = admin.get();
+        s.logins = gate.get();
+        s.server = &server;
+        if (!read || !api.start(c, s, why)) {
             std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
             server.stop();
             return 3;
@@ -554,6 +573,9 @@ int cmdServe(int argc, char** argv) {
 #endif
     MetricsEndpoint metrics;
     metrics.setReadiness(&serverReady, &sources);
+#if defined(MODBEE_HAVE_APP_API)
+    if (file.api.rest && !file.api.grpc.empty()) metrics.setRest(&restCall, &api);
+#endif
     if (file.metrics.enabled) {
         std::string why;
         if (!metrics.start(file.metrics.address, file.metrics.port, &renderMetrics, &sources, why)) {
@@ -563,6 +585,12 @@ int cmdServe(int argc, char** argv) {
         }
         std::printf("modbee serve: metrics on http://%s:%u/metrics\n", file.metrics.address.c_str(),
                     metrics.port());
+#if defined(MODBEE_HAVE_APP_API)
+        if (file.api.rest && !file.api.grpc.empty()) {
+            std::printf("modbee serve: Application API (REST) on http://%s:%u/v1/\n", file.metrics.address.c_str(),
+                        metrics.port());
+        }
+#endif
     }
 #if defined(MODBEE_HAVE_KAFKA)
     if (pipe) {
@@ -639,11 +667,11 @@ int cmdServe(int argc, char** argv) {
         }
     }
     std::printf("modbee serve: stopping\n");
+    metrics.stop();      // first: its REST calls reach the Application API
 #if defined(MODBEE_HAVE_APP_API)
     api.stop();          // before the shards: its calls reach them
     if (connections) connections->stop();
 #endif
-    metrics.stop();
     server.stop();
     return 0;
 }

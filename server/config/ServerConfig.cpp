@@ -864,6 +864,18 @@ void crossCheck(Loader& loader, ServerConfig& config) {
                            "and api.token-file");
         }
     }
+    if (config.api.rest) {
+        if (config.api.grpc.empty()) {
+            loader.problem(nullptr, "api.rest", "REST is the Application API's: it needs api.grpc");
+        } else if (!config.metrics.enabled) {
+            loader.problem(nullptr, "api.rest", "REST is served on the metrics listener: it needs a metrics: section");
+        } else if (config.metrics.address.compare(0, 4, "127.") != 0 && config.api.tokenFile.empty()) {
+            // The metrics listener has no TLS: off loopback, a proxy in front
+            // of it should add some.
+            loader.problem(nullptr, "api.rest", "metrics.address " + config.metrics.address +
+                           " is reachable from other hosts: REST there needs api.token-file");
+        }
+    }
     if (config.sessions.store == SessionStore::File && config.sessions.directory.empty()) {
         loader.problem(nullptr, "sessions.directory", "store: file needs a directory to keep them in");
     }
@@ -1025,6 +1037,7 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     api.text("token-file", out.api.tokenFile);
     api.integer("max-queued", out.api.maxQueued, 1, 100000000);
     api.text("state-directory", out.api.stateDirectory);
+    api.flag("rest", out.api.rest);
     if (api.present()) api.finish();
 
     Section events = top.child("events");

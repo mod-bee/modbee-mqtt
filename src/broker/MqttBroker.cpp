@@ -857,6 +857,60 @@ void MqttBroker::handOff(MqttBrokerConnection& connection, int target) {
     }
 }
 
+void MqttBroker::describeSessions(MqttBrokerSessionVisitFn visit, void* context) const {
+    const mq_time_t now = mq_millis();
+    for (const MqttBrokerSession& session : _sessions) {
+        if (!session.inUse()) continue;
+        MqttBrokerSessionSummary summary;
+        summary.clientId = session.clientId();
+        summary.login = session.userName;
+        summary.connected = session.connected;
+        summary.protocol = (uint8_t)session.version;
+        summary.expiryInterval = session.expiryInterval;
+        if (session.connected && session.connectionSlot < _connections.size()) {
+            const MqttBrokerConnection& connection = _connections[session.connectionSlot];
+            if (connection.transport) summary.address = connection.transport->peerName();
+            summary.connectedForMs = (uint32_t)mq_elapsed(connection.openedAt, now);
+        }
+        for (size_t index = 0; index < session.subscriptionCount(); index++) {
+            const MqttBrokerSubscription* subscription = session.subscriptionAt(index);
+            if (subscription && subscription->inUse()) summary.subscriptions.push_back(subscription->filter);
+        }
+        MqttBrokerSession& mutableSession = const_cast<MqttBrokerSession&>(session);
+        for (size_t index = 0; index < session.queuedExtent(); index++) {
+            const MqttBrokerDelivery* entry = mutableSession.deliveryAt(index);
+            if (entry == nullptr || !entry->inUse()) continue;
+            summary.queued++;
+            if (entry->sent) summary.inFlight++;
+        }
+        visit(context, summary);
+    }
+}
+
+size_t MqttBroker::disconnectClient(const MqttSpan& clientId, uint8_t reasonCode, bool discardSession) {
+    MqttBrokerSession* session = sessionFor(clientId);
+    if (session == nullptr) return 0;
+    size_t closed = 0;
+    if (session->connected) {
+        MqttBrokerConnection* connection = connectionForSession(*session);
+        if (connection != nullptr) {
+            closeConnection(*connection, reasonCode, true, true);
+            closed = 1;
+        }
+    }
+    if (discardSession) {
+        session = sessionFor(clientId);       // the close may have ended it already
+        if (session != nullptr && !session->connected) {
+            // A Will still owed goes out as the session ends [V5:3.1.3.2.2].
+            if (session->will.scheduled) publishWill(*session);
+            _wheel.cancel(session->willTimer);
+            _wheel.cancel(session->expiryTimer);
+            session->release();
+        }
+    }
+    return closed;
+}
+
 void MqttBroker::onConfirm(MqttBrokerConfirmFn handler, void* context) {
     _onConfirm = handler;
     _confirmContext = context;

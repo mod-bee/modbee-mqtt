@@ -25,6 +25,9 @@
 class Authority;
 class AppHub;
 class AppConnections;
+class AppAdmin;
+class AuthGate;
+class ShardedBroker;
 
 struct ApiServerConfig {
     std::vector<std::string> addresses;   // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
@@ -40,11 +43,25 @@ public:
     ApiServer();
     ~ApiServer();
 
-    // `authority` may be null: logins are then the login database's, and the
-    // Authority service says so (FAILED_PRECONDITION). `messages` serves the
-    // Messages service. Neither is owned; both outlive stop().
-    bool start(const ApiServerConfig& config, Authority* authority, AppHub* messages, std::string& error,
-               AppConnections* connections = nullptr);
+    // What it serves. None is owned; each outlives stop(). One left null has
+    // its service say so: Authority without an authority (logins are the
+    // login database's), Admin's logins without a database, and so on.
+    struct Services {
+        Authority* authority = nullptr;
+        AppHub* messages = nullptr;
+        AppConnections* connections = nullptr;
+        AppAdmin* admin = nullptr;           // sessions and retained messages, on the shards
+        AuthGate* logins = nullptr;          // the login database, where logins are kept here
+        ShardedBroker* server = nullptr;     // its listeners, TLS and status
+    };
+    bool start(const ApiServerConfig& config, const Services& services, std::string& error);
+
+    // THE REST SURFACE (internal/APP-API-SPEC.md section 5): one HTTP request,
+    // answered with the same code as its gRPC call. `target` is the path with
+    // its query; `authorization` the header. Returns the HTTP status; the body
+    // is JSON. Callable from any thread; it waits for the answer.
+    int rest(const std::string& method, const std::string& target, const std::string& authorization,
+             const std::string& body, std::string& response);
 
     // Every stream is ended and every call answered or cancelled, within a
     // couple of seconds. Safe to call twice.

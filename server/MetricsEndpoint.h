@@ -12,6 +12,9 @@
 // broker - it calls `render`, which reads the snapshots ShardedBroker and
 // KafkaPipe already keep for exactly this, so a scrape costs the shards
 // nothing. Put it behind the same network policy as any metrics port.
+//
+// With setRest(), /v1/... is the Application API's REST surface too, handed
+// to `rest` whole (ApiServer::rest).
 
 #include "ShardedBroker.h"
 
@@ -25,6 +28,9 @@ public:
     typedef void (*RenderFn)(void* context, std::string& out);
     // Readiness: true when the server should be given clients; false with why.
     typedef bool (*ReadyFn)(void* context, std::string& why);
+    // One /v1/ request; returns the HTTP status, `response` the JSON body.
+    typedef int (*RestFn)(void* context, const std::string& method, const std::string& target,
+                          const std::string& authorization, const std::string& body, std::string& response);
 
     MetricsEndpoint() = default;
     ~MetricsEndpoint() { stop(); }
@@ -38,6 +44,8 @@ public:
     void stop();
     // /readyz answers 200 "ready" or 503 with the reason; without this, "ready".
     void setReadiness(ReadyFn ready, void* context) { _ready = ready; _readyContext = context; }
+    // Before start().
+    void setRest(RestFn rest, void* context) { _rest = rest; _restContext = context; }
     uint16_t port() const { return _port; }
 
 private:
@@ -47,6 +55,8 @@ private:
     RenderFn _render = nullptr;
     ReadyFn _ready = nullptr;
     void* _readyContext = nullptr;
+    RestFn _rest = nullptr;
+    void* _restContext = nullptr;
     void* _context = nullptr;
     std::atomic<bool> _stopping{false};
     std::thread _thread;

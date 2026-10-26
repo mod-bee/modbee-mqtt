@@ -12,7 +12,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 bool MetricsEndpoint::start(const std::string& address, uint16_t port, RenderFn render,
@@ -57,30 +59,112 @@ void MetricsEndpoint::stop() {
     ::close(_wake); _wake = -1;
 }
 
+namespace {
+
+// A REST body is a login, a key, a connection or a message: well under this.
+const size_t kMaxBody = 1024 * 1024;
+
+std::string lowered(std::string text) {
+    for (char& c : text) c = (char)std::tolower((unsigned char)c);
+    return text;
+}
+
+struct Request {
+    std::string method, target, authorization, body;
+    bool tooLarge = false;
+};
+
+// The request line, the two headers wanted and the body, or false.
+bool readRequest(int client, Request& request) {
+    std::string data;
+    char chunk[4096];
+    size_t headEnd = std::string::npos;
+    while (headEnd == std::string::npos) {
+        const ssize_t got = ::recv(client, chunk, sizeof chunk, 0);
+        if (got <= 0) return false;
+        data.append(chunk, (size_t)got);
+        headEnd = data.find("\r\n\r\n");
+        if (headEnd == std::string::npos && data.size() > 16384) return false;
+    }
+    const size_t lineEnd = data.find("\r\n");
+    const std::string line = data.substr(0, lineEnd);
+    const size_t space = line.find(' ');
+    const size_t space2 = line.find(' ', space + 1);
+    if (space == std::string::npos || space2 == std::string::npos) return false;
+    request.method = line.substr(0, space);
+    request.target = line.substr(space + 1, space2 - space - 1);
+    size_t length = 0;
+    size_t at = lineEnd + 2;
+    while (at < headEnd) {
+        size_t end = data.find("\r\n", at);
+        if (end == std::string::npos || end > headEnd) end = headEnd;
+        const std::string header = data.substr(at, end - at);
+        const size_t colon = header.find(':');
+        if (colon != std::string::npos) {
+            const std::string name = lowered(header.substr(0, colon));
+            size_t from = colon + 1;
+            while (from < header.size() && header[from] == ' ') from++;
+            const std::string value = header.substr(from);
+            if (name == "authorization") request.authorization = value;
+            else if (name == "content-length") length = (size_t)std::strtoull(value.c_str(), nullptr, 10);
+        }
+        at = end + 2;
+    }
+    if (length > kMaxBody) {
+        request.tooLarge = true;
+        return true;
+    }
+    request.body = data.substr(headEnd + 4);
+    while (request.body.size() < length) {
+        const ssize_t got = ::recv(client, chunk, sizeof chunk, 0);
+        if (got <= 0) return false;
+        request.body.append(chunk, (size_t)got);
+    }
+    request.body.resize(length);
+    return true;
+}
+
+} // namespace
+
 void MetricsEndpoint::serve() {
     while (!_stopping.load()) {
         pollfd fds[2] = {{_listen, POLLIN, 0}, {_wake, POLLIN, 0}};
         if (::poll(fds, 2, 1000) <= 0 || !(fds[0].revents & POLLIN)) continue;
         const int client = ::accept4(_listen, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) continue;
-        // One read is enough for a GET; a client that dribbles its request
-        // gets two seconds, then the door.
+        // A client that dribbles its request gets two seconds a read, then
+        // the door.
         timeval timeout = {2, 0};
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
         setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
-        char request[1024];
-        const ssize_t got = ::recv(client, request, sizeof request - 1, 0);
+        Request request;
+        const bool got = readRequest(client, request);
+        const std::string& target = request.target;
+        auto is = [&](const char* method, const char* path) {
+            const size_t n = std::strlen(path);
+            return request.method == method && target.compare(0, n, path) == 0 &&
+                   (target.size() == n || target[n] == '?');
+        };
         std::string body, status = "200 OK", type = "text/plain; version=0.0.4; charset=utf-8";
-        if (got > 0) {
-            request[got] = '\0';
-            if (std::strncmp(request, "GET /metrics", 12) == 0) {
+        if (got) {
+            if (_rest != nullptr && target.compare(0, 4, "/v1/") == 0) {
+                type = "application/json";
+                int code = 413;
+                if (request.tooLarge) body = "{\"code\":413,\"message\":\"the body is over 1 MB\"}";
+                else code = _rest(_restContext, request.method, target, request.authorization, request.body, body);
+                const char* reason = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 401 ? "Unauthorized"
+                                   : code == 403 ? "Forbidden" : code == 404 ? "Not Found" : code == 409 ? "Conflict"
+                                   : code == 413 ? "Payload Too Large" : code == 429 ? "Too Many Requests"
+                                   : code == 501 ? "Not Implemented" : code == 503 ? "Service Unavailable"
+                                   : code == 504 ? "Gateway Timeout" : "Error";
+                status = std::to_string(code) + " " + reason;
+            } else if (is("GET", "/metrics")) {
                 _render(_context, body);
-            } else if (std::strncmp(request, "GET / ", 6) == 0 ||
-                       std::strncmp(request, "GET /healthz", 12) == 0) {
+            } else if (is("GET", "/") || is("GET", "/healthz")) {
                 // LIVENESS: the process answers. Restart it only if this fails.
                 body = "ok\n";
                 type = "text/plain";
-            } else if (std::strncmp(request, "GET /readyz", 11) == 0) {
+            } else if (is("GET", "/readyz")) {
                 // READINESS: give it clients. Not ready while Kafka, which
                 // holds publishers' acknowledgements, cannot be reached.
                 std::string why;

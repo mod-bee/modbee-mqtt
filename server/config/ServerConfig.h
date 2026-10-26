@@ -277,6 +277,9 @@ struct ApiSection {
     std::string tokenFile;               // a token every call must carry ("authorization: Bearer ...")
     long long maxQueued = 100000;        // per consumer group: past it, the group refuses
     std::string stateDirectory = "/var/lib/modbee";   // managed connections are kept here
+    // The REST surface, /v1/..., on the metrics listener: off a loopback
+    // address only with the token.
+    bool rest = false;
 };
 
 struct ServerConfig {

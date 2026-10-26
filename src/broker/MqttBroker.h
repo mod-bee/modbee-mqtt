@@ -313,6 +313,21 @@ struct MqttBrokerSessionImage {
 };
 #endif
 
+#if defined(MQTT_PLATFORM_HOST)
+// --- One session, as an administrator sees it (host only) ---
+struct MqttBrokerSessionSummary {
+    std::string clientId, login, address;
+    bool connected = false;
+    uint8_t protocol = 5;              // 4 (3.1.1) or 5
+    uint32_t connectedForMs = 0;       // how long its connection has been up
+    uint32_t expiryInterval = 0;
+    std::vector<std::string> subscriptions;
+    size_t queued = 0;                 // messages owed to it
+    size_t inFlight = 0;               // of those, sent and not yet acknowledged
+};
+typedef void (*MqttBrokerSessionVisitFn)(void* context, const MqttBrokerSessionSummary& summary);
+#endif
+
 // --- Counters ---
 //
 // Running totals, never flags, for the same reason the client's are: two
@@ -662,6 +677,16 @@ public:
     // Told what happens to messages published with a confirm id
     // (MqttBrokerRouted::confirm).
     void onConfirm(MqttBrokerConfirmFn handler, void* context);
+
+    // --- For an administrator (host only) ---
+
+    // Every session this broker holds, connected or not.
+    void describeSessions(MqttBrokerSessionVisitFn visit, void* context) const;
+
+    // Closes the connection of `clientId`, telling a 5.0 client `reasonCode`
+    // (its Will is published, as for disconnectUser()); with
+    // `discardSession`, its session ends too. How many connections closed.
+    size_t disconnectClient(const MqttSpan& clientId, uint8_t reasonCode, bool discardSession);
 
     // --- A permission hook that answers later ---
 

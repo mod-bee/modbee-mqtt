@@ -5,7 +5,7 @@ backend, a gateway's own software - can speak to it a different way: over
 the Application API, gRPC on a local socket, with no MQTT library at all.
 
 The contract is [`proto/modbee/app/v1/app.proto`](../proto/modbee/app/v1/app.proto).
-Today the server answers four of its services:
+The server answers all five of its services:
 
 | Service | What it is for |
 | --- | --- |
@@ -13,9 +13,10 @@ Today the server answers four of its services:
 | `Messages` | **Every device's messages, shared by your application's instances, and messages back to the devices** - [below](#messages) |
 | `Connections` | **MQTT connections the server keeps to other brokers for your application** - [below](#connections-to-other-brokers) |
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
+| `Admin` | **Logins, site keys, sessions, kicks, retained messages, TLS, counters** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
 
-`Admin` answers `UNIMPLEMENTED` for now; `Hello`'s `features` lists what a server serves, so an application asks
-rather than guesses.
+`Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), so an
+application asks rather than guesses.
 
 **`System.Attach`** is an instance's presence. Open it with the messages to
 publish should the instance vanish - its Wills, as an MQTT client has one:
@@ -172,6 +173,75 @@ never its password or key. `Watch` streams every change of state.
 TLS: `ca_pem` (empty: the system's trust store), and `certificate_pem` and
 `key_pem` for mutual TLS, written beside `connections.json`. The name checked
 is the server's `host`; `server_name` is not used yet.
+
+---
+
+## Administration, and REST
+
+`Admin` is what an operator - or the platform's own console - does to a
+running server, without restarting it:
+
+| Calls | |
+| --- | --- |
+| `ListLogins` `GetLogin` `PutLogin` `DeleteLogin` `ResetLogin` | The logins in the server's login database (`authentication.database`). `PutLogin` without a password generates one and returns it, once. `ResetLogin` gives a new one and closes the login's connections. With logins decided by your application, there is no database: `FAILED_PRECONDITION` |
+| `ListKeys` `PutKey` `DeleteKey` | Site keys devices register with. A new key's secret, `<name>.<secret>`, is returned once |
+| `ListSessions` | Every session on every shard, connected or not: its login, address, protocol, subscriptions, what is queued and in flight |
+| `Kick` | Closes a client's connection, or every connection of a login, with DISCONNECT `0x98` (administrative action); its Will is published. `discard_session` ends the session too |
+| `ListRetained` `DeleteRetained` | Retained messages under a filter, with payloads if asked; deleting is the same as a device publishing an empty retained message to each |
+| `GetListeners` `PutTls` | The listeners, and the TLS certificate they serve - replaced live: new handshakes use it, open connections keep theirs |
+| `Stats` | The server's counters: connections, sessions, messages in and out, logins asked of your application and answered from its cache |
+
+### REST
+
+The same calls, as JSON, on the HTTP listener `/metrics` is on:
+
+```yaml
+metrics:
+  address: 127.0.0.1
+  port: 9464
+api:
+  grpc: ["unix:/run/modbee/api.sock"]
+  rest: true
+```
+
+```
+modbee serve: Application API (REST) on http://127.0.0.1:9464/v1/
+```
+
+```sh
+curl -X PUT localhost:9464/v1/logins/sensor-7 -d '{"login":{"publish":["plant/sensor-7/#"]}}'
+# {"login":{"name":"sensor-7","enabled":true,...},"password":"YT4SDLSozVV1cuLkvKLnKeB6xCC49mBb"}
+curl 'localhost:9464/v1/retained?filter=plant/%23&payloads=true'
+curl -X POST localhost:9464/v1/sessions/pump-1:kick
+```
+
+| REST | gRPC |
+| --- | --- |
+| `GET /v1/logins?prefix=&pageSize=&pageToken=` | `Admin.ListLogins` |
+| `GET` · `PUT` · `DELETE /v1/logins/{name}` | `GetLogin` · `PutLogin` · `DeleteLogin` |
+| `POST /v1/logins/{name}:reset` · `POST /v1/logins/{name}:kick` | `ResetLogin` · `Kick` |
+| `GET /v1/keys` · `PUT` · `DELETE /v1/keys/{name}` | `ListKeys` · `PutKey` · `DeleteKey` |
+| `GET /v1/sessions?clientIdPrefix=&login=&connectedOnly=` · `POST /v1/sessions/{clientId}:kick` | `ListSessions` · `Kick` |
+| `GET /v1/retained?filter=&payloads=` · `DELETE /v1/retained?filter=` | `ListRetained` · `DeleteRetained` |
+| `GET /v1/listeners` · `PUT /v1/listeners/tls` | `GetListeners` · `PutTls` |
+| `GET /v1/stats` · `GET /v1/health` | `Stats` · health |
+| `GET /v1/connections` · `GET` · `PUT` · `DELETE /v1/connections/{id}` | `Connections.*` |
+| `GET /v1/groups` · `DELETE /v1/groups/{group}?connection=` | `Messages.ListGroups` · `DeleteGroup` |
+| `POST /v1/publish` | `Messages.Publish` (the streams are gRPC only) |
+
+- **The JSON is protobuf's own mapping**: field names in lowerCamelCase,
+  64-bit numbers as strings, `bytes` (a password, a payload) as base64, enums
+  by name. A field the message does not have is refused, `400`.
+- **Errors** are the gRPC status as HTTP - `400` invalid, `401` no token,
+  `404` not found, `409` exists, `503` unavailable - with
+  `{"code": 404, "message": "..."}`.
+- **Who may call.** With `api.token-file`, every request carries
+  `Authorization: Bearer <token>`. Without one, REST must be on a loopback
+  address (`metrics.address: 127.x`); the server refuses to start otherwise.
+  The listener has no TLS: reach it from another host through a proxy that
+  adds it.
+- One request at a time, as `/metrics` is: it is for an operator and a
+  console, not for traffic. Messages in volume go over gRPC.
 
 ---
 
