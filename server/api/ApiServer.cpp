@@ -1525,9 +1525,10 @@ private:
 
 class SystemService final : public v1::System::CallbackService {
 public:
-    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections, bool admin)
+    SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections, bool admin,
+                  bool aware = false)
         : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr),
-          _connections(connections), _admin(admin) {}
+          _connections(connections), _admin(admin), _aware(aware) {}
 
     grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown>* Attach(grpc::CallbackServerContext* context) override {
         return new AttachReactor(_hub, allowed(context, _config.token));
@@ -1552,6 +1553,8 @@ public:
         if (_messages) reply->add_features("events.handshake");
         reply->add_features("sparkplug.codec");
         if (_connections) reply->add_features("sparkplug.host");
+        if (_connections) reply->add_features("sparkplug.edge");
+        if (_aware) reply->add_features("sparkplug.aware");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1563,6 +1566,7 @@ private:
     bool _messages;
     bool _connections;
     bool _admin;
+    bool _aware;
 };
 
 
@@ -1792,6 +1796,66 @@ private:
 // Sparkplug: the codec on its own
 // =============================================================================
 
+void edgeInfoTo(const AppSparkplugEdgeNodeInfo& info, v1::SparkplugEdgeNodeInfo& wire) {
+    v1::SparkplugEdgeNodeSpec* s = wire.mutable_spec();
+    s->set_id(info.spec.id);
+    s->set_connection(info.spec.connection);
+    s->set_group(info.spec.group);
+    s->set_node(info.spec.node);
+    s->set_primary_host_id(info.spec.primaryHostId);
+    for (const std::string& d : info.spec.devices) s->add_devices(d);
+    s->set_history_max(info.spec.historyMax);
+    for (const AppSparkplugMetricDeclaration& m : info.spec.metrics) {
+        v1::SparkplugMetricDeclaration* d = s->add_metrics();
+        d->set_name(m.name);
+        d->set_device(m.device);
+        d->set_datatype((v1::SparkplugDataType)m.datatype);
+        d->set_writable(m.writable);
+        d->set_units(m.units);
+        if (m.hasRange) {
+            d->set_low(m.low);
+            d->set_high(m.high);
+        }
+        d->set_deadband(m.deadband);
+        d->set_deadband_percent(m.deadbandPercent);
+    }
+    wire.set_born(info.born);
+    wire.set_bd_seq(info.bdSeq);
+    wire.set_primary_host_online(info.primaryHostOnline);
+    wire.set_births(info.births);
+    wire.set_history(info.history);
+    wire.set_history_lost(info.historyLost);
+    for (const std::string& d : info.devicesOnline) wire.add_devices_online(d);
+}
+
+// A value given in any field, as `type` holds it.
+void coerce(const v1::SparkplugValue& v, MqttSparkplugDataType type, AppSparkplugSet& set) {
+    double n = 0;
+    switch (v.kind_case()) {
+    case v1::SparkplugValue::kIntValue: n = (double)v.int_value(); break;
+    case v1::SparkplugValue::kUintValue: n = (double)v.uint_value(); break;
+    case v1::SparkplugValue::kFloatValue: n = v.float_value(); break;
+    case v1::SparkplugValue::kDoubleValue: n = v.double_value(); break;
+    case v1::SparkplugValue::kBooleanValue: n = v.boolean_value() ? 1 : 0; break;
+    default: return;                  // text and bytes stay as given
+    }
+    MqttSparkplugValue& out = set.value;
+    switch (type) {
+    case MqttSparkplugDataType::Int8: case MqttSparkplugDataType::Int16:
+    case MqttSparkplugDataType::Int32: case MqttSparkplugDataType::Int64:
+        out.as.signedValue = v.kind_case() == v1::SparkplugValue::kIntValue ? v.int_value() : (int64_t)n;
+        break;
+    case MqttSparkplugDataType::UInt8: case MqttSparkplugDataType::UInt16: case MqttSparkplugDataType::UInt32:
+    case MqttSparkplugDataType::UInt64: case MqttSparkplugDataType::DateTime:
+        out.as.unsignedValue = v.kind_case() == v1::SparkplugValue::kUintValue ? v.uint_value() : (uint64_t)n;
+        break;
+    case MqttSparkplugDataType::Float: out.as.float32 = (float)n; break;
+    case MqttSparkplugDataType::Double: out.as.float64 = n; break;
+    case MqttSparkplugDataType::Boolean: out.as.boolean = n != 0; break;
+    default: break;
+    }
+}
+
 void hostSpecTo(const AppSparkplugHostSpec& spec, v1::SparkplugHostSpec& wire) {
     wire.set_id(spec.id);
     wire.set_connection(spec.connection);
@@ -1815,6 +1879,153 @@ public:
     SparkplugService(const ApiServerConfig& config, AppConnections* connections, AppHub* hub,
                      const ApiServer::Services& services)
         : _config(config), _connections(connections), _hub(hub), _services(services) {}
+
+    // --- Edge nodes ---
+
+    grpc::ServerUnaryReactor* PutEdgeNode(grpc::CallbackServerContext* context, const v1::SparkplugEdgeNodeSpec* request,
+                                          v1::SparkplugEdgeNodeInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        AppSparkplugEdgeNodeSpec spec;
+        spec.id = request->id();
+        spec.connection = request->connection();
+        spec.group = request->group();
+        spec.node = request->node();
+        spec.primaryHostId = request->primary_host_id();
+        spec.devices.assign(request->devices().begin(), request->devices().end());
+        if (request->has_history_max()) spec.historyMax = request->history_max();
+        for (const v1::SparkplugMetricDeclaration& d : request->metrics()) {
+            AppSparkplugMetricDeclaration m;
+            m.name = d.name();
+            m.device = d.device();
+            m.datatype = (uint32_t)d.datatype();
+            m.writable = d.writable();
+            m.units = d.units();
+            m.hasRange = d.has_low() || d.has_high();
+            m.low = d.low();
+            m.high = d.high();
+            m.deadband = d.deadband();
+            m.deadbandPercent = d.deadband_percent();
+            spec.metrics.push_back(m);
+        }
+        AppSparkplugEdgeNodeInfo info;
+        std::string error;
+        if (!_connections->putEdgeNode(spec, &info, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
+        edgeInfoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* GetEdgeNode(grpc::CallbackServerContext* context, const v1::SparkplugEdgeNodeRef* request,
+                                          v1::SparkplugEdgeNodeInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        AppSparkplugEdgeNodeInfo info;
+        if (!_connections->getEdgeNode(request->id(), info)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, "no edge node \"" + request->id() + "\""));
+            return reactor;
+        }
+        edgeInfoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* ListEdgeNodes(grpc::CallbackServerContext* context, const v1::Empty*,
+                                            v1::SparkplugEdgeNodeList* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        for (const AppSparkplugEdgeNodeInfo& info : _connections->edgeNodes()) edgeInfoTo(info, *reply->add_edge_nodes());
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* DeleteEdgeNode(grpc::CallbackServerContext* context,
+                                             const v1::SparkplugEdgeNodeRef* request, v1::Empty*) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        reactor->Finish(_connections->removeEdgeNode(request->id())
+                            ? grpc::Status::OK
+                            : grpc::Status(grpc::StatusCode::NOT_FOUND, "no edge node \"" + request->id() + "\""));
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* SetValues(grpc::CallbackServerContext* context, const v1::SparkplugValuesRequest* request,
+                                        v1::SparkplugValuesReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::vector<AppSparkplugSet> sets;
+        for (const v1::SparkplugMetric& m : request->metrics()) {
+            AppSparkplugSet set;
+            set.name = m.name();
+            set.timestamp = m.has_timestamp() ? m.timestamp() : 0;
+            MqttSparkplugValue& v = set.value;
+            v.isNull = m.is_null();
+            switch (m.value().kind_case()) {
+            case v1::SparkplugValue::kIntValue: v.as.signedValue = m.value().int_value(); break;
+            case v1::SparkplugValue::kUintValue: v.as.unsignedValue = m.value().uint_value(); break;
+            case v1::SparkplugValue::kFloatValue: v.as.float32 = m.value().float_value(); break;
+            case v1::SparkplugValue::kDoubleValue: v.as.float64 = m.value().double_value(); break;
+            case v1::SparkplugValue::kBooleanValue: v.as.boolean = m.value().boolean_value(); break;
+            case v1::SparkplugValue::kStringValue: set.text = m.value().string_value(); break;
+            case v1::SparkplugValue::kBytesValue: set.text = m.value().bytes_value(); break;
+            default: v.isNull = true; break;
+            }
+            sets.push_back(std::move(set));
+        }
+        // A value given in another field than its datatype's is read as that datatype wants it.
+        AppSparkplugEdgeNodeInfo info;
+        if (_connections->getEdgeNode(request->edge_node(), info)) {
+            for (size_t i = 0; i < sets.size(); i++) {
+                for (const AppSparkplugMetricDeclaration& d : info.spec.metrics) {
+                    if (d.name != sets[i].name || d.device != request->device()) continue;
+                    coerce(request->metrics((int)i).value(), (MqttSparkplugDataType)d.datatype, sets[i]);
+                }
+            }
+        }
+        for (AppSparkplugSet& set : sets) {
+            if (!set.text.empty() || set.value.isText() || set.value.isBytes()) {
+                set.value.as.bytes.data = (const uint8_t*)set.text.data();
+                set.value.as.bytes.length = (uint32_t)set.text.size();
+            }
+        }
+        uint32_t sent = 0, kept = 0;
+        std::vector<std::string> unknown;
+        std::string error;
+        if (!_connections->setValues(request->edge_node(), request->device(), sets, sent, kept, unknown, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, error));
+            return reactor;
+        }
+        reply->set_sent(sent);
+        reply->set_kept(kept);
+        for (const std::string& u : unknown) reply->add_unknown(u);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* SetDeviceState(grpc::CallbackServerContext* context,
+                                             const v1::SparkplugDeviceStateRequest* request, v1::Empty*) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::string error;
+        reactor->Finish(_connections->deviceState(request->edge_node(), request->device(), request->online(), error)
+                            ? grpc::Status::OK
+                            : grpc::Status(grpc::StatusCode::NOT_FOUND, error));
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* RebirthEdgeNode(grpc::CallbackServerContext* context,
+                                              const v1::SparkplugEdgeNodeRef* request, v1::Empty*) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::string error;
+        reactor->Finish(_connections->rebirthEdgeNode(request->id(), error)
+                            ? grpc::Status::OK
+                            : grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error));
+        return reactor;
+    }
 
     grpc::ServerUnaryReactor* GetAware(grpc::CallbackServerContext* context, const v1::Empty*,
                                        v1::SparkplugAwareSetting* reply) override {
@@ -2182,7 +2393,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     self.core.reset(new AdminCore(self.services));
     self.admin.reset(new AdminService(self.config, *self.core));
     self.system.reset(new SystemService(self.config, authority != nullptr, messages, connections != nullptr,
-                                         services.admin != nullptr));
+                                         services.admin != nullptr, (bool)services.sparkplugAware));
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));

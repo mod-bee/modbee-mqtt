@@ -307,6 +307,13 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt sparkplug nodes` | `Sparkplug.ListNodes` | - |
 | `modbee-mqtt sparkplug rebirth` | `Sparkplug.Rebirth` | - |
 | `modbee-mqtt sparkplug write` | `Sparkplug.Write` | - |
+| `modbee-mqtt sparkplug-nodes put` | `Sparkplug.PutEdgeNode` | - |
+| `modbee-mqtt sparkplug-nodes get` | `Sparkplug.GetEdgeNode` | - |
+| `modbee-mqtt sparkplug-nodes list` | `Sparkplug.ListEdgeNodes` | - |
+| `modbee-mqtt sparkplug-nodes delete` | `Sparkplug.DeleteEdgeNode` | - |
+| `modbee-mqtt sparkplug-nodes set` | `Sparkplug.SetValues` | - |
+| `modbee-mqtt sparkplug-nodes device` | `Sparkplug.SetDeviceState` | - |
+| `modbee-mqtt sparkplug-nodes rebirth` | `Sparkplug.RebirthEdgeNode` | - |
 | `modbee-mqtt sparkplug-aware get` | `Sparkplug.GetAware` | - |
 | `modbee-mqtt sparkplug-aware set` | `Sparkplug.PutAware` | - |
 | `modbee-mqtt messages consume` | `Messages.Consume` | - |

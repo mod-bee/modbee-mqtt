@@ -8,6 +8,7 @@
 #include "Json.h"
 #include "MqttClient.h"
 #include "sparkplug/MqttSparkplugHost.h"
+#include "sparkplug/MqttSparkplugNode.h"
 #include "transport/MqttTcpTransport.h"
 #if MQTT_TLS_SOCKETS
 #include "transport/MqttTlsTransport.h"
@@ -17,6 +18,7 @@
 #include <set>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -319,6 +321,59 @@ struct AppConnections::Host {
 };
 
 // =============================================================================
+// A SPARKPLUG EDGE NODE ON A CONNECTION
+// =============================================================================
+//
+// The library's node does the protocol on the connection's own client. Values
+// set while it is not born are kept in the outbox under this node's key, and
+// sent with is_historical once it is.
+
+struct AppConnections::EdgeNode {
+    AppSparkplugEdgeNodeSpec spec;
+    std::unique_ptr<MqttSparkplugNode> library;
+    uint64_t history = 0, historyLost = 0;
+    std::string key() const { return "sparkplug-node:" + spec.id; }
+    const char* device(const std::string& d) const { return d.empty() ? nullptr : d.c_str(); }
+};
+
+namespace {
+
+// A value kept while the node was not born, as an outbox message: its metric
+// name the topic, its device the publisher, its time the broker time.
+AppMessage keptValue(const std::string& device, const AppSparkplugSet& set) {
+    AppMessage m;
+    m.topic = set.name;
+    m.clientId = device;
+    m.brokerTimeMs = (int64_t)set.timestamp;
+    const uint32_t type = (uint32_t)set.value.type;
+    m.payload.assign((const char*)&type, sizeof type);
+    m.payload.push_back(set.value.isNull ? 1 : 0);
+    m.payload.append((const char*)&set.value.as.unsignedValue, sizeof set.value.as.unsignedValue);
+    if (set.value.isText() || set.value.isBytes()) m.payload += set.text;
+    return m;
+}
+
+bool valueOfKept(const AppMessage& m, AppSparkplugSet& set) {
+    const size_t head = sizeof(uint32_t) + 1 + sizeof(uint64_t);
+    if (m.payload.size() < head) return false;
+    uint32_t type = 0;
+    std::memcpy(&type, m.payload.data(), sizeof type);
+    set.name = m.topic;
+    set.timestamp = (uint64_t)m.brokerTimeMs;
+    set.value.type = (MqttSparkplugDataType)type;
+    set.value.isNull = m.payload[sizeof type] != 0;
+    std::memcpy(&set.value.as.unsignedValue, m.payload.data() + sizeof type + 1, sizeof(uint64_t));
+    if (set.value.isText() || set.value.isBytes()) {
+        set.text = m.payload.substr(head);
+        set.value.as.bytes.data = (const uint8_t*)set.text.data();
+        set.value.as.bytes.length = (uint32_t)set.text.size();
+    }
+    return true;
+}
+
+} // namespace
+
+// =============================================================================
 // ONE CONNECTION
 // =============================================================================
 
@@ -433,6 +488,19 @@ struct AppConnections::Connection {
         if (message.properties) m->properties.copyForForwarding(*message.properties);
         m->brokerTimeMs = utcNowMs();
         m->connection = self.spec.id;
+        if (self.edge && (m->topic.find("/NCMD/") != std::string::npos || m->topic.find("/DCMD/") != std::string::npos)) {
+            // A command to this node names its metrics by the aliases its births gave them.
+            const MqttSparkplugNode& node = *self.edge->library;
+            for (size_t i = 0; i < node.pointCount(); i++) {
+                const MqttSparkplugPoint* point = node.pointAt(i);
+                if (point == nullptr) continue;
+                AppSparkplugName n;
+                n.alias = point->alias;
+                n.name = point->name;
+                n.datatype = (uint32_t)point->type;
+                m->sparkplugNames.push_back(n);
+            }
+        }
         if (self.host) {
             Host& h = *self.host;
             if (h.fresh) {
@@ -461,8 +529,9 @@ struct AppConnections::Connection {
     bool usesTls() const { return spec.thisServer ? hereTls : spec.tls; }
     uint16_t portOf(const AppEndpoint& e) const { return e.port ? e.port : (usesTls() ? 8883 : 1883); }
 
-    // Last, so it goes before the client it is attached to.
+    // Last, so they go before the client they are attached to.
     std::unique_ptr<Host> host;
+    std::unique_ptr<EdgeNode> edge;
 
     void setState(AppConnectionState next, const std::string& error = std::string()) {
         if (next == state && error == lastError) return;
@@ -629,6 +698,89 @@ void AppConnections::open(Connection& c) {
     c.nextAttempt = Clock::now();
     c.filtersChanged = true;
     startHost(c);
+    startEdgeNode(c);
+}
+
+void AppConnections::startEdgeNode(Connection& c) {
+    c.edge.reset();
+    for (const auto& one : _edgeNodes) {
+        if (one.second.connection != c.spec.id) continue;
+        std::unique_ptr<EdgeNode> e(new EdgeNode());
+        e->spec = one.second;
+        e->library.reset(new MqttSparkplugNode(c.client));
+        MqttSparkplugNode& node = *e->library;
+        node.group(e->spec.group.c_str());
+        node.node(e->spec.node.c_str());
+        if (!e->spec.primaryHostId.empty()) node.primaryHost(e->spec.primaryHostId.c_str());
+        node.epochNow((uint64_t)utcNowMs());
+        for (const std::string& d : e->spec.devices) node.addDevice(d.c_str());
+        for (const AppSparkplugMetricDeclaration& m : e->spec.metrics) {
+            const MqttSparkplugDataType type = (MqttSparkplugDataType)m.datatype;
+            const char* device = e->device(m.device);
+            if (device) {
+                if (m.writable) node.declareWritableFor(device, m.name.c_str(), type);
+                else node.declareFor(device, m.name.c_str(), type);
+            } else {
+                if (m.writable) node.declareWritable(m.name.c_str(), type);
+                else node.declare(m.name.c_str(), type);
+            }
+            const int at = node.indexOf(device, m.name.c_str());
+            if (at < 0) continue;
+            if (!m.units.empty()) node.unitsAt((size_t)at, m.units.c_str());
+            if (m.hasRange) node.rangeAt((size_t)at, m.low, m.high);
+            if (m.deadband != 0 || m.deadbandPercent != 0) node.deadbandAt((size_t)at, m.deadband, m.deadbandPercent);
+        }
+        for (const std::string& d : e->spec.devices) node.deviceOnline(d.c_str());
+        e->history = _outbox.totals(e->key()).messages;
+        node.connect();                            // its NDEATH is this connection's Will from now on
+        c.edge = std::move(e);
+        return;
+    }
+}
+
+void AppConnections::serviceEdgeNode(Connection& c) {
+    if (!c.edge) return;
+    EdgeNode& e = *c.edge;
+    MqttSparkplugNode& node = *e.library;
+    node.epochNow((uint64_t)utcNowMs());
+    node.poll();
+    // A host's writes reach the application on the connection, as NCMD and
+    // DCMD; the node's own queue of them is let go.
+    MqttSparkplugValue ignored;
+    for (size_t i = 0; i < node.pointCount(); i++) {
+        while (node.commandPendingAt(i) && node.takeAt(i, ignored)) {}
+    }
+    // Born again: what was kept goes, oldest first, one device at a time.
+    if (e.history == 0 || !node.isBorn()) return;
+    std::vector<ConnectionOutbox::Kept> kept = _outbox.next(e.key(), 0, 64);
+    std::vector<AppSparkplugSet> sets(kept.size());
+    std::vector<MqttSparkplugRecord> records;
+    std::vector<uint64_t> sent;
+    std::string device;
+    for (size_t i = 0; i < kept.size(); i++) {
+        if (!valueOfKept(kept[i].message, sets[i])) {
+            _outbox.drop(kept[i].id);           // unreadable: let go
+            e.history--;
+            continue;
+        }
+        if (!records.empty() && kept[i].message.clientId != device) break;
+        device = kept[i].message.clientId;
+        const int at = node.indexOf(e.device(device), sets[i].name.c_str());
+        if (at < 0) {
+            _outbox.drop(kept[i].id);           // no longer declared
+            e.history--;
+            continue;
+        }
+        MqttSparkplugRecord r;
+        r.index = (size_t)at;
+        r.value = sets[i].value;
+        r.timestamp = sets[i].timestamp;
+        records.push_back(r);
+        sent.push_back(kept[i].id);
+    }
+    if (records.empty() || !node.publishRecords(records.data(), records.size(), true)) return;
+    for (uint64_t id : sent) _outbox.drop(id);
+    e.history -= std::min<uint64_t>(e.history, sent.size());
 }
 
 void AppConnections::startHost(Connection& c) {
@@ -681,13 +833,15 @@ void AppConnections::serviceHost(Connection& c) {
 
 void AppConnections::close(Connection& c) {
     // A host's STATE dies first, on purpose rather than by its Will.
-    if (c.host) {
-        c.host->library->disconnect();
+    if (c.host || c.edge) {
+        if (c.host) c.host->library->disconnect();
+        if (c.edge) c.edge->library->disconnect();
         for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
             c.client.poll();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         c.host.reset();
+        c.edge.reset();
     }
     if (c.client.isConnected()) c.client.disconnect();
     for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
@@ -717,6 +871,7 @@ void AppConnections::service(Connection& c) {
     const Clock::time_point now = Clock::now();
     c.client.poll();
     serviceHost(c);
+    serviceEdgeNode(c);
     // CONFIRM_DELIVERED past its deadline: kept, and sent when it can be.
     for (size_t i = 0; i < c.waiting.size(); i++) {
         if (now < c.waiting[i].deadline) continue;
@@ -1177,6 +1332,13 @@ bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostI
                 return;
             }
         }
+        for (const auto& one : _edgeNodes) {
+            if (one.second.connection == spec.connection) {
+                error = "the connection \"" + spec.connection + "\" has an edge node on it: one Will each";
+                ok = false;
+                return;
+            }
+        }
         auto had = _hosts.find(spec.id);
         const std::string before = had == _hosts.end() ? std::string() : had->second.connection;
         _hosts[spec.id] = spec;
@@ -1364,6 +1526,220 @@ bool AppConnections::hostConnection(const std::string& host, std::string& connec
     return found;
 }
 
+// --- Sparkplug edge nodes -------------------------------------------------------
+
+namespace {
+
+AppSparkplugEdgeNodeInfo edgeInfoOf(const AppSparkplugEdgeNodeSpec& spec, const AppConnections::EdgeNode* e,
+                                    uint64_t history) {
+    AppSparkplugEdgeNodeInfo info;
+    info.spec = spec;
+    info.history = history;
+    if (e == nullptr) return info;
+    const MqttSparkplugNode& node = *e->library;
+    info.born = node.isBorn();
+    info.bdSeq = node.birthDeathSequence();
+    info.primaryHostOnline = node.primaryHostOnline();
+    info.births = node.birthCount();
+    info.historyLost = e->historyLost;
+    for (const std::string& d : spec.devices) {
+        if (node.deviceIsOnline(d.c_str())) info.devicesOnline.push_back(d);
+    }
+    return info;
+}
+
+} // namespace
+
+bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkplugEdgeNodeInfo* info,
+                                 std::string& error) {
+    if (spec.id.empty() || spec.connection.empty()) {
+        error = "an edge node needs an id and the connection it runs on";
+        return false;
+    }
+    if (!mq_sparkplugValidId(spec.group.c_str()) || !mq_sparkplugValidId(spec.node.c_str())) {
+        error = "group and node are Sparkplug ids (no '/', '+' or '#')";
+        return false;
+    }
+    for (const AppSparkplugMetricDeclaration& m : spec.metrics) {
+        if (!mq_sparkplugDataTypeSupported((MqttSparkplugDataType)m.datatype)) {
+            error = "metric \"" + m.name + "\": an edge node here carries numbers, bool, text, bytes and DateTime, not " +
+                    mq_sparkplugDataTypeName((MqttSparkplugDataType)m.datatype);
+            return false;
+        }
+        if (!m.device.empty() && std::find(spec.devices.begin(), spec.devices.end(), m.device) == spec.devices.end()) {
+            error = "metric \"" + m.name + "\": its device \"" + m.device + "\" is not in devices";
+            return false;
+        }
+    }
+    bool ok = true;
+    call([&] {
+        for (const auto& one : _hosts) {
+            if (one.second.connection == spec.connection) {
+                error = "the connection \"" + spec.connection + "\" has a host on it: one Will each";
+                ok = false;
+                return;
+            }
+        }
+        for (const auto& one : _edgeNodes) {
+            if (one.first != spec.id && one.second.connection == spec.connection) {
+                error = "the connection \"" + spec.connection + "\" has an edge node already: \"" + one.first + "\"";
+                ok = false;
+                return;
+            }
+        }
+        auto had = _edgeNodes.find(spec.id);
+        const std::string before = had == _edgeNodes.end() ? std::string() : had->second.connection;
+        _edgeNodes[spec.id] = spec;
+        saveHosts();
+        // Born anew where it runs: a new session, a new bdSeq, its births from this declaration.
+        for (const std::string& id : {before, spec.connection}) {
+            auto at = _connections.find(id);
+            if (at == _connections.end()) continue;
+            Connection& c = *at->second;
+            if (c.edge) {
+                c.edge->library->disconnect();
+                c.edge.reset();
+            }
+            startEdgeNode(c);
+        }
+        auto at = _connections.find(spec.connection);
+        if (info) {
+            *info = edgeInfoOf(spec, at != _connections.end() ? at->second->edge.get() : nullptr,
+                               _outbox.totals("sparkplug-node:" + spec.id).messages);
+        }
+    });
+    return ok;
+}
+
+bool AppConnections::getEdgeNode(const std::string& id, AppSparkplugEdgeNodeInfo& info) const {
+    bool found = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        if (spec == _edgeNodes.end()) return;
+        auto at = _connections.find(spec->second.connection);
+        info = edgeInfoOf(spec->second, at != _connections.end() ? at->second->edge.get() : nullptr,
+                          const_cast<ConnectionOutbox&>(_outbox).totals("sparkplug-node:" + id).messages);
+        found = true;
+    });
+    return found;
+}
+
+std::vector<AppSparkplugEdgeNodeInfo> AppConnections::edgeNodes() const {
+    std::vector<AppSparkplugEdgeNodeInfo> out;
+    call([&] {
+        for (const auto& spec : _edgeNodes) {
+            auto at = _connections.find(spec.second.connection);
+            out.push_back(edgeInfoOf(spec.second, at != _connections.end() ? at->second->edge.get() : nullptr,
+                                     const_cast<ConnectionOutbox&>(_outbox).totals("sparkplug-node:" + spec.first).messages));
+        }
+    });
+    return out;
+}
+
+bool AppConnections::removeEdgeNode(const std::string& id) {
+    bool found = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        if (spec == _edgeNodes.end()) return;
+        auto at = _connections.find(spec->second.connection);
+        if (at != _connections.end() && at->second->edge) {
+            Connection& c = *at->second;
+            c.edge->library->disconnect();
+            for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
+                c.client.poll();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            c.edge.reset();
+        }
+        _outbox.dropAll("sparkplug-node:" + id);
+        _edgeNodes.erase(spec);
+        saveHosts();
+        found = true;
+    });
+    return found;
+}
+
+bool AppConnections::setValues(const std::string& id, const std::string& device, std::vector<AppSparkplugSet>& values,
+                               uint32_t& sent, uint32_t& kept, std::vector<std::string>& unknown, std::string& error) {
+    sent = kept = 0;
+    bool found = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        if (spec == _edgeNodes.end()) {
+            error = "no edge node \"" + id + "\"";
+            return;
+        }
+        found = true;
+        auto at = _connections.find(spec->second.connection);
+        EdgeNode* e = at != _connections.end() ? at->second->edge.get() : nullptr;
+        if (e == nullptr) {
+            error = "its connection \"" + spec->second.connection + "\" does not exist";
+            found = false;
+            return;
+        }
+        MqttSparkplugNode& node = *e->library;
+        const bool born = node.isBorn() && e->history == 0;      // history first, in order
+        for (AppSparkplugSet& set : values) {
+            const int index = node.indexOf(e->device(device), set.name.c_str());
+            if (index < 0) {
+                unknown.push_back(set.name);
+                continue;
+            }
+            const MqttSparkplugPoint* point = node.pointAt((size_t)index);
+            set.value.type = point->type;
+            if (set.timestamp == 0) set.timestamp = (uint64_t)utcNowMs();
+            if (born && node.setAt((size_t)index, set.value)) {
+                sent++;
+                continue;
+            }
+            // Not born (or behind what it kept): kept, and sent as history.
+            uint64_t ignored = 0;
+            while (e->history >= e->spec.historyMax && e->spec.historyMax != 0) {
+                if (!_outbox.dropOldest(e->key(), nullptr)) break;
+                e->history--;
+                e->historyLost++;
+            }
+            if (e->spec.historyMax != 0 && _outbox.push(e->key(), keptValue(device, set), ignored)) {
+                e->history++;
+                kept++;
+            }
+        }
+        if (sent != 0) node.publishChanged();
+    });
+    return found;
+}
+
+bool AppConnections::deviceState(const std::string& id, const std::string& device, bool online, std::string& error) {
+    bool done = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        auto at = spec == _edgeNodes.end() ? _connections.end() : _connections.find(spec->second.connection);
+        if (at == _connections.end() || !at->second->edge) {
+            error = "no edge node \"" + id + "\" running";
+            return;
+        }
+        MqttSparkplugNode& node = *at->second->edge->library;
+        done = online ? node.deviceOnline(device.c_str()) : node.deviceOffline(device.c_str());
+        if (!done) error = "no device \"" + device + "\" on it";
+    });
+    return done;
+}
+
+bool AppConnections::rebirthEdgeNode(const std::string& id, std::string& error) {
+    bool done = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        auto at = spec == _edgeNodes.end() ? _connections.end() : _connections.find(spec->second.connection);
+        if (at == _connections.end() || !at->second->edge) {
+            error = "no edge node \"" + id + "\" running";
+            return;
+        }
+        done = at->second->edge->library->rebirth();
+        if (!done) error = "it is not connected";
+    });
+    return done;
+}
+
 void AppConnections::saveHosts() {
     if (_directory.empty()) return;
     std::string text = "[";
@@ -1378,9 +1754,67 @@ void AppConnections::saveHosts() {
         first = false;
     }
     writePrivate(_directory + "/sparkplug-hosts.json", text + "\n]\n");
+    text = "[";
+    first = true;
+    for (const auto& one : _edgeNodes) {
+        const AppSparkplugEdgeNodeSpec& n = one.second;
+        json::Object o;
+        o.add("id", n.id).add("connection", n.connection).add("group", n.group).add("node", n.node);
+        o.add("primaryHostId", n.primaryHostId).add("historyMax", (long long)n.historyMax);
+        o.raw("devices", json::array(n.devices));
+        std::string metrics = "[";
+        for (size_t i = 0; i < n.metrics.size(); i++) {
+            const AppSparkplugMetricDeclaration& m = n.metrics[i];
+            json::Object d;
+            d.add("name", m.name).add("device", m.device).add("datatype", (long long)m.datatype);
+            d.add("writable", m.writable).add("units", m.units).add("hasRange", m.hasRange);
+            d.add("low", std::to_string(m.low)).add("high", std::to_string(m.high));
+            d.add("deadband", std::to_string(m.deadband)).add("deadbandPercent", std::to_string(m.deadbandPercent));
+            metrics += (i ? "," : "") + d.str();
+        }
+        o.raw("metrics", metrics + "]");
+        text += (first ? "\n" : ",\n") + o.str();
+        first = false;
+    }
+    writePrivate(_directory + "/sparkplug-nodes.json", text + "\n]\n");
 }
 
 bool AppConnections::loadHosts(std::string& error) {
+    std::ifstream nodesIn(_directory + "/sparkplug-nodes.json");
+    if (nodesIn) {
+        std::stringstream text;
+        text << nodesIn.rdbuf();
+        json::Value all;
+        if (!json::parse(text.str(), all)) {
+            error = _directory + "/sparkplug-nodes.json: not JSON";
+            return false;
+        }
+        for (const json::Value& v : all.items) {
+            AppSparkplugEdgeNodeSpec n;
+            n.id = v.str("id");
+            n.connection = v.str("connection");
+            n.group = v.str("group");
+            n.node = v.str("node");
+            n.primaryHostId = v.str("primaryHostId");
+            n.historyMax = (uint64_t)v.integer("historyMax", 100000);
+            v.strings("devices", n.devices);
+            for (const json::Value& d : v["metrics"].items) {
+                AppSparkplugMetricDeclaration m;
+                m.name = d.str("name");
+                m.device = d.str("device");
+                m.datatype = (uint32_t)d.integer("datatype");
+                m.writable = d.flag("writable");
+                m.units = d.str("units");
+                m.hasRange = d.flag("hasRange");
+                m.low = std::atof(d.str("low").c_str());
+                m.high = std::atof(d.str("high").c_str());
+                m.deadband = std::atof(d.str("deadband").c_str());
+                m.deadbandPercent = std::atof(d.str("deadbandPercent").c_str());
+                n.metrics.push_back(m);
+            }
+            if (!n.id.empty()) _edgeNodes[n.id] = n;
+        }
+    }
     std::ifstream in(_directory + "/sparkplug-hosts.json");
     if (!in) return true;
     std::stringstream text;

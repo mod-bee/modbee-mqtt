@@ -13,6 +13,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **A Sparkplug B Edge Node in the server** (`Sparkplug.PutEdgeNode` ... `DeleteEdgeNode`, `SetValues`,
+  `SetDeviceState`, `RebirthEdgeNode`; `modbee-mqtt sparkplug-nodes ...`): the library's TCK-tested node on one of the
+  server's connections - births from what it declares, data as values are set, a primary host waited for - and
+  Sparkplug's store and forward: values set while it is not born kept on disk and sent `is_historical`, in order,
+  once it is. A host's writes reach the application on the connection, names filled in.
 - **Sparkplug Aware** (Sparkplug B 3.0 section 10; `serve --sparkplug-aware`, `sparkplug: aware`, `Sparkplug.PutAware`
   live): every NBIRTH and DBIRTH kept retained on `$sparkplug/certificates/...`, cleared by its death; every login may
   read them, none may write them.

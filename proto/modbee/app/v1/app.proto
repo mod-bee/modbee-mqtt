@@ -454,6 +454,74 @@ service Sparkplug {
   // Sparkplug Aware (Sparkplug B 3.0 section 10): see SparkplugAwareSetting. Changed live. serve --sparkplug-aware.
   rpc GetAware(Empty) returns (SparkplugAwareSetting);
   rpc PutAware(SparkplugAwareSetting) returns (SparkplugAwareSetting);
+
+  // An Edge Node the server runs, on one of its connections (one Will each: a host or an edge node), from the library's
+  // TCK-tested node: NDEATH its connection's Will with a new bdSeq each session, NBIRTH and a DBIRTH per device from
+  // what it declares (aliases its own), NDATA and DDATA as values are set - deadbands applied - a rebirth when a host
+  // asks, and a primary host's STATE waited for. While it is not born, values set are kept on disk and sent, oldest
+  // first, with is_historical once it is: Sparkplug's store and forward. A host's writes reach the application on the
+  // connection, as NCMD and DCMD (ConsumeOpen.sparkplug: names filled in). Kept in the state directory. Its datatypes are
+  // the library's: numbers, Boolean, String, Text, UUID, Bytes, File, DateTime.
+  rpc PutEdgeNode(SparkplugEdgeNodeSpec) returns (SparkplugEdgeNodeInfo);
+  rpc GetEdgeNode(SparkplugEdgeNodeRef) returns (SparkplugEdgeNodeInfo);
+  rpc ListEdgeNodes(Empty) returns (SparkplugEdgeNodeList);
+  rpc DeleteEdgeNode(SparkplugEdgeNodeRef) returns (Empty);   // its NDEATH first; what it kept is dropped
+  rpc SetValues(SparkplugValuesRequest) returns (SparkplugValuesReply);
+  rpc SetDeviceState(SparkplugDeviceStateRequest) returns (Empty);  // DBIRTH (online) or DDEATH
+  rpc RebirthEdgeNode(SparkplugEdgeNodeRef) returns (Empty);
+}
+
+message SparkplugEdgeNodeSpec {
+  string id = 1;                   // this server's name for it
+  string connection = 2;           // the connection it runs on
+  string group = 3;
+  string node = 4;
+  string primary_host_id = 5;      // born only while that host's STATE is online; "": whenever connected
+  repeated string devices = 6;
+  repeated SparkplugMetricDeclaration metrics = 7;
+  optional uint64 history_max = 8; // values kept while not born (default 100000; 0: none); full, the oldest go
+}
+message SparkplugMetricDeclaration {
+  string name = 1;
+  string device = 2;               // "": the node's own; else one of `devices`
+  SparkplugDataType datatype = 3;
+  bool writable = 4;               // a host may write it (NCMD/DCMD)
+  string units = 5;                // engUnit
+  optional double low = 6;         // engLow
+  optional double high = 7;        // engHigh
+  double deadband = 8;             // published only when it has moved this much...
+  double deadband_percent = 9;     // ...or this percent of its range
+}
+message SparkplugEdgeNodeRef {
+  string id = 1;
+}
+message SparkplugEdgeNodeInfo {
+  SparkplugEdgeNodeSpec spec = 1;
+  bool born = 2;
+  uint32 bd_seq = 3;
+  bool primary_host_online = 4;
+  uint32 births = 5;
+  uint64 history = 6;              // values kept, waiting to be sent as history
+  uint64 history_lost = 7;
+  repeated string devices_online = 8;
+}
+message SparkplugEdgeNodeList {
+  repeated SparkplugEdgeNodeInfo edge_nodes = 1;
+}
+message SparkplugValuesRequest {
+  string edge_node = 1;
+  string device = 2;               // "": the node's own metrics
+  repeated SparkplugMetric metrics = 3; // name, value, and a timestamp if not now
+}
+message SparkplugValuesReply {
+  uint32 sent = 1;                 // set and published (deadbands may hold some back)
+  uint32 kept = 2;                 // not born: kept, sent as history once it is
+  repeated string unknown = 3;     // names it never declared
+}
+message SparkplugDeviceStateRequest {
+  string edge_node = 1;
+  string device = 2;
+  bool online = 3;
 }
 
 // Every NBIRTH and DBIRTH the server's clients publish kept, retained, on

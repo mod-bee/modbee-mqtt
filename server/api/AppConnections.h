@@ -34,6 +34,7 @@
 
 #include "AppHub.h"
 #include "ConnectionOutbox.h"
+#include "sparkplug/MqttSparkplugValue.h"
 
 #include <condition_variable>
 #include <functional>
@@ -152,6 +153,52 @@ struct AppSparkplugNodeInfo {
     std::vector<AppSparkplugMetricInfo> metrics;
 };
 
+// A Sparkplug B Edge Node the server runs on one of its connections (the
+// library's MqttSparkplugNode, sharing the connection's client): NDEATH the
+// connection's Will with a new bdSeq each session, births from what it
+// declares (aliases its own), data as the application sets values -
+// deadbands applied - a rebirth when a host asks, a primary host's STATE
+// waited for. While it is not born, values set are kept on disk (the
+// connections' outbox) and sent, oldest first, with is_historical once it is:
+// Sparkplug's own store and forward. The library's datatypes: numbers, bool,
+// text, bytes, DateTime - no arrays, datasets or templates.
+struct AppSparkplugMetricDeclaration {
+    std::string name, device;              // device "": the node's own
+    uint32_t datatype = 0;
+    bool writable = false;
+    std::string units;
+    bool hasRange = false;
+    double low = 0, high = 0;
+    double deadband = 0, deadbandPercent = 0;
+};
+
+struct AppSparkplugEdgeNodeSpec {
+    std::string id, connection, group, node;
+    std::string primaryHostId;             // "": born whenever connected
+    std::vector<std::string> devices;
+    std::vector<AppSparkplugMetricDeclaration> metrics;
+    uint64_t historyMax = 100000;          // values kept while not born; full, the oldest go (counted)
+};
+
+struct AppSparkplugEdgeNodeInfo {
+    AppSparkplugEdgeNodeSpec spec;
+    bool born = false;
+    uint32_t bdSeq = 0;
+    bool primaryHostOnline = false;
+    uint32_t births = 0;
+    uint64_t history = 0, historyLost = 0;
+    std::vector<std::string> devicesOnline;
+};
+
+// A value the application sets: `value` at the metric's datatype, `text` the
+// bytes of a String/Text/UUID/Bytes one (value points into it).
+struct AppSparkplugSet {
+    std::string name;
+    MqttSparkplugValue value;
+    std::string text;
+    uint64_t timestamp = 0;                // 0: now
+};
+
 class AppConnections {
 public:
     // `stateDirectory` holds connections.json (and any TLS material given as
@@ -209,12 +256,25 @@ public:
     // The connection a host runs on, to publish commands on.
     bool hostConnection(const std::string& host, std::string& connection) const;
 
+    // --- Sparkplug edge nodes (AppSparkplugEdgeNodeSpec) ---
+    bool putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkplugEdgeNodeInfo* info, std::string& error);
+    bool getEdgeNode(const std::string& id, AppSparkplugEdgeNodeInfo& info) const;
+    std::vector<AppSparkplugEdgeNodeInfo> edgeNodes() const;
+    bool removeEdgeNode(const std::string& id);          // its NDEATH first
+    // Born: set, and the changes published (NDATA or DDATA, deadbands applied).
+    // Not born: kept, and sent as history once it is. `unknown`: names it never declared.
+    bool setValues(const std::string& id, const std::string& device, std::vector<AppSparkplugSet>& values,
+                   uint32_t& sent, uint32_t& kept, std::vector<std::string>& unknown, std::string& error);
+    bool deviceState(const std::string& id, const std::string& device, bool online, std::string& error);
+    bool rebirthEdgeNode(const std::string& id, std::string& error);
+
     // From AppHub: a publish on a connection; a group on one opened or closed.
     void publish(const AppPublish& message, std::function<void(const AppPublishResult&)> done);
     void groupsChanged(const std::string& connection);
 
     struct Connection;
     struct Host;
+    struct EdgeNode;
 
 private:
     AppHub& _hub;
@@ -226,6 +286,7 @@ private:
     std::condition_variable _wake;
     std::map<std::string, std::unique_ptr<Connection>> _connections;
     std::map<std::string, AppSparkplugHostSpec> _hosts;      // by id; each runs on its connection
+    std::map<std::string, AppSparkplugEdgeNodeSpec> _edgeNodes;
     std::vector<std::function<void()>> _commands;   // run on the manager's thread
     struct Watcher {
         std::vector<std::string> ids;
@@ -250,6 +311,8 @@ private:
     void serviceHost(Connection& connection);
     void saveHosts();
     bool loadHosts(std::string& error);
+    void startEdgeNode(Connection& connection);
+    void serviceEdgeNode(Connection& connection);
     void post(std::function<void()> command);
     // Runs `command` on the manager's thread and waits for it: every
     // connection is touched there and nowhere else.

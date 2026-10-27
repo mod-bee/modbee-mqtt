@@ -637,6 +637,173 @@ void sparkplugHost(Server& server) {
     reader.join();
 }
 
+void sparkplugEdgeNode(Server& server) {
+    section("a Sparkplug edge node in the server: births, history while its host is away, data, a host's writes");
+    auto connections = v1::Connections::NewStub(server.channel());
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    auto messages = v1::Messages::NewStub(server.channel());
+    auto decode = [&](const check::Got& g) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDecodeRequest request;
+        request.set_topic(g.topic);
+        request.set_payload(g.payload);
+        v1::SparkplugMessage out;
+        sparkplug->Decode(&c, request, &out);
+        return out;
+    };
+    Fleet fleet(server.broker.port());
+    Client& watcher = fleet.make("edge-watcher");
+    watcher.subscribe("spBv1.0/plant2/#", MQ_QOS_1);
+    ok(fleet.connected(watcher) && fleet.until([&] { return watcher.subscribed >= 1; }), "a watcher on the group");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::ConnectionSpec edge;
+        edge.set_id("edge");
+        edge.set_this_server(true);
+        edge.set_client_id("gw-9");
+        v1::ConnectionInfo info;
+        connections->Put(&c, edge, &info);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeSpec spec;
+        spec.set_id("gw");
+        spec.set_connection("edge");
+        spec.set_group("plant2");
+        spec.set_node("gw-9");
+        spec.set_primary_host_id("ph");
+        spec.add_devices("plc1");
+        v1::SparkplugMetricDeclaration* temp = spec.add_metrics();
+        temp->set_name("Temp");
+        temp->set_datatype(v1::DATATYPE_DOUBLE);
+        temp->set_units("C");
+        v1::SparkplugMetricDeclaration* run = spec.add_metrics();
+        run->set_name("Run");
+        run->set_device("plc1");
+        run->set_datatype(v1::DATATYPE_BOOLEAN);
+        run->set_writable(true);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, spec, &info).ok() && !info.born(), "PutEdgeNode, waiting for its primary host");
+    }
+    auto setTemp = [&](double value, uint64_t at) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugValuesRequest request;
+        request.set_edge_node("gw");
+        v1::SparkplugMetric* m = request.add_metrics();
+        m->set_name("Temp");
+        m->mutable_value()->set_double_value(value);
+        if (at) m->set_timestamp(at);
+        v1::SparkplugValuesReply reply;
+        sparkplug->SetValues(&c, request, &reply);
+        return reply;
+    };
+    fleet.until([&] { return false; }, 300);
+    uint32_t kept = 0;
+    for (int i = 1; i <= 3; i++) kept += setTemp(i, 1793000000000ull + (uint64_t)i).kept();
+    equal<uint32_t>("its host away: three values kept", kept, 3);
+    Client& host = fleet.make("ph-host");
+    ok(fleet.connected(host), "the primary host comes online");
+    host.publish("spBv1.0/STATE/ph", "{\"online\":true,\"timestamp\":1793000000000}", MQ_QOS_1, true);
+    auto births = [&](const char* topic) {
+        size_t n = 0;
+        for (const check::Got& g : watcher.got) n += g.topic == topic ? 1 : 0;
+        return n;
+    };
+    ok(fleet.until([&] { return births("spBv1.0/plant2/NBIRTH/gw-9") >= 1 && births("spBv1.0/plant2/DBIRTH/gw-9/plc1") >= 1; }),
+       "  it is born: NBIRTH, and a DBIRTH for its device");
+    std::vector<double> history;
+    ok(fleet.until([&] {
+           history.clear();
+           for (const check::Got& g : watcher.got) {
+               if (g.topic != "spBv1.0/plant2/NDATA/gw-9") continue;
+               const v1::SparkplugMessage read = decode(g);
+               for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+                   if (m.is_historical()) history.push_back(m.value().double_value());
+               }
+           }
+           return history.size() >= 3;
+       }),
+       "  what it kept is sent, is_historical");
+    ok(history == std::vector<double>({1, 2, 3}), "  in order, as it was set");
+    const v1::SparkplugEdgeNodeRef ref = [] { v1::SparkplugEdgeNodeRef r; r.set_id("gw"); return r; }();
+    {
+        v1::SparkplugValuesReply reply = setTemp(21.5, 0);
+        ok(reply.sent() == 1 && reply.kept() == 0, "born: a value is sent at once");
+    }
+    ok(fleet.until([&] {
+           for (const check::Got& g : watcher.got) {
+               if (g.topic != "spBv1.0/plant2/NDATA/gw-9") continue;
+               const v1::SparkplugMessage read = decode(g);
+               for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+                   if (!m.is_historical() && m.value().double_value() == 21.5) return true;
+               }
+           }
+           return false;
+       }),
+       "  an NDATA, live");
+
+    // A host's write: the application reads it on the connection, by name.
+    uint64_t runAlias = 0;
+    for (const check::Got& g : watcher.got) {
+        if (g.topic != "spBv1.0/plant2/DBIRTH/gw-9/plc1") continue;
+        const v1::SparkplugMessage read = decode(g);
+               for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+            if (m.name() == "Run") runAlias = m.alias();
+        }
+    }
+    ok(runAlias != 0, "the DBIRTH gave Run an alias");
+    grpc::ClientContext consumeContext;
+    authorize(consumeContext);
+    std::unique_ptr<grpc::ClientReaderWriter<v1::ConsumeUp, v1::ConsumeDown>> stream(messages->Consume(&consumeContext));
+    v1::ConsumeUp open;
+    open.mutable_open()->set_connection("edge");
+    open.mutable_open()->add_filters("spBv1.0/plant2/DCMD/gw-9/#");
+    open.mutable_open()->set_sparkplug(true);
+    stream->Write(open);
+    v1::ConsumeDown down;
+    stream->Read(&down);
+    {
+        v1::SparkplugPayload p;
+        p.set_timestamp(1793000000000ull);
+        v1::SparkplugMetric* run = p.add_metrics();
+        run->set_alias(runAlias);
+        run->set_datatype(v1::DATATYPE_BOOLEAN);
+        run->mutable_value()->set_boolean_value(true);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEncodeRequest encode;
+        *encode.mutable_payload() = p;
+        v1::SparkplugEncodeReply bytes;
+        sparkplug->Encode(&c, encode, &bytes);
+        host.publish("spBv1.0/plant2/DCMD/gw-9/plc1", bytes.payload(), MQ_QOS_0);
+    }
+    std::atomic<bool> written{false};
+    std::thread reader([&] {
+        v1::ConsumeDown d;
+        while (stream->Read(&d)) {
+            if (!d.has_delivery()) continue;
+            const v1::SparkplugMessage& m = d.delivery().sparkplug();
+            written = m.kind() == v1::SPARKPLUG_DCMD && m.payload().metrics_size() == 1 &&
+                      m.payload().metrics(0).name() == "Run" && m.payload().metrics(0).value().boolean_value();
+            return;
+        }
+    });
+    ok(fleet.until([&] { return written.load(); }), "a host's DCMD reaches the application: Run = true, by name");
+    consumeContext.TryCancel();
+    reader.join();
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::Empty none;
+        ok(sparkplug->DeleteEdgeNode(&c, ref, &none).ok(), "DeleteEdgeNode");
+    }
+    ok(fleet.until([&] { return births("spBv1.0/plant2/NDEATH/gw-9") >= 1; }), "  its NDEATH first");
+}
+
 void sparkplugAware(Server& server) {
     section("Sparkplug Aware: births kept on $sparkplug/certificates/..., cleared by deaths, turned on and off live");
     auto sparkplug = v1::Sparkplug::NewStub(server.channel());
@@ -819,6 +986,7 @@ int main() {
     if (server.started) sparkplugCodec(server);
     if (server.started) sparkplugHost(server);
     if (server.started) sparkplugAware(server);
+    if (server.started) sparkplugEdgeNode(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);
     return check::report("api_tests");
