@@ -13,6 +13,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Per-session counters** (Application API, `Admin.ListSessions`): `messages_in`, `messages_out`, `bytes_in`,
+  `bytes_out`, `last_activity_ms` and `connects` for each session, the connection that is up included - so an
+  application can say whether a device is talking. They carry over when the same client starts clean while its
+  session is held; 48 bytes a session. `ListSessions` now filters by client id and login on each shard before it
+  gathers, rather than describing every session on every call.
 - **A failed TLS handshake is a client event** (platform builds): `$modbee/events/handshake-failed`, and
   `CLIENT_EVENT_HANDSHAKE_FAILED` over the Application API, with the address and the TLS engine's own words
   (`ClientEvent.detail`) - a client certificate missing or untrusted, a protocol neither end shares, HTTP on the TLS

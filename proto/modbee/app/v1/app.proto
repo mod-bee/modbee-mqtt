@@ -617,6 +617,14 @@ message Session {
   repeated string subscriptions = 8;
   uint64 queued = 9;
   uint64 in_flight = 10;
+  // Is it talking: since the session began (kept across a clean start by the same client and login; not across a
+  // restart of the server), the connection that is up included.
+  uint64 messages_in = 11;         // PUBLISHes it sent
+  uint64 messages_out = 12;        // PUBLISHes it was sent
+  uint64 bytes_in = 13;            // every byte it sent, MQTT packets whole (TLS: what was decrypted)
+  uint64 bytes_out = 14;
+  int64 last_activity_ms = 15;     // its last packet (ms since 1970 UTC); 0: none yet
+  uint32 connects = 16;            // CONNECTs that took this session: more than 1, it has reconnected
 }
 message ListSessionsReply {
   repeated Session sessions = 1;

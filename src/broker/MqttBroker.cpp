@@ -897,20 +897,42 @@ void MqttBroker::handOff(MqttBrokerConnection& connection, int target) {
     }
 }
 
-void MqttBroker::describeSessions(MqttBrokerSessionVisitFn visit, void* context) const {
+// When `connection` last had a packet from its client, in UTC ms - 0 where
+// there is no such clock. Its last packet is at most a keep-alive ago, well
+// inside what the 32-bit clock can look back on.
+uint64_t MqttBroker::lastPacketMs(const MqttBrokerConnection& connection) const {
+    const uint64_t utc = mq_epochMillis();
+    if (utc == 0) return 0;
+    const mq_time_t idle = mq_elapsed(connection.lastPacketAt, mq_millis());
+    return utc > idle ? utc - idle : 0;
+}
+
+void MqttBroker::describeSessions(MqttBrokerSessionVisitFn visit, void* context, const std::string& clientIdPrefix,
+                                  const std::string& login) const {
     const mq_time_t now = mq_millis();
     for (const MqttBrokerSession& session : _sessions) {
         if (!session.inUse()) continue;
+        if (session.clientId().compare(0, clientIdPrefix.size(), clientIdPrefix) != 0) continue;
+        if (!login.empty() && session.userName != login) continue;
         MqttBrokerSessionSummary summary;
         summary.clientId = session.clientId();
         summary.login = session.userName;
         summary.connected = session.connected;
         summary.protocol = (uint8_t)session.version;
         summary.expiryInterval = session.expiryInterval;
+        summary.messagesIn = session.traffic.messagesIn;
+        summary.messagesOut = session.traffic.messagesOut;
+        summary.bytesIn = session.traffic.bytesIn;
+        summary.bytesOut = session.traffic.bytesOut;
+        summary.lastActivityMs = session.traffic.lastActivityMs;
+        summary.connects = session.traffic.connects;
         if (session.connected && session.connectionSlot < _connections.size()) {
             const MqttBrokerConnection& connection = _connections[session.connectionSlot];
             if (connection.transport) summary.address = connection.transport->peerName();
             summary.connectedForMs = (uint32_t)mq_elapsed(connection.openedAt, now);
+            summary.bytesIn += connection.link.bytesReceived() - connection.bytesInBefore;
+            summary.bytesOut += connection.link.bytesSent() - connection.bytesOutBefore;
+            summary.lastActivityMs = lastPacketMs(connection);
         }
         for (size_t index = 0; index < session.subscriptionCount(); index++) {
             const MqttBrokerSubscription* subscription = session.subscriptionAt(index);
@@ -1126,6 +1148,8 @@ bool MqttBroker::adopt(MqttTransport& transport, MqttListener* origin,
     slot->lastPacketAt = slot->openedAt;
     slot->link.begin(transport, _config.receiveBufferSize, _config.transmitBufferSize,
                      _config.reserveUpFront ? 0 : kLinkInitialBytes);
+    slot->bytesInBefore = slot->link.bytesReceived();
+    slot->bytesOutBefore = slot->link.bytesSent();
     if (!slot->link.prime(bytes, length)) {
         // More than this broker could ever hold; the caller keeps the
         // transport and decides what to do with it.
@@ -1378,6 +1402,10 @@ void MqttBroker::acceptNew() {
             slot->link.begin(*transport, _config.receiveBufferSize,
                              _config.transmitBufferSize,
                              _config.reserveUpFront ? 0 : kLinkInitialBytes);
+#if defined(MQTT_PLATFORM_HOST)
+            slot->bytesInBefore = slot->link.bytesReceived();
+            slot->bytesOutBefore = slot->link.bytesSent();
+#endif
             _status.accepted++;
 #if defined(MQTT_PLATFORM_HOST)
             _liveConnections++;
@@ -1658,6 +1686,11 @@ void MqttBroker::closeConnection(MqttBrokerConnection& connection,
     if (session != nullptr) {
         session->connected = false;
         session->offlineSince = mq_millis();
+#if defined(MQTT_PLATFORM_HOST)
+        session->traffic.bytesIn += connection.link.bytesReceived() - connection.bytesInBefore;
+        session->traffic.bytesOut += connection.link.bytesSent() - connection.bytesOutBefore;
+        session->traffic.lastActivityMs = lastPacketMs(connection);
+#endif
 
         if (!publishWillNow) {
             // A clean DISCONNECT DELETES the Will rather than delaying it.
@@ -2586,6 +2619,14 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     // --- Clean Start ---
     bool sessionPresent = false;
 
+#if defined(MQTT_PLATFORM_HOST)
+    // The same client starting clean keeps its counts: they are about the
+    // device, not about what MQTT keeps for it. Another login's are not its.
+    MqttBrokerSession::Traffic carried;
+    if (session != nullptr && !foreign && (request.cleanStart || session->version != connection.version)) {
+        carried = session->traffic;
+    }
+#endif
     if (request.cleanStart || foreign) {
         // [V5:MQTT-3.1.2-4] "If a CONNECT packet is received with Clean Start
         // set to 1, the Client and Server MUST discard any existing Session
@@ -2679,6 +2720,9 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         }
         session->adopt(clientId);
         session->version = connection.version;
+#if defined(MQTT_PLATFORM_HOST)
+        session->traffic = carried;
+#endif
     } else {
         // [V5:MQTT-3.2.2-2] "If the Server accepts a connection with Clean
         // Start set to 0 and the Server has Session State for the ClientID, it
@@ -2734,6 +2778,9 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
     }
 
     session->connected = true;
+#if defined(MQTT_PLATFORM_HOST)
+    session->traffic.connects++;
+#endif
     session->setOwner(owner);
     session->retainedLimit = retainedLimit;
     session->connectionSlot = (uint32_t)(&connection - _connections.data());
@@ -3468,6 +3515,9 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
 
         _status.delivered++;
         session->messagesDelivered++;
+#if defined(MQTT_PLATFORM_HOST)
+        session->traffic.messagesOut++;
+#endif
 
         if (next->qos == MQ_QOS_0) {
             // Nothing acknowledges a QoS 0 delivery, so reaching the wire is
@@ -3569,6 +3619,9 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
     const MqttPublish& message = packet.publish;
     MqttBrokerSession* session = connection.session;
     if (session == nullptr) return;
+#if defined(MQTT_PLATFORM_HOST)
+    session->traffic.messagesIn++;
+#endif
 
     const bool isV5 = connection.version == MqttVersion::V5;
     MqttSpan topic = message.topic;

@@ -574,11 +574,11 @@ public:
         std::shared_ptr<Gathered> gathered(new Gathered());
         const v1::ListSessionsRequest filter = request;
         _s.admin->everyShard(
-            [gathered](uint32_t, MqttBroker& broker) {
+            [gathered, filter](uint32_t, MqttBroker& broker) {
                 std::vector<MqttBrokerSessionSummary> mine;
                 broker.describeSessions([](void* context, const MqttBrokerSessionSummary& s) {
                     static_cast<std::vector<MqttBrokerSessionSummary>*>(context)->push_back(s);
-                }, &mine);
+                }, &mine, filter.client_id_prefix(), filter.login());
                 std::lock_guard<std::mutex> guard(gathered->lock);
                 for (auto& s : mine) gathered->all.push_back(std::move(s));
             },
@@ -610,6 +610,12 @@ public:
                     for (const std::string& f : s.subscriptions) out->add_subscriptions(f);
                     out->set_queued(s.queued);
                     out->set_in_flight(s.inFlight);
+                    out->set_messages_in(s.messagesIn);
+                    out->set_messages_out(s.messagesOut);
+                    out->set_bytes_in(s.bytesIn);
+                    out->set_bytes_out(s.bytesOut);
+                    out->set_last_activity_ms((int64_t)s.lastActivityMs);
+                    out->set_connects(s.connects);
                 }
                 done(grpc::Status::OK);
             });

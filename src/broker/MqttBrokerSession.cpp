@@ -86,6 +86,9 @@ void MqttBrokerSession::adopt(const MqttSpan& clientId) {
     offlineSince = 0;
     messagesDelivered = 0;
     messagesDropped = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    traffic = Traffic();
+#endif
     will.clear();
     clearSubscriptions();
     clearInbound();

@@ -333,6 +333,11 @@ struct MqttBrokerSessionSummary {
     std::vector<std::string> subscriptions;
     size_t queued = 0;                 // messages owed to it
     size_t inFlight = 0;               // of those, sent and not yet acknowledged
+    // Since the session began, the connection that is up included
+    // (MqttBrokerSession::Traffic).
+    uint64_t messagesIn = 0, messagesOut = 0, bytesIn = 0, bytesOut = 0;
+    uint64_t lastActivityMs = 0;       // UTC ms of its last packet; 0: none, or no clock
+    uint32_t connects = 0;
 };
 typedef void (*MqttBrokerSessionVisitFn)(void* context, const MqttBrokerSessionSummary& summary);
 #endif
@@ -466,6 +471,11 @@ struct MqttBrokerConnection {
     bool sessionExpiryRevised = false;
 
     mq_time_t openedAt = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    // The link's byte counts when this connection began: the link is the
+    // slot's, and counts for every connection the slot has held.
+    uint64_t bytesInBefore = 0, bytesOutBefore = 0;
+#endif
 
     // --- Event-driven servicing (MqttPollSet persistent mode) ---
     //
@@ -713,8 +723,12 @@ public:
 
     // --- For an administrator (host only) ---
 
-    // Every session this broker holds, connected or not.
-    void describeSessions(MqttBrokerSessionVisitFn visit, void* context) const;
+    // Every session this broker holds, connected or not - or only those whose
+    // client id starts with `clientIdPrefix` and, given one, of `login`: they
+    // are passed over before anything is copied, so asking about one device
+    // costs a walk, not a description of every session.
+    void describeSessions(MqttBrokerSessionVisitFn visit, void* context, const std::string& clientIdPrefix = "",
+                          const std::string& login = "") const;
 
     // Closes the connection of `clientId`, telling a 5.0 client `reasonCode`
     // (its Will is published, as for disconnectUser()); with
@@ -778,6 +792,7 @@ private:
                      bool resumed = false);
 #if defined(MQTT_PLATFORM_HOST)
     // A refusal, for a client that may have no session yet (a CONNECT turned away).
+    uint64_t lastPacketMs(const MqttBrokerConnection& connection) const;
     void refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
                       const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection = nullptr);
 #endif

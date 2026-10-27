@@ -174,6 +174,56 @@ void consumeAndPublish(Server& server) {
     reader.join();
 }
 
+v1::Session sessionOf(Server& server, const std::string& clientId) {
+    auto admin = v1::Admin::NewStub(server.channel());
+    grpc::ClientContext context;
+    authorize(context);
+    v1::ListSessionsRequest request;
+    request.set_client_id_prefix(clientId);
+    v1::ListSessionsReply reply;
+    admin->ListSessions(&context, request, &reply);
+    for (const v1::Session& s : reply.sessions()) {
+        if (s.client_id() == clientId) return s;
+    }
+    return v1::Session();
+}
+
+void sessionCounters(Server& server) {
+    section("ListSessions: what each device has said and been sent, and how often it has connected");
+    Fleet fleet(server.broker.port());
+    Client& first = fleet.make("meter-9");
+    first.persistent(60);                                    // its session outlives a connection
+    first.subscribe("cmd/meter-9", MQ_QOS_1);
+    ok(fleet.connected(first) && fleet.until([&] { return first.subscribed >= 1; }), "a device connects");
+    const int64_t before = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+    for (int n = 0; n < 3; n++) first.series("plant/meter-9/kwh", std::to_string(n), MQ_QOS_1);
+    first.publish("cmd/meter-9", "read", MQ_QOS_1);          // to itself: one in, one out
+    ok(fleet.until([&] { return first.completed >= 4 && !first.got.empty(); }), "  publishes 4, is sent 1");
+    v1::Session s = sessionOf(server, "meter-9");
+    equal<uint64_t>("  messages_in", s.messages_in(), 4u);
+    equal<uint64_t>("  messages_out", s.messages_out(), 1u);
+    ok(s.bytes_in() > 0 && s.bytes_out() > 0 && s.bytes_in() > s.bytes_out(), "  bytes both ways, more in than out");
+    ok(s.last_activity_ms() >= before - 1000 && s.connects() == 1, "  its last packet just now, connected once");
+
+    first.mqtt.disconnect();
+    fleet.until([&] { return !first.mqtt.isConnected(); }, 1000);
+    Client& resumed = fleet.make("meter-9");
+    resumed.persistent(60);
+    resumed.config.cleanStart = false;
+    ok(fleet.connected(resumed), "it reconnects, resuming its session");
+    v1::Session t = sessionOf(server, "meter-9");
+    ok(t.connects() == 2 && t.messages_in() == 4 && t.bytes_in() > s.bytes_in(),
+       "  connected twice, its counts kept, the new connection's bytes added");
+    resumed.mqtt.disconnect();
+    fleet.until([&] { return !resumed.mqtt.isConnected(); }, 1000);
+    Client& clean = fleet.make("meter-9");                   // clean start: a new session, the same device
+    clean.persistent(60);
+    ok(fleet.connected(clean), "it connects again, starting clean");
+    v1::Session u = sessionOf(server, "meter-9");
+    ok(u.connects() == 3 && u.messages_in() == 4, "  a new MQTT session, the device's counts carried over");
+}
+
 // A port no one listens on: one the kernel picked, given back.
 uint16_t freePort() {
     uint16_t port = 0;
@@ -238,6 +288,7 @@ int main() {
     Server server;
     helloAndToken(server);
     if (server.started) consumeAndPublish(server);
+    if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);
     return check::report("api_tests");
 }

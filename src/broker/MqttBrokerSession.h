@@ -465,6 +465,23 @@ public:
     uint32_t messagesDelivered = 0;
     uint32_t messagesDropped = 0;
 
+#if defined(MQTT_PLATFORM_HOST)
+    // What it has said and been sent, since the session began - kept across a
+    // clean start by the same client and login - so an application can tell
+    // whether a device is talking (Admin.ListSessions). The connection that
+    // is up adds its own bytes and last packet while it lasts
+    // (MqttBroker::describeSessions); they are folded in here when it goes.
+    // 48 bytes a session.
+    struct Traffic {
+        uint64_t messagesIn = 0;              // PUBLISHes it sent
+        uint64_t messagesOut = 0;             // PUBLISHes it was sent
+        uint64_t bytesIn = 0, bytesOut = 0;   // its connections that have ended
+        uint64_t lastActivityMs = 0;          // UTC ms of its last packet, as its last connection ended; 0: none
+        uint32_t connects = 0;                // CONNECTs that took it: more than one, it has reconnected
+    };
+    Traffic traffic;
+#endif
+
 private:
     bool _inUse = false;
     std::string _clientId;
