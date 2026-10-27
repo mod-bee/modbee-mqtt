@@ -56,12 +56,17 @@ AppClientEvent eventOf(const std::string& topic, const std::string& payload) {
                : kind == "subscribed"     ? AppClientEvent::Subscribed
                : kind == "unsubscribed"   ? AppClientEvent::Unsubscribed
                : kind == "started"        ? AppClientEvent::ServerStarted
+               : kind == "publish-refused"   ? AppClientEvent::PublishRefused
+               : kind == "subscribe-refused" ? AppClientEvent::SubscribeRefused
+               : kind == "connect-refused"   ? AppClientEvent::ConnectRefused
                                           : AppClientEvent::Unknown;
     json::Value value;
     if (!json::parse(payload, value)) return event;
     event.clientId = value.str("clientid");
     event.login = value.str("username");
     event.filter = value.str("filter");
+    // A refused publish names its topic; the event carries it where a filter goes.
+    if (event.filter.empty()) event.filter = value.str("topic");
     event.address = value.str("address");
     event.timeMs = value.integer("time");
     event.resumed = value.flag("resumed");

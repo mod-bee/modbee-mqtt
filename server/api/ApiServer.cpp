@@ -162,6 +162,9 @@ void deliveryTo(uint64_t id, const AppMessage& m, bool replay, bool redelivered,
         case AppClientEvent::Subscribed: event->set_kind(v1::CLIENT_EVENT_SUBSCRIBED); break;
         case AppClientEvent::Unsubscribed: event->set_kind(v1::CLIENT_EVENT_UNSUBSCRIBED); break;
         case AppClientEvent::ServerStarted: event->set_kind(v1::CLIENT_EVENT_SERVER_STARTED); break;
+        case AppClientEvent::PublishRefused: event->set_kind(v1::CLIENT_EVENT_PUBLISH_REFUSED); break;
+        case AppClientEvent::SubscribeRefused: event->set_kind(v1::CLIENT_EVENT_SUBSCRIBE_REFUSED); break;
+        case AppClientEvent::ConnectRefused: event->set_kind(v1::CLIENT_EVENT_CONNECT_REFUSED); break;
         default: event->set_kind(v1::CLIENT_EVENT_UNSPECIFIED); break;
         }
         event->set_client_id(m.event.clientId);

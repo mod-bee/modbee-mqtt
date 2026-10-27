@@ -285,8 +285,8 @@ message ClientEvent {
   string login = 3;
   int64 time_ms = 4;
   bool resumed = 5;                // CONNECTED: picked up a session the broker held
-  uint32 reason_code = 6;          // DISCONNECTED: what the broker sent, or 0 when the client went itself
-  string filter = 7;               // SUBSCRIBED / UNSUBSCRIBED
+  uint32 reason_code = 6;          // DISCONNECTED: what the broker sent, or 0 when the client went itself; a refusal: why
+  string filter = 7;               // SUBSCRIBED / UNSUBSCRIBED / SUBSCRIBE_REFUSED; PUBLISH_REFUSED: its topic
   uint32 qos = 8;                  // SUBSCRIBED: the QoS granted
   string address = 9;              // CONNECTED
 }
@@ -298,6 +298,12 @@ enum ClientEventKind {
   CLIENT_EVENT_SUBSCRIBED = 3;
   CLIENT_EVENT_UNSUBSCRIBED = 4;
   CLIENT_EVENT_SERVER_STARTED = 5; // every session from before is gone or resumed: rebuild from here
+  // Refusals, so an application can say why a device is not getting through. `reason_code` is what the device was
+  // told; `filter` holds the topic (PUBLISH) or the filter (SUBSCRIBE). A CONNECT refusal is the server's own (full,
+  // or the login holds all its sessions) - one the authority decided, the application already knows.
+  CLIENT_EVENT_PUBLISH_REFUSED = 6;
+  CLIENT_EVENT_SUBSCRIBE_REFUSED = 7;
+  CLIENT_EVENT_CONNECT_REFUSED = 8;
 }
 
 message PublishRequest {

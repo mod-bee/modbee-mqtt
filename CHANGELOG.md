@@ -11,6 +11,13 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+### Added
+
+- **Refusals are client events** (platform builds): `$modbee/events/publish-refused`, `subscribe-refused` and
+  `connect-refused` (the server full, or a login at its session limit), and over the Application API as
+  `CLIENT_EVENT_PUBLISH_REFUSED` / `_SUBSCRIBE_REFUSED` / `_CONNECT_REFUSED` with the topic or filter and the reason
+  code — so an application can say why a device is not getting through. A board build compiles none of it.
+
 ### Fixed
 
 - **Application API:** `Messages.Publish` with `CONFIRM_ACCEPTED` now says how many subscribers it matched

@@ -49,7 +49,8 @@
 
 // A client event, from the server's own $modbee/events/... (BrokerEvents).
 struct AppClientEvent {
-    enum Kind : uint8_t { Unknown, Connected, Disconnected, Subscribed, Unsubscribed, ServerStarted };
+    enum Kind : uint8_t { Unknown, Connected, Disconnected, Subscribed, Unsubscribed, ServerStarted,
+                          PublishRefused, SubscribeRefused, ConnectRefused };
     Kind kind = Unknown;
     std::string clientId, login, filter, address;
     int64_t timeMs = 0;

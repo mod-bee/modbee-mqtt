@@ -372,6 +372,20 @@ void MqttBroker::clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSes
     _onClientEvent(_clientEventContext, event);
 }
 
+#if defined(MQTT_PLATFORM_HOST)
+void MqttBroker::refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
+                              const MqttSpan& filter, uint8_t reasonCode) {
+    if (_onClientEvent == nullptr) return;
+    MqttBrokerClientEvent event;
+    event.kind = kind;
+    event.clientId = clientId;
+    event.userName = userName;
+    event.filter = filter;
+    event.reasonCode = reasonCode;
+    _onClientEvent(_clientEventContext, event);
+}
+#endif
+
 // =============================================================================
 // THE POLL
 // =============================================================================
@@ -2238,6 +2252,10 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
                     isBusyV5 ? MQ_REASON_SERVER_BUSY : MQ_RETURN_SERVER_UNAVAILABLE,
                     false, nullptr);
         _status.refused++;
+#if defined(MQTT_PLATFORM_HOST)
+        refusalEvent(MqttBrokerClientEventKind::ConnectRefused, request.clientId,
+                     request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_SERVER_BUSY);
+#endif
         closeConnection(connection,
                         (uint8_t)(isBusyV5 ? MQ_REASON_SERVER_BUSY
                                            : MQ_RETURN_SERVER_UNAVAILABLE),
@@ -2601,6 +2619,10 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
             const uint8_t code = isV5 ? MQ_REASON_QUOTA_EXCEEDED : MQ_RETURN_SERVER_UNAVAILABLE;
             sendConnAck(connection, code, false, nullptr);
             _status.refused++;
+#if defined(MQTT_PLATFORM_HOST)
+            refusalEvent(MqttBrokerClientEventKind::ConnectRefused, clientId,
+                         request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_QUOTA_EXCEEDED);
+#endif
             closeConnection(connection, code, false, false);
             return;
         }
@@ -2613,6 +2635,10 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
                         isV5 ? MQ_REASON_SERVER_BUSY : MQ_RETURN_SERVER_UNAVAILABLE,
                         false, nullptr);
             _status.refused++;
+#if defined(MQTT_PLATFORM_HOST)
+            refusalEvent(MqttBrokerClientEventKind::ConnectRefused, clientId,
+                         request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_SERVER_BUSY);
+#endif
             closeConnection(connection, (uint8_t)(isV5 ? MQ_REASON_SERVER_BUSY : MQ_RETURN_SERVER_UNAVAILABLE), false, false);
             return;
         }
@@ -3617,6 +3643,10 @@ void MqttBroker::handlePublish(MqttBrokerConnection& connection,
         if (message.qos > MQ_QOS_0) {
             sendSimpleAck(connection, ackType, message.packetId, refusal);
         }
+#if defined(MQTT_PLATFORM_HOST)
+        refusalEvent(MqttBrokerClientEventKind::PublishRefused, asSpan(session->clientId()),
+                     asSpan(session->userName), topic, refusal);
+#endif
         // At QoS 0 there is nothing to answer with, and dropping the
         // connection over one refused topic would take out everything else
         // that client is doing. The refusal is counted, not shouted about.
@@ -4068,6 +4098,10 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
 #endif
             if (!subscribeAllowed) {
                 granted = isV5 ? refusal : 0x80;
+#if defined(MQTT_PLATFORM_HOST)
+                refusalEvent(MqttBrokerClientEventKind::SubscribeRefused, asSpan(session->clientId()),
+                             asSpan(session->userName), filter.filter, refusal);
+#endif
             } else {
                 // [V5:MQTT-3.8.4-6] The granted QoS may be lower than the one
                 // requested, and never higher than our Maximum QoS.

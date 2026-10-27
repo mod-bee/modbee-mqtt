@@ -48,6 +48,9 @@ const char* BrokerEvents::topicFor(MqttBrokerClientEventKind kind) {
     case MqttBrokerClientEventKind::Disconnected: return "$modbee/events/disconnected";
     case MqttBrokerClientEventKind::Subscribed: return "$modbee/events/subscribed";
     case MqttBrokerClientEventKind::Unsubscribed: return "$modbee/events/unsubscribed";
+    case MqttBrokerClientEventKind::PublishRefused: return "$modbee/events/publish-refused";
+    case MqttBrokerClientEventKind::SubscribeRefused: return "$modbee/events/subscribe-refused";
+    case MqttBrokerClientEventKind::ConnectRefused: return "$modbee/events/connect-refused";
     }
     return "$modbee/events/unknown";
 }
@@ -56,11 +59,16 @@ std::string BrokerEvents::document(const MqttBrokerClientEvent& e, uint64_t time
     const char* name = topicFor(e.kind) + 15;   // after "$modbee/events/"
     std::string out = "{\"event\":" + quote(name) + ",\"clientid\":" + quote(text(e.clientId)) +
                       ",\"username\":" + quote(text(e.userName));
-    if (e.kind == MqttBrokerClientEventKind::Subscribed || e.kind == MqttBrokerClientEventKind::Unsubscribed) {
+    if (e.kind == MqttBrokerClientEventKind::Subscribed || e.kind == MqttBrokerClientEventKind::Unsubscribed ||
+        e.kind == MqttBrokerClientEventKind::SubscribeRefused) {
         out += ",\"filter\":" + quote(text(e.filter));
     }
+    if (e.kind == MqttBrokerClientEventKind::PublishRefused) out += ",\"topic\":" + quote(text(e.filter));
     if (e.kind == MqttBrokerClientEventKind::Subscribed) out += ",\"qos\":" + std::to_string(e.qos);
-    if (e.kind == MqttBrokerClientEventKind::Disconnected) out += ",\"reason\":" + std::to_string(e.reasonCode);
+    if (e.kind == MqttBrokerClientEventKind::Disconnected || e.kind == MqttBrokerClientEventKind::PublishRefused ||
+        e.kind == MqttBrokerClientEventKind::SubscribeRefused || e.kind == MqttBrokerClientEventKind::ConnectRefused) {
+        out += ",\"reason\":" + std::to_string(e.reasonCode);
+    }
     // A clean start drops every subscription the client had, with no unsubscribed events; a resumed
     // session keeps them without new subscribed ones. A reader keeping subscriptions needs to know which.
     if (e.kind == MqttBrokerClientEventKind::Connected) out += std::string(",\"resumed\":") + (e.resumed ? "true" : "false");

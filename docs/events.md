@@ -39,6 +39,9 @@ modbee-mqtt serve: client events published on $modbee/events/...
 | `$modbee/events/disconnected` | Its connection has gone | the same, and `reason` |
 | `$modbee/events/subscribed` | It was granted a subscription | the same, and `filter`, `qos` |
 | `$modbee/events/unsubscribed` | It removed a subscription it had | the same, and `filter` |
+| `$modbee/events/publish-refused` | A PUBLISH its rules do not allow was refused | `event`, `clientid`, `username`, `topic`, `reason` (what it was told, e.g. 135 Not authorized), `time` |
+| `$modbee/events/subscribe-refused` | A SUBSCRIBE its rules do not allow was refused | the same, with `filter` instead of `topic` |
+| `$modbee/events/connect-refused` | The server turned a CONNECT away itself: it is full (`reason` 137 Server busy), or the login already holds all its sessions (151 Quota exceeded) | `event`, `clientid`, `username`, `reason`, `time` |
 
 ```json
 {"event":"subscribed","clientid":"pump-07","username":"pump-07","filter":"plant/pump-07/cmd/SETPOINT","qos":1,"time":1791278042000}

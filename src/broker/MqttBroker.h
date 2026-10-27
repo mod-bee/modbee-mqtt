@@ -204,6 +204,10 @@ enum class MqttBrokerClientEventKind : uint8_t {
     Disconnected,
     Subscribed,
     Unsubscribed,
+    // Refusals, so an application can say why a device is not getting through (host builds raise them):
+    PublishRefused,                    // filter: the topic; reasonCode: what the PUBACK said (or would have)
+    SubscribeRefused,                  // filter: the filter; reasonCode: what the SUBACK said
+    ConnectRefused,                    // the server is full, or the login holds all its sessions; reasonCode
 };
 
 struct MqttBrokerClientEvent {
@@ -212,7 +216,7 @@ struct MqttBrokerClientEvent {
     MqttSpan userName;
     MqttSpan filter;                   // Subscribed / Unsubscribed
     uint8_t qos = 0;                   // Subscribed: the QoS granted
-    uint8_t reasonCode = 0;            // Disconnected: what we sent, or 0
+    uint8_t reasonCode = 0;            // Disconnected: what we sent, or 0; a refusal: why
     bool resumed = false;              // Connected: an existing session was resumed (CONNACK session present)
 };
 
@@ -743,6 +747,11 @@ private:
     void clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSession& session,
                      const MqttSpan& filter, uint8_t qos, uint8_t reasonCode,
                      bool resumed = false);
+#if defined(MQTT_PLATFORM_HOST)
+    // A refusal, for a client that may have no session yet (a CONNECT turned away).
+    void refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
+                      const MqttSpan& filter, uint8_t reasonCode);
+#endif
 
     // Assigned client identifiers are "auto-<n>". Per broker instance, never a
     // process-wide counter - R5, and two brokers in one test binary.
