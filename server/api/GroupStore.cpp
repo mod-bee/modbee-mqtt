@@ -132,6 +132,7 @@ std::string encodeMessage(const AppMessage& m) {
         put(out, e.address);
         put(out, (uint64_t)e.timeMs);
         put(out, (uint64_t)e.reasonCode | ((uint64_t)e.qos << 32));
+        put(out, e.detail);
     }
     return out;
 }
@@ -164,6 +165,8 @@ bool decodeMessage(const void* data, int size, AppMessage& m) {
         const uint64_t codes = r.number();
         e.reasonCode = (uint32_t)(codes & 0xFFFFFFFFu);
         e.qos = (uint32_t)(codes >> 32);
+        // Written since handshake-failed events: an older file's events end here.
+        if (r.ok && r.at < r.end) e.detail = r.text();
     }
     return r.ok;
 }
@@ -202,6 +205,10 @@ void bindBlob(sqlite3_stmt* statement, int index, const std::string& value) {
 }
 
 } // namespace
+
+std::string encodeAppMessage(const AppMessage& message) { return encodeMessage(message); }
+
+bool decodeAppMessage(const void* data, int size, AppMessage& message) { return decodeMessage(data, size, message); }
 
 GroupStore::GroupStore(const GroupStoreConfig& config) : _config(config) {}
 

@@ -205,6 +205,7 @@ v1::PublishOutcome outcomeOf(AppPublishOutcome outcome) {
     case AppPublishOutcome::Partial: return v1::PUBLISH_PARTIAL;
     case AppPublishOutcome::Refused: return v1::PUBLISH_REFUSED;
     case AppPublishOutcome::NotConnected: return v1::PUBLISH_NOT_CONNECTED;
+    case AppPublishOutcome::Stored: return v1::PUBLISH_STORED;
     }
     return v1::PUBLISH_OUTCOME_UNSPECIFIED;
 }
@@ -317,6 +318,17 @@ AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     }
     s.reconnectWhenAsked = wire.reconnect() == v1::RECONNECT_WHEN_ASKED;
     s.primaryCheckSeconds = wire.primary_check_seconds() ? wire.primary_check_seconds() : 60;
+    s.willDelaySeconds = wire.will_delay_seconds();
+    s.receiveMaximum = (uint16_t)std::min<uint32_t>(wire.receive_maximum(), 65535);
+    s.topicAliasMaximum = (uint16_t)std::min<uint32_t>(wire.topic_alias_maximum(), 65535);
+    s.maximumPacketSize = wire.maximum_packet_size();
+    if (wire.store_and_forward().enabled()) {
+        const v1::StoreAndForward& k = wire.store_and_forward();
+        s.storeAndForward = true;
+        if (k.max_messages()) s.storeMaxMessages = k.max_messages();
+        if (k.max_bytes()) s.storeMaxBytes = k.max_bytes();
+        s.storeDropOldest = k.when_full() == v1::WHEN_FULL_DROP_OLDEST;
+    }
     return s;
 }
 
@@ -343,7 +355,24 @@ void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
         will->set_payload(info.spec.will.payload);
         will->set_qos(info.spec.will.qos);
         will->set_retain(info.spec.will.retain);
+        propertiesTo(info.spec.will.properties, *will->mutable_properties());
     }
+    s->set_will_delay_seconds(info.spec.willDelaySeconds);
+    s->set_receive_maximum(info.spec.receiveMaximum);
+    s->set_topic_alias_maximum(info.spec.topicAliasMaximum);
+    s->set_maximum_packet_size(info.spec.maximumPacketSize);
+    if (info.spec.storeAndForward) {
+        v1::StoreAndForward* k = s->mutable_store_and_forward();
+        k->set_enabled(true);
+        k->set_max_messages(info.spec.storeMaxMessages);
+        k->set_max_bytes(info.spec.storeMaxBytes);
+        k->set_when_full(info.spec.storeDropOldest ? v1::WHEN_FULL_DROP_OLDEST : v1::WHEN_FULL_REFUSE);
+    }
+    wire.set_stored(info.stored);
+    wire.set_stored_bytes(info.storedBytes);
+    wire.set_oldest_stored_ms(info.oldestStoredMs);
+    wire.set_stored_dropped(info.storedDropped);
+    wire.set_stored_expired(info.storedExpired);
     s->set_reconnect(info.spec.reconnectWhenAsked ? v1::RECONNECT_WHEN_ASKED : v1::RECONNECT_AUTOMATIC);
     s->set_primary_check_seconds(info.spec.primaryCheckSeconds);
     switch (info.state) {

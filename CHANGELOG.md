@@ -13,6 +13,16 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Store and forward on a managed connection** (`ConnectionSpec.store_and_forward`): every publish on it is kept on
+  disk until the other broker acknowledges it - a connection that is down, a restart or a crash loses none, and
+  they are sent in order, at QoS 1 or more. `PUBLISH_STORED` while it is down; bounded in messages and bytes, full
+  it refuses (0x97) or drops the oldest; expired messages are not sent. `ConnectionInfo` says what it holds.
+- **A managed connection's CONNECT, all of MQTT 5's**: the Will's properties (they were accepted and not sent) and
+  delay, `receive_maximum`, `topic_alias_maximum`, `maximum_packet_size`; a connection kept across a restart now
+  keeps its Will's properties too.
+- **`pub`, `sub` and `req` take a Will** (`--will-topic`, `--will-message`, `--will-qos`, `--will-retain`,
+  `--will-delay`) **and MQTT 5's connect limits** (`--receive-maximum`, `--topic-alias-maximum`,
+  `--maximum-packet-size`).
 - **The Application API from the command line, one command for each call**: `modbee-mqtt hello`, `authority
   revoke|regrant|forget`, `messages publish|consume`, `groups list|delete`, `connections
   put|get|list|delete|watch|reconnect`, `logins ...`, `keys ...`, `sessions list|kick`, `retained list|delete`,
@@ -64,6 +74,7 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- A named group kept on disk lost a handshake-failed event's `detail` across a restart.
 - **Client events say where a client came from**: `connected` and `connect-refused` carry `address`, and so does
   `ClientEvent.address` over the Application API, which the contract promised for CONNECTED and was always empty.
 - **Managed connections say why they cannot connect**: `ConnectionInfo.last_error` reads "cannot connect to plant.local:

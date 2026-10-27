@@ -33,6 +33,7 @@
 // non-blocking); calls from the API reach it through a queue.
 
 #include "AppHub.h"
+#include "ConnectionOutbox.h"
 
 #include <condition_variable>
 #include <functional>
@@ -67,6 +68,17 @@ struct AppConnectionSpec {
     AppPublish will;
     bool reconnectWhenAsked = false;
     uint32_t primaryCheckSeconds = 60;
+    // MQTT 5 CONNECT: the Will's delay (its properties are will.properties),
+    // and what this end will take (0: the protocol's defaults).
+    uint32_t willDelaySeconds = 0;
+    uint16_t receiveMaximum = 0, topicAliasMaximum = 0;
+    uint32_t maximumPacketSize = 0;
+    // STORE AND FORWARD (ConnectionOutbox): every publish on it kept on disk
+    // until the other broker has acknowledged it, whether it is up or not.
+    bool storeAndForward = false;
+    uint64_t storeMaxMessages = 100000;
+    uint64_t storeMaxBytes = 64ull << 20;
+    bool storeDropOldest = false;           // full: give up the oldest; otherwise refuse the new one (0x97)
 };
 
 enum class AppConnectionState : uint8_t { Connecting, Connected, Waiting, BackingOff, Refused };
@@ -79,13 +91,19 @@ struct AppConnectionInfo {
     std::string lastError;
     int64_t sinceMs = 0;
     uint64_t messagesIn = 0, messagesOut = 0;
+    uint64_t stored = 0, storedBytes = 0;   // held for the other broker now
+    int64_t oldestStoredMs = 0;             // when the oldest of them was taken; 0: none
+    uint64_t storedDropped = 0;             // given up to make room (store_and_forward.when_full)
+    uint64_t storedExpired = 0;             // their Message Expiry Interval ran out while they waited
 };
 
 class AppConnections {
 public:
     // `stateDirectory` holds connections.json (and any TLS material given as
     // text), readable by the server's own user only. "" keeps nothing.
-    AppConnections(AppHub& hub, const std::string& stateDirectory);
+    // `syncFull`: what store and forward keeps is on the disk before the
+    // publish is answered, power loss included.
+    AppConnections(AppHub& hub, const std::string& stateDirectory, bool syncFull = false);
     ~AppConnections();
 
     // Opens what was kept, and starts the thread.
@@ -116,6 +134,8 @@ public:
 private:
     AppHub& _hub;
     std::string _directory;
+    bool _syncFull = false;
+    ConnectionOutbox _outbox;                 // the manager's thread only
     mutable std::mutex _lock;                 // the maps and the queue
     std::condition_variable _wake;
     std::map<std::string, std::unique_ptr<Connection>> _connections;
@@ -133,6 +153,9 @@ private:
     void open(Connection& connection);
     void close(Connection& connection);
     void service(Connection& connection);
+    void forward(Connection& connection);     // what store and forward holds, to the other broker
+    void store(Connection& connection, const AppPublish& message,
+               std::function<void(const AppPublishResult&)> done);
     void announce(Connection& connection);
     void save();
     bool load(std::string& error);

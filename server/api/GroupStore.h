@@ -38,6 +38,12 @@
 #include <thread>
 #include <vector>
 
+// A message as the stores keep it: its topic, payload, flags, MQTT 5
+// properties, publisher and time (and a client event's fields). Shared by the
+// groups and the connections' outboxes, so both read the same bytes.
+std::string encodeAppMessage(const AppMessage& message);
+bool decodeAppMessage(const void* data, int size, AppMessage& message);
+
 struct sqlite3;
 
 struct GroupStoreConfig {

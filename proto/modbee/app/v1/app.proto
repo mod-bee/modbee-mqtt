@@ -363,6 +363,7 @@ enum PublishOutcome {
   PUBLISH_PARTIAL = 4;             // the deadline came with acknowledgements still pending
   PUBLISH_REFUSED = 5;             // see reason_code
   PUBLISH_NOT_CONNECTED = 6;       // the managed connection is down: nothing was sent
+  PUBLISH_STORED = 7;              // store and forward: kept on disk, sent in order when the other broker can take it
 }
 
 message Message {
@@ -443,6 +444,28 @@ message ConnectionSpec {
   Message will = 11;
   ReconnectMode reconnect = 12;
   uint32 primary_check_seconds = 13; // how often a lower-priority connection checks the first server (default 60)
+  StoreAndForward store_and_forward = 14;
+  // MQTT 5 CONNECT. The Will's properties are will.properties; these are the rest.
+  uint32 will_delay_seconds = 15;
+  uint32 receive_maximum = 16;     // QoS 1/2 messages the other broker may have in flight to it; 0: 65535
+  uint32 topic_alias_maximum = 17; // 0: none
+  uint32 maximum_packet_size = 18; // the largest it takes; 0: no limit
+}
+
+// What a bridge does (EMQX's buffer, HiveMQ Edge, Mosquitto's bridge queue): every publish on the connection is
+// written to disk (connections' outbox.db) before it is answered, and leaves only when the other broker has
+// acknowledged it - so a connection that is down, a restart or a crash loses none, and they go in order, at QoS 1 or
+// more. A message whose Message Expiry Interval runs out while it waits is not sent. Delete drops what it holds.
+message StoreAndForward {
+  bool enabled = 1;
+  uint64 max_messages = 2;         // default 100000
+  uint64 max_bytes = 3;            // topics and payloads; default 67108864
+  WhenFull when_full = 4;
+}
+
+enum WhenFull {
+  WHEN_FULL_REFUSE = 0;            // the new message is refused (0x97), the kept ones go first (the default)
+  WHEN_FULL_DROP_OLDEST = 1;       // the oldest is given up, and counted
 }
 
 message Endpoint {
@@ -483,6 +506,11 @@ message ConnectionInfo {
   int64 since_ms = 6;
   uint64 messages_in = 7;
   uint64 messages_out = 8;
+  uint64 stored = 9;               // store and forward: held for the other broker now
+  uint64 stored_bytes = 10;
+  int64 oldest_stored_ms = 11;     // when the oldest of them was taken (ms since 1970 UTC); 0: none
+  uint64 stored_dropped = 12;      // given up to make room (WHEN_FULL_DROP_OLDEST)
+  uint64 stored_expired = 13;      // their Message Expiry Interval ran out while they waited
 }
 
 enum ConnectionState {

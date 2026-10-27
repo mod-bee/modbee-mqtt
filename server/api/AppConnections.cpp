@@ -13,12 +13,14 @@
 #endif
 
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
 
 #include "ServerOs.h"
+#include "GroupStore.h"
 
 namespace {
 
@@ -74,6 +76,55 @@ AppPublishResult resultOf(MqttResult result, bool confirmDelivered) {
     return out;
 }
 
+std::string hex(const std::string& bytes) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : bytes) {
+        out.push_back(digits[c >> 4]);
+        out.push_back(digits[c & 15]);
+    }
+    return out;
+}
+
+std::string unhex(const std::string& text) {
+    std::string out;
+    for (size_t i = 0; i + 1 < text.size(); i += 2) out.push_back((char)std::strtoul(text.substr(i, 2).c_str(), nullptr, 16));
+    return out;
+}
+
+// The Will, whole - its MQTT 5 properties too - as the stores keep a message.
+std::string willText(const AppPublish& will) {
+    AppMessage m;
+    m.topic = will.topic;
+    m.payload = will.payload;
+    m.qos = will.qos;
+    m.retain = will.retain;
+    m.properties = will.properties;
+    return hex(encodeAppMessage(m));
+}
+
+bool willFrom(const std::string& text, AppPublish& will) {
+    const std::string bytes = unhex(text);
+    AppMessage m;
+    if (!decodeAppMessage(bytes.data(), (int)bytes.size(), m)) return false;
+    will.topic = m.topic;
+    will.payload = m.payload;
+    will.qos = m.qos;
+    will.retain = m.retain;
+    will.properties = m.properties;
+    return true;
+}
+
+// The CONNECT's Will: its message, properties and delay.
+void applyWill(const AppConnectionSpec& spec, MqttConnectionConfig& connection) {
+    connection.will = MqttWillConfig();
+    if (!spec.hasWill) return;
+    connection.will.set(spec.will.topic.c_str(), (const uint8_t*)spec.will.payload.data(), spec.will.payload.size(),
+                        spec.will.qos, spec.will.retain);
+    connection.will.properties = spec.will.properties;
+    connection.will.delayInterval = spec.willDelaySeconds;
+}
+
 bool writePrivate(const std::string& path, const std::string& text) {
     std::string ignored;
     return server_os::writeFileAtomically(path, text, ignored, 0600);
@@ -102,10 +153,22 @@ std::string toJson(const AppConnectionSpec& s) {
         w.add("payload", s.will.payload);
         w.add("qos", (long long)s.will.qos);
         w.add("retain", s.will.retain);
+        w.add("whole", willText(s.will));
+        w.add("delay", (long long)s.willDelaySeconds);
         o.raw("will", w.str());
     }
     o.add("whenAsked", s.reconnectWhenAsked);
     o.add("primaryCheck", (long long)s.primaryCheckSeconds);
+    o.add("receiveMaximum", (long long)s.receiveMaximum);
+    o.add("topicAliasMaximum", (long long)s.topicAliasMaximum);
+    o.add("maximumPacketSize", (long long)s.maximumPacketSize);
+    if (s.storeAndForward) {
+        json::Object k;
+        k.add("messages", (long long)s.storeMaxMessages);
+        k.add("bytes", (long long)s.storeMaxBytes);
+        k.add("dropOldest", s.storeDropOldest);
+        o.raw("store", k.str());
+    }
     return o.str();
 }
 
@@ -140,9 +203,21 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
         s.will.payload = w.str("payload");
         s.will.qos = (uint8_t)w.integer("qos");
         s.will.retain = w.flag("retain");
+        if (w.has("whole")) willFrom(w.str("whole"), s.will);
+        s.willDelaySeconds = (uint32_t)w.integer("delay");
     }
     s.reconnectWhenAsked = v.flag("whenAsked");
     s.primaryCheckSeconds = (uint32_t)v.integer("primaryCheck", 60);
+    s.receiveMaximum = (uint16_t)v.integer("receiveMaximum");
+    s.topicAliasMaximum = (uint16_t)v.integer("topicAliasMaximum");
+    s.maximumPacketSize = (uint32_t)v.integer("maximumPacketSize");
+    if (v.has("store")) {
+        const json::Value& k = v["store"];
+        s.storeAndForward = true;
+        s.storeMaxMessages = (uint64_t)k.integer("messages", 100000);
+        s.storeMaxBytes = (uint64_t)k.integer("bytes", 64ll << 20);
+        s.storeDropOldest = k.flag("dropOldest");
+    }
     return !s.id.empty() && !s.servers.empty();
 }
 
@@ -203,6 +278,53 @@ struct AppConnections::Connection {
                            self.pending.end());
     }
 
+    // --- Store and forward ---
+    uint64_t stored = 0, storedBytes = 0, storedDropped = 0, storedExpired = 0;
+    std::set<uint64_t> inClient;               // kept messages handed to the client, not yet answered
+    struct Waiting {                           // CONFIRM_DELIVERED: until the other broker has it, or the deadline
+        uint64_t id;
+        Clock::time_point deadline;
+        std::function<void(const AppPublishResult&)> done;
+    };
+    std::vector<Waiting> waiting;
+    struct Sent {
+        Connection* connection;
+        uint64_t id;
+        size_t bytes;
+    };
+    std::vector<std::unique_ptr<Sent>> sent;
+
+    // A kept message is answered by everyone waiting for it.
+    void settle(uint64_t id, const AppPublishResult& result) {
+        for (size_t i = 0; i < waiting.size(); i++) {
+            if (waiting[i].id != id) continue;
+            if (waiting[i].done) waiting[i].done(result);
+            waiting.erase(waiting.begin() + (long)i--);
+        }
+    }
+
+    // The other broker's answer to a kept message. Taken (or refused: its answer
+    // is final) - it leaves the store; lost on the way - it stays, and goes again.
+    static void forwarded(void* context, MqttResult result, uint16_t) {
+        Sent* s = static_cast<Sent*>(context);
+        Connection& self = *s->connection;
+        // Not with the client any more: given up to make room while it was on its way.
+        const bool held = self.inClient.erase(s->id) > 0;
+        const bool lost = result == MqttResult::ConnectionLost || result == MqttResult::SessionLost ||
+                          result == MqttResult::AckTimeout || result == MqttResult::NotConnected;
+        if (held && !lost) {
+            self.owner->_outbox.drop(s->id);
+            if (self.stored > 0) self.stored--;
+            self.storedBytes -= std::min<uint64_t>(self.storedBytes, s->bytes);
+            AppPublishResult answer = resultOf(result, true);
+            if (result == MqttResult::NoMatchingSubscribers) answer.outcome = AppPublishOutcome::NoSubscribers;
+            self.settle(s->id, answer);
+        }
+        self.sent.erase(std::remove_if(self.sent.begin(), self.sent.end(),
+                                       [s](const std::unique_ptr<Sent>& one) { return one.get() == s; }),
+                        self.sent.end());
+    }
+
     static void established(void* context, bool sessionPresent) {
         static_cast<Connection*>(context)->sessionPresent = sessionPresent;
     }
@@ -237,12 +359,15 @@ struct AppConnections::Connection {
 // THE MANAGER
 // =============================================================================
 
-AppConnections::AppConnections(AppHub& hub, const std::string& stateDirectory)
-    : _hub(hub), _directory(stateDirectory) {}
+AppConnections::AppConnections(AppHub& hub, const std::string& stateDirectory, bool syncFull)
+    : _hub(hub), _directory(stateDirectory), _syncFull(syncFull) {}
 
 AppConnections::~AppConnections() { stop(); }
 
 bool AppConnections::start(std::string& error) {
+    // What store and forward held when the server stopped, before the
+    // connections it belongs to are opened again.
+    if (!_outbox.open(_directory, _syncFull, error)) return false;
     if (!_directory.empty()) {
         server_os::makeDirectory(_directory, 0700);
         if (!load(error)) return false;
@@ -325,10 +450,10 @@ void AppConnections::open(Connection& c) {
         connection.password.assign(c.spec.password.begin(), c.spec.password.end());
         connection.hasPassword = true;
     }
-    if (c.spec.hasWill) {
-        connection.will.set(c.spec.will.topic.c_str(), (const uint8_t*)c.spec.will.payload.data(),
-                            c.spec.will.payload.size(), c.spec.will.qos, c.spec.will.retain);
-    }
+    applyWill(c.spec, connection);
+    connection.receiveMaximum = c.spec.receiveMaximum;
+    connection.topicAliasMaximum = c.spec.topicAliasMaximum;
+    connection.maximumPacketSize = c.spec.maximumPacketSize;
     const AppEndpoint& first = c.endpoint(c.serverIndex);
     connection.host = first.host.c_str();
     connection.port = c.portOf(first);
@@ -355,8 +480,12 @@ void AppConnections::open(Connection& c) {
         c.tls = nullptr;
 #endif
     }
+    const ConnectionOutbox::Totals kept = _outbox.totals(c.spec.id);
+    c.stored = kept.messages;
+    c.storedBytes = kept.bytes;
     MqttClientConfig behaviour;
     behaviour.autoReconnect = false;     // the manager decides: which server, and when
+    behaviour.queueCapacity = 256;       // room for store and forward's window as well
     behaviour.receiveBufferSize = 65536;
     behaviour.transmitBufferSize = 65536;
     c.client.begin(*c.transport, connection, behaviour);
@@ -380,11 +509,30 @@ void AppConnections::close(Connection& c) {
         if (p->done) p->done(resultOf(MqttResult::ConnectionLost, p->confirmDelivered));
     }
     c.pending.clear();
+    // Kept, and still kept: whoever waits is told so.
+    AppPublishResult kept;
+    kept.outcome = AppPublishOutcome::Stored;
+    kept.pending = 1;
+    for (auto& w : c.waiting) {
+        if (w.done) w.done(kept);
+    }
+    c.waiting.clear();
+    c.sent.clear();
+    c.inClient.clear();
 }
 
 void AppConnections::service(Connection& c) {
     const Clock::time_point now = Clock::now();
     c.client.poll();
+    // CONFIRM_DELIVERED past its deadline: kept, and sent when it can be.
+    for (size_t i = 0; i < c.waiting.size(); i++) {
+        if (now < c.waiting[i].deadline) continue;
+        AppPublishResult kept;
+        kept.outcome = AppPublishOutcome::Stored;
+        kept.pending = 1;
+        if (c.waiting[i].done) c.waiting[i].done(kept);
+        c.waiting.erase(c.waiting.begin() + (long)i--);
+    }
     // A server that cannot even be opened sends the client into its own
     // retry loop, whatever autoReconnect says. The manager decides which
     // server is next and when, so it takes the attempt back.
@@ -406,12 +554,7 @@ void AppConnections::service(Connection& c) {
         MqttConnectionConfig connection = c.client.connection();
         connection.host = e.host.c_str();
         connection.port = c.portOf(e);
-        if (c.spec.hasWill) {
-            connection.will.set(c.spec.will.topic.c_str(), (const uint8_t*)c.spec.will.payload.data(),
-                                c.spec.will.payload.size(), c.spec.will.qos, c.spec.will.retain);
-        } else {
-            connection.will = MqttWillConfig();
-        }
+        applyWill(c.spec, connection);
         c.client.reconfigure(connection);
 #if MQTT_TLS_SOCKETS
         if (c.spec.tls) static_cast<MqttTlsTransport*>(c.transport.get())->configure(e.host.c_str(), c.portOf(e));
@@ -463,6 +606,8 @@ void AppConnections::service(Connection& c) {
     }
 
     if (state != MqttState::Connected) return;
+
+    forward(c);
 
     // --- Subscriptions: what the groups on it want ---
     if (c.filtersChanged) {
@@ -520,6 +665,11 @@ AppConnectionInfo AppConnections::infoOf(const Connection& c) const {
     info.sinceMs = c.sinceMs;
     info.messagesIn = c.messagesIn;
     info.messagesOut = c.messagesOut;
+    info.stored = c.stored;
+    info.storedBytes = c.storedBytes;
+    info.storedDropped = c.storedDropped;
+    info.storedExpired = c.storedExpired;
+    if (c.stored != 0) info.oldestStoredMs = const_cast<ConnectionOutbox&>(_outbox).totals(c.spec.id).oldestMs;
     return info;
 }
 
@@ -587,6 +737,7 @@ bool AppConnections::remove(const std::string& id) {
         if (at == _connections.end()) return;
         close(*at->second);
         _connections.erase(at);
+        _outbox.dropAll(id);              // nobody left to send it to
         found = true;
         save();
     });
@@ -645,6 +796,10 @@ void AppConnections::unwatch(uint64_t watcher) {
 void AppConnections::publish(const AppPublish& message, std::function<void(const AppPublishResult&)> done) {
     post([this, message, done] {
         auto at = _connections.find(message.connection);
+        if (at != _connections.end() && at->second->spec.storeAndForward) {
+            store(*at->second, message, done);
+            return;
+        }
         if (at == _connections.end() || !at->second->client.isConnected()) {
             AppPublishResult result;
             result.outcome = AppPublishOutcome::NotConnected;
@@ -675,6 +830,101 @@ void AppConnections::publish(const AppPublish& message, std::function<void(const
             p->done = nullptr;
         }
     });
+}
+
+// --- Store and forward ---------------------------------------------------------
+
+void AppConnections::store(Connection& c, const AppPublish& message,
+                           std::function<void(const AppPublishResult&)> done) {
+    const uint64_t bytes = message.topic.size() + message.payload.size();
+    AppPublishResult result;
+    if (bytes > c.spec.storeMaxBytes) {
+        result.outcome = AppPublishOutcome::Refused;
+        result.reasonCode = MQ_REASON_PACKET_TOO_LARGE;
+        return done(result);
+    }
+    // Full: the oldest makes room, or the new one is refused - as it was told.
+    while (c.stored + 1 > c.spec.storeMaxMessages || c.storedBytes + bytes > c.spec.storeMaxBytes) {
+        ConnectionOutbox::Kept oldest;
+        if (!c.spec.storeDropOldest || !_outbox.dropOldest(c.spec.id, &oldest)) {
+            result.outcome = AppPublishOutcome::Refused;
+            result.reasonCode = MQ_REASON_QUOTA_EXCEEDED;
+            return done(result);
+        }
+        c.stored = c.stored ? c.stored - 1 : 0;
+        c.storedBytes -= std::min<uint64_t>(c.storedBytes, oldest.bytes);
+        c.storedDropped++;
+        c.inClient.erase(oldest.id);
+        AppPublishResult dropped;
+        dropped.outcome = AppPublishOutcome::Refused;
+        dropped.reasonCode = MQ_REASON_QUOTA_EXCEEDED;
+        c.settle(oldest.id, dropped);
+    }
+    AppMessage m;
+    m.topic = message.topic;
+    m.payload = message.payload;
+    m.qos = message.qos;
+    m.retain = message.retain;
+    m.properties = message.properties;
+    m.origin = message.origin;
+    m.brokerTimeMs = utcNowMs();
+    m.connection = c.spec.id;
+    uint64_t id = 0;
+    if (!_outbox.push(c.spec.id, m, id)) {
+        result.outcome = AppPublishOutcome::Refused;
+        result.reasonCode = MQ_REASON_IMPLEMENTATION_SPECIFIC_ERROR;
+        return done(result);
+    }
+    c.stored++;
+    c.storedBytes += bytes;
+    if (message.confirmDelivered) {
+        c.waiting.push_back(Connection::Waiting{
+            id, Clock::now() + std::chrono::milliseconds(message.deadlineMs ? message.deadlineMs : 10000), done});
+    } else {
+        // Up: on its way now. Down: kept until it is back.
+        result.outcome = c.client.isConnected() ? AppPublishOutcome::Accepted : AppPublishOutcome::Stored;
+        done(result);
+    }
+    if (c.client.isConnected()) forward(c);
+}
+
+void AppConnections::forward(Connection& c) {
+    // A window of kept messages with the client at once, oldest first; the
+    // rest wait their turn, in order.
+    const size_t kWindow = 64;
+    if (c.stored <= c.inClient.size() || c.inClient.size() >= kWindow) return;
+    const int64_t now = utcNowMs();
+    for (ConnectionOutbox::Kept& k : _outbox.next(c.spec.id, 0, kWindow + c.inClient.size())) {
+        if (c.inClient.size() >= kWindow) break;
+        if (c.inClient.count(k.id)) continue;
+        MqttOwnedProperties properties = k.message.properties;
+        // [MQTT-3.3.2-6] what is left of its Message Expiry Interval; gone, it is not sent.
+        if (properties.hasExpiry) {
+            const int64_t waited = (now - k.message.brokerTimeMs) / 1000;
+            if (waited >= (int64_t)properties.expiryInterval) {
+                _outbox.drop(k.id);
+                c.stored = c.stored ? c.stored - 1 : 0;
+                c.storedBytes -= std::min<uint64_t>(c.storedBytes, k.bytes);
+                c.storedExpired++;
+                AppPublishResult expired;
+                expired.outcome = AppPublishOutcome::Refused;
+                expired.reasonCode = MQ_REASON_UNSPECIFIED_ERROR;
+                c.settle(k.id, expired);
+                continue;
+            }
+            properties.setMessageExpiry((uint32_t)(properties.expiryInterval - waited));
+        }
+        std::unique_ptr<Connection::Sent> sent(new Connection::Sent{&c, k.id, k.bytes});
+        // At least QoS 1: it leaves the store only on the other broker's word.
+        const uint8_t qos = k.message.qos > MQ_QOS_1 ? k.message.qos : MQ_QOS_1;
+        const MqttResult queued = c.client.publishSeries(
+            k.message.topic.c_str(), (const uint8_t*)k.message.payload.data(), k.message.payload.size(), qos,
+            k.message.retain, properties, &Connection::forwarded, sent.get());
+        if (queued != MqttResult::Queued && queued != MqttResult::Ok) break;   // the client is full: next pass
+        c.inClient.insert(k.id);
+        c.sent.push_back(std::move(sent));
+        c.messagesOut++;
+    }
 }
 
 void AppConnections::groupsChanged(const std::string& connection) {

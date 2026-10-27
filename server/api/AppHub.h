@@ -115,7 +115,9 @@ struct AppPublish {
     uint64_t confirmId = 0;          // the hub's own, as it routes it
 };
 
-enum class AppPublishOutcome : uint8_t { Accepted, Delivered, NoSubscribers, Partial, Refused, NotConnected };
+// Stored: on a connection with store and forward, kept on disk while it is
+// down (or past the deadline, CONFIRM_DELIVERED): sent, in order, when it can be.
+enum class AppPublishOutcome : uint8_t { Accepted, Delivered, NoSubscribers, Partial, Refused, NotConnected, Stored };
 
 struct AppPublishResult {
     AppPublishOutcome outcome = AppPublishOutcome::Accepted;

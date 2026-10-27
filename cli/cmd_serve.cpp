@@ -571,7 +571,7 @@ int cmdServe(int argc, char** argv) {
         c.plainTcp = file.api.plain;
         std::string why;
         if (!read) why = "api: a tls file could not be read";
-        connections.reset(new AppConnections(*hub, file.api.stateDirectory));
+        connections.reset(new AppConnections(*hub, file.api.stateDirectory, file.sessions.syncFull));
         if (read && !connections->start(why)) read = false;
         ApiServer::Services s;
         s.authority = authority.get();

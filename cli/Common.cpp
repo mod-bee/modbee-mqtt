@@ -173,6 +173,14 @@ std::vector<ArgSpec> connectionSpecs() {
         {"keepalive", 'k', true, "keep alive in seconds (default 60)"},
         {"session-expiry", 0, true, "MQTT 5 Session Expiry Interval, seconds"},
         {"no-clean", 'c', false, "Clean Start 0: resume a session that exists"},
+        {"will-topic", 0, true, "a Will: published for this client if it goes without a DISCONNECT"},
+        {"will-message", 0, true, "the Will's payload, as text"},
+        {"will-qos", 0, true, "the Will's QoS: 0, 1 or 2 (default 0)"},
+        {"will-retain", 0, false, "retain the Will"},
+        {"will-delay", 0, true, "MQTT 5 Will Delay Interval, seconds"},
+        {"receive-maximum", 0, true, "MQTT 5: QoS 1/2 messages the broker may have in flight to this client"},
+        {"topic-alias-maximum", 0, true, "MQTT 5: topic aliases the broker may use towards this client"},
+        {"maximum-packet-size", 0, true, "MQTT 5: the largest packet this client takes, bytes"},
         {"tls", 0, false, "connect with TLS"},
         {"cafile", 0, true, "CA certificate file to verify the broker against"},
         {"pin", 0, true, "pin the broker's key fingerprint instead of a CA"},
@@ -195,13 +203,31 @@ bool CliClient::configure(Args& args, const char* defaultClientIdPrefix, std::st
     const bool tls = args.has("tls") || args.has("cafile") || args.has("pin") ||
                      args.has("insecure");
 
-    long long port = 0, keepAlive = 0, expiry = 0;
+    long long port = 0, keepAlive = 0, expiry = 0, willQos = 0, willDelay = 0, receiveMaximum = 0,
+              aliasMaximum = 0, packetMaximum = 0;
     if (!args.getInt("port", tls ? MQ_PORT_TLS : MQ_PORT_TCP, 1, 65535, port) ||
         !args.getInt("keepalive", 60, 0, 65535, keepAlive) ||
-        !args.getInt("session-expiry", 0, 0, 0xFFFFFFFFll, expiry)) {
+        !args.getInt("session-expiry", 0, 0, 0xFFFFFFFFll, expiry) ||
+        !args.getInt("will-qos", 0, 0, 2, willQos) || !args.getInt("will-delay", 0, 0, 0xFFFFFFFFll, willDelay) ||
+        !args.getInt("receive-maximum", 0, 1, 65535, receiveMaximum) ||
+        !args.getInt("topic-alias-maximum", 0, 0, 65535, aliasMaximum) ||
+        !args.getInt("maximum-packet-size", 0, 1, 0xFFFFFFFFll, packetMaximum)) {
         error = args.error();
         return false;
     }
+    if (args.has("will-topic")) {
+        const std::string topic = args.get("will-topic"), message = args.get("will-message", "");
+        connection.will.set(topic.c_str(), (const uint8_t*)message.data(), message.size(), (uint8_t)willQos,
+                            args.has("will-retain"));
+        connection.will.delayInterval = (uint32_t)willDelay;
+    } else if (args.has("will-message") || args.has("will-qos") || args.has("will-retain") ||
+               args.has("will-delay")) {
+        error = "a Will needs --will-topic";
+        return false;
+    }
+    connection.receiveMaximum = (uint16_t)receiveMaximum;
+    connection.topicAliasMaximum = (uint16_t)aliasMaximum;
+    connection.maximumPacketSize = (uint32_t)packetMaximum;
 
     const std::string host = args.get("host", "localhost");
     connection.host = host;
