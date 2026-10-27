@@ -554,14 +554,16 @@ void AppHub::publish(const AppPublish& message, std::function<void(const AppPubl
     }
     Shard& shard = *_shards[_nextShard++ % _shards.size()];
     AppPublish routed = message;
-    if (message.confirmDelivered) {
-        // Followed: every shard reports how many of its subscribers it reached,
-        // and each of those deliveries how it ended.
+    // Followed, always: every shard reports how many of its subscribers it
+    // reached - so even CONFIRM_ACCEPTED can say how many matched, or that
+    // nobody did - and, for CONFIRM_DELIVERED, how each of those deliveries ended.
+    {
         const uint64_t confirm = _nextConfirm++;
         {
             std::lock_guard<std::mutex> guard(_followLock);
             Followed& followed = _followed[confirm];
             followed.expected = _shards.size();
+            followed.acceptedOnly = !message.confirmDelivered;
             followed.deadline = Clock::now() + std::chrono::milliseconds(message.deadlineMs);
             followed.done = std::move(done);
         }
@@ -578,6 +580,11 @@ void AppHub::publish(const AppPublish& message, std::function<void(const AppPubl
 AppPublishResult AppHub::resultOf(const Followed& followed, bool timedOut) {
     AppPublishResult result;
     result.matched = followed.matched;
+    if (followed.acceptedOnly) {
+        // Taken; and whether anybody matched (a retained message is kept either way).
+        result.outcome = followed.matched == 0 && !timedOut ? AppPublishOutcome::NoSubscribers : AppPublishOutcome::Accepted;
+        return result;
+    }
     result.acknowledged = followed.acknowledged;
     const uint32_t ended = followed.acknowledged + followed.lost;
     result.pending = followed.awaited > ended ? followed.awaited - ended : 0;
@@ -611,7 +618,7 @@ void AppHub::confirmed(void* context, uint64_t confirm, MqttBrokerConfirm what, 
         case MqttBrokerConfirm::Lost: followed.lost++; break;
         }
         if (followed.reports < followed.expected ||
-            followed.acknowledged + followed.lost < followed.awaited) {
+            (!followed.acceptedOnly && followed.acknowledged + followed.lost < followed.awaited)) {
             return;
         }
         result = resultOf(followed, false);

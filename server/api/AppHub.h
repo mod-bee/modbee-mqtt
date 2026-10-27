@@ -215,6 +215,9 @@ private:
     struct Followed {
         size_t reports = 0, expected = 0;     // shards that have routed it, of how many
         uint32_t matched = 0, awaited = 0, acknowledged = 0, lost = 0;
+        // CONFIRM_ACCEPTED: answered once every shard has routed it (how many it
+        // matched), without waiting for any acknowledgement.
+        bool acceptedOnly = false;
         Clock::time_point deadline;
         std::function<void(const AppPublishResult&)> done;
     };
