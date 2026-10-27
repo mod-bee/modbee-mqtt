@@ -13,6 +13,8 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **`sub --sparkplug`**: Sparkplug B messages printed decoded, as JSON lines - the same codec the Application API
+  uses.
 - **A Sparkplug B Edge Node in the server** (`Sparkplug.PutEdgeNode` ... `DeleteEdgeNode`, `SetValues`,
   `SetDeviceState`, `RebirthEdgeNode`; `modbee-mqtt sparkplug-nodes ...`): the library's TCK-tested node on one of the
   server's connections - births from what it declares, data as values are set, a primary host waited for - and

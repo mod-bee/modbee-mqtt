@@ -131,6 +131,12 @@ plant/tank-01/level 4.25
 - `-C N` exits after N messages, and `-W s` after N seconds.
 - MQTT 5 subscription options: `--no-local`, `--retain-as-published`,
   `--retain-handling 0|1|2`.
+- **`--sparkplug`** prints Sparkplug B messages decoded, one JSON line each -
+  their kind, group, node and device, and every metric typed, as the
+  Application API gives them: `modbee-mqtt sub -t 'spBv1.0/#' --sparkplug`.
+- A Will and MQTT 5's connect limits, on `pub`, `sub` and `req`: `--will-topic`,
+  `--will-message`, `--will-qos`, `--will-retain`, `--will-delay`;
+  `--receive-maximum`, `--topic-alias-maximum`, `--maximum-packet-size`.
 - **Binary payloads, such as Sparkplug B protobuf, print as base64** rather
   than wrecking the terminal.
 - **With `--json`, each message is one line.** Text payloads appear as

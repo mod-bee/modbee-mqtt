@@ -14,11 +14,17 @@
 
 #include <cstdio>
 
+#if defined(MODBEE_HAVE_APP_API)
+#include "SparkplugCodec.h"
+#include <google/protobuf/util/json_util.h>
+#endif
+
 namespace {
 
 struct SubState {
     bool json = false;
     bool verbose = false;
+    bool sparkplug = false;
     long long received = 0;
     long long limit = 0;
     size_t answered = 0;
@@ -47,9 +53,29 @@ void onSubscribed(void* context, MqttResult result, uint16_t) {
     }
 }
 
+#if defined(MODBEE_HAVE_APP_API)
+// A Sparkplug B message, read as the Application API reads one: a JSON line
+// with its kind, group, node, device and every metric typed.
+bool printSparkplug(const MqttMessage& message) {
+    const std::string topic((const char*)message.topic.data, message.topic.length);
+    if (!sparkplug_codec::isSparkplugTopic(topic)) return false;
+    modbee::app::v1::SparkplugMessage read;
+    sparkplug_codec::decode(topic, std::string((const char*)message.payload.data, message.payload.length), read);
+    google::protobuf::util::JsonPrintOptions options;
+    options.preserve_proto_field_names = true;
+    std::string json;
+    google::protobuf::util::MessageToJsonString(read, &json, options);
+    std::printf("{\"topic\":%s,\"sparkplug\":%s}\n", jsonString(topic).c_str(), json.c_str());
+    return true;
+}
+#endif
+
 void onMessage(void*, const MqttMessage& message) {
     if (g_state == nullptr) return;
     g_state->received++;
+#if defined(MODBEE_HAVE_APP_API)
+    if (g_state->sparkplug && printSparkplug(message)) return;
+#endif
     if (g_state->json) {
         std::printf("%s\n", messageJson(message).c_str());
         return;
@@ -74,6 +100,7 @@ const std::vector<ArgSpec>& subSpecs() {
         {"count", 'C', true, "exit after this many messages"},
         {"wait", 'W', true, "exit after this many seconds"},
         {"no-local", 0, false, "MQTT 5: do not receive my own publishes"},
+        {"sparkplug", 0, false, "print Sparkplug B messages decoded, as JSON lines (every datatype, aliases as sent)"},
         {"retain-as-published", 0, false, "MQTT 5: keep the retain flag as published"},
         {"retain-handling", 0, true, "MQTT 5: 0 send, 1 send if new, 2 never"},
     });
@@ -118,6 +145,13 @@ int cmdSub(int argc, char** argv) {
     SubState state;
     state.json = cli.json;
     state.verbose = args.has("verbose");
+    state.sparkplug = args.has("sparkplug");
+#if !defined(MODBEE_HAVE_APP_API)
+    if (state.sparkplug) {
+        std::fprintf(stderr, "modbee-mqtt sub: --sparkplug needs a build with the Application API (gRPC)\n");
+        return 2;
+    }
+#endif
     state.limit = count;
     g_state = &state;
     cli.client.onMessage(&onMessage, nullptr);
