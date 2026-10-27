@@ -35,13 +35,15 @@ built from it, as downloads for Linux and Windows and as a Docker image.
 - The Application API, gRPC with a REST admin surface: consumer groups that
   share a device's messages, publishing to devices, connections, sessions,
   retained messages and logins - on a Unix socket, or TCP with a token.
-- Linux (x86-64, ARM64) and Windows (x86-64), as a Windows service too.
+- Linux (x86-64, ARM64) and Windows (x86-64), as a service on both.
 
 ### Ready to run
 
-- `.deb` and `.rpm` packages, x86-64 and ARM64: one command installs modbee
-  as a systemd service, with a `modbee` user, a starting configuration and
-  an admin password chosen at install.
+- `.deb` and `.rpm` packages, x86-64 and ARM64.
+- Set up with the `modbee` command alone, the same on Linux and Windows:
+  `modbee service install` runs it as a service (systemd, or a Windows
+  service) keeping everything in one folder, and `modbee admin` sets the
+  admin login. No configuration file.
 - `modbee` for Linux as one static binary that runs on any distribution, and
   `modbee.exe` for Windows as one file - each with the broker, the Kafka pipe,
   the Application API and the CLI inside; `modbee --version` lists them.

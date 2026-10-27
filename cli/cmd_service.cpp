@@ -3,11 +3,17 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// `modbee service`: `modbee serve` as a Windows service.
+// `modbee service`: `modbee serve` as a service - Windows' Service Control
+// Manager, or systemd on Linux - the same commands on both.
 //
-//   modbee service install [--name modbee] [--log <file>] -- --config C:\ModBee\modbee.yaml
+//   modbee service install [--name modbee] [-- <serve options>]
 //   modbee service start | stop | status | uninstall [--name modbee]
 //
+// install also starts it. With no serve options it runs
+// `modbee serve --data <folder>` - everything in one folder
+// (cliDataDirectory), set up with `modbee admin` and `modbee config`.
+//
+// WINDOWS:
 // install registers the service with the Service Control Manager - started
 // at boot, restarted by Windows if it ever stops unexpectedly - to run
 // `modbee service run`, which is serve with the arguments given after `--`.
@@ -15,8 +21,7 @@
 // stops the way it always does, telling every client and keeping what it
 // keeps. Its output goes to a log file (default
 // %ProgramData%\ModBee\<name>.log); started, stopped and failed go to the
-// Windows Event Log too. Linux has systemd for this (docs/docker.md shows
-// the container; any unit that runs `modbee serve` will do).
+// Windows Event Log too.
 
 #include "Common.h"
 
@@ -136,15 +141,26 @@ bool waitFor(SC_HANDLE service, DWORD wanted, DWORD ms) {
     return false;
 }
 
-int install(const Options& o) {
+int start(const Options& o);
+
+int install(Options o) {
     char exe[MAX_PATH] = {0};
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (o.serve.empty()) o.serve = {"--data", cliDataDirectory(o.name)};
+    std::string data;
+    for (size_t i = 1; i < o.serve.size(); i++) {
+        if (o.serve[i - 1] == "--data") data = o.serve[i] = absolute(o.serve[i]);
+    }
+    if (!data.empty() && !cliMakeDirectories(data)) {
+        std::fprintf(stderr, "modbee service: cannot make the folder %s\n", data.c_str());
+        return 3;
+    }
     // The service starts in C:\Windows\System32: a relative path given here
     // is made absolute now, while it still means what was meant.
     std::string command = quoted(exe) + " service run --name " + quoted(o.name) +
                           " --log " + quoted(o.log.empty() ? defaultLog(o.name) : absolute(o.log)) + " --";
     for (size_t i = 0; i < o.serve.size(); i++) {
-        const bool isPath = i > 0 && (o.serve[i - 1] == "--config" || o.serve[i - 1] == "-c");
+        const bool isPath = i > 0 && (o.serve[i - 1] == "--config" || o.serve[i - 1] == "-C");
         command += " " + quoted(isPath ? absolute(o.serve[i]) : o.serve[i]);
     }
     Handles h;
@@ -179,8 +195,15 @@ int install(const Options& o) {
     SERVICE_FAILURE_ACTIONS_FLAG onErrors;
     onErrors.fFailureActionsOnNonCrashFailures = TRUE;
     ChangeServiceConfig2A(h.service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &onErrors);
-    std::printf("modbee service: installed \"%s\" (starts with Windows)\n  %s\n", o.name.c_str(), command.c_str());
-    std::printf("  start it now: modbee service start --name %s\n", o.name.c_str());
+    std::printf("modbee service: installed \"%s\" - it starts with Windows, and again if it stops\n  %s\n",
+                o.name.c_str(), command.c_str());
+    const int started = start(o);
+    if (started != 0) return started;
+    if (!data.empty()) {
+        std::printf("  everything it keeps: %s\n", data.c_str());
+        const std::string where = data == cliDataDirectory() ? "" : " --data \"" + data + "\"";
+        std::printf("  the admin login, to set it or change its password: modbee admin%s\n", where.c_str());
+    }
     return 0;
 }
 
@@ -357,11 +380,233 @@ int cmdService(int argc, char** argv) {
     return 2;
 }
 
+#elif defined(__linux__) && defined(MODBEE_HAVE_SERVER)
+
+// LINUX: the same commands, through systemd. install writes the unit
+// (/etc/systemd/system/<name>.service), makes the `modbee` system user and
+// the data folder, and enables and starts it; its output is in the journal.
+
+#include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cstdlib>
+#include <fstream>
+
+namespace {
+
+struct Options {
+    std::string name = "modbee";
+    std::vector<std::string> serve;      // what follows `--`
+};
+
+const char* kUsage =
+    "usage: modbee service <install|uninstall|start|stop|status> [--name <name>]\n"
+    "                      [-- <serve options; default --data /var/lib/<name>>]\n";
+
+bool parse(int argc, char** argv, int from, Options& o) {
+    for (int i = from; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--") {
+            for (i++; i < argc; i++) o.serve.push_back(argv[i]);
+            break;
+        }
+        if (a == "--name" && i + 1 < argc) {
+            o.name = argv[++i];
+        } else {
+            std::fprintf(stderr, "modbee service: unknown option %s\n%s", a.c_str(), kUsage);
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string unitFile(const Options& o) { return "/etc/systemd/system/" + o.name + ".service"; }
+
+// For the shell, in single quotes.
+std::string shell(const std::string& arg) {
+    std::string out = "'";
+    for (char c : arg) out += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return out + "'";
+}
+
+// For a unit's ExecStart, in double quotes.
+std::string unitQuoted(const std::string& arg) {
+    std::string out = "\"";
+    for (char c : arg) {
+        if (c == '"' || c == '\\') out += '\\';
+        if (c == '%') out += '%';
+        out += c;
+    }
+    return out + "\"";
+}
+
+bool sh(const std::string& command) { return std::system(command.c_str()) == 0; }
+
+bool ready(const Options& o) {
+    if (geteuid() != 0) {
+        std::fprintf(stderr, "modbee service: run it as root (sudo modbee service ...)\n");
+        return false;
+    }
+    struct stat info;
+    if (::stat("/run/systemd/system", &info) != 0) {
+        std::fprintf(stderr, "modbee service: this system does not run systemd - run `modbee serve --data %s` "
+                             "under what it has instead\n", cliDataDirectory(o.name).c_str());
+        return false;
+    }
+    return true;
+}
+
+bool installed(const Options& o) {
+    struct stat info;
+    if (::stat(unitFile(o).c_str(), &info) == 0) return true;
+    std::fprintf(stderr, "modbee service: \"%s\" is not installed (modbee service install)\n", o.name.c_str());
+    return false;
+}
+
+std::string absolute(const std::string& path) {
+    if (path.empty() || path[0] == '/') return path;
+    char here[4096];
+    return getcwd(here, sizeof here) ? std::string(here) + "/" + path : path;
+}
+
+int install(Options o) {
+    if (!ready(o)) return 3;
+    char exe[4096] = {0};
+    const ssize_t length = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (length <= 0) {
+        std::fprintf(stderr, "modbee service: cannot tell where this modbee is\n");
+        return 3;
+    }
+    if (o.serve.empty()) o.serve = {"--data", cliDataDirectory(o.name)};
+    std::string data;
+    for (size_t i = 0; i < o.serve.size(); i++) {
+        const bool isPath = i > 0 && (o.serve[i - 1] == "--config" || o.serve[i - 1] == "-C" ||
+                                      o.serve[i - 1] == "--data");
+        if (isPath) o.serve[i] = absolute(o.serve[i]);
+        if (i > 0 && o.serve[i - 1] == "--data") data = o.serve[i];
+    }
+    // The user it runs as: made once, shared by every instance.
+    if (getpwnam("modbee") == nullptr &&
+        !sh("useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "
+            "--comment 'ModBee MQTT' modbee 2>/dev/null || adduser -S -D -H -h /nonexistent -s /sbin/nologin modbee")) {
+        std::fprintf(stderr, "modbee service: cannot make the modbee user\n");
+        return 3;
+    }
+    if (!data.empty()) {
+        if (!cliMakeDirectories(data) || !sh("chown -R modbee:modbee " + shell(data) + " && chmod 0750 " + shell(data))) {
+            std::fprintf(stderr, "modbee service: cannot prepare %s\n", data.c_str());
+            return 3;
+        }
+    }
+    std::string command = unitQuoted(std::string(exe, (size_t)length)) + " serve";
+    std::string shown = std::string(exe, (size_t)length) + " serve";        // as a person would type it
+    for (const std::string& a : o.serve) {
+        command += " " + unitQuoted(a);
+        shown += " " + (a.find_first_of(" \t'\"") == std::string::npos ? a : shell(a));
+    }
+    std::ofstream unit(unitFile(o).c_str(), std::ios::trunc);
+    unit << "# Written by `modbee service install`; `modbee service uninstall` removes it.\n"
+            "[Unit]\n"
+            "Description=ModBee MQTT (" << o.name << ")\n"
+            "Documentation=https://github.com/mod-bee/modbee-mqtt\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "User=modbee\n"
+            "Group=modbee\n"
+            "ExecStart=" << command << "\n"
+            // Always: a setting applied with --restart stops it on purpose,
+            // and this is what starts it again.
+            "Restart=always\n"
+            "RestartSec=2\n"
+            "TimeoutStopSec=30\n"
+            "LimitNOFILE=1048576\n"
+            "NoNewPrivileges=yes\n"
+            "ProtectSystem=full\n"
+            "ProtectHome=yes\n"
+            "PrivateTmp=yes\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n";
+    unit.close();
+    if (!unit) {
+        std::fprintf(stderr, "modbee service: cannot write %s\n", unitFile(o).c_str());
+        return 3;
+    }
+    if (!sh("systemctl daemon-reload && systemctl enable --now " + shell(o.name) + " >/dev/null 2>&1")) {
+        std::fprintf(stderr, "modbee service: systemd would not start it - journalctl -u %s says why\n",
+                     o.name.c_str());
+        return 3;
+    }
+    std::printf("modbee service: \"%s\" installed and running - it starts at boot, and again if it stops\n",
+                o.name.c_str());
+    std::printf("  %s\n", shown.c_str());
+    if (!data.empty()) std::printf("  everything it keeps: %s\n", data.c_str());
+    std::printf("  its log: journalctl -u %s\n", o.name.c_str());
+    if (!data.empty()) {
+        const std::string where = data == cliDataDirectory() ? "" : " --data " + data;
+        std::printf("  the admin login, to set it or change its password: sudo modbee admin%s\n", where.c_str());
+    }
+    return 0;
+}
+
+int uninstall(const Options& o) {
+    if (!ready(o) || !installed(o)) return 3;
+    sh("systemctl disable --now " + shell(o.name) + " >/dev/null 2>&1");
+    std::remove(unitFile(o).c_str());
+    sh("systemctl daemon-reload");
+    std::printf("modbee service: \"%s\" stopped and removed - what it kept is still there\n", o.name.c_str());
+    return 0;
+}
+
+int control(const Options& o, const char* verb, const char* done) {
+    if (!ready(o) || !installed(o)) return 3;
+    if (!sh(std::string("systemctl ") + verb + " " + shell(o.name))) {
+        std::fprintf(stderr, "modbee service: cannot %s \"%s\" - journalctl -u %s says why\n", verb,
+                     o.name.c_str(), o.name.c_str());
+        return 3;
+    }
+    std::printf("modbee service: \"%s\" %s\n", o.name.c_str(), done);
+    return 0;
+}
+
+int status(const Options& o) {
+    struct stat info;
+    if (::stat(unitFile(o).c_str(), &info) != 0) {
+        std::printf("%s not installed\n", o.name.c_str());
+        return 3;
+    }
+    const bool running = sh("systemctl is-active --quiet " + shell(o.name));
+    std::printf("%s %s\n", o.name.c_str(), running ? "running" : "stopped");
+    return running ? 0 : 1;
+}
+
+} // namespace
+
+int cmdService(int argc, char** argv) {
+    if (argc < 3 || std::strcmp(argv[2], "--help") == 0) {
+        std::fprintf(argc < 3 ? stderr : stdout, "%s", kUsage);
+        return argc < 3 ? 2 : 0;
+    }
+    const std::string action = argv[2];
+    Options o;
+    if (!parse(argc, argv, 3, o)) return 2;
+    if (action == "install") return install(o);
+    if (action == "uninstall") return uninstall(o);
+    if (action == "start") return control(o, "start", "running");
+    if (action == "stop") return control(o, "stop", "stopped");
+    if (action == "status") return status(o);
+    std::fprintf(stderr, "modbee service: unknown action %s\n%s", action.c_str(), kUsage);
+    return 2;
+}
+
 #else
 
 int cmdService(int, char**) {
-    std::fprintf(stderr, "modbee service: Windows only. On Linux run `modbee serve` under systemd "
-                         "(or the Docker image, docs/docker.md).\n");
+    std::fprintf(stderr, "modbee service: Linux (systemd) and Windows only - elsewhere, run "
+                         "`modbee serve --data <folder>` under what the system has.\n");
     return 2;
 }
 

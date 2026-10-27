@@ -2,7 +2,7 @@
 # and Windows (x64), tests each build, signs every file, and publishes a
 # GitHub release with the notes from CHANGELOG.md and the files to download.
 #
-#   modbee_<v>-1_amd64.deb, modbee_<v>-1_arm64.deb   Debian, Ubuntu: modbee as a systemd service
+#   modbee_<v>-1_amd64.deb, modbee_<v>-1_arm64.deb   Debian, Ubuntu: modbee installed
 #   modbee-<v>-1.x86_64.rpm, modbee-<v>-1.aarch64.rpm RHEL, Rocky, Alma, Fedora: the same
 #   modbee-<v>-linux-x86_64, modbee-<v>-linux-arm64  one static binary (musl), any Linux
 #   modbee-<v>-windows-x86_64.exe                    one file, also a Windows service
@@ -193,23 +193,17 @@ jobs:
           merge-multiple: true
       - name: The .deb and .rpm packages
         run: sh scripts/release/packages.sh "$VERSION"
-      # Each package installed and removed on the distribution it is for, as
-      # root without systemd running - what an image build or a fresh server
-      # does.
+      # Each package installed and removed on the distribution it is for.
       - name: The packages install
         run: |
           docker run --rm -v "$PWD/dist":/dist:ro debian:trixie-slim sh -ec '
             apt-get install -y /dist/modbee_'"$VERSION"'-1_amd64.deb >/dev/null
             modbee --version
-            test -s /etc/modbee/admin-password
-            modbee check -C /etc/modbee/modbee.yaml
             apt-get remove -y modbee >/dev/null
             test ! -e /usr/bin/modbee'
           docker run --rm -v "$PWD/dist":/dist:ro fedora:42 sh -ec '
             dnf install -y -q /dist/modbee-'"$VERSION"'-1.x86_64.rpm
             modbee --version
-            test -s /etc/modbee/admin-password
-            modbee check -C /etc/modbee/modbee.yaml
             dnf remove -y -q modbee
             test ! -e /usr/bin/modbee'
       - name: Checksums
@@ -248,15 +242,16 @@ jobs:
 
           | For | x86-64 | ARM 64-bit (Raspberry Pi 4/5, ARM servers) |
           |---|---|---|
-          | **Debian, Ubuntu**: installs the modbee service | \`modbee_${VERSION}-1_amd64.deb\` | \`modbee_${VERSION}-1_arm64.deb\` |
-          | **RHEL, Rocky, Alma, Fedora**: the same | \`modbee-$VERSION-1.x86_64.rpm\` | \`modbee-$VERSION-1.aarch64.rpm\` |
+          | **Debian, Ubuntu** | \`modbee_${VERSION}-1_amd64.deb\` | \`modbee_${VERSION}-1_arm64.deb\` |
+          | **RHEL, Rocky, Alma, Fedora** | \`modbee-$VERSION-1.x86_64.rpm\` | \`modbee-$VERSION-1.aarch64.rpm\` |
           | **Any Linux**: one file, nothing to install | \`modbee-$VERSION-linux-x86_64\` | \`modbee-$VERSION-linux-arm64\` |
           | **Windows**: one file, also a Windows service | \`modbee-$VERSION-windows-x86_64.exe\` | |
           | **Docker** | \`ghcr.io/mod-bee/modbee-mqtt:$VERSION\` | the same tag |
 
           \`\`\`sh
           sudo apt install ./modbee_${VERSION}-1_amd64.deb     # or: sudo dnf install ./modbee-$VERSION-1.x86_64.rpm
-          sudo systemctl enable --now modbee
+          sudo modbee service install                         # runs it as a service; Windows: the same
+          sudo modbee admin                                   # the admin login
           \`\`\`
 
           Each is the broker, the Kafka pipe, the Application API and the CLI;

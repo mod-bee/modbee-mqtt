@@ -54,8 +54,9 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee sub` | Subscribe, print what the broker granted, then print what arrives |
 | `modbee req` | MQTT 5 request/response: publish with a response topic and correlation data, wait for the matching reply |
 | `modbee bench` | Load generator, Linux only: `conn`, `pub`, `sub` |
-| `modbee serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe |
-| `modbee service` | Windows: `serve` as a Windows service - `install`, `start`, `stop`, `status`, `uninstall` ([windows.md](windows.md)) |
+| `modbee serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe. `--data <folder>` keeps everything in that folder - logins, settings, retained messages, sessions - with no `modbee.yaml` |
+| `modbee service` | `serve` as a service - systemd on Linux, a Windows service on Windows: `install` (and start), `start`, `stop`, `status`, `uninstall`. With nothing else, it keeps everything in one folder (`serve --data`) ([releases.md](releases.md#installing-it)) |
+| `modbee admin` | The admin login, set on the server itself - added, or given a new password; it works at once, on a running server too |
 | `modbee check` | Validate a `modbee.yaml` and report every problem with its line |
 | `modbee user` | Device logins on a broker: `list`, `show`, `add`, `set`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart. `add` and `set` take `--fingerprint`, binding a login to one client certificate ([logins.md](logins.md#logging-in-with-a-certificate)) |
 | `modbee key` | Provisioning keys, with which devices register themselves: `create`, `list`, `remove` |

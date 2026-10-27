@@ -51,6 +51,7 @@ namespace {
 const std::vector<ArgSpec>& serveSpecs() {
     static const std::vector<ArgSpec> specs = {
         {"config", 'C', true, "modbee.yaml to run (flags given as well override it)"},
+        {"data", 0, true, "keep everything in this folder - logins and settings (auth.db), retained messages, sessions; how `modbee service` runs it"},
         {"address", 'a', true, "address to listen on (default 0.0.0.0)"},
         {"port", 'p', true, "port (default 1883)"},
         {"no-plain", 0, false, "no plain-TCP listener (TLS only)"},
@@ -140,9 +141,9 @@ int cmdServe(int argc, char** argv) {
     // THE FILE FIRST, then any flag given on the command line on top of it -
     // so `modbee serve -c modbee.yaml -p 1884` is the file with another port.
     ServerConfig file;
-    if (args.has("config")) {
+    const std::string path = args.has("config") ? args.get("config") : std::string();
+    if (!path.empty()) {
         std::vector<ConfigProblem> problems;
-        const std::string path = args.get("config");
         const bool ok = loadServerConfigFile(path, file, problems);
         for (const ConfigProblem& problem : problems) {
             std::fprintf(stderr, "%s\n", describe(problem, path).c_str());
@@ -152,38 +153,64 @@ int cmdServe(int argc, char** argv) {
                          path.c_str(), path.c_str());
             return 2;
         }
-        // SETTINGS STORED IN THE DATABASE, over the file and under the
-        // environment (and the flags below). They were validated when they were
-        // stored; if they no longer load - a newer version, a changed file - the
-        // server starts from the file alone and says so, rather than not at all.
-        if (!file.authentication.database.empty()) {
-            AuthStore stored;
-            std::string why;
-            if (stored.open(file.authentication.database, 0, why)) {
-                StoredSettings settings;
-                settings.hasDocument = stored.getSetting("config.document", settings.document);
-                std::vector<std::pair<std::string, std::string>> rows;
-                stored.listSettings("config.override.", rows);
-                for (const auto& r : rows) settings.overrides.emplace_back(r.first.substr(16), r.second);
-                stored.close();
-                if (settings.hasDocument || !settings.overrides.empty()) {
-                    std::string text;
-                    readWholeFile(path, text);
-                    ServerConfig effective;
-                    std::vector<ConfigProblem> problems;
-                    if (loadEffectiveConfig(text, path, settings, effective, problems)) {
-                        file = effective;
-                        std::printf("modbee serve: settings from the database (%s, %zu override(s))\n",
-                                    settings.hasDocument ? "a stored document" : "the file", settings.overrides.size());
-                    } else {
-                        for (const ConfigProblem& problem : problems) {
-                            std::fprintf(stderr, "%s\n", describe(problem, "stored settings").c_str());
-                        }
-                        std::fprintf(stderr, "modbee serve: the stored settings would not load - starting from %s alone\n",
-                                     path.c_str());
+    }
+    // --data: EVERYTHING IN ONE FOLDER, and no file needed. The logins, the
+    // admin (`modbee admin`) and the settings (`modbee config`) in its
+    // auth.db; retained messages and sessions beside it. Applied before the
+    // stored settings are read - they are in that database - and again after,
+    // so a stored setting cannot move them elsewhere.
+    const std::string data = args.has("data") ? args.get("data") : std::string();
+    if (!data.empty() && !cliMakeDirectories(data)) {
+        std::fprintf(stderr, "modbee serve: cannot make the folder %s\n", data.c_str());
+        return 1;
+    }
+    const auto keepIn = [&data](ServerConfig& c) {
+        if (data.empty()) return;
+        c.authentication.database = cliInFolder(data, "auth.db");
+        if (c.retained.store == RetainedStore::Memory) c.retained.store = RetainedStore::File;
+        c.retained.file = cliInFolder(data, "retained.db");
+        c.sessions.store = SessionStore::File;
+        c.sessions.directory = cliInFolder(data, "sessions");
+        c.api.stateDirectory = data;
+    };
+    keepIn(file);
+    // SETTINGS STORED IN THE DATABASE, over the file (or the defaults, without
+    // one) and under the environment and the flags below. They were validated
+    // when they were stored; if they no longer load - a newer version, a
+    // changed file - the server starts without them and says so, rather than
+    // not at all.
+    if (!file.authentication.database.empty()) {
+        AuthStore stored;
+        std::string why;
+        if (stored.open(file.authentication.database, 0, why)) {
+            StoredSettings settings;
+            settings.hasDocument = stored.getSetting("config.document", settings.document);
+            std::vector<std::pair<std::string, std::string>> rows;
+            stored.listSettings("config.override.", rows);
+            for (const auto& r : rows) settings.overrides.emplace_back(r.first.substr(16), r.second);
+            stored.close();
+            if (settings.hasDocument || !settings.overrides.empty()) {
+                std::string text;
+                if (!path.empty()) readWholeFile(path, text);
+                ServerConfig effective;
+                std::vector<ConfigProblem> problems;
+                if (loadEffectiveConfig(text, path.empty() ? "(defaults)" : path, settings, effective, problems)) {
+                    file = effective;
+                    keepIn(file);
+                    std::printf("modbee serve: settings from the database (%s, %zu override(s))\n",
+                                settings.hasDocument ? "a stored document" : path.empty() ? "the defaults" : "the file",
+                                settings.overrides.size());
+                } else {
+                    for (const ConfigProblem& problem : problems) {
+                        std::fprintf(stderr, "%s\n", describe(problem, "stored settings").c_str());
                     }
+                    std::fprintf(stderr, "modbee serve: the stored settings would not load - starting from %s alone\n",
+                                 path.empty() ? "the defaults" : path.c_str());
                 }
             }
+        } else if (!data.empty()) {
+            std::fprintf(stderr, "modbee serve: %s: %s\n", file.authentication.database.c_str(), why.c_str());
+            return 1;
         }
     }
     BrokerSection& b = file.broker;
@@ -522,11 +549,20 @@ int cmdServe(int argc, char** argv) {
     }
     std::printf(", up to %lld connections\n", b.maxConnections);
     if (gate) {
-        std::printf("modbee serve: MQTT clients must log in - device logins in %s (%zu), "
-                    "admin \"%s\"; a login without rules uses %s\n", file.authentication.database.c_str(),
-                    gate->store().userCount(), file.authentication.accounts[0].username.c_str(),
+        const bool fileAdmin = file.authentication.hasAdmin && !file.authentication.accounts.empty();
+        const size_t admins = gate->store().adminCount();
+        std::printf("modbee serve: MQTT clients must log in - logins in %s (%zu, %zu admin(s))%s%s%s; "
+                    "a login without rules uses %s\n", file.authentication.database.c_str(),
+                    gate->store().userCount(), admins, fileAdmin ? ", and admin \"" : "",
+                    fileAdmin ? file.authentication.accounts[0].username.c_str() : "", fileAdmin ? "\"" : "",
                     file.authentication.defaultTopics == "none" ? "no topic (default-topics: none)"
                                                                 : "every topic (default-topics: all)");
+        if (!fileAdmin && admins == 0) {
+            const std::string where = !data.empty() ? (data == cliDataDirectory() ? "" : " --data " + data)
+                                                    : " --database " + file.authentication.database;
+            std::printf("modbee serve: no admin login yet - set one on this server with `modbee admin%s`; "
+                        "it works at once, no restart\n", where.c_str());
+        }
     } else if (accounts.count() > 0) {
         std::printf("modbee serve: MQTT clients must log in (%zu user name(s))\n", accounts.count());
     } else if (file.authentication.authority.enabled) {

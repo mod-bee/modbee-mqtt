@@ -33,6 +33,7 @@ int cmdConfig(int argc, char** argv);
 int cmdProvision(int argc, char** argv);
 int cmdRestore(int argc, char** argv);
 int cmdService(int argc, char** argv);
+int cmdAdmin(int argc, char** argv);
 
 namespace {
 
@@ -47,7 +48,8 @@ void usage() {
         "  req      MQTT 5 request/response: publish and wait for the reply\n"
         "  bench    load generator: conn, pub, sub\n"
         "  serve    the broker: one per core behind one port\n"
-        "  service  run serve as a Windows service: install, uninstall, start, stop, status\n"
+        "  service  serve as a service (systemd, Windows): install, uninstall, start, stop, status\n"
+        "  admin    set the admin login, on the server itself\n"
         "  check    validate a modbee.yaml and report every problem with its line\n"
         "  user     device logins on a broker: list, add, reset, disable, approve, remove...\n"
         "  key      provisioning keys, with which devices register themselves\n"
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(command, "provision") == 0) return cmdProvision(argc, argv);
     if (std::strcmp(command, "restore") == 0) return cmdRestore(argc, argv);
     if (std::strcmp(command, "service") == 0) return cmdService(argc, argv);
+    if (std::strcmp(command, "admin") == 0) return cmdAdmin(argc, argv);
 
     std::fprintf(stderr, "modbee: unknown command '%s'\n\n", command);
     usage();

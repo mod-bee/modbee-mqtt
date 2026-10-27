@@ -309,6 +309,27 @@ size_t AuthStore::userCount() {
     return st.step() == SQLITE_ROW ? (size_t)sqlite3_column_int64(st.s, 0) : 0;
 }
 
+size_t AuthStore::adminCount() {
+    std::lock_guard<std::mutex> lock(_write);
+    if (!_writer) return 0;
+    Statement st(_writer, "SELECT count(*) FROM users WHERE admin = 1 AND enabled = 1");
+    return st.step() == SQLITE_ROW ? (size_t)sqlite3_column_int64(st.s, 0) : 0;
+}
+
+bool AuthStore::noticeOutsideWrites() {
+    std::lock_guard<std::mutex> lock(_write);
+    if (!_writer) return false;
+    // data_version moves when ANOTHER connection commits - `modbee admin`,
+    // run beside the server - and never for this one's own writes.
+    Statement st(_writer, "PRAGMA data_version");
+    if (st.step() != SQLITE_ROW) return false;
+    const int64_t version = sqlite3_column_int64(st.s, 0);
+    const bool moved = _dataVersion != 0 && version != _dataVersion;
+    _dataVersion = version;
+    if (moved) changed();
+    return moved;
+}
+
 AuthResult AuthStore::putKey(const AuthKey& k, bool replace) {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return AuthResult::Failed;

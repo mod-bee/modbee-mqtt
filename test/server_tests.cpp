@@ -6,7 +6,8 @@
 // THE SERVER (`modbee serve`'s engine), END TO END: one broker per core
 // behind one port, messages crossing shards, a client id taken over from
 // another shard, and what `sessions: store: file` and `retained: store: file`
-// keep across a restart. Real TCP on loopback, files in the system's
+// keep across a restart; and an admin login set beside the running server,
+// as `modbee admin` sets it. Real TCP on loopback, files in the system's
 // temporary directory.
 
 #include "TestClient.h"
@@ -14,6 +15,8 @@
 #include "ShardedBroker.h"
 #include "SessionKeeper.h"
 #include "RetainedKeeper.h"
+#include "AuthGate.h"
+#include "AuthHash.h"
 
 #include <filesystem>
 #include <memory>
@@ -173,11 +176,67 @@ void keptAcrossRestart() {
     }
 }
 
+// `modbee admin`: the login database written by ANOTHER program while the
+// server runs - how the first admin is made, and a lost password replaced.
+void adminSetBeside() {
+    section("an admin set beside the running server (modbee admin)");
+    TempDir dir("admin");
+    const std::string database = (dir.path / "auth.db").string();
+    AuthGateConfig g;
+    g.database = database;
+    g.backupEveryHours = 0;
+    AuthGate gate(g);
+    ShardExtensionChain chain;
+    chain.add(&gate);
+    ShardedBrokerConfig c;
+    c.address = "127.0.0.1";
+    c.port = 0;
+    c.shards = 2;
+    c.extension = &chain;
+    ShardedBroker broker;
+    ok(broker.start(c), "a server with a login database and no admin");
+    Fleet fleet(broker.port());
+    Client& early = fleet.make("ops-1");
+    early.login("admin", "first");
+    ok(!fleet.connected(early, 1500), "  nobody logs in as admin");
+
+    // What `modbee admin` does: its own connection to the file.
+    const auto setAdmin = [&](const std::string& password) {
+        AuthStore other;
+        std::string why;
+        if (!other.open(database, 0, why)) return false;
+        AuthUser u;
+        other.findUser("admin", u);
+        u.username = "admin";
+        u.hash = auth::hashChosen(password);
+        u.generated = false;
+        u.admin = true;
+        u.enabled = true;
+        return other.putUser(u, true) == AuthResult::Ok;
+    };
+    const uint64_t before = gate.store().generation();
+    ok(setAdmin("first"), "another program adds the admin to the database");
+    Client& admin = fleet.make("ops-2");
+    admin.login("admin", "first");
+    ok(fleet.connected(admin), "  it logs in at once");
+    ok(fleet.until([&] { return gate.store().generation() != before; }, 3000),
+       "  and the server noticed the outside write, dropping what it had cached");
+    ok(setAdmin("second"), "a new password, the same way");
+    Client& old = fleet.make("ops-3");
+    old.login("admin", "first");
+    ok(!fleet.connected(old, 1500), "  the old one no longer works");
+    Client& fresh = fleet.make("ops-4");
+    fresh.login("admin", "second");
+    ok(fleet.connected(fresh), "  the new one does");
+    broker.stop();
+}
+
 } // namespace
 
 int main() {
     acrossShards();
     takeover();
     keptAcrossRestart();
+    adminSetBeside();
     return check::report("server_tests");
 }

@@ -22,13 +22,17 @@ it.
 
 ## What it needs
 
-- **`authentication: database:`** - in the file, or as
-  `MODBEE_AUTHENTICATION_DATABASE`. The settings are kept in the same SQLite
-  file as the logins, in a table of their own. The `docker/examples` setups
-  already have it.
-- **The server started with a file** (`modbee serve -C modbee.yaml`). The
-  Docker image always is: `/etc/modbee/modbee.yaml`.
-- **An admin login**, as for managing logins.
+- **A login database.** A server installed with `modbee service install`
+  has one - it runs `modbee serve --data <folder>`, which keeps everything in
+  that folder, no file needed ([releases.md](releases.md#installing-it)).
+  Otherwise `authentication: database:` in `modbee.yaml`, or
+  `MODBEE_AUTHENTICATION_DATABASE`; the `docker/examples` setups already
+  have it. The settings are kept in the same SQLite file as the logins, in a
+  table of their own.
+- **An admin login**, as for managing logins (`modbee admin` on the server).
+
+With `--data` and no file, a stored setting is applied over the defaults;
+with a file, over the file.
 
 Without a login database, `modbee.yaml` and the environment are all there is.
 

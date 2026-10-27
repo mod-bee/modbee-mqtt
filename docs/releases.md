@@ -6,8 +6,8 @@ and the Docker image is published under the same version.
 
 | For | x86-64 | ARM 64-bit (Raspberry Pi 4/5, ARM servers) |
 |---|---|---|
-| **Debian, Ubuntu**: installs the modbee service | `modbee_<version>-1_amd64.deb` | `modbee_<version>-1_arm64.deb` |
-| **RHEL, Rocky, Alma, Fedora**: the same | `modbee-<version>-1.x86_64.rpm` | `modbee-<version>-1.aarch64.rpm` |
+| **Debian, Ubuntu** | `modbee_<version>-1_amd64.deb` | `modbee_<version>-1_arm64.deb` |
+| **RHEL, Rocky, Alma, Fedora** | `modbee-<version>-1.x86_64.rpm` | `modbee-<version>-1.aarch64.rpm` |
 | **Any Linux**: one file, nothing to install | `modbee-<version>-linux-x86_64` | `modbee-<version>-linux-arm64` |
 | **Windows**: one file, also a Windows service | `modbee-<version>-windows-x86_64.exe` | |
 | **Docker** ([docker.md](docker.md)) | `ghcr.io/mod-bee/modbee-mqtt:<version>` | the same tag |
@@ -32,47 +32,53 @@ years ago - with nothing else installed. The packages carry that same binary.
 
 ---
 
-## Installing on Debian or Ubuntu, RHEL or Fedora
+## Installing it
+
+Put `modbee` on the machine - one of these:
 
 ```sh
 sudo apt install ./modbee_0.1.0-1_amd64.deb        # Debian, Ubuntu
 sudo dnf install ./modbee-0.1.0-1.x86_64.rpm       # RHEL, Rocky, Alma, Fedora
-sudo systemctl enable --now modbee
+sudo install modbee-0.1.0-linux-x86_64 /usr/local/bin/modbee     # any Linux
 ```
 
-The package installs:
+On Windows, rename `modbee-0.1.0-windows-x86_64.exe` to `modbee.exe` and put
+it where it is to live ([windows.md](windows.md)).
+
+Then the same two commands everywhere (Windows: in an Administrator prompt,
+without `sudo`):
+
+```sh
+sudo modbee service install      # runs it as a service, now and at every start
+sudo modbee admin                # the admin login: asks for its password
+```
+
+```
+modbee service: "modbee" installed and running - it starts at boot, and again if it stops
+  /usr/bin/modbee serve --data /var/lib/modbee
+  everything it keeps: /var/lib/modbee
+  its log: journalctl -u modbee
+```
+
+That is all there is to set up. Everything after is the `modbee` command,
+and all of it is kept in one database in the data folder - `/var/lib/modbee`
+(Windows: `C:\ProgramData\ModBee`):
 
 | | |
 |---|---|
-| `/usr/bin/modbee` | the program |
-| `/etc/modbee/modbee.yaml` | its settings: port 1883, a login for every device, retained messages and sessions kept across restarts |
-| `/etc/modbee/admin-password` | the admin login's password - the login is `admin` - chosen at random when it was installed |
-| `/var/lib/modbee` | its data - the logins, sessions and retained messages - owned by the `modbee` user it creates |
-| the `modbee` service | systemd, restarted if it stops; not started until you enable it |
+| Devices | `modbee user add tank-01 -u admin -P ...` ([logins.md](logins.md)) |
+| Settings | `modbee config set broker.port=8883 --restart -u admin -P ...` ([settings.md](settings.md)) |
+| The admin's password | `sudo modbee admin` again - on the server, it works at once |
+| The service | `modbee service status`, `stop`, `start`, `uninstall` |
 
-An upgrade - installing a newer package - keeps what is in `/etc/modbee`
-and restarts a running broker on the new version. Removing the package keeps
-`/var/lib/modbee`: removing a program does not delete a plant's data.
+Until there is an admin, the broker runs and lets nobody in, and its log
+says so. Every device needs a login of its own; retained messages and
+sessions are kept across restarts. `modbee service uninstall` (before
+removing the package) stops and removes the service and keeps the data.
 
-## Installing the binary on any Linux
-
-```sh
-chmod +x modbee-0.1.0-linux-x86_64
-sudo mv modbee-0.1.0-linux-x86_64 /usr/local/bin/modbee
-modbee --version
-```
-
-As a service, with systemd - the same unit the packages install,
-[modbee.service](../scripts/release/packaging/modbee.service), with
-`ExecStart=/usr/local/bin/modbee ...` and the `modbee` user and
-`/etc/modbee` made by hand. `Restart=always` is also what brings it back
-after a setting that needs a restart ([settings.md](settings.md#applying-a-change-the-restart)).
-
-## Installing on Windows
-
-`modbee-0.1.0-windows-x86_64.exe` is the whole program: rename it
-`modbee.exe`, put it where it is to live, and `modbee.exe service install`
-makes it a Windows service ([windows.md](windows.md)).
+`modbee.yaml` is not needed for any of this. It is how the Docker image is
+configured ([docker.md](docker.md)), and `modbee serve -C modbee.yaml` still
+reads one anywhere.
 
 ---
 

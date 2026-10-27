@@ -31,14 +31,15 @@ claiming it.
 ## Running a server
 
 The broker as a server on Linux or Windows, one broker per CPU core, with a
-pass-through pipe to Apache Kafka. Published as a Docker image, and as a
-Windows service; none of it is part of the Arduino library.
+pass-through pipe to Apache Kafka. Published as a Docker image, and as
+downloads that `modbee service install` runs as a service on Linux or
+Windows; none of it is part of the Arduino library.
 
 | | |
 | --- | --- |
 | [docker.md](docker.md) | **Running it**: one command, a stack with a Let's Encrypt certificate, or that stack with Kafka included |
 | [releases.md](releases.md) | **Downloads**: `.deb`, `.rpm`, and `modbee` for any Linux or Windows, ready to run - installing it, and checking a download is genuine |
-| [windows.md](windows.md) | **On Windows**: `modbee.exe serve`, and `modbee service` to run it as a Windows service |
+| [windows.md](windows.md) | **On Windows**: `modbee.exe service install` and `modbee.exe admin`, and it is running |
 | [kafka.md](kafka.md) | `modbee.yaml`, and the Kafka pipe: MQTT to Kafka and back, untouched, and exactly what an acknowledgement means |
 | [app-api.md](app-api.md) | The Application API: your application talks to the server over gRPC - and decides who may log in |
 | [kafka-apps.md](kafka-apps.md) | **Your own app on Kafka**: read your devices' MQTT messages and send them commands, from Node.js, Python or any language - with a working example |

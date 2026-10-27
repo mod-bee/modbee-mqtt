@@ -56,10 +56,11 @@ int cmdCheck(int argc, char** argv) {
         std::printf(", %zu shard(s)%s, up to %lld connections", b.shards,
                     b.shards == 0 ? " (one per core)" : "", b.maxConnections);
         if (!config.authentication.database.empty()) {
-            std::printf("; MQTT: device logins in %s, admin \"%s\", default-topics %s",
-                        config.authentication.database.c_str(),
-                        config.authentication.accounts.empty() ? "?" : config.authentication.accounts[0].username.c_str(),
-                        config.authentication.defaultTopics.c_str());
+            const bool fileAdmin = config.authentication.hasAdmin && !config.authentication.accounts.empty();
+            std::printf("; MQTT: device logins in %s, admin %s%s%s, default-topics %s",
+                        config.authentication.database.c_str(), fileAdmin ? "\"" : "",
+                        fileAdmin ? config.authentication.accounts[0].username.c_str() : "from the database (modbee admin)",
+                        fileAdmin ? "\"" : "", config.authentication.defaultTopics.c_str());
         } else if (config.authentication.authority.enabled) {
             std::printf("; MQTT: logins decided by the application (authority), %zu fixed",
                         config.authentication.accounts.size());

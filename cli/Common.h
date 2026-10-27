@@ -74,6 +74,21 @@ void cliInstallSignalHandlers();
 // This process's id, for a unique client id.
 long cliProcessId();
 
+// Where a server installed as the service `service` keeps everything
+// (`modbee serve --data`): /var/lib/<service> on Linux; on Windows
+// %ProgramData%\ModBee, or %ProgramData%\ModBee\<service> for another name.
+std::string cliDataDirectory(const std::string& service = "modbee");
+
+// The folder and every missing one above it.
+bool cliMakeDirectories(const std::string& path);
+// A name in a folder, with the system's own separator.
+std::string cliInFolder(const std::string& folder, const std::string& name);
+
+// Whether the input is a person at a terminal, not a pipe.
+bool cliIsTerminal();
+// One line from the input - typed without being shown, at a terminal.
+bool cliReadSecret(const char* prompt, std::string& out);
+
 // --- Output ---
 
 // A JSON string literal, quotes included.

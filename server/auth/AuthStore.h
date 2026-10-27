@@ -94,6 +94,12 @@ public:
     bool listUsers(const std::string& prefix, const std::string& after, size_t limit,
                    std::vector<AuthUser>& out);
     size_t userCount();
+    size_t adminCount();                 // enabled logins that are admins
+
+    // Whether another program - `modbee admin`, run beside the server - has
+    // written the file since this was last asked; if so, generation() moves,
+    // so every shard drops what it cached.
+    bool noticeOutsideWrites();
 
     AuthResult putKey(const AuthKey& key, bool replace = false);
     AuthResult removeKey(const std::string& name);
@@ -134,4 +140,5 @@ private:
     };
     std::vector<Reader> _readers;
     std::atomic<uint64_t> _generation{1};
+    int64_t _dataVersion = 0;
 };

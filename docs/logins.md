@@ -479,18 +479,22 @@ beside the old database is dealt with rather than replayed over the backup.
 
 ## Without Docker
 
-In `modbee.yaml`:
+Installed as a service - `sudo modbee service install`, on Linux or Windows
+([releases.md](releases.md#installing-it)) - the login database is already
+there, in the data folder. The admin login is set on the server itself:
 
-```yaml
-authentication:
-  username: admin                  # the admin login
-  password-file: /etc/modbee/admin-password
-  database: /var/lib/modbee/auth.db
+```bash
+sudo modbee admin                  # asks for its password; again to change it
 ```
 
-Then manage it with the same `modbee user` and `modbee key` commands, giving
-the admin login with `-u` and `-P` (or `MODBEE_AUTHENTICATION_USERNAME` and
-`_PASSWORD` in the environment).
+It works at once, on the running server. Then manage the logins with the
+same `modbee user` and `modbee key` commands, giving the admin login with
+`-u` and `-P` (or `MODBEE_AUTHENTICATION_USERNAME` and `_PASSWORD` in the
+environment). Until there is an admin, nobody can log in.
+
+With a `modbee.yaml` instead, `authentication: database:` names the file, and
+`modbee admin --database <that file>` sets its admin - or the file's
+`username` and `password` (or `password-file`) are an admin of their own.
 
 Without a `database`, `username`/`password` (and a `users:` list) are a fixed
 set of logins, read at start - simple, and enough for a handful of clients

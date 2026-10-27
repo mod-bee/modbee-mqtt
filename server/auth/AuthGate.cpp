@@ -217,9 +217,7 @@ bool AuthGate::begin(size_t shards, std::string& error) {
         _shards.push_back(std::move(shard));
     }
     _stopped = 0;
-    if (_config.backupEveryHours > 0 && !_backups.joinable()) {
-        _backups = std::thread([this] { backupLoop(); });
-    }
+    if (!_backups.joinable()) _backups = std::thread([this] { backupLoop(); });
     return true;
 }
 
@@ -922,15 +920,25 @@ bool AuthGate::backupNow(std::string& path, std::string& error) {
     return true;
 }
 
+// The gate's own thread. Once a second: whether another program wrote the
+// login file - `modbee admin`, setting the admin beside the running server -
+// so what the shards cached is dropped and the change applies at once. And
+// the backup, every backupEveryHours.
 void AuthGate::backupLoop() {
+    const auto every = std::chrono::hours(_config.backupEveryHours > 0 ? _config.backupEveryHours : 1);
+    auto due = std::chrono::steady_clock::now() + every;
     std::unique_lock<std::mutex> lock(_backupMutex);
     while (!_quit) {
-        _backupWake.wait_for(lock, std::chrono::hours(_config.backupEveryHours));
+        _backupWake.wait_for(lock, std::chrono::seconds(1));
         if (_quit) break;
         lock.unlock();
-        std::string path, error;
-        if (!backupNow(path, error)) {
-            std::fprintf(stderr, "modbee serve: the login store backup failed: %s\n", error.c_str());
+        _store.noticeOutsideWrites();
+        if (_config.backupEveryHours > 0 && std::chrono::steady_clock::now() >= due) {
+            due = std::chrono::steady_clock::now() + every;
+            std::string path, error;
+            if (!backupNow(path, error)) {
+                std::fprintf(stderr, "modbee serve: the login store backup failed: %s\n", error.c_str());
+            }
         }
         lock.lock();
     }

@@ -176,3 +176,26 @@ jobs:
           Get-Content "$env:ProgramData\ModBee\modbee-ci.log"
           if ($got -ne 5) { Write-Error "the service passed $got of 5 messages"; exit 1 }
           if (-not $stillStopped) { Write-Error "the service did not stay stopped"; exit 1 }
+      # As a person sets it up: the service with nothing else - everything in
+      # its data folder - then the admin login, set beside it while it runs.
+      - name: The Windows service, set up with the CLI alone
+        shell: pwsh
+        run: |
+          $m = "build\cli\Release\modbee.exe"
+          $data = "$env:ProgramData\ModBee\modbee-setup"
+          & $m service install --name modbee-setup
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\ModBee\modbee-setup.log"; exit 1 }
+          Start-Sleep -Seconds 2
+          & $m pub -t ci/x -m before -q 1
+          $refused = $LASTEXITCODE -eq 3
+          & $m admin --data $data --secret ci-admin-password
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Sleep -Seconds 2
+          & $m pub -t ci/x -m after -q 1 -u admin -P ci-admin-password
+          $accepted = $LASTEXITCODE -eq 0
+          & $m service uninstall --name modbee-setup
+          Write-Host "--- the service's log"
+          Get-Content "$env:ProgramData\ModBee\modbee-setup.log"
+          if (-not $refused) { Write-Error "a client with no login was let in before the admin was set"; exit 1 }
+          if (-not $accepted) { Write-Error "the admin set with modbee admin could not log in"; exit 1 }
+          if (-not (Test-Path "$data\auth.db")) { Write-Error "nothing kept in $data"; exit 1 }

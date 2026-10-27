@@ -5,10 +5,9 @@
 # ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 #
 # THE .deb AND .rpm PACKAGES, for x86-64 and ARM64, from the static binaries
-# build-linux.sh left in dist/: the program, the modbee systemd service, a
-# starting modbee.yaml, and an admin password chosen at install
-# (scripts/release/packaging/). Runs on any x86-64 Linux, from the
-# repository's root:
+# build-linux.sh left in dist/: /usr/bin/modbee and nothing else to set up
+# (nfpm.yaml) - `sudo modbee service install` does that. Runs on any x86-64
+# Linux, from the repository's root:
 #
 #   sh scripts/release/packages.sh 0.1.0
 #
@@ -41,7 +40,7 @@ for arch in x86_64 arm64; do
     cp "$binary" build-packages/modbee
     for format in deb rpm; do
         MODBEE_VERSION=$version MODBEE_ARCH=$goarch \
-            "$tools/nfpm" package --config scripts/release/packaging/nfpm.yaml \
+            "$tools/nfpm" package --config scripts/release/nfpm.yaml \
             --packager "$format" --target dist/
     done
 done

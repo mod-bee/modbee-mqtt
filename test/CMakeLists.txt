@@ -27,7 +27,7 @@ endforeach()
 # The server tier, where it is built (Linux; Windows with wepoll).
 if(TARGET modbee-server AND TARGET modbee-sessions AND TARGET modbee-retained)
     add_executable(server_tests server_tests.cpp)
-    target_link_libraries(server_tests PRIVATE modbee-server modbee-sessions modbee-retained)
+    target_link_libraries(server_tests PRIVATE modbee-server modbee-sessions modbee-retained modbee-auth)
     target_compile_features(server_tests PRIVATE cxx_std_17)
     if(MSVC)
         target_compile_options(server_tests PRIVATE /W4 /utf-8)

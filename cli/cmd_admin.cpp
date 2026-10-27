@@ -18,12 +18,19 @@
 #include "Json.h"
 #if defined(MODBEE_HAVE_SERVER)
 #include "AuthStore.h"
+#include "AuthHash.h"
 #endif
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -666,6 +673,118 @@ int cmdRestore(int argc, char** argv) {
     return 0;
 #else
     std::fprintf(stderr, "modbee restore: this build has no server tier (Linux only)\n");
+    return 2;
+#endif
+}
+
+// modbee admin - THE ADMIN LOGIN, SET ON THE SERVER ITSELF.
+//
+// Not a request over MQTT like every command above: it is how the first
+// admin is made, when there is nobody yet to ask, and how a lost admin
+// password is replaced. So it writes the login database directly - which only
+// someone who may write that file can do (root; Administrator on Windows) -
+// and a running server takes the change within a second
+// (AuthStore::noticeOutsideWrites), no restart.
+int cmdAdmin(int argc, char** argv) {
+    static const std::vector<ArgSpec> specs = {
+        {"secret", 0, true, "the password (asked for, unseen, when not given)"},
+        {"data", 0, true, "the server's folder, as `modbee serve --data` (default /var/lib/modbee; Windows: %ProgramData%\\ModBee)"},
+        {"database", 'd', true, "the login database itself, as authentication.database in a modbee.yaml"},
+        {"help", 0, false, "show this help"},
+    };
+    Args args;
+    if (!args.parse(argc, argv, 2, specs)) {
+        std::fprintf(stderr, "modbee admin: %s\n", args.error().c_str());
+        return 2;
+    }
+    if (args.has("help") || args.positional().size() > 1) {
+        Args::printHelp("modbee admin [<login, default admin>]   (on the server, as root / Administrator)\n\n"
+                        "Adds the admin login, or gives it a new password. It works at once, on a running\n"
+                        "server too.",
+                        specs);
+        return args.has("help") ? 0 : 2;
+    }
+#if defined(MODBEE_HAVE_SERVER)
+    const std::string name = args.positional().empty() ? std::string("admin") : args.positional()[0];
+    bool nameOk = !name.empty() && name.size() <= 256 && name[0] != '$';
+    for (char c : name) nameOk = nameOk && (unsigned char)c >= 0x20 && c != 0x7f;
+    if (!nameOk) {
+        std::fprintf(stderr, "modbee admin: a login may not be empty, longer than 256, start with $, "
+                             "or hold control characters\n");
+        return 2;
+    }
+    const std::string folder = args.has("data") ? args.get("data") : cliDataDirectory();
+    const std::string path = args.has("database") ? args.get("database") : cliInFolder(folder, "auth.db");
+
+    std::string secret = args.get("secret", "");
+    if (!args.has("secret")) {
+        const std::string prompt = "Password for " + name + ": ";
+        if (!cliReadSecret(prompt.c_str(), secret)) return 2;
+        if (cliIsTerminal()) {
+            std::string again;
+            if (!cliReadSecret("Again: ", again)) return 2;
+            if (again != secret) {
+                std::fprintf(stderr, "modbee admin: the two were not the same - nothing changed\n");
+                return 2;
+            }
+        }
+    }
+    if (secret.empty()) {
+        std::fprintf(stderr, "modbee admin: a password is required\n");
+        return 2;
+    }
+
+#if !defined(_WIN32)
+    // AS THE SERVER'S OWN USER, when run as root: SQLite's journal files
+    // belong to whoever writes, and the server must still be able to write
+    // after this has gone.
+    if (geteuid() == 0) {
+        struct stat owner;
+        if ((::stat(path.c_str(), &owner) == 0 || ::stat(folder.c_str(), &owner) == 0) && owner.st_uid != 0) {
+            if (setgid(owner.st_gid) != 0 || setuid(owner.st_uid) != 0) {
+                std::fprintf(stderr, "modbee admin: cannot act as the server's user\n");
+                return 1;
+            }
+        }
+    }
+#endif
+    const size_t slash = path.find_last_of("/\\");
+    if (slash != std::string::npos && slash > 0 && !cliMakeDirectories(path.substr(0, slash))) {
+        std::fprintf(stderr, "modbee admin: cannot make the folder %s\n", path.substr(0, slash).c_str());
+        return 1;
+    }
+    AuthStore store;
+    std::string why;
+    if (!store.open(path, 0, why)) {
+        std::fprintf(stderr, "modbee admin: %s: %s (run it as root, or as Administrator on Windows)\n",
+                     path.c_str(), why.c_str());
+        return 1;
+    }
+    AuthUser user;
+    const bool existed = store.findUser(name, user);
+    const int64_t now = (int64_t)std::time(nullptr);
+    if (!existed) {
+        user = AuthUser();
+        user.username = name;
+        user.created = now;
+    }
+    user.hash = auth::hashChosen(secret);
+    user.generated = false;
+    user.admin = true;
+    user.enabled = true;
+    user.pending = false;
+    user.updated = now;
+    if (store.putUser(user, true) != AuthResult::Ok) {
+        std::fprintf(stderr, "modbee admin: %s could not be written\n", path.c_str());
+        return 1;
+    }
+    store.close();
+    std::printf("%s admin login \"%s\" in %s - it works now, no restart\n",
+                existed ? "changed the password of the" : "added the", name.c_str(), path.c_str());
+    std::printf("  for example: modbee user list -u %s -P '<password>'\n", name.c_str());
+    return 0;
+#else
+    std::fprintf(stderr, "modbee admin: this build has no server tier\n");
     return 2;
 #endif
 }

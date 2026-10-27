@@ -36,6 +36,15 @@ has its Wills published, in order. One that closes first has none.
 
 ## Turning it on
 
+On a server installed with `modbee service install`, one command - TCP on
+this machine, with a token you choose:
+
+```bash
+modbee config set api.grpc=tcp://127.0.0.1:7660 api.token=<token> --restart -u admin -P <password>
+```
+
+In a `modbee.yaml` (the Docker image's way):
+
 ```yaml
 api:
   grpc: ["unix:/run/modbee/api.sock"]

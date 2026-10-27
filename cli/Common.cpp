@@ -15,11 +15,18 @@
 
 #include "transport/MqttSocketSupport.h"   // poll, or WSAPoll
 
+#include <sys/stat.h>
+#include <cerrno>
+
 #if defined(_WIN32)
+#include <direct.h>
+#include <io.h>
 #include <process.h>
+#include <windows.h>
 #define MQ_CLI_POLL WSAPoll
 typedef WSAPOLLFD MqCliPollFd;
 #else
+#include <termios.h>
 #include <unistd.h>
 #define MQ_CLI_POLL ::poll
 typedef struct pollfd MqCliPollFd;
@@ -50,6 +57,81 @@ void cliIdle(MqttTransport* transport, int ms) {
 }
 
 bool cliStopRequested() { return g_stop != 0; }
+
+std::string cliDataDirectory(const std::string& service) {
+#if defined(_WIN32)
+    const char* programData = std::getenv("ProgramData");
+    const std::string base = std::string(programData ? programData : "C:\\ProgramData") + "\\ModBee";
+    return service == "modbee" ? base : base + "\\" + service;
+#else
+    return "/var/lib/" + service;
+#endif
+}
+
+std::string cliInFolder(const std::string& folder, const std::string& name) {
+#if defined(_WIN32)
+    return folder + "\\" + name;
+#else
+    return folder + "/" + name;
+#endif
+}
+
+bool cliMakeDirectories(const std::string& path) {
+    for (size_t at = 1; at <= path.size(); at++) {
+        if (at < path.size() && path[at] != '/' && path[at] != '\\') continue;
+        const std::string part = path.substr(0, at);
+        if (part.size() == 2 && part[1] == ':') continue;        // C:
+#if defined(_WIN32)
+        if (_mkdir(part.c_str()) != 0 && errno != EEXIST) return false;
+#else
+        if (::mkdir(part.c_str(), 0755) != 0 && errno != EEXIST) return false;
+#endif
+    }
+    struct stat info;
+    return ::stat(path.c_str(), &info) == 0 && (info.st_mode & S_IFDIR) != 0;
+}
+
+bool cliIsTerminal() {
+#if defined(_WIN32)
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0;
+#endif
+}
+
+bool cliReadSecret(const char* prompt, std::string& out) {
+    const bool terminal = cliIsTerminal();
+    if (terminal) {
+        std::fprintf(stderr, "%s", prompt);
+        std::fflush(stderr);
+    }
+    // Not shown as it is typed.
+#if defined(_WIN32)
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    const bool hidden = terminal && GetConsoleMode(in, &mode) && SetConsoleMode(in, mode & ~ENABLE_ECHO_INPUT);
+#else
+    struct termios old;
+    const bool hidden = terminal && tcgetattr(STDIN_FILENO, &old) == 0;
+    if (hidden) {
+        struct termios quiet = old;
+        quiet.c_lflag &= ~(tcflag_t)ECHO;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet);
+    }
+#endif
+    char line[1024];
+    const bool got = std::fgets(line, sizeof line, stdin) != nullptr;
+#if defined(_WIN32)
+    if (hidden) SetConsoleMode(in, mode);
+#else
+    if (hidden) tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
+#endif
+    if (terminal) std::fprintf(stderr, "\n");
+    if (!got) return false;
+    out = line;
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return true;
+}
 
 long cliProcessId() {
 #if defined(_WIN32)
