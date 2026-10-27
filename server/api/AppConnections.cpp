@@ -31,6 +31,18 @@ int64_t utcNowMs() {
 }
 
 // What a refusal by the remote broker means for the publish that asked.
+// Why a connection could not be made, as its transport put it ("cannot connect to plant.local: connection refused",
+// "cannot resolve ...", a TLS handshake that failed) - a person acts on that; "could not connect" alone they cannot.
+template <typename C>
+std::string whyNotConnected(const C& c) {
+    std::string why;
+    if (c.tcp) why = c.tcp->lastError();
+#if MQTT_TLS_SOCKETS
+    if (c.tls) why = c.tls->lastError();
+#endif
+    return why.empty() ? std::string("could not connect") : why;
+}
+
 AppPublishResult resultOf(MqttResult result, bool confirmDelivered) {
     AppPublishResult out;
     switch (result) {
@@ -147,6 +159,11 @@ struct AppConnections::Connection {
     AppConnections* owner = nullptr;
     AppConnectionSpec spec;
     std::unique_ptr<MqttTransport> transport;
+    // The same transport, typed, for its own words when a connect fails (this target has no RTTI).
+    const MqttTcpTransport* tcp = nullptr;
+#if MQTT_TLS_SOCKETS
+    const MqttTlsTransport* tls = nullptr;
+#endif
     MqttClient client;
 
     AppConnectionState state = AppConnectionState::Connecting;
@@ -327,10 +344,17 @@ void AppConnections::open(Connection& c) {
             tls->setClientCertificate((base + ".crt").c_str(), (base + ".key").c_str());
         }
         c.transport.reset(tls);
+        c.tls = tls;
+        c.tcp = nullptr;
     } else
 #endif
     {
-        c.transport.reset(new MqttTcpTransport());
+        MqttTcpTransport* tcp = new MqttTcpTransport();
+        c.transport.reset(tcp);
+        c.tcp = tcp;
+#if MQTT_TLS_SOCKETS
+        c.tls = nullptr;
+#endif
     }
     MqttClientConfig behaviour;
     behaviour.autoReconnect = false;     // the manager decides: which server, and when
@@ -434,7 +458,7 @@ void AppConnections::service(Connection& c) {
                 c.backoffMs = c.backoffMs ? std::min<uint32_t>(c.backoffMs * 2, 30000) : 500;
                 c.nextAttempt = now + std::chrono::milliseconds(c.reachedThisAttempt ? 200 : c.backoffMs);
                 c.setState(AppConnectionState::BackingOff,
-                           c.reachedThisAttempt ? "the connection was lost" : "could not connect");
+                           c.reachedThisAttempt ? std::string("the connection was lost") : whyNotConnected(c));
             }
         }
     }

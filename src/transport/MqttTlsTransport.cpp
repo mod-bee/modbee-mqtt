@@ -121,7 +121,11 @@ bool MqttTlsTransport::nextAddress() {
     // reason at all - which is how an intermittent public-broker failure went
     // uninvestigated.
     char note[96];
-    snprintf(note, sizeof note, ": none of %u address(es) answered",
+    // Why, from the last address tried (connection refused, timed out, no route): a person acts on that.
+    const std::string why = mq_socket::connectErrorWords(_connectError);
+    if (!why.empty() && _addresses.tried() <= 1) snprintf(note, sizeof note, ": %s", why.c_str());
+    else if (!why.empty()) snprintf(note, sizeof note, ": none of %u address(es) answered (the last: %s)", _addresses.tried(), why.c_str());
+    else snprintf(note, sizeof note, ": none of %u address(es) answered",
              _addresses.tried());
     _lastError = "cannot connect to " + _host + note;
     _addresses.reset();
@@ -135,6 +139,7 @@ bool MqttTlsTransport::begin() {
     mq_tls::ensureEngine();
     closeAll();
     _lastError.clear();
+    _connectError = 0;
     _failed = false;
 
     if (_host.empty() || _port == 0) {
@@ -265,7 +270,9 @@ bool MqttTlsTransport::finishTcp() {
         }
     }
 
-    const mq_socket::ConnectOutcome outcome = mq_socket::connectOutcome(_socket);
+    int connectError = 0;
+    const mq_socket::ConnectOutcome outcome = mq_socket::connectOutcome(_socket, &connectError);
+    if (outcome == mq_socket::ConnectOutcome::Failed && connectError != 0) _connectError = connectError;
     if (outcome == mq_socket::ConnectOutcome::Pending) return false;
     if (outcome == mq_socket::ConnectOutcome::Failed) {
         // THIS ADDRESS failed - not the host. Close it and try the next one;

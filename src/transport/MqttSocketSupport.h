@@ -97,7 +97,8 @@ namespace mq_socket {
  *  for a reason that looks nothing like the cause. */
 enum class ConnectOutcome { Pending, Connected, Failed };
 
-inline ConnectOutcome connectOutcome(int socketHandle) {
+// `errorOut`: the socket's own error when the connect failed (SO_ERROR), for saying why.
+inline ConnectOutcome connectOutcome(int socketHandle, int* errorOut = nullptr) {
 #if defined(_WIN32)
     fd_set writable;
     fd_set failed;
@@ -118,10 +119,32 @@ inline ConnectOutcome connectOutcome(int socketHandle) {
 #endif
     int error = 0;
     socklen_t length = sizeof error;
-    if (bad || getsockopt(socketHandle, SOL_SOCKET, SO_ERROR, (char*)&error, &length) != 0 || error != 0) {
+    const bool queried = getsockopt(socketHandle, SOL_SOCKET, SO_ERROR, (char*)&error, &length) == 0;
+    if (bad || !queried || error != 0) {
+        if (errorOut) *errorOut = queried ? error : 0;
         return ConnectOutcome::Failed;
     }
     return ConnectOutcome::Connected;
+}
+
+// Why a connect failed, in the words a person reading a status line needs.
+inline std::string connectErrorWords(int error) {
+    switch (error) {
+    case 0: return "";
+#if defined(_WIN32)
+    case WSAECONNREFUSED: return "connection refused";
+    case WSAETIMEDOUT: return "timed out";
+    case WSAEHOSTUNREACH: return "no route to host";
+    case WSAENETUNREACH: return "network unreachable";
+    default: return "error " + std::to_string(error);
+#else
+    case ECONNREFUSED: return "connection refused";
+    case ETIMEDOUT: return "timed out";
+    case EHOSTUNREACH: return "no route to host";
+    case ENETUNREACH: return "network unreachable";
+    default: return strerror(error);
+#endif
+    }
 }
 
 #if defined(_WIN32)

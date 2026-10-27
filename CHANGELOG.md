@@ -20,6 +20,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Managed connections say why they cannot connect**: `ConnectionInfo.last_error` reads "cannot connect to plant.local:
+  connection refused" (timed out, no route to host, a name that does not resolve, a TLS handshake that failed) — the
+  transport's own words, from the socket's error — instead of "could not connect".
 - **Application API:** `Messages.Publish` with `CONFIRM_ACCEPTED` now says how many subscribers it matched
   (`matched`) and answers `PUBLISH_NO_SUBSCRIBERS` when none did, as the contract promised; before, it always answered
   `PUBLISH_ACCEPTED` with `matched` 0. The publish is followed across the shards until each has routed it — no

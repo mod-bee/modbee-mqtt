@@ -74,6 +74,7 @@ private:
     bool _peerClosed = false;
 
     std::string _lastError;
+    int _connectError = 0;      // the socket's error from the last failed connect (SO_ERROR)
 
     // A receive buffer, because the interface above is byte-at-a-time and a
     // syscall per byte would make a 200 kB payload 200,000 of them. One recv

@@ -142,6 +142,7 @@ private:
     bool _failed = false;       // the attempt begin() started is over, unconnected
 
     std::string _lastError;
+    int _connectError = 0;      // the socket's error from the last failed connect (SO_ERROR)
 
     // Set when the engine would not take the hostname before the handshake,
     // so the check runs against the peer certificate afterwards instead. Only
