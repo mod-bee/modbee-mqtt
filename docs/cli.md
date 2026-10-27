@@ -165,7 +165,22 @@ modbee-mqtt serve -c 200000                                   # plain MQTT on 18
 modbee-mqtt serve --tls-port 8883 --cert broker.pem --key broker.key
 modbee-mqtt serve --no-plain --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem
 modbee-mqtt serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem --client-certificates optional
+# An application's own broker, from flags alone - then changed through the API while it runs:
+modbee-mqtt serve --data /var/lib/app/broker --api unix:/run/app/broker.sock --api-token-file /run/app/token \
+    --authority --authority-timeout-ms 1500 --events --max-sessions 200000 --queue-bytes-total 268435456
 ```
+
+- **Everything from flags, no file.** `--api unix:<path>` and/or
+  `--api tcp://host:port` serve the [Application API](app-api.md) (repeat the
+  flag for both), `--api-token-file` names the token every call must carry,
+  `--authority` has your application decide logins (`--authority-timeout-ms`,
+  2000 by default), `--events` turns client events on, `--queue-bytes` and
+  `--queue-bytes-total` cap what sessions hold. **`--set path=value`** sets
+  any other setting by its place in `modbee.yaml` - `--set
+  broker.max-keepalive=60`, `--set authentication.max-sessions-per-login=4` -
+  checked as the file is, and refused with the reason if it is not a setting
+  or not a value it takes. What changes live after that is changed through the
+  API, or these commands ([below](#the-application-api-from-the-command-line)).
 
 - **One broker per core, on one port.** Each shard is an `MqttBroker` on its
   own thread with its own listener (`SO_REUSEPORT`), and a session lives on the
@@ -228,6 +243,97 @@ modbee-mqtt serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca
 The TLS figures already include the engine releasing its idle record
 buffers; without that, OpenSSL is 63 KB. At a million devices TLS is most of
 the memory, so size the host for it.
+
+## The Application API, from the command line
+
+Every call of the [Application API](app-api.md) is a command: the same
+names, the same fields, the same answers and the same errors. A command's
+flags are the fields of the call's request, read from the contract compiled
+into the program, so a command can neither lack a field its call has nor have
+one it lacks; what it prints is the call's answer, as JSON with the
+contract's field names.
+
+```sh
+export MODBEE_API=unix:/run/modbee-mqtt/api.sock      # what serve --api was given
+export MODBEE_API_TOKEN_FILE=/etc/modbee-mqtt/api-token
+modbee-mqtt sessions list --client-id-prefix pump-
+modbee-mqtt listeners set --port 1884 --max-packet 131072 --queue 256 --queue-bytes-total 268435456
+modbee-mqtt tls set --certificate-pem @server.crt --key-pem @server.key
+modbee-mqtt connections put --id cloud --servers '{"host":"broker.example.com","port":8883}' --tls.enabled --client-id gw-1
+modbee-mqtt messages publish --message.topic plant/cmd --message.payload start --confirm delivered
+modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
+```
+
+| Flag | Becomes |
+| --- | --- |
+| `--client-id-prefix pump` | `client_id_prefix: "pump"` - a field, kebab-case for snake_case |
+| `--message.topic plant/x` | `message { topic: "plant/x" }` - a dot reaches inside a message |
+| `--filters a --filters b` | `filters: ["a", "b"]` - a repeated field, once for each |
+| `--set broker.port=1884` | `set { "broker.port": "1884" }` - a map, `key=value` |
+| `--servers '{"host":"a"}'` | `servers: [{host: "a"}]` - a message, as its JSON |
+| `--confirm delivered` | `confirm: CONFIRM_DELIVERED` - an enum by its name, or the end of it |
+| `--connected-only` | `connected_only: true` - a bool, alone (or `=false`) |
+| `--key-pem @server.key` | the file's contents (`@@` for a value that starts with `@`) |
+| `--json '{...}'` or `--json @request.json` | the whole request, before the flags, which win |
+
+- **Where:** `--api unix:<path>` or `--api tcp://host:port` (`MODBEE_API`),
+  `--token-file` (`MODBEE_API_TOKEN_FILE`) or `--token` (`MODBEE_API_TOKEN`),
+  `--api-ca` for an API on TLS. `--timeout` seconds (30; a stream waits for
+  ever, or `--count N`).
+- **`--help`** on a command lists its fields; `modbee-mqtt sessions` lists
+  the `sessions` commands.
+- **Errors** are the call's status, by name - `modbee-mqtt listeners set:
+  FAILED_PRECONDITION: at most 400 connections without a restart ...` - and
+  the exit code is `1` for a refusal, `3` when the server cannot be reached,
+  `2` for a command that is not right.
+- `messages consume` acknowledges what it prints; `connections watch` prints
+  each change of state, one JSON line each.
+- `logins` and `keys` are the same calls as `user` and `key`, over the API
+  rather than MQTT; `settings` is `config`'s.
+
+<!-- One row per call; test/cli_api_tests.cpp fails when this table, cli/ApiCommands.h and app.proto disagree. -->
+| Command | Call | REST |
+| --- | --- | --- |
+| `modbee-mqtt hello` | `System.Hello` | - |
+| `modbee-mqtt authority revoke` | `Authority.Revoke` | - |
+| `modbee-mqtt authority regrant` | `Authority.Regrant` | - |
+| `modbee-mqtt authority forget` | `Authority.Forget` | - |
+| `modbee-mqtt messages consume` | `Messages.Consume` | - |
+| `modbee-mqtt messages publish` | `Messages.Publish` | `POST /v1/publish` |
+| `modbee-mqtt groups list` | `Messages.ListGroups` | `GET /v1/groups` |
+| `modbee-mqtt groups delete` | `Messages.DeleteGroup` | `DELETE /v1/groups/{group}?connection=` |
+| `modbee-mqtt connections put` | `Connections.Put` | `PUT /v1/connections/{id}` |
+| `modbee-mqtt connections get` | `Connections.Get` | `GET /v1/connections/{id}` |
+| `modbee-mqtt connections list` | `Connections.List` | `GET /v1/connections` |
+| `modbee-mqtt connections delete` | `Connections.Delete` | `DELETE /v1/connections/{id}` |
+| `modbee-mqtt connections watch` | `Connections.Watch` | - |
+| `modbee-mqtt connections reconnect` | `Connections.Reconnect` | `POST /v1/connections/{id}:reconnect` |
+| `modbee-mqtt logins list` | `Admin.ListLogins` | `GET /v1/logins` |
+| `modbee-mqtt logins get` | `Admin.GetLogin` | `GET /v1/logins/{name}` |
+| `modbee-mqtt logins put` | `Admin.PutLogin` | `PUT /v1/logins/{name}` |
+| `modbee-mqtt logins delete` | `Admin.DeleteLogin` | `DELETE /v1/logins/{name}` |
+| `modbee-mqtt logins reset` | `Admin.ResetLogin` | `POST /v1/logins/{name}:reset` |
+| `modbee-mqtt keys list` | `Admin.ListKeys` | `GET /v1/keys` |
+| `modbee-mqtt keys put` | `Admin.PutKey` | `PUT /v1/keys/{name}` |
+| `modbee-mqtt keys delete` | `Admin.DeleteKey` | `DELETE /v1/keys/{name}` |
+| `modbee-mqtt sessions list` | `Admin.ListSessions` | `GET /v1/sessions` |
+| `modbee-mqtt sessions kick` | `Admin.Kick` | `POST /v1/sessions/{clientId}:kick` |
+| `modbee-mqtt retained list` | `Admin.ListRetained` | `GET /v1/retained` |
+| `modbee-mqtt retained delete` | `Admin.DeleteRetained` | `DELETE /v1/retained?filter=` |
+| `modbee-mqtt listeners get` | `Admin.GetListeners` | `GET /v1/listeners` |
+| `modbee-mqtt listeners set` | `Admin.PutListeners` | `PUT /v1/listeners` |
+| `modbee-mqtt tls set` | `Admin.PutTls` | `PUT /v1/listeners/tls` |
+| `modbee-mqtt stats` | `Admin.Stats` | `GET /v1/stats` |
+| `modbee-mqtt settings get` | `Admin.GetSettings` | `GET /v1/settings` |
+| `modbee-mqtt settings check` | `Admin.CheckSettings` | `POST /v1/settings:check` |
+| `modbee-mqtt settings set` | `Admin.SetSettings` | `PATCH /v1/settings` |
+| `modbee-mqtt settings apply` | `Admin.ApplySettings` | `PUT /v1/settings` |
+| `modbee-mqtt settings reset` | `Admin.ResetSettings` | `POST /v1/settings:reset` |
+| - | `System.Attach` | an application instance's presence, held open for as long as it runs |
+| - | `Authority.Serve` | the application answering CONNECTs, for as long as it runs |
+| - | `Messages.PublishStream` | an outbox draining; `messages publish` sends one at a time |
+
+---
 
 ## Benchmarking
 

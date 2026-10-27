@@ -258,6 +258,20 @@ Everything is allocated once at `begin()` and never grows, so the memory the
 broker will use is knowable before it starts rather than discovered on a busy
 afternoon.
 
+**On a host, some of it can change while it runs** - what `modbee-mqtt serve`
+does for `Admin.PutListeners`. Call these on the broker's own thread, between
+two `poll()`s:
+
+| | |
+| --- | --- |
+| `setMaxConnections(n)` | From 1 up to `connectionCapacity` (in the config: how far it may be raised; the address space is kept at `begin()` so no slot moves, but only `maxConnections` slots are built). Lowered, it closes nobody; new connections are told `0x89` until enough have gone |
+| `setMaximumPacketSize(bytes)` | For connections from now on; one already up keeps what its CONNACK said |
+| `setQueueLimits(messages, bytes, bytesTotal)` | A queue over a lowered cap keeps what it holds and refuses new messages, counted as dropped, until it drains below it; raised, a queue already built grows at once |
+| `removeListener(l)` / `addListener(l)` | Stop and start accepting from a listener whose socket is being changed (`MqttTcpListener::useSocket`); the connections it lent stay up |
+| `disconnectFrom(origins, reason)` | Close every connection those listeners lent - a listener turned off |
+
+`status()` also says what is queued now: `queuedMessages` and `queuedBytes`.
+
 **One slot more than you asked for, in three places.** The connection pool and
 each listener's pool hold `maxConnections + 1`. The extra one never serves: it
 is where a connection arriving at a full broker is accepted, read, and answered

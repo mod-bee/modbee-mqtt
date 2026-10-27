@@ -2206,6 +2206,18 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
             const bool found = connections.get(name, info);
             if (found) infoTo(info, *out);
             answer(out, found ? grpc::Status::OK : missing);
+        } else if (method == "POST" && verb == "reconnect") {
+            v1::ReconnectRequest r;
+            if (body.empty() || read(r)) {
+                AppPublish will;
+                const bool hasWill = r.has_will() && !r.will().topic().empty();
+                if (hasWill) will = messageOf(r.will());
+                AppConnectionInfo info;
+                auto out = made<v1::ConnectionInfo>();
+                const bool done = connections.reconnect(name, hasWill ? &will : nullptr, &info, error);
+                if (done) infoTo(info, *out);
+                answer(out, done ? grpc::Status::OK : grpc::Status(grpc::StatusCode::NOT_FOUND, error));
+            }
         } else if (method == "PUT") {
             v1::ConnectionSpec r;
             if (read(r)) {

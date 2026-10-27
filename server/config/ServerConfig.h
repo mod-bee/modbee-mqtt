@@ -349,6 +349,8 @@ struct StoredSettings {
     bool hasDocument = false;
     std::string document;                                        // YAML, like modbee.yaml
     std::vector<std::pair<std::string, std::string>> overrides;  // path -> value
+    // `serve --set path=value`: a flag, so over the environment as well.
+    std::vector<std::pair<std::string, std::string>> flags;
 };
 
 struct EffectiveConfigInfo {

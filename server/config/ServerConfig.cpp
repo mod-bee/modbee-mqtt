@@ -1204,6 +1204,7 @@ std::string configEnvironmentName(const std::string& path) { return environmentN
 namespace {
 
 struct EffectiveEnvironment {
+    std::vector<std::pair<std::string, std::string>> flags;       // MODBEE_ name -> value, over the environment
     std::vector<std::pair<std::string, std::string>> overrides;   // MODBEE_ name -> value
     std::vector<std::string> asked;                               // every name the loader asked for
     std::vector<std::string> pinned;
@@ -1212,6 +1213,7 @@ struct EffectiveEnvironment {
 const char* effectiveEnvironment(void* context, const char* name) {
     EffectiveEnvironment& env = *static_cast<EffectiveEnvironment*>(context);
     env.asked.push_back(name);
+    for (const auto& f : env.flags) if (f.first == name) return f.second.c_str();
     if (const char* value = std::getenv(name)) {
         env.pinned.push_back(name);
         return value;
@@ -1227,6 +1229,7 @@ bool loadEffectiveConfig(const std::string& fileText, const std::string& fileNam
                          std::vector<ConfigProblem>& problems, EffectiveConfigInfo* info) {
     EffectiveEnvironment env;
     for (const auto& o : stored.overrides) env.overrides.emplace_back(environmentName(o.first), o.second);
+    for (const auto& f : stored.flags) env.flags.emplace_back(environmentName(f.first), f.second);
     ConfigSource source;
     source.name = stored.hasDocument ? std::string("the stored settings") : fileName;
     source.env = &effectiveEnvironment;
@@ -1235,7 +1238,9 @@ bool loadEffectiveConfig(const std::string& fileText, const std::string& fileNam
     // An override the loader never asked about names no setting: refused, as a
     // misspelt key in the file is, because a setting silently not set is the
     // worse failure.
-    for (const auto& o : stored.overrides) {
+    std::vector<std::pair<std::string, std::string>> given = stored.overrides;
+    given.insert(given.end(), stored.flags.begin(), stored.flags.end());
+    for (const auto& o : given) {
         const std::string name = environmentName(o.first);
         bool asked = false;
         for (const std::string& a : env.asked) if (a == name) { asked = true; break; }

@@ -50,4 +50,11 @@ if(TARGET modbee-api AND TARGET modbee-retained)
     endif()
     add_test(NAME api_tests COMMAND api_tests)
     set_tests_properties(api_tests PROPERTIES TIMEOUT 300)
+
+    # The command line and the API, one to one (cli/ApiCommands.h, docs/cli.md).
+    add_executable(cli_api_tests cli_api_tests.cpp)
+    target_link_libraries(cli_api_tests PRIVATE modbee-api)
+    target_compile_features(cli_api_tests PRIVATE cxx_std_17)
+    target_compile_definitions(cli_api_tests PRIVATE MODBEE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME cli_api_tests COMMAND cli_api_tests)
 endif()

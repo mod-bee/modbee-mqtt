@@ -15,6 +15,10 @@ The server answers all five of its services:
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 | `Admin` | **Logins, site keys, sessions, kicks, retained messages, TLS, counters** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
 
+Every call is also a command - `modbee-mqtt sessions list`, `modbee-mqtt listeners set --port 1884` - with the
+call's own fields as its flags ([cli.md](cli.md#the-application-api-from-the-command-line)), and the server is
+started with flags alone (`serve --api unix:<path> --api-token-file <file> --authority --events`).
+
 `Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), and what
 it added since (`connections.subscriptions`: subscription options on a connection; `admin.listeners`:
 `PutListeners`), so an application asks rather than guesses.
@@ -239,8 +243,9 @@ running server, without restarting it:
 | `Kick` | Closes a client's connection, or every connection of a login, with DISCONNECT `0x98` (administrative action); its Will is published. `discard_session` ends the session too |
 | `ListRetained` `DeleteRetained` | Retained messages under a filter, with payloads if asked; deleting is the same as a device publishing an empty retained message to each |
 | `GetListeners` `PutTls` | The listeners, and the TLS certificate they serve - replaced live: new handshakes use it, open connections keep theirs |
-| `PutListeners` | Changed live, all or nothing: the plain and TLS ports (`0` turns one off; turning TLS on brings its certificate in `tls`), `max_connections` and `max_packet`. A listener that moves keeps its connections - they have their sockets already; one turned off closes its own with DISCONNECT `0x98`. `max_connections` goes as far as `max_connections_ceiling`, the room kept for sessions at the start (`--max-sessions`); lowered, it closes nobody and refuses new connections (`0x89`) until enough have gone. A connection already up keeps the packet size its CONNACK told it. A taken port is `FAILED_PRECONDITION`, with nothing changed. Like `PutTls` it is not kept: the next start uses what the server is started with |
-| `Stats` | The server's counters: connections, sessions, messages in and out, logins asked of your application and answered from its cache |
+| `PutListeners` | Changed live, all or nothing: the plain and TLS ports (`0` turns one off; turning TLS on brings its certificate in `tls`), `max_connections` and `max_packet`. A listener that moves keeps its connections - they have their sockets already; one turned off closes its own with DISCONNECT `0x98`. `max_connections` goes as far as `max_connections_ceiling`, the room kept for sessions at the start (`--max-sessions`); lowered, it closes nobody and refuses new connections (`0x89`) until enough have gone. A connection already up keeps the packet size its CONNACK told it. A taken port is `FAILED_PRECONDITION`, with nothing changed. The queue caps too: `queue` (messages a session holds), `queue_bytes` (its bytes) and `queue_bytes_total` (every session's together, the whole server's; `0`: no cap) - a queue already over a lowered cap keeps what it holds and refuses new messages, counted as dropped, until it drains below it. Like `PutTls` it is not kept: the next start uses what the server is started with |
+| `Stats` | The server's counters: connections, sessions, messages in and out, what is queued right now (`queued_messages`, `queued_bytes`), logins asked of your application and answered from its cache |
+| `GetSettings` `CheckSettings` `SetSettings` `ApplySettings` `ResetSettings` | The settings kept in the login database - what `modbee-mqtt config` does over MQTT ([settings.md](settings.md)): single settings by their path (`set`, `remove`), or a whole `modbee.yaml` (`document`), validated as the file is and applied at the next start, or at once with `restart`; the TLS material is applied live. A change that would not load is `INVALID_ARGUMENT`, naming the setting; `CheckSettings` answers with the problems instead. Without a login database, `FAILED_PRECONDITION` |
 
 ### REST
 
@@ -276,7 +281,8 @@ curl -X POST localhost:9464/v1/sessions/pump-1:kick
 | `GET /v1/retained?filter=&payloads=` · `DELETE /v1/retained?filter=` | `ListRetained` · `DeleteRetained` |
 | `GET /v1/listeners` · `PUT /v1/listeners` · `PUT /v1/listeners/tls` | `GetListeners` · `PutListeners` · `PutTls` |
 | `GET /v1/stats` · `GET /v1/health` | `Stats` · health |
-| `GET /v1/connections` · `GET` · `PUT` · `DELETE /v1/connections/{id}` | `Connections.*` |
+| `GET /v1/settings` · `PATCH` · `PUT /v1/settings` · `POST /v1/settings:check` · `POST /v1/settings:reset` | `GetSettings` · `SetSettings` · `ApplySettings` · `CheckSettings` · `ResetSettings` |
+| `GET /v1/connections` · `GET` · `PUT` · `DELETE /v1/connections/{id}` · `POST /v1/connections/{id}:reconnect` | `Connections.*` (`Watch` is gRPC only) |
 | `GET /v1/groups` · `DELETE /v1/groups/{group}?connection=` | `Messages.ListGroups` · `DeleteGroup` |
 | `POST /v1/publish` | `Messages.Publish` (the streams are gRPC only) |
 

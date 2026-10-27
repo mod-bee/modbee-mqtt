@@ -34,7 +34,13 @@ it.
 With `--data` and no file, a stored setting is applied over the defaults;
 with a file, over the file.
 
-Without a login database, `modbee.yaml` and the environment are all there is.
+Without a login database - a server whose logins your application decides,
+say - nothing is stored: a setting comes from the file, the environment, or
+`serve --set path=value`, which takes any setting by its path, so a server can
+be started with no file at all. What can change while it runs - the
+listeners, TLS, max connections, max packet and the queue caps - changes
+through the Application API (`Admin.PutListeners`, `PutTls`) on every server,
+database or not.
 
 ---
 
@@ -66,7 +72,7 @@ it:
 
 | | |
 | --- | --- |
-| 1 | A flag on the command line (`modbee-mqtt serve -C modbee.yaml -p 1884`) |
+| 1 | A flag on the command line (`modbee-mqtt serve -C modbee.yaml -p 1884`), `--set broker.port=1884` among them |
 | 2 | An environment variable (`MODBEE_BROKER_PORT`) |
 | 3 | A stored override (`config.set`) |
 | 4 | The stored document (`config.apply`) - or, when there is none, the file |
@@ -179,6 +185,12 @@ docker compose exec modbee modbee-mqtt config apply --file /tmp/new.yaml --resta
 ---
 
 ## From your own platform
+
+**Over the Application API** the same five are `Admin.GetSettings`,
+`CheckSettings`, `SetSettings`, `ApplySettings` and `ResetSettings` (REST:
+`GET`/`PATCH`/`PUT /v1/settings`, `POST /v1/settings:check`, `:reset`), and
+from the command line `modbee-mqtt settings get|check|set|apply|reset`
+([app-api.md](app-api.md#administration-and-rest)). Over MQTT:
 
 Every command is a JSON request, published to `$modbee/admin/request` with a
 reply topic of `$modbee/admin/<your client id>/reply` subscribed - the same

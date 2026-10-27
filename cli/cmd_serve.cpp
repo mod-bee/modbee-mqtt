@@ -84,6 +84,7 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"authority", 0, false, "logins are decided by the application, over the API (Authority.Serve)"},
         {"authority-timeout-ms", 0, true, "how long a CONNECT waits for the application's answer (default 2000)"},
         {"events", 0, false, "publish client events on $modbee/events/... (and to API consumers)"},
+        {"set", 0, true, "any setting by its place in modbee.yaml: --set broker.max-keepalive=60 (repeatable)"},
         {"help", 0, false, "show this help"},
     };
     return specs;
@@ -182,42 +183,58 @@ int cmdServe(int argc, char** argv) {
     };
     keepIn(file);
     // SETTINGS STORED IN THE DATABASE, over the file (or the defaults, without
-    // one) and under the environment and the flags below. They were validated
-    // when they were stored; if they no longer load - a newer version, a
-    // changed file - the server starts without them and says so, rather than
-    // not at all.
+    // one) and under the environment and the flags below - and `--set
+    // path=value`, any setting by its place in modbee.yaml, a flag over all of
+    // those (the environment included). They
+    // were validated when they were stored; if they no longer load - a newer
+    // version, a changed file - the server starts without them and says so,
+    // rather than not at all. A --set that will not load is refused.
+    StoredSettings settings;
     if (!file.authentication.database.empty()) {
         AuthStore stored;
         std::string why;
         if (stored.open(file.authentication.database, 0, why)) {
-            StoredSettings settings;
             settings.hasDocument = stored.getSetting("config.document", settings.document);
             std::vector<std::pair<std::string, std::string>> rows;
             stored.listSettings("config.override.", rows);
             for (const auto& r : rows) settings.overrides.emplace_back(r.first.substr(16), r.second);
             stored.close();
-            if (settings.hasDocument || !settings.overrides.empty()) {
-                std::string text;
-                if (!path.empty()) readWholeFile(path, text);
-                ServerConfig effective;
-                std::vector<ConfigProblem> problems;
-                if (loadEffectiveConfig(text, path.empty() ? "(defaults)" : path, settings, effective, problems)) {
-                    file = effective;
-                    keepIn(file);
-                    std::printf("modbee-mqtt serve: settings from the database (%s, %zu override(s))\n",
-                                settings.hasDocument ? "a stored document" : path.empty() ? "the defaults" : "the file",
-                                settings.overrides.size());
-                } else {
-                    for (const ConfigProblem& problem : problems) {
-                        std::fprintf(stderr, "%s\n", describe(problem, "stored settings").c_str());
-                    }
-                    std::fprintf(stderr, "modbee-mqtt serve: the stored settings would not load - starting from %s alone\n",
-                                 path.empty() ? "the defaults" : path.c_str());
-                }
-            }
         } else if (!data.empty()) {
             std::fprintf(stderr, "modbee-mqtt serve: %s: %s\n", file.authentication.database.c_str(), why.c_str());
             return 1;
+        }
+    }
+    const size_t fromDatabase = settings.overrides.size();   // the stored ones, for saying so
+    const std::vector<std::string> sets = args.all("set");
+    for (const std::string& set : sets) {
+        const size_t equals = set.find('=');
+        if (equals == std::string::npos || equals == 0) {
+            std::fprintf(stderr, "modbee-mqtt serve: --set is path=value (broker.max-keepalive=60), not \"%s\"\n",
+                         set.c_str());
+            return 2;
+        }
+        settings.flags.emplace_back(set.substr(0, equals), set.substr(equals + 1));
+    }
+    if (settings.hasDocument || !settings.overrides.empty() || !settings.flags.empty()) {
+        std::string text;
+        if (!path.empty()) readWholeFile(path, text);
+        ServerConfig effective;
+        std::vector<ConfigProblem> problems;
+        if (loadEffectiveConfig(text, path.empty() ? "(defaults)" : path, settings, effective, problems)) {
+            file = effective;
+            keepIn(file);
+            if (settings.hasDocument || fromDatabase != 0) {
+                std::printf("modbee-mqtt serve: settings from the database (%s, %zu override(s))\n",
+                            settings.hasDocument ? "a stored document" : path.empty() ? "the defaults" : "the file",
+                            fromDatabase);
+            }
+        } else {
+            for (const ConfigProblem& problem : problems) {
+                std::fprintf(stderr, "%s\n", describe(problem, sets.empty() ? "stored settings" : "--set").c_str());
+            }
+            if (!sets.empty()) return 2;
+            std::fprintf(stderr, "modbee-mqtt serve: the stored settings would not load - starting from %s alone\n",
+                         path.empty() ? "the defaults" : path.c_str());
         }
     }
     BrokerSection& b = file.broker;

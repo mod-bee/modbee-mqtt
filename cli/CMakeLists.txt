@@ -16,6 +16,7 @@ add_executable(modbee
     cmd_check.cpp
     cmd_admin.cpp
     cmd_service.cpp
+    cmd_api.cpp
     # The JSON the admin topics speak - plain C++, so the admin commands work
     # from any computer, not only where the server tier builds.
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/auth/Json.cpp

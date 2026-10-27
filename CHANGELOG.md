@@ -13,6 +13,17 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **The Application API from the command line, one command for each call**: `modbee-mqtt hello`, `authority
+  revoke|regrant|forget`, `messages publish|consume`, `groups list|delete`, `connections
+  put|get|list|delete|watch|reconnect`, `logins ...`, `keys ...`, `sessions list|kick`, `retained list|delete`,
+  `listeners get|set`, `tls set`, `stats`, `settings get|check|set|apply|reset`. A command's flags are its call's
+  request fields, read from the contract compiled into the program (`--client-id-prefix`, `--message.topic`,
+  `--set k=v`, `@file`, `--json`), its output is the call's answer as JSON, its errors the call's status. `--api`,
+  `--token-file` (or `MODBEE_API`, `MODBEE_API_TOKEN_FILE`). One table in docs/cli.md maps each command to its call
+  and REST route, and `cli_api_tests` fails when the commands, the contract and that table disagree.
+- **`serve --set path=value`**: any setting by its place in modbee.yaml, as a flag - over the environment, checked
+  as the file is - so no setting needs the file.
+- **`POST /v1/connections/{id}:reconnect`**, the REST route for `Connections.Reconnect`.
 - **`serve` takes everything an application needs at start as flags**, so it needs no file: `--api unix:<path>` /
   `tcp://host:port` (repeatable), `--api-token-file`, `--authority`, `--authority-timeout-ms`, `--events`,
   `--queue-bytes`, `--queue-bytes-total`.
