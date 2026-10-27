@@ -13,6 +13,12 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Subscription options on a managed connection** (Application API): `ConsumeOpen.subscriptions` sets each
+  filter's QoS (0 to 2; a filter in `filters` alone stays QoS 1) and MQTT 5's no-local, retain-as-published and
+  retain handling, for how the connection subscribes on the other broker. Groups asking for one filter share one
+  subscription (the higher QoS); opening a group again with other options re-subscribes with them; a named group
+  keeps them across a restart; `GroupInfo.subscriptions` lists them. Additive: an application that sends none sees
+  no change.
 - **Refusals are client events** (platform builds): `$modbee/events/publish-refused`, `subscribe-refused` and
   `connect-refused` (the server full, or a login at its session limit), and over the Application API as
   `CLIENT_EVENT_PUBLISH_REFUSED` / `_SUBSCRIBE_REFUSED` / `_CONNECT_REFUSED` with the topic or filter and the reason

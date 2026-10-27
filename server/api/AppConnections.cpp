@@ -16,7 +16,6 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
-#include <set>
 #include <sstream>
 
 #include "ServerOs.h"
@@ -180,7 +179,7 @@ struct AppConnections::Connection {
     Clock::time_point nextAttempt = Clock::now();
     uint32_t backoffMs = 0;
 
-    std::set<std::string> subscribed;          // what the remote broker has been asked for
+    std::map<std::string, uint8_t> subscribed; // what the remote broker has been asked for, with its options
     bool filtersChanged = true;
 
     // The first server, while connected to another: is it back?
@@ -468,13 +467,17 @@ void AppConnections::service(Connection& c) {
     // --- Subscriptions: what the groups on it want ---
     if (c.filtersChanged) {
         c.filtersChanged = false;
-        const std::vector<std::string> wanted = _hub.filtersFor(c.spec.id);
-        std::set<std::string> want(wanted.begin(), wanted.end());
-        for (const std::string& filter : want) {
-            if (!c.subscribed.count(filter)) c.client.subscribe(filter.c_str(), MQ_QOS_1);
+        const std::map<std::string, uint8_t> want = _hub.filtersFor(c.spec.id);
+        // A filter asked for again with other options is subscribed again: the
+        // remote broker replaces the subscription.
+        for (const auto& filter : want) {
+            auto had = c.subscribed.find(filter.first);
+            if (had == c.subscribed.end() || had->second != filter.second) {
+                c.client.subscribeWithOptions(filter.first.c_str(), filter.second);
+            }
         }
-        for (const std::string& filter : c.subscribed) {
-            if (!want.count(filter)) c.client.unsubscribe(filter.c_str());
+        for (const auto& filter : c.subscribed) {
+            if (!want.count(filter.first)) c.client.unsubscribe(filter.first.c_str());
         }
         c.subscribed = want;
     }

@@ -405,6 +405,16 @@ AppHub::Member* AppHub::open(const AppConsumeOptions& options, AppConsumer* cons
             return nullptr;
         }
     }
+    for (size_t i = 0; i < options.subscribeOptions.size(); i++) {
+        const uint8_t byte = options.subscribeOptions[i];
+        if ((byte & MQ_SUBOPT_QOS_MASK) > MQ_QOS_2 || (byte & MQ_SUBOPT_RESERVED_MASK) != 0 ||
+            ((byte & MQ_SUBOPT_RETAIN_HANDLING_MASK) >> MQ_SUBOPT_RETAIN_HANDLING_SHIFT) > 2) {
+            error = "the subscription options of \"" +
+                    (i < options.filters.size() ? options.filters[i] : std::string()) +
+                    "\" are not valid: QoS 0 to 2, retain handling 0 to 2";
+            return nullptr;
+        }
+    }
     if (options.events && !_config.eventsEnabled) {
         error = "client events are off on this server (events: enabled)";
         return nullptr;
@@ -430,6 +440,21 @@ AppHub::Member* AppHub::open(const AppConsumeOptions& options, AppConsumer* cons
         if (mine != theirs || options.events != found->second->options.events) {
             error = "the group \"" + options.group + "\" exists with other filters";
             return nullptr;
+        }
+        // The same filters with other subscription options: the latest open
+        // says how the connection subscribes from now on.
+        Group& existing = *found->second;
+        bool changed = false;
+        for (size_t i = 0; i < options.filters.size() && !changed; i++) {
+            const size_t at = (size_t)(std::find(existing.options.filters.begin(), existing.options.filters.end(),
+                                                 options.filters[i]) -
+                                       existing.options.filters.begin());
+            changed = appSubscribeOptions(options, i) != appSubscribeOptions(existing.options, at);
+        }
+        if (changed) {
+            existing.options.filters = options.filters;
+            existing.options.subscribeOptions = options.subscribeOptions;
+            keepGroup(existing);
         }
     }
     Group& group = *found->second;
@@ -715,13 +740,30 @@ void AppHub::groupsChanged(const std::string& connection) {
     if (AppConnections* connections = _connections.load()) connections->groupsChanged(connection);
 }
 
-std::vector<std::string> AppHub::filtersFor(const std::string& connection) const {
+uint8_t appSubscribeOptions(const AppConsumeOptions& options, size_t i) {
+    return i < options.subscribeOptions.size() ? options.subscribeOptions[i] : (uint8_t)MQ_QOS_1;
+}
+
+std::map<std::string, uint8_t> AppHub::filtersFor(const std::string& connection) const {
     std::lock_guard<std::mutex> guard(_lock);
-    std::vector<std::string> out;
+    std::map<std::string, uint8_t> out;
     for (const auto& named : _groups) {
-        if (named.second->connection != connection) continue;
-        for (const std::string& filter : named.second->options.filters) {
-            if (std::find(out.begin(), out.end(), filter) == out.end()) out.push_back(filter);
+        const Group& group = *named.second;
+        if (group.connection != connection) continue;
+        for (size_t i = 0; i < group.options.filters.size(); i++) {
+            const uint8_t mine = appSubscribeOptions(group.options, i);
+            auto at = out.find(group.options.filters[i]);
+            if (at == out.end()) {
+                out.emplace(group.options.filters[i], mine);
+                continue;
+            }
+            const uint8_t theirs = at->second;
+            const uint8_t qos = std::max<uint8_t>(mine & MQ_SUBOPT_QOS_MASK, theirs & MQ_SUBOPT_QOS_MASK);
+            const uint8_t noLocal = mine & theirs & MQ_SUBOPT_NO_LOCAL;
+            const uint8_t asPublished = (mine | theirs) & MQ_SUBOPT_RETAIN_AS_PUB;
+            const uint8_t handling = std::min<uint8_t>(mine & MQ_SUBOPT_RETAIN_HANDLING_MASK,
+                                                       theirs & MQ_SUBOPT_RETAIN_HANDLING_MASK);
+            at->second = (uint8_t)(qos | noLocal | asPublished | handling);
         }
     }
     return out;
@@ -755,6 +797,9 @@ std::vector<AppGroupInfo> AppHub::groups() const {
         info.group = group.name;
         info.connection = group.connection;
         info.filters = group.options.filters;
+        for (size_t i = 0; i < info.filters.size(); i++) {
+            info.subscribeOptions.push_back(appSubscribeOptions(group.options, i));
+        }
         info.members = (uint32_t)group.members.size();
         info.queued = group.queued;
         for (const Member* member : group.members) info.inFlight += member->inFlight.size();

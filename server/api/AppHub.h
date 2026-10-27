@@ -79,6 +79,10 @@ enum class AppOnFull : uint8_t { Refuse, Drop };
 struct AppConsumeOptions {
     std::string group;                           // "": a stream of its own, nothing outlives it
     std::vector<std::string> filters;
+    // On a managed connection, how it subscribes to each filter on the remote
+    // broker: the MQTT 5 subscription options byte (QoS, no local, retain as
+    // published, retain handling), one per filter in order. Missing: QoS 1.
+    std::vector<uint8_t> subscribeOptions;
     std::string connection;
     uint32_t maxInFlight = 100;
     AppPick pick = AppPick::Publisher;
@@ -119,9 +123,13 @@ struct AppPublishResult {
     uint32_t matched = 0, acknowledged = 0, pending = 0;
 };
 
+// Filter i's subscription options byte (AppConsumeOptions::subscribeOptions).
+uint8_t appSubscribeOptions(const AppConsumeOptions& options, size_t i);
+
 struct AppGroupInfo {
     std::string group, connection;
     std::vector<std::string> filters;
+    std::vector<uint8_t> subscribeOptions;       // one per filter
     uint32_t members = 0;
     uint64_t queued = 0, inFlight = 0, refused = 0;
 };
@@ -174,8 +182,11 @@ public:
 
     // --- Managed connections (AppConnections) ---
     void attachConnections(AppConnections* connections);
-    // The filters every group opened on `connection` asks for, together.
-    std::vector<std::string> filtersFor(const std::string& connection) const;
+    // The filters every group opened on `connection` asks for, together, each
+    // with its subscription options: where two groups ask for one filter, the
+    // higher QoS, no local only if both, retain as published if either, and
+    // the retained messages sent if either wants them.
+    std::map<std::string, uint8_t> filtersFor(const std::string& connection) const;
     // A message a managed connection received, for its groups.
     void connectionMessage(const std::string& connection, const std::shared_ptr<const AppMessage>& message);
 

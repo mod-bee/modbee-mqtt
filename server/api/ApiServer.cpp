@@ -250,6 +250,48 @@ AppPublish messageOf(const v1::Message& wire) {
     return m;
 }
 
+// A ConsumeOpen's filters, each with its subscription options byte.
+void subscriptionsOf(const v1::ConsumeOpen& wire, AppConsumeOptions& options) {
+    options.filters.assign(wire.filters().begin(), wire.filters().end());
+    options.subscribeOptions.assign(options.filters.size(), (uint8_t)MQ_QOS_1);
+    for (const v1::Subscription& one : wire.subscriptions()) {
+        // Out of range is kept out of range, for AppHub::open to refuse.
+        const uint32_t qos = one.has_qos() ? one.qos() : 1u;
+        const uint32_t handling = (uint32_t)one.retain_handling();
+        uint8_t byte = (uint8_t)(qos > 3 ? 3 : qos);
+        if (one.no_local()) byte |= MQ_SUBOPT_NO_LOCAL;
+        if (one.retain_as_published()) byte |= MQ_SUBOPT_RETAIN_AS_PUB;
+        byte |= (uint8_t)((handling > 3 ? 3 : handling) << MQ_SUBOPT_RETAIN_HANDLING_SHIFT);
+        auto at = std::find(options.filters.begin(), options.filters.end(), one.filter());
+        if (at == options.filters.end()) {
+            options.filters.push_back(one.filter());
+            options.subscribeOptions.push_back(byte);
+        } else {
+            options.subscribeOptions[(size_t)(at - options.filters.begin())] = byte;
+        }
+    }
+}
+
+void groupTo(const AppGroupInfo& info, v1::GroupInfo& group) {
+    group.set_group(info.group);
+    group.set_connection(info.connection);
+    for (size_t i = 0; i < info.filters.size(); i++) {
+        group.add_filters(info.filters[i]);
+        const uint8_t byte = i < info.subscribeOptions.size() ? info.subscribeOptions[i] : (uint8_t)MQ_QOS_1;
+        v1::Subscription* one = group.add_subscriptions();
+        one->set_filter(info.filters[i]);
+        one->set_qos(byte & MQ_SUBOPT_QOS_MASK);
+        one->set_no_local((byte & MQ_SUBOPT_NO_LOCAL) != 0);
+        one->set_retain_as_published((byte & MQ_SUBOPT_RETAIN_AS_PUB) != 0);
+        one->set_retain_handling(
+            (v1::RetainHandling)((byte & MQ_SUBOPT_RETAIN_HANDLING_MASK) >> MQ_SUBOPT_RETAIN_HANDLING_SHIFT));
+    }
+    group.set_members(info.members);
+    group.set_queued(info.queued);
+    group.set_in_flight(info.inFlight);
+    group.set_refused(info.refused);
+}
+
 AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     AppConnectionSpec s;
     s.id = wire.id();
@@ -929,7 +971,7 @@ private:
     bool open(const v1::ConsumeOpen& wire) {
         AppConsumeOptions options;
         options.group = wire.group();
-        options.filters.assign(wire.filters().begin(), wire.filters().end());
+        subscriptionsOf(wire, options);
         options.connection = wire.connection();
         options.maxInFlight = wire.max_in_flight() ? wire.max_in_flight() : 100;
         options.pick = wire.pick() == v1::PICK_ROUND_ROBIN ? AppPick::RoundRobin : AppPick::Publisher;
@@ -1456,16 +1498,7 @@ public:
             reactor->Finish(refusedToken());
             return reactor;
         }
-        for (const AppGroupInfo& info : _hub.groups()) {
-            v1::GroupInfo* group = reply->add_groups();
-            group->set_group(info.group);
-            group->set_connection(info.connection);
-            for (const std::string& filter : info.filters) group->add_filters(filter);
-            group->set_members(info.members);
-            group->set_queued(info.queued);
-            group->set_in_flight(info.inFlight);
-            group->set_refused(info.refused);
-        }
+        for (const AppGroupInfo& info : _hub.groups()) groupTo(info, *reply->add_groups());
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1992,16 +2025,7 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
         AppHub& hub = *self.services.messages;
         if (method == "GET") {
             auto out = made<v1::ListGroupsReply>();
-            for (const AppGroupInfo& info : hub.groups()) {
-                v1::GroupInfo* group = out->add_groups();
-                group->set_group(info.group);
-                group->set_connection(info.connection);
-                for (const std::string& f : info.filters) group->add_filters(f);
-                group->set_members(info.members);
-                group->set_queued(info.queued);
-                group->set_in_flight(info.inFlight);
-                group->set_refused(info.refused);
-            }
+            for (const AppGroupInfo& info : hub.groups()) groupTo(info, *out->add_groups());
             answer(out, grpc::Status::OK);
         } else if (method == "DELETE") {
             uint64_t discarded = 0;

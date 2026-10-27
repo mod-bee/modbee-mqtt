@@ -28,13 +28,22 @@ namespace {
 
 const char* const kTables =
     "CREATE TABLE IF NOT EXISTS groups(connection BLOB, name BLOB, filters BLOB, events INTEGER, "
-    "  pick INTEGER, expiry INTEGER, on_full INTEGER, exclude BLOB, empty_since INTEGER, "
+    "  pick INTEGER, expiry INTEGER, on_full INTEGER, exclude BLOB, empty_since INTEGER, subscribe BLOB, "
     "  PRIMARY KEY(connection, name)) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, connection BLOB, name BLOB, message BLOB);"
     "CREATE INDEX IF NOT EXISTS messages_by_group ON messages(connection, name);";
 
 bool exec(sqlite3* db, const char* sql) {
     return sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
+}
+
+// A file from before the groups kept their subscription options (one byte per
+// filter) gains the column; its groups subscribe at QoS 1, as they did.
+bool addSubscribeColumn(sqlite3* db) {
+    sqlite3_stmt* probe = nullptr;
+    const bool has = sqlite3_prepare_v2(db, "SELECT subscribe FROM groups LIMIT 0", -1, &probe, nullptr) == SQLITE_OK;
+    sqlite3_finalize(probe);
+    return has || exec(db, "ALTER TABLE groups ADD COLUMN subscribe BLOB");
 }
 
 // --- A message as a blob: length-prefixed fields, in order ---
@@ -217,7 +226,7 @@ bool GroupStore::open(std::vector<StoredGroup>& groups, uint64_t& nextId, std::f
     sqlite3_busy_timeout(_db, 5000);
     if (!exec(_db, "PRAGMA journal_mode=WAL") ||
         !exec(_db, _config.syncFull ? "PRAGMA synchronous=FULL" : "PRAGMA synchronous=NORMAL") ||
-        !exec(_db, kTables)) {
+        !exec(_db, kTables) || !addSubscribeColumn(_db)) {
         error = file + ": " + sqlite3_errmsg(_db);
         sqlite3_close(_db);
         _db = nullptr;
@@ -238,7 +247,7 @@ bool GroupStore::load(std::vector<StoredGroup>& groups, uint64_t& nextId, std::s
     std::map<std::pair<std::string, std::string>, size_t> index;
     sqlite3_stmt* statement = nullptr;
     if (sqlite3_prepare_v2(_db, "SELECT connection, name, filters, events, pick, expiry, on_full, exclude, "
-                                "empty_since FROM groups", -1, &statement, nullptr) != SQLITE_OK) {
+                                "empty_since, subscribe FROM groups", -1, &statement, nullptr) != SQLITE_OK) {
         error = path() + ": " + sqlite3_errmsg(_db);
         return false;
     }
@@ -255,6 +264,8 @@ bool GroupStore::load(std::vector<StoredGroup>& groups, uint64_t& nextId, std::s
         group.options.onFull = (AppOnFull)sqlite3_column_int(statement, 6);
         group.options.excludeOrigins = split(sqlite3_column_blob(statement, 7), sqlite3_column_bytes(statement, 7));
         group.emptySinceMs = sqlite3_column_int64(statement, 8);
+        const std::string subscribe = column(statement, 9);
+        group.options.subscribeOptions.assign(subscribe.begin(), subscribe.end());
         index[std::make_pair(group.connection, group.name)] = groups.size();
         groups.push_back(std::move(group));
     }
@@ -378,8 +389,10 @@ bool GroupStore::apply(const std::vector<Change>& batch) {
     sqlite3_stmt* putMessage = nullptr;
     sqlite3_stmt* dropMessage = nullptr;
     bool ok =
-        sqlite3_prepare_v2(_db, "INSERT OR REPLACE INTO groups VALUES(?,?,?,?,?,?,?,?,?)", -1, &putGroup,
-                           nullptr) == SQLITE_OK &&
+        sqlite3_prepare_v2(_db,
+                           "INSERT OR REPLACE INTO groups(connection, name, filters, events, pick, expiry, on_full, "
+                           "exclude, empty_since, subscribe) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           -1, &putGroup, nullptr) == SQLITE_OK &&
         sqlite3_prepare_v2(_db, "DELETE FROM groups WHERE connection=? AND name=?", -1, &dropGroup, nullptr) ==
             SQLITE_OK &&
         sqlite3_prepare_v2(_db, "DELETE FROM messages WHERE connection=? AND name=?", -1, &dropGroupMessages,
@@ -402,6 +415,7 @@ bool GroupStore::apply(const std::vector<Change>& batch) {
             sqlite3_bind_int(s, 7, (int)c.options.onFull);
             bindBlob(s, 8, joined(c.options.excludeOrigins));
             sqlite3_bind_int64(s, 9, c.emptySinceMs);
+            bindBlob(s, 10, std::string(c.options.subscribeOptions.begin(), c.options.subscribeOptions.end()));
             break;
         case Change::DropGroup:
             bindBlob(dropGroupMessages, 1, c.connection);

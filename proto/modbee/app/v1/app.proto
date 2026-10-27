@@ -223,6 +223,27 @@ message ConsumeOpen {
   uint32 expiry_seconds = 7;       // a named group with no member is kept this long (default 86400)
   OnFull on_full = 8;
   repeated string exclude_origins = 9; // skip messages published through this API with these origins
+  // On a managed connection: how it subscribes to each filter on the remote broker. A filter here is one of the
+  // group's filters whether `filters` names it or not; one only in `filters` is QoS 1 with no options. On the
+  // broker's own clients only the filter counts. Groups on one connection that ask for one filter share one
+  // subscription: the highest QoS, no_local only if every group asks for it, retain_as_published and the retained
+  // messages if any does. Opening a group that exists with other options changes them.
+  repeated Subscription subscriptions = 10;
+}
+
+message Subscription {
+  string filter = 1;
+  optional uint32 qos = 2;         // 0 to 2; absent: 1
+  bool no_local = 3;               // MQTT 5: not sent what this connection itself published
+  bool retain_as_published = 4;    // MQTT 5: `retain` as the publisher set it, not only on the retained copy
+  RetainHandling retain_handling = 5; // MQTT 5
+}
+
+// A 3.1.1 connection subscribes with the QoS alone; these are MQTT 5's.
+enum RetainHandling {
+  RETAIN_SEND = 0;                 // the retained messages, at every subscribe (the default)
+  RETAIN_SEND_IF_NEW = 1;          // only when the subscription did not exist
+  RETAIN_DONT_SEND = 2;
 }
 
 enum Pick {
@@ -374,6 +395,7 @@ message GroupInfo {
   uint64 queued = 5;
   uint64 in_flight = 6;
   uint64 refused = 7;              // publishers refused because it was full
+  repeated Subscription subscriptions = 8; // every filter, with how it is subscribed (a managed connection's)
 }
 message DeleteGroupRequest {
   string group = 1;
