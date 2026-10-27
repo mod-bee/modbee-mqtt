@@ -13,6 +13,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Sparkplug B through the Application API, every part of it**: `ConsumeOpen.sparkplug` delivers `spBv1.0/...`
+  messages decoded (`Delivery.sparkplug`) - every datatype, arrays, datasets, templates, property sets and their
+  lists, metadata, compressed payloads (DEFLATE, GZIP) - `PublishRequest.sparkplug` publishes a typed payload, and
+  `Sparkplug.Decode` / `Encode` convert one on their own (`modbee-mqtt sparkplug decode|encode`). The server's codec
+  is its own (proto/modbee/sparkplug/v1/wire.proto); the library's, for boards, is unchanged.
 - **Store and forward on a managed connection** (`ConnectionSpec.store_and_forward`): every publish on it is kept on
   disk until the other broker acknowledges it - a connection that is down, a restart or a crash loses none, and
   they are sent in order, at QoS 1 or more. `PUBLISH_STORED` while it is down; bounded in messages and bytes, full

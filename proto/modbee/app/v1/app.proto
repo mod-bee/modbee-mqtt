@@ -229,6 +229,9 @@ message ConsumeOpen {
   // subscription: the highest QoS, no_local only if every group asks for it, retain_as_published and the retained
   // messages if any does. Opening a group that exists with other options changes them.
   repeated Subscription subscriptions = 10;
+  // Sparkplug B: a message on spBv1.0/... arrives decoded as well (Delivery.sparkplug) - every datatype, templates,
+  // datasets, property sets, arrays, compressed payloads - so the application needs no Sparkplug codec of its own.
+  bool sparkplug = 11;
 }
 
 message Subscription {
@@ -290,6 +293,7 @@ message Delivery {
   bool redelivered = 10;           // sent before, to a member that did not acknowledge it
   bool will = 11;                  // a Will, published for a client that went
   string connection = 12;          // the managed connection it came in on; "" for the broker's own clients
+  SparkplugMessage sparkplug = 13; // ConsumeOpen.sparkplug, on a spBv1.0/... topic: what the payload says
 }
 
 message Publisher {
@@ -338,6 +342,9 @@ message PublishRequest {
   Message message = 3;
   Confirm confirm = 4;
   string origin = 5;               // who published it, for exclude_origins and Publisher.origin
+  // Sparkplug B: the payload, encoded here in place of message.payload (message.topic is still the topic).
+  SparkplugPayload sparkplug = 6;
+  bool sparkplug_compress = 7;     // and compressed (DEFLATE), as a node does a large birth
 }
 
 // When the reply comes. The call's gRPC deadline bounds the wait.
@@ -409,6 +416,189 @@ message DeleteGroupRequest {
 }
 message DeleteGroupReply {
   uint64 discarded = 1;            // messages it still held
+}
+
+// =============================================================================
+// SPARKPLUG B - Sparkplug kept once, in the broker
+// =============================================================================
+//
+// What a Sparkplug message says, typed: what every Sparkplug B 3.0 payload can hold, without the application
+// carrying a codec. Read from deliveries (ConsumeOpen.sparkplug), written through Messages.Publish
+// (PublishRequest.sparkplug), and converted here on their own.
+
+service Sparkplug {
+  rpc Decode(SparkplugDecodeRequest) returns (SparkplugMessage);
+  rpc Encode(SparkplugEncodeRequest) returns (SparkplugEncodeReply);
+}
+
+message SparkplugDecodeRequest {
+  string topic = 1;                // spBv1.0/... (STATE included)
+  bytes payload = 2;
+}
+message SparkplugEncodeRequest {
+  SparkplugPayload payload = 1;
+  bool compress = 2;               // DEFLATE, inside a SPBV1.0_COMPRESSED payload
+}
+message SparkplugEncodeReply {
+  bytes payload = 1;
+}
+
+message SparkplugMessage {
+  SparkplugKind kind = 1;
+  string group = 2;
+  string node = 3;
+  string device = 4;               // DBIRTH, DDEATH, DDATA, DCMD
+  string host_id = 5;              // STATE
+  SparkplugPayload payload = 6;    // all but STATE
+  bool online = 7;                 // STATE
+  uint64 state_timestamp = 8;      // STATE
+  string error = 9;                // it could not be read: why (the delivery still has the bytes)
+}
+
+enum SparkplugKind {
+  SPARKPLUG_KIND_UNSPECIFIED = 0;
+  SPARKPLUG_NBIRTH = 1;
+  SPARKPLUG_NDEATH = 2;
+  SPARKPLUG_DBIRTH = 3;
+  SPARKPLUG_DDEATH = 4;
+  SPARKPLUG_NDATA = 5;
+  SPARKPLUG_DDATA = 6;
+  SPARKPLUG_NCMD = 7;
+  SPARKPLUG_DCMD = 8;
+  SPARKPLUG_STATE = 9;
+}
+
+message SparkplugPayload {
+  optional uint64 timestamp = 1;
+  repeated SparkplugMetric metrics = 2;
+  optional uint64 seq = 3;
+  string uuid = 4;
+  bytes body = 5;
+  bool compressed = 6;             // it arrived compressed (decoded: this is what was inside)
+}
+
+message SparkplugMetric {
+  string name = 1;                 // "" in data that uses aliases (a host resolves them)
+  optional uint64 alias = 2;
+  optional uint64 timestamp = 3;
+  SparkplugDataType datatype = 4;
+  bool is_historical = 5;
+  bool is_transient = 6;
+  bool is_null = 7;
+  SparkplugMetaData metadata = 8;
+  repeated SparkplugProperty properties = 9;
+  SparkplugValue value = 10;
+}
+
+// One of these, as `datatype` says: Int8..Int64 int_value; UInt8..UInt64 and DateTime (ms since 1970) uint_value;
+// String, Text, UUID string_value; Bytes, File bytes_value; the arrays array_value; DataSet, Template theirs.
+message SparkplugValue {
+  oneof kind {
+    int64 int_value = 1;
+    uint64 uint_value = 2;
+    float float_value = 3;
+    double double_value = 4;
+    bool boolean_value = 5;
+    string string_value = 6;
+    bytes bytes_value = 7;
+    SparkplugArray array_value = 8;
+    SparkplugDataSet dataset_value = 9;
+    SparkplugTemplate template_value = 10;
+  }
+}
+
+// An array metric's elements, in the list its datatype names: Int8Array..Int64Array `ints`; UInt8Array..UInt64Array
+// and DateTimeArray `uints`; FloatArray `floats`; DoubleArray `doubles`; BooleanArray `booleans`; StringArray `strings`.
+message SparkplugArray {
+  repeated int64 ints = 1;
+  repeated uint64 uints = 2;
+  repeated float floats = 3;
+  repeated double doubles = 4;
+  repeated bool booleans = 5;
+  repeated string strings = 6;
+}
+
+message SparkplugProperty {
+  string key = 1;
+  SparkplugDataType type = 2;      // a scalar's, or PropertySet / PropertySetList
+  bool is_null = 3;
+  SparkplugValue value = 4;        // a scalar
+  SparkplugPropertySet set = 5;    // PropertySet
+  repeated SparkplugPropertySet sets = 6; // PropertySetList
+}
+message SparkplugPropertySet {
+  repeated SparkplugProperty properties = 1;
+}
+
+message SparkplugDataSet {
+  repeated string columns = 1;
+  repeated SparkplugDataType types = 2;
+  repeated SparkplugRow rows = 3;
+}
+message SparkplugRow {
+  repeated SparkplugValue values = 1;
+}
+
+message SparkplugTemplate {
+  string version = 1;
+  repeated SparkplugMetric metrics = 2;
+  repeated SparkplugParameter parameters = 3;
+  string template_ref = 4;         // an instance: the definition it is of
+  bool is_definition = 5;
+}
+message SparkplugParameter {
+  string name = 1;
+  SparkplugDataType type = 2;
+  SparkplugValue value = 3;
+}
+
+message SparkplugMetaData {
+  bool is_multi_part = 1;
+  string content_type = 2;
+  uint64 size = 3;
+  uint64 seq = 4;
+  string file_name = 5;
+  string file_type = 6;
+  string md5 = 7;
+  string description = 8;
+}
+
+enum SparkplugDataType {
+  DATATYPE_UNKNOWN = 0;
+  DATATYPE_INT8 = 1;
+  DATATYPE_INT16 = 2;
+  DATATYPE_INT32 = 3;
+  DATATYPE_INT64 = 4;
+  DATATYPE_UINT8 = 5;
+  DATATYPE_UINT16 = 6;
+  DATATYPE_UINT32 = 7;
+  DATATYPE_UINT64 = 8;
+  DATATYPE_FLOAT = 9;
+  DATATYPE_DOUBLE = 10;
+  DATATYPE_BOOLEAN = 11;
+  DATATYPE_STRING = 12;
+  DATATYPE_DATETIME = 13;
+  DATATYPE_TEXT = 14;
+  DATATYPE_UUID = 15;
+  DATATYPE_DATASET = 16;
+  DATATYPE_BYTES = 17;
+  DATATYPE_FILE = 18;
+  DATATYPE_TEMPLATE = 19;
+  DATATYPE_PROPERTY_SET = 20;
+  DATATYPE_PROPERTY_SET_LIST = 21;
+  DATATYPE_INT8_ARRAY = 22;
+  DATATYPE_INT16_ARRAY = 23;
+  DATATYPE_INT32_ARRAY = 24;
+  DATATYPE_INT64_ARRAY = 25;
+  DATATYPE_UINT8_ARRAY = 26;
+  DATATYPE_UINT16_ARRAY = 27;
+  DATATYPE_UINT32_ARRAY = 28;
+  DATATYPE_UINT64_ARRAY = 29;
+  DATATYPE_FLOAT_ARRAY = 30;
+  DATATYPE_DOUBLE_ARRAY = 31;
+  DATATYPE_BOOLEAN_ARRAY = 32;
+  DATATYPE_STRING_ARRAY = 33;
+  DATATYPE_DATETIME_ARRAY = 34;
 }
 
 // =============================================================================

@@ -176,13 +176,25 @@ if(MQTT_BUILD_APP_API)
         DEPENDS ${_modbee_proto}/modbee/app/v1/app.proto
         COMMENT "Generating the Application API from proto/modbee/app/v1/app.proto"
         VERBATIM)
-    add_library(modbee-api STATIC api/ApiServer.cpp ${_modbee_app}.pb.cc ${_modbee_app}.grpc.pb.cc)
-    target_link_libraries(modbee-api PUBLIC modbee-app gRPC::grpc++ protobuf::libprotobuf)
+    # Sparkplug B's own payload, for the API's codec (api/SparkplugCodec.cpp).
+    set(_modbee_wire ${_modbee_generated}/modbee/sparkplug/v1/wire)
+    add_custom_command(
+        OUTPUT ${_modbee_wire}.pb.cc ${_modbee_wire}.pb.h
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_modbee_generated}
+        COMMAND protobuf::protoc --proto_path=${_modbee_proto} --cpp_out=${_modbee_generated}
+                modbee/sparkplug/v1/wire.proto
+        DEPENDS ${_modbee_proto}/modbee/sparkplug/v1/wire.proto
+        COMMENT "Generating the Sparkplug B payload from proto/modbee/sparkplug/v1/wire.proto"
+        VERBATIM)
+    find_package(ZLIB REQUIRED)    # compressed Sparkplug payloads; gRPC needs it already
+    add_library(modbee-api STATIC api/ApiServer.cpp api/SparkplugCodec.cpp ${_modbee_app}.pb.cc
+        ${_modbee_app}.grpc.pb.cc ${_modbee_wire}.pb.cc)
+    target_link_libraries(modbee-api PUBLIC modbee-app gRPC::grpc++ protobuf::libprotobuf ZLIB::ZLIB)
     target_include_directories(modbee-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api ${_modbee_generated})
     target_compile_definitions(modbee-api PUBLIC MODBEE_HAVE_APP_API=1)
     target_compile_features(modbee-api PUBLIC cxx_std_17)
     if(NOT MSVC)
-        set_source_files_properties(api/ApiServer.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
+        set_source_files_properties(api/ApiServer.cpp api/SparkplugCodec.cpp PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
     endif()
     message(STATUS "modbee: gRPC ${gRPC_VERSION} found - the Application API is built")
 else()

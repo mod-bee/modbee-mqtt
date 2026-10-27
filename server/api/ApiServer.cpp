@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "ApiServer.h"
+#include "SparkplugCodec.h"
 #include "ServerConfig.h"   // apiAddressIsLoopback
 #include "Authority.h"
 #include "AppHub.h"
@@ -228,7 +229,9 @@ uint32_t deadlineMsOf(grpc::CallbackServerContext* context) {
     return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
 }
 
-AppPublish publishOf(const v1::PublishRequest& request) {
+// A Sparkplug payload given typed (PublishRequest.sparkplug) is encoded here,
+// in place of message.payload; `error` says why when it cannot be.
+AppPublish publishOf(const v1::PublishRequest& request, std::string* error = nullptr) {
     AppPublish message;
     message.confirmDelivered = request.confirm() == v1::CONFIRM_DELIVERED;
     message.topic = request.message().topic();
@@ -238,6 +241,12 @@ AppPublish publishOf(const v1::PublishRequest& request) {
     message.properties = propertiesOf(request.message().properties());
     message.connection = request.connection();
     message.origin = request.origin();
+    if (request.has_sparkplug()) {
+        std::string why;
+        if (!sparkplug_codec::encode(request.sparkplug(), request.sparkplug_compress(), message.payload, why) && error) {
+            *error = "sparkplug: " + why;
+        }
+    }
     return message;
 }
 
@@ -1102,6 +1111,7 @@ public:
             _writing = true;
             next = &_queue.front();
         }
+        dress(next);
         StartWrite(next);
     }
 
@@ -1143,7 +1153,10 @@ public:
             }
         }
         if (!ok) leave();
-        if (next) StartWrite(next);
+        if (next) {
+            dress(next);
+            StartWrite(next);
+        }
         if (finish) Finish(_status);
     }
 
@@ -1153,7 +1166,17 @@ public:
     }
 
 private:
+    // A Sparkplug message is decoded as it goes out (ConsumeOpen.sparkplug):
+    // on this stream's own thread, not under the hub's lock.
+    void dress(v1::ConsumeDown* down) {
+        if (!_sparkplug || down == nullptr || !down->has_delivery()) return;
+        v1::Delivery& d = *down->mutable_delivery();
+        if (d.has_sparkplug() || !sparkplug_codec::isSparkplugTopic(d.topic())) return;
+        sparkplug_codec::decode(d.topic(), d.payload(), *d.mutable_sparkplug());
+    }
+
     bool open(const v1::ConsumeOpen& wire) {
+        _sparkplug = wire.sparkplug();
         AppConsumeOptions options;
         options.group = wire.group();
         subscriptionsOf(wire, options);
@@ -1191,6 +1214,7 @@ private:
             end(grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error));
             return false;
         }
+        dress(next);
         StartWrite(next);
         return true;
     }
@@ -1232,6 +1256,7 @@ private:
     bool _holding = false;
     bool _ending = false;
     bool _finished = false;
+    bool _sparkplug = false;
     grpc::Status _status = grpc::Status::OK;
 };
 
@@ -1260,8 +1285,19 @@ public:
             _outstanding++;
         }
         const uint64_t requestId = _request.request_id();
-        AppPublish message = publishOf(_request);
+        std::string error;
+        AppPublish message = publishOf(_request, &error);
         message.deadlineMs = _deadlineMs;
+        if (!error.empty()) {
+            AppPublishResult refused;
+            refused.outcome = AppPublishOutcome::Refused;
+            refused.reasonCode = MQ_REASON_PAYLOAD_FORMAT_INVALID;
+            v1::PublishReply reply;
+            resultTo(refused, requestId, reply);
+            reply_(reply);
+            StartRead(&_request);
+            return;
+        }
         _hub.publish(message, [this, requestId](const AppPublishResult& result) {
             v1::PublishReply reply;
             resultTo(result, requestId, reply);
@@ -1494,6 +1530,7 @@ public:
         if (_admin) reply->add_features("admin");
         if (_admin) reply->add_features("admin.listeners");
         if (_messages) reply->add_features("events.handshake");
+        reply->add_features("sparkplug.codec");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1676,7 +1713,12 @@ public:
             return reactor;
         }
         const uint64_t requestId = request->request_id();
-        AppPublish message = publishOf(*request);
+        std::string error;
+        AppPublish message = publishOf(*request, &error);
+        if (!error.empty()) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
         message.deadlineMs = deadlineMsOf(context);
         _hub.publish(message, [reactor, reply, requestId](const AppPublishResult& result) {
             resultTo(result, requestId, *reply);
@@ -1723,6 +1765,51 @@ public:
 private:
     const ApiServerConfig& _config;
     AppHub& _hub;
+};
+
+// =============================================================================
+// Sparkplug: the codec on its own
+// =============================================================================
+
+class SparkplugService final : public v1::Sparkplug::CallbackService {
+public:
+    explicit SparkplugService(const ApiServerConfig& config) : _config(config) {}
+
+    grpc::ServerUnaryReactor* Decode(grpc::CallbackServerContext* context, const v1::SparkplugDecodeRequest* request,
+                                     v1::SparkplugMessage* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        if (!sparkplug_codec::isSparkplugTopic(request->topic())) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "not a Sparkplug B topic (spBv1.0/...)"));
+            return reactor;
+        }
+        // What could not be read is said in `error`, beside what could.
+        sparkplug_codec::decode(request->topic(), request->payload(), *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* Encode(grpc::CallbackServerContext* context, const v1::SparkplugEncodeRequest* request,
+                                     v1::SparkplugEncodeReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return reactor;
+        }
+        std::string error;
+        if (!sparkplug_codec::encode(request->payload(), request->compress(), *reply->mutable_payload(), error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+private:
+    const ApiServerConfig& _config;
 };
 
 class AuthorityService final : public v1::Authority::CallbackService {
@@ -1821,6 +1908,7 @@ struct ApiServer::Impl {
     std::unique_ptr<AuthorityService> authority;
     std::unique_ptr<MessagesService> messages;
     std::unique_ptr<ConnectionsService> connections;
+    std::unique_ptr<SparkplugService> sparkplug;
     std::unique_ptr<grpc::Server> server;
     std::vector<std::string> listening;
     std::vector<std::string> sockets;      // Unix socket files, removed at stop
@@ -1844,6 +1932,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
+    self.sparkplug.reset(new SparkplugService(self.config));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -1886,6 +1975,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     if (self.messages) builder.RegisterService(self.messages.get());
     if (self.connections) builder.RegisterService(self.connections.get());
     builder.RegisterService(self.admin.get());
+    builder.RegisterService(self.sparkplug.get());
     self.server = builder.BuildAndStart();
     if (!self.server) {
         error = "the Application API could not listen on every address (in use, or no permission?)";
@@ -2276,14 +2366,20 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
     } else if (collection == "publish" && method == "POST" && self.services.messages) {
         auto r = made<v1::PublishRequest>();
         if (read(*r)) {
-            auto out = made<v1::PublishReply>();
-            AppHub* hub = self.services.messages;
-            run(r, out, [=](Done done) {
-                hub->publish(publishOf(*r), [r, out, done](const AppPublishResult& result) {
-                    resultTo(result, r->request_id(), *out);
-                    done(grpc::Status::OK);
+            std::string encodeError;
+            const AppPublish message = publishOf(*r, &encodeError);
+            if (!encodeError.empty()) {
+                status = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, encodeError);
+            } else {
+                auto out = made<v1::PublishReply>();
+                AppHub* hub = self.services.messages;
+                run(r, out, [=](Done done) {
+                    hub->publish(message, [r, out, done](const AppPublishResult& result) {
+                        resultTo(result, r->request_id(), *out);
+                        done(grpc::Status::OK);
+                    });
                 });
-            });
+            }
         }
     }
 

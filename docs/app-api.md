@@ -12,6 +12,7 @@ The server answers all five of its services:
 | `System.Hello` | What this server is, which API version it speaks, and what it can do (`features`) |
 | `Messages` | **Every device's messages, shared by your application's instances, and messages back to the devices** - [below](#messages) |
 | `Connections` | **MQTT connections the server keeps to other brokers for your application** - [below](#connections-to-other-brokers) |
+| `Sparkplug` | **Sparkplug B, decoded and encoded** - [below](#sparkplug-b) |
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 | `Admin` | **Logins, site keys, sessions, kicks, retained messages, TLS, counters** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
 
@@ -21,7 +22,7 @@ started with flags alone (`serve --api unix:<path> --api-token-file <file> --aut
 
 `Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), and what
 it added since (`connections.subscriptions`: subscription options on a connection; `admin.listeners`:
-`PutListeners`), so an application asks rather than guesses.
+`PutListeners`; `events.handshake`; `sparkplug.codec`), so an application asks rather than guesses.
 
 **`System.Attach`** is an instance's presence. Open it with the messages to
 publish should the instance vanish - its Wills, as an MQTT client has one:
@@ -191,6 +192,22 @@ never could have it (its queue full, the message expired or too large for
 it) also makes it `PARTIAL`. Use it for a command that must have reached its
 device before your application goes on; a store-and-forward outbox deletes
 only what came back `PUBLISH_DELIVERED`.
+
+---
+
+## Sparkplug B
+
+Sparkplug is kept once, here: your application needs no Sparkplug codec of its own.
+
+| | |
+| --- | --- |
+| **Read** | `ConsumeOpen.sparkplug: true`: a delivery on `spBv1.0/...` comes with `sparkplug` - what it is (`SPARKPLUG_NBIRTH` ... `SPARKPLUG_STATE`), its group, node, device or host id, and its payload typed: every datatype of Sparkplug B 3.0, arrays unpacked, datasets, templates (definitions and instances), property sets and their lists, metadata, `is_historical`, `is_transient`, nulls. A compressed payload (`SPBV1.0_COMPRESSED`, DEFLATE or GZIP) arrives inflated, with `compressed` set. One that cannot be read says why in `error`; the delivery still has its bytes |
+| **Write** | `PublishRequest.sparkplug`: the payload typed, encoded here in place of `message.payload` (`sparkplug_compress` to DEFLATE it). A value its datatype cannot carry is `INVALID_ARGUMENT` |
+| **On their own** | `Sparkplug.Decode` (a topic and bytes) and `Sparkplug.Encode` (a payload, to bytes) |
+
+A value is in the field its datatype names: `Int8`-`Int64` in `int_value`, `UInt8`-`UInt64` and `DateTime` (ms since
+1970) in `uint_value`, `String`/`Text`/`UUID` in `string_value`, `Bytes`/`File` in `bytes_value`, an array's elements
+in `array_value` (`ints`, `uints`, `floats`, `doubles`, `booleans`, `strings`).
 
 ---
 

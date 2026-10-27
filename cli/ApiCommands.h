@@ -34,6 +34,9 @@ static const ApiCommand kApiCommands[] = {
     {"authority", "regrant", "Authority.Regrant", ""},
     {"authority", "forget", "Authority.Forget", ""},
 
+    {"sparkplug", "decode", "Sparkplug.Decode", ""},
+    {"sparkplug", "encode", "Sparkplug.Encode", ""},
+
     {"messages", "consume", "Messages.Consume", ""},
     {"messages", "publish", "Messages.Publish", "POST /v1/publish"},
     {"groups", "list", "Messages.ListGroups", "GET /v1/groups"},

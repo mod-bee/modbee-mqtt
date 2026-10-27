@@ -298,6 +298,8 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt authority revoke` | `Authority.Revoke` | - |
 | `modbee-mqtt authority regrant` | `Authority.Regrant` | - |
 | `modbee-mqtt authority forget` | `Authority.Forget` | - |
+| `modbee-mqtt sparkplug decode` | `Sparkplug.Decode` | - |
+| `modbee-mqtt sparkplug encode` | `Sparkplug.Encode` | - |
 | `modbee-mqtt messages consume` | `Messages.Consume` | - |
 | `modbee-mqtt messages publish` | `Messages.Publish` | `POST /v1/publish` |
 | `modbee-mqtt groups list` | `Messages.ListGroups` | `GET /v1/groups` |
