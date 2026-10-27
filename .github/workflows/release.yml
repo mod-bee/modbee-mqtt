@@ -2,15 +2,16 @@
 # and Windows (x64), tests each build, signs every file, and publishes a
 # GitHub release with the notes from CHANGELOG.md and the files to download.
 #
-#   modbee-<v>-linux-x86_64.tar.gz    one static binary, any Linux (musl)
-#   modbee-<v>-linux-arm64.tar.gz     the same for ARM (a Raspberry Pi 4/5, an ARM server)
-#   modbee-<v>-windows-x86_64.zip     modbee.exe, one file, also a Windows service
-#   *.cdx.json                        each one's CycloneDX SBOM
-#   *.sigstore.json                   each file's Sigstore signature (cosign, keyless)
-#   SHA256SUMS                        the checksums of all of them
+#   modbee_<v>-1_amd64.deb, modbee_<v>-1_arm64.deb   Debian, Ubuntu: modbee as a systemd service
+#   modbee-<v>-1.x86_64.rpm, modbee-<v>-1.aarch64.rpm RHEL, Rocky, Alma, Fedora: the same
+#   modbee-<v>-linux-x86_64, modbee-<v>-linux-arm64  one static binary (musl), any Linux
+#   modbee-<v>-windows-x86_64.exe                    one file, also a Windows service
+#   *.cdx.json                                       each binary's CycloneDX SBOM
+#   SHA256SUMS, SHA256SUMS.sigstore.json             the checksums, signed (cosign, keyless)
 #
 # plus a GitHub build-provenance attestation for every file, so anyone can
 # check a download came from this workflow and this commit (docs/releases.md).
+# The checksums are the one file signed with cosign: they cover every other.
 # Every binary carries the broker, the Kafka pipe and the Application API -
 # a build missing any of them stops the release.
 #
@@ -160,10 +161,8 @@ jobs:
             $_ -match '^(VCRUNTIME|MSVCP|ucrtbase|api-ms-win-crt)' -or -not (Test-Path "$env:SystemRoot\System32\$_") }
           if ($foreign) { Write-Error "modbee.exe needs DLLs not part of Windows: $($foreign -join ', ')"; exit 1 }
           $name = "modbee-$env:VERSION-windows-x86_64"
-          New-Item -ItemType Directory -Force "dist\$name" | Out-Null
-          Copy-Item $exe, LICENSE, README.md "dist\$name\"
-          Compress-Archive -Path "dist\$name\*" -DestinationPath "dist\$name.zip"
-          Remove-Item -Recurse "dist\$name"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe "dist\$name.exe"
           python scripts/release/sbom.py --installed "$env:VCPKG_INSTALLATION_ROOT\installed\$env:TRIPLET" `
             --version $env:VERSION --platform windows-x86_64 --out "dist\$name.cdx.json"
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -192,31 +191,48 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: The .deb and .rpm packages
+        run: sh scripts/release/packages.sh "$VERSION"
+      # Each package installed and removed on the distribution it is for, as
+      # root without systemd running - what an image build or a fresh server
+      # does.
+      - name: The packages install
+        run: |
+          docker run --rm -v "$PWD/dist":/dist:ro debian:trixie-slim sh -ec '
+            apt-get install -y /dist/modbee_'"$VERSION"'-1_amd64.deb >/dev/null
+            modbee --version
+            test -s /etc/modbee/admin-password
+            modbee check -C /etc/modbee/modbee.yaml
+            apt-get remove -y modbee >/dev/null
+            test ! -e /usr/bin/modbee'
+          docker run --rm -v "$PWD/dist":/dist:ro fedora:42 sh -ec '
+            dnf install -y -q /dist/modbee-'"$VERSION"'-1.x86_64.rpm
+            modbee --version
+            test -s /etc/modbee/admin-password
+            modbee check -C /etc/modbee/modbee.yaml
+            dnf remove -y -q modbee
+            test ! -e /usr/bin/modbee'
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum modbee-* > SHA256SUMS
+          sha256sum modbee* > SHA256SUMS
           cat SHA256SUMS
       - name: Provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            dist/modbee-*
+            dist/modbee*
             dist/SHA256SUMS
       - uses: sigstore/cosign-installer@v3
       - name: Sign
         working-directory: dist
         run: |
-          for f in modbee-* SHA256SUMS; do
-            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f" >/dev/null
-          done
-          # Each signature checked as a user would check it, before it ships.
-          for f in modbee-* SHA256SUMS; do
-            case "$f" in *.sigstore.json) continue ;; esac
-            cosign verify-blob --bundle "$f.sigstore.json" \
-              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
-          done
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS >/dev/null
+          # Checked as a user would check it, before it ships.
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+          sha256sum --check SHA256SUMS
           ls -l
       - name: The notes
         run: |
@@ -230,24 +246,30 @@ jobs:
 
           ## Downloads
 
-          | File | For |
-          |---|---|
-          | \`modbee-$VERSION-linux-x86_64.tar.gz\` | Linux, x86-64 - one static binary, any distribution |
-          | \`modbee-$VERSION-linux-arm64.tar.gz\` | Linux, ARM 64-bit - Raspberry Pi 4/5, ARM servers |
-          | \`modbee-$VERSION-windows-x86_64.zip\` | Windows, x86-64 - \`modbee.exe\`, also a Windows service |
-          | \`*.cdx.json\` | the CycloneDX SBOM of each: every library inside, with its version and licence |
-          | \`*.sigstore.json\`, \`SHA256SUMS\` | signatures and checksums |
+          | For | x86-64 | ARM 64-bit (Raspberry Pi 4/5, ARM servers) |
+          |---|---|---|
+          | **Debian, Ubuntu**: installs the modbee service | \`modbee_${VERSION}-1_amd64.deb\` | \`modbee_${VERSION}-1_arm64.deb\` |
+          | **RHEL, Rocky, Alma, Fedora**: the same | \`modbee-$VERSION-1.x86_64.rpm\` | \`modbee-$VERSION-1.aarch64.rpm\` |
+          | **Any Linux**: one file, nothing to install | \`modbee-$VERSION-linux-x86_64\` | \`modbee-$VERSION-linux-arm64\` |
+          | **Windows**: one file, also a Windows service | \`modbee-$VERSION-windows-x86_64.exe\` | |
+          | **Docker** | \`ghcr.io/mod-bee/modbee-mqtt:$VERSION\` | the same tag |
 
-          Each binary is the broker, the Kafka pipe, the Application API and the CLI;
-          \`modbee --version\` lists them. Docker: \`ghcr.io/mod-bee/modbee-mqtt:$VERSION\`.
+          \`\`\`sh
+          sudo apt install ./modbee_${VERSION}-1_amd64.deb     # or: sudo dnf install ./modbee-$VERSION-1.x86_64.rpm
+          sudo systemctl enable --now modbee
+          \`\`\`
+
+          Each is the broker, the Kafka pipe, the Application API and the CLI;
+          \`modbee --version\` lists them. The \`.cdx.json\` files are each binary's SBOM:
+          every library inside, with its version and licence.
 
           ## Checking a download
 
           \`\`\`sh
-          gh attestation verify modbee-$VERSION-linux-x86_64.tar.gz --repo ${GITHUB_REPOSITORY}
+          gh attestation verify modbee_${VERSION}-1_amd64.deb --repo ${GITHUB_REPOSITORY}
           \`\`\`
 
-          or with cosign, or by checksum - [docs/releases.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/releases.md).
+          or against \`SHA256SUMS\`, signed with Sigstore - [docs/releases.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/releases.md).
           EOF
           cat notes.md
       - uses: actions/upload-artifact@v4

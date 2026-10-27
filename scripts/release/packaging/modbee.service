@@ -1,0 +1,31 @@
+[Unit]
+Description=ModBee MQTT broker
+Documentation=https://github.com/mod-bee/modbee-mqtt/blob/main/docs/releases.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=modbee
+Group=modbee
+# Settings as MODBEE_* variables (docs/kafka.md lists them), if this file is
+# there; modbee.yaml is the usual place.
+EnvironmentFile=-/etc/modbee/modbee.env
+ExecStart=/usr/bin/modbee serve -C /etc/modbee/modbee.yaml
+# Always: a setting applied with --restart stops modbee gracefully, exit code
+# 0, and this is what starts it again (docs/settings.md).
+Restart=always
+RestartSec=2
+# A stop is graceful - devices are told, messages on their way to Kafka are
+# given their time - and takes a few seconds at most.
+TimeoutStopSec=30
+StateDirectory=modbee
+StateDirectoryMode=0750
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

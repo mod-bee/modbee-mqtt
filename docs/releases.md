@@ -4,17 +4,19 @@ Each release on the [Releases page](https://github.com/mod-bee/modbee-mqtt/relea
 carries `modbee` ready to run - no compiler, nothing to install beside it -
 and the Docker image is published under the same version.
 
-| File | For |
-|---|---|
-| `modbee-<version>-linux-x86_64.tar.gz` | Linux on x86-64: one static binary, any distribution |
-| `modbee-<version>-linux-arm64.tar.gz` | Linux on ARM 64-bit: a Raspberry Pi 4 or 5, an ARM server |
-| `modbee-<version>-windows-x86_64.zip` | Windows on x86-64: `modbee.exe`, one file ([windows.md](windows.md)) |
-| `*.cdx.json` | Each one's SBOM (CycloneDX): every library inside it, with its version and licence |
-| `*.sigstore.json` | Each file's signature |
-| `SHA256SUMS` | The checksum of every file |
-| Docker | `ghcr.io/mod-bee/modbee-mqtt:<version>`, amd64 and arm64 ([docker.md](docker.md)) |
+| For | x86-64 | ARM 64-bit (Raspberry Pi 4/5, ARM servers) |
+|---|---|---|
+| **Debian, Ubuntu**: installs the modbee service | `modbee_<version>-1_amd64.deb` | `modbee_<version>-1_arm64.deb` |
+| **RHEL, Rocky, Alma, Fedora**: the same | `modbee-<version>-1.x86_64.rpm` | `modbee-<version>-1.aarch64.rpm` |
+| **Any Linux**: one file, nothing to install | `modbee-<version>-linux-x86_64` | `modbee-<version>-linux-arm64` |
+| **Windows**: one file, also a Windows service | `modbee-<version>-windows-x86_64.exe` | |
+| **Docker** ([docker.md](docker.md)) | `ghcr.io/mod-bee/modbee-mqtt:<version>` | the same tag |
 
-Every binary is the whole of it: the broker (`modbee serve`), the Kafka pipe,
+Beside them: `*.cdx.json`, each binary's SBOM (CycloneDX) - every library
+inside it, with its version and licence - and `SHA256SUMS` with its
+signature, `SHA256SUMS.sigstore.json`.
+
+Every one is the whole of it: the broker (`modbee serve`), the Kafka pipe,
 the Application API and every command. It says so itself:
 
 ```
@@ -26,79 +28,78 @@ modbee 0.1.0 (TLS: OpenSSL)
 
 The Linux binary is linked statically against musl, so it runs on any Linux
 of its architecture - Debian, Ubuntu, RHEL, Alpine, a distribution from ten
-years ago - with nothing else installed.
+years ago - with nothing else installed. The packages carry that same binary.
 
 ---
 
-## Installing on Linux
+## Installing on Debian or Ubuntu, RHEL or Fedora
 
 ```sh
-tar xzf modbee-0.1.0-linux-x86_64.tar.gz
-sudo install modbee-0.1.0-linux-x86_64/modbee /usr/local/bin/
-modbee --version
-```
-
-Run as a service with systemd - `Restart=always` is also what brings it back
-after a setting that needs a restart ([settings.md](settings.md#applying-a-change-the-restart)):
-
-```ini
-# /etc/systemd/system/modbee.service
-[Unit]
-Description=ModBee MQTT
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/modbee serve --config /etc/modbee/modbee.yaml
-Restart=always
-User=modbee
-StateDirectory=modbee
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```sh
-sudo useradd --system --no-create-home modbee
+sudo apt install ./modbee_0.1.0-1_amd64.deb        # Debian, Ubuntu
+sudo dnf install ./modbee-0.1.0-1.x86_64.rpm       # RHEL, Rocky, Alma, Fedora
 sudo systemctl enable --now modbee
 ```
 
+The package installs:
+
+| | |
+|---|---|
+| `/usr/bin/modbee` | the program |
+| `/etc/modbee/modbee.yaml` | its settings: port 1883, a login for every device, retained messages and sessions kept across restarts |
+| `/etc/modbee/admin-password` | the admin login's password - the login is `admin` - chosen at random when it was installed |
+| `/var/lib/modbee` | its data - the logins, sessions and retained messages - owned by the `modbee` user it creates |
+| the `modbee` service | systemd, restarted if it stops; not started until you enable it |
+
+An upgrade - installing a newer package - keeps what is in `/etc/modbee`
+and restarts a running broker on the new version. Removing the package keeps
+`/var/lib/modbee`: removing a program does not delete a plant's data.
+
+## Installing the binary on any Linux
+
+```sh
+chmod +x modbee-0.1.0-linux-x86_64
+sudo mv modbee-0.1.0-linux-x86_64 /usr/local/bin/modbee
+modbee --version
+```
+
+As a service, with systemd - the same unit the packages install,
+[modbee.service](../scripts/release/packaging/modbee.service), with
+`ExecStart=/usr/local/bin/modbee ...` and the `modbee` user and
+`/etc/modbee` made by hand. `Restart=always` is also what brings it back
+after a setting that needs a restart ([settings.md](settings.md#applying-a-change-the-restart)).
+
 ## Installing on Windows
 
-Unzip it anywhere; `modbee.exe service install` makes it a Windows service
-([windows.md](windows.md)).
+`modbee-0.1.0-windows-x86_64.exe` is the whole program: rename it
+`modbee.exe`, put it where it is to live, and `modbee.exe service install`
+makes it a Windows service ([windows.md](windows.md)).
 
 ---
 
 ## Checking a download
 
-Three ways, each enough on its own. They prove the file was built by this
+Any one of these is enough. Each proves the file was built by this
 repository's release workflow from the tagged commit, and not changed since.
 
-**GitHub's attestation** - with the [GitHub CLI](https://cli.github.com):
+**GitHub's attestation** - every file has one; with the [GitHub CLI](https://cli.github.com):
 
 ```sh
-gh attestation verify modbee-0.1.0-linux-x86_64.tar.gz --repo mod-bee/modbee-mqtt
+gh attestation verify modbee_0.1.0-1_amd64.deb --repo mod-bee/modbee-mqtt
 ```
 
-**Sigstore** - with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/),
-and the file's `.sigstore.json` beside it:
+**The checksums, signed** - `SHA256SUMS` lists every file, and is signed
+with Sigstore. Check the signature with
+[cosign](https://docs.sigstore.dev/cosign/system_config/installation/), then
+the files against it:
 
 ```sh
-cosign verify-blob modbee-0.1.0-linux-x86_64.tar.gz \
-  --bundle modbee-0.1.0-linux-x86_64.tar.gz.sigstore.json \
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
   --certificate-identity https://github.com/mod-bee/modbee-mqtt/.github/workflows/release.yml@refs/tags/v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
-
-**The checksum** - against `SHA256SUMS`, which is itself signed and attested
-the same way:
-
-```sh
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-On Windows: `Get-FileHash modbee-0.1.0-windows-x86_64.zip` and compare with
+On Windows: `Get-FileHash modbee-0.1.0-windows-x86_64.exe` and compare with
 its line in `SHA256SUMS`.
 
 ---
@@ -137,4 +138,6 @@ To build the Linux binary on your own machine, with only Docker:
 docker run --rm -v "$PWD":/src -w /src alpine:3.22 sh scripts/release/build-linux.sh
 ```
 
-It leaves the same `.tar.gz` and SBOM in `dist/` ([build-linux.sh](../scripts/release/build-linux.sh)).
+It leaves the binary and its SBOM in `dist/` ([build-linux.sh](../scripts/release/build-linux.sh));
+`sh scripts/release/packages.sh <version>` then makes the `.deb` and `.rpm`
+from the x86-64 and ARM64 binaries there.

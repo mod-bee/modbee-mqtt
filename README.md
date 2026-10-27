@@ -54,7 +54,7 @@ a Windows service too), and not part of the Arduino library.
 | **Retained messages that survive a restart** | Kept in memory as always, and in a file or a compacted Kafka topic as well, with one setting |
 | **Application API** | Your application beside the server, over gRPC (and REST for admin): consumer groups sharing devices' messages, publishing to devices, and managing connections, sessions and logins ([app-api.md](docs/app-api.md)) |
 | **`modbee` command** | Publish, subscribe, request/response and benchmark from a terminal |
-| **Downloads** | `modbee` for Linux (x86-64, ARM64) as one static binary, and `modbee.exe` for Windows - signed, with an SBOM ([releases.md](docs/releases.md)) |
+| **Downloads** | `.deb` and `.rpm` packages that install it as a systemd service, `modbee` for any Linux (x86-64, ARM64) as one static binary, and `modbee.exe` for Windows - attested, with an SBOM ([releases.md](docs/releases.md)) |
 | **Docker image** | `ghcr.io/mod-bee/modbee-mqtt`: the server and the `modbee` command, for amd64 and arm64 |
 
 ---

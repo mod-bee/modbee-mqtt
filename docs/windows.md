@@ -6,6 +6,12 @@ and run as a Windows service.
 
 ## Running it
 
+Download `modbee-<version>-windows-x86_64.exe` from the
+[Releases page](https://github.com/mod-bee/modbee-mqtt/releases), rename it
+`modbee.exe`, and put it where it is to live - it is the whole program, with
+nothing beside it ([releases.md](releases.md) shows how to check it is
+genuine).
+
 ```powershell
 modbee.exe serve --config C:\ModBee\modbee.yaml
 ```

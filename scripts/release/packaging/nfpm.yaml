@@ -1,0 +1,53 @@
+# modbee as a .deb and an .rpm, built by nfpm from the static release binary
+# (scripts/release/packages.sh sets the environment).
+#
+#   /usr/bin/modbee                       the program
+#   /usr/lib/systemd/system/modbee.service
+#   /etc/modbee/modbee.yaml               settings - kept across upgrades
+#   /etc/modbee/admin-password            made at install, never by the package
+#   /var/lib/modbee                       logins, sessions, retained messages
+name: modbee
+arch: ${MODBEE_ARCH}
+platform: linux
+version: ${MODBEE_VERSION}
+release: 1
+section: net
+priority: optional
+maintainer: ModBee <info@modbee.org>
+vendor: ModBee
+homepage: https://github.com/mod-bee/modbee-mqtt
+license: AGPL-3.0 with additional ModBee terms
+description: |
+  MQTT 5.0 and 3.1.1 broker, with a Kafka pipe and an Application API.
+  One broker per CPU core behind one port, device logins managed live,
+  sessions and retained messages that survive a restart, MQTT to Kafka and
+  back, and an Application API (gRPC) for the applications beside it.
+  One static binary; runs as the modbee systemd service.
+
+contents:
+  - src: build-packages/modbee
+    dst: /usr/bin/modbee
+    file_info:
+      mode: 0755
+  - src: scripts/release/packaging/modbee.service
+    dst: /usr/lib/systemd/system/modbee.service
+    file_info:
+      mode: 0644
+  - src: scripts/release/packaging/modbee.yaml
+    dst: /etc/modbee/modbee.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/modbee/LICENSE
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/modbee/README.md
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: scripts/release/packaging/postinstall.sh
+  preremove: scripts/release/packaging/preremove.sh
+  postremove: scripts/release/packaging/postremove.sh

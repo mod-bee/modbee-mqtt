@@ -39,11 +39,14 @@ built from it, as downloads for Linux and Windows and as a Docker image.
 
 ### Ready to run
 
+- `.deb` and `.rpm` packages, x86-64 and ARM64: one command installs modbee
+  as a systemd service, with a `modbee` user, a starting configuration and
+  an admin password chosen at install.
 - `modbee` for Linux as one static binary that runs on any distribution, and
   `modbee.exe` for Windows as one file - each with the broker, the Kafka pipe,
   the Application API and the CLI inside; `modbee --version` lists them.
-- Each signed with Sigstore, attested by GitHub, and listed in a CycloneDX
-  SBOM. [docs/releases.md](https://github.com/mod-bee/modbee-mqtt/blob/main/docs/releases.md)
+- Each attested by GitHub, with a CycloneDX SBOM, and a checksum list signed
+  with Sigstore. [docs/releases.md](https://github.com/mod-bee/modbee-mqtt/blob/main/docs/releases.md)
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 

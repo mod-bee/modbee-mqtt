@@ -15,8 +15,9 @@
 #       -e VCPKG_DEFAULT_BINARY_CACHE=/cache alpine:3.22 sh scripts/release/build-linux.sh
 #
 # Leaves, in dist/:
-#   modbee-<version>-linux-<arch>.tar.gz     modbee, LICENSE, README.md
+#   modbee-<version>-linux-<arch>            the binary
 #   modbee-<version>-linux-<arch>.cdx.json   its CycloneDX SBOM
+# from which packages.sh makes the .deb and .rpm.
 #
 # gRPC, protobuf, librdkafka and OpenSSL are built from source by vcpkg, at
 # the version VCPKG_TAG pins - Alpine packages none of them as static
@@ -83,10 +84,8 @@ for part in 'Kafka pipe: librdkafka.*ssl' 'sasl_scram' 'zstd' 'Application API: 
     grep -q "$part" build-release-linux.version.txt || { echo "build-linux: --version lacks: $part" >&2; exit 1; }
 done
 
-mkdir -p "dist/$name"
-cp "$binary" LICENSE README.md "dist/$name/"
-tar -C dist -czf "dist/$name.tar.gz" "$name"
-rm -rf "dist/$name"
+mkdir -p dist
+cp "$binary" "dist/$name"
 python3 scripts/release/sbom.py --installed "$VCPKG_ROOT/installed/$triplet" --version "$version" \
     --platform "linux-$arch" --out "dist/$name.cdx.json"
 
