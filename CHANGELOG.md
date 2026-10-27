@@ -13,6 +13,15 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **A Sparkplug B Host Application in the server** (`Sparkplug.PutHost` ... `DeleteHost`, `ListNodes`, `Rebirth`,
+  `Write`; `modbee-mqtt sparkplug-hosts ...`, `sparkplug nodes|rebirth|write`): the library's TCK-tested host on one
+  of the server's connections, its STATE that connection's Will. It follows every node's session and asks for
+  rebirths with limits (a gap past the reorder window, data with no birth, an unknown alias, a payload that does
+  not decode, every node when its own session begins); data delivered on the connection carries the names and
+  datatypes the births gave its aliases, and says `stale` (a death of a replaced session) and `gap`. Writes go by
+  alias at the birth's datatype, any datatype. Kept across restarts.
+- **A connection to this server itself** (`ConnectionSpec.this_server`): over loopback, with a login the server makes
+  at each start - what a Sparkplug host or edge node on the server's own devices runs on.
 - **Sparkplug B through the Application API, every part of it**: `ConsumeOpen.sparkplug` delivers `spBv1.0/...`
   messages decoded (`Delivery.sparkplug`) - every datatype, arrays, datasets, templates, property sets and their
   lists, metadata, compressed payloads (DEFLATE, GZIP) - `PublishRequest.sparkplug` publishes a typed payload, and

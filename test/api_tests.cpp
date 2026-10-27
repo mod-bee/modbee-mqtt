@@ -14,6 +14,7 @@
 #include "RetainedKeeper.h"
 #include "AppHub.h"
 #include "AppAdmin.h"
+#include "AppConnections.h"
 #include "ApiServer.h"
 #include "modbee/app/v1/app.grpc.pb.h"
 
@@ -37,6 +38,7 @@ const char* const kToken = "api-tests-token";
 struct Server {
     AppHub hub{AppHubConfig()};
     AppAdmin admin;
+    std::unique_ptr<AppConnections> connections;
     ShardExtensionChain chain;
     ShardedBroker broker;
     ApiServer api;
@@ -57,10 +59,20 @@ struct Server {
         a.token = kToken;
         a.serverVersion = "modbee-mqtt test";
         a.serverId = "api-tests";
+        // Connections - one to this server itself among them, which is where a
+        // Sparkplug host on its own devices runs.
+        connections.reset(new AppConnections(hub, ""));
+        connections->reachThisServer([this](AppConnections::ThisServer& where) {
+            where.port = broker.port();
+            return where.port != 0;
+        });
+        std::string error;
+        connections->start(error);
         ApiServer::Services s;
         s.messages = &hub;
         s.admin = &admin;
         s.server = &broker;
+        s.connections = connections.get();
         std::string why;
         started = api.start(a, s, why);
         if (!started) std::printf("    api: %s\n", why.c_str());
@@ -68,6 +80,7 @@ struct Server {
     }
     ~Server() {
         api.stop();
+        if (connections) connections->stop();
         broker.stop();
     }
     std::shared_ptr<grpc::Channel> channel() {
@@ -389,6 +402,236 @@ void sparkplugCodec(Server& server) {
     }
 }
 
+// What a watcher on the broker has seen on a topic.
+size_t seen(Client& c, const std::string& topic) {
+    size_t n = 0;
+    for (const check::Got& g : c.got) n += g.topic == topic ? 1 : 0;
+    return n;
+}
+
+void sparkplugHost(Server& server) {
+    section("a Sparkplug host in the server: STATE, aliases resolved in what it delivers, the registry, writes, rebirths");
+    auto connections = v1::Connections::NewStub(server.channel());
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    auto messages = v1::Messages::NewStub(server.channel());
+    Fleet fleet(server.broker.port());
+    Client& watcher = fleet.make("watcher");
+    watcher.subscribe("spBv1.0/STATE/#", MQ_QOS_1);
+    watcher.subscribe("spBv1.0/plant/NBIRTH/#", MQ_QOS_1);
+    ok(fleet.connected(watcher) && fleet.until([&] { return watcher.subscribed >= 2; }), "a watcher on STATE and births");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::ConnectionSpec local;
+        local.set_id("local");
+        local.set_this_server(true);
+        local.set_client_id("sparkplug-host");
+        v1::ConnectionInfo info;
+        ok(connections->Put(&c, local, &info).ok(), "a connection to this server itself");
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostSpec host;
+        host.set_id("h");
+        host.set_connection("local");
+        host.set_host_id("platform");
+        host.set_group("plant");
+        host.set_reorder_timeout_ms(200);
+        host.set_rebirth_min_interval_ms(0);
+        v1::SparkplugHostInfo info;
+        ok(sparkplug->PutHost(&c, host, &info).ok(), "PutHost on it");
+    }
+    ok(fleet.until([&] {
+           for (const check::Got& g : watcher.got) {
+               if (g.topic == "spBv1.0/STATE/platform" && g.payload.find("\"online\":true") != std::string::npos) return true;
+           }
+           return false;
+       }),
+       "  its STATE is born");
+
+    grpc::ClientContext consumeContext;
+    authorize(consumeContext);
+    std::unique_ptr<grpc::ClientReaderWriter<v1::ConsumeUp, v1::ConsumeDown>> stream(messages->Consume(&consumeContext));
+    v1::ConsumeUp open;
+    open.mutable_open()->set_connection("local");
+    open.mutable_open()->add_filters("spBv1.0/plant/#");
+    open.mutable_open()->set_sparkplug(true);
+    stream->Write(open);
+    v1::ConsumeDown down;
+    ok(stream->Read(&down) && down.has_opened(), "a Consume stream on the host's connection, sparkplug: true");
+    std::mutex lock;
+    std::vector<v1::SparkplugMessage> got;
+    std::thread reader([&] {
+        v1::ConsumeDown d;
+        while (stream->Read(&d)) {
+            if (!d.has_delivery()) continue;
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                got.push_back(d.delivery().sparkplug());
+            }
+            v1::ConsumeUp ack;
+            ack.mutable_ack()->add_ids(d.delivery().id());
+            stream->Write(ack);
+        }
+    });
+    auto find = [&](v1::SparkplugKind kind, std::function<bool(const v1::SparkplugMessage&)> also) {
+        std::lock_guard<std::mutex> guard(lock);
+        for (const v1::SparkplugMessage& m : got) {
+            if (m.kind() == kind && also(m)) return true;
+        }
+        return false;
+    };
+
+    // The library's edge node (a board's, TCK-tested): aliases in its data, datatypes only in its birth.
+    MqttTcpTransport transport;
+    transport.configure("127.0.0.1", server.broker.port());
+    MqttSparkplugNode node(transport);
+    node.group("plant");
+    node.node("gw-1");
+    node.server("127.0.0.1", server.broker.port());
+    node.epochNow((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count());
+    node.declare("Level", MqttSparkplugDataType::Int8);
+    node.declareWritable("Setpoint", MqttSparkplugDataType::Double);
+    MqttSparkplugValue level;
+    level.type = MqttSparkplugDataType::Int8;
+    node.connect();
+    auto run = [&](std::function<bool()> done, int ms = 5000) {
+        return check::until(done, [&] { node.poll(); fleet.poll(); }, ms);
+    };
+    ok(run([&] { return node.isBorn(); }), "an edge node is born");
+    level.as.signedValue = -5;
+    node.set("Level", level);
+    node.publishChanged();
+    ok(run([&] {
+           return find(v1::SPARKPLUG_NDATA, [](const v1::SparkplugMessage& m) {
+               return m.payload().metrics_size() == 1 && m.payload().metrics(0).name() == "Level" &&
+                      m.payload().metrics(0).datatype() == v1::DATATYPE_INT8 &&
+                      m.payload().metrics(0).value().int_value() == -5 && m.payload().metrics(0).has_alias();
+           });
+       }),
+       "its NDATA is delivered with the name and datatype its birth gave the alias: Level, Int8, -5");
+
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugNodesRequest request;
+        request.set_host("h");
+        v1::SparkplugNodesReply reply;
+        bool shown = false;
+        if (sparkplug->ListNodes(&c, request, &reply).ok() && reply.nodes_size() == 1) {
+            const v1::SparkplugNode& n = reply.nodes(0);
+            for (const v1::SparkplugNodeMetric& m : n.metrics()) {
+                if (m.name() == "Level") shown = n.online() && n.has_bd_seq() && m.value().int_value() == -5;
+            }
+        }
+        ok(shown, "ListNodes: the node online, its bdSeq, Level's last value");
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugWriteRequest write;
+        write.set_host("h");
+        write.set_group("plant");
+        write.set_node("gw-1");
+        v1::SparkplugMetric* setpoint = write.add_metrics();
+        setpoint->set_name("Setpoint");
+        setpoint->mutable_value()->set_double_value(42.5);
+        v1::SparkplugCommandReply reply;
+        ok(sparkplug->Write(&c, write, &reply).ok() && reply.sent(), "Write Setpoint = 42.5 (an NCMD, by its alias)");
+    }
+    const int setpointAt = node.indexOf(nullptr, "Setpoint");
+    MqttSparkplugValue written;
+    ok(run([&] { return setpointAt >= 0 && node.commandPendingAt((size_t)setpointAt); }) &&
+           node.takeAt((size_t)setpointAt, written) && written.as.float64 == 42.5,
+       "  the node has it: 42.5");
+
+    const size_t births = seen(watcher, "spBv1.0/plant/NBIRTH/gw-1");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugRebirthRequest rebirth;
+        rebirth.set_host("h");
+        rebirth.set_group("plant");
+        rebirth.set_node("gw-1");
+        v1::SparkplugCommandReply reply;
+        ok(sparkplug->Rebirth(&c, rebirth, &reply).ok() && reply.sent(), "Rebirth");
+    }
+    ok(run([&] { return seen(watcher, "spBv1.0/plant/NBIRTH/gw-1") > births; }), "  the node is born again");
+
+    // A gap the reorder window does not close: a rebirth asked for, and the message marked.
+    const size_t before = seen(watcher, "spBv1.0/plant/NBIRTH/gw-1");
+    {
+        v1::SparkplugPayload p;
+        p.set_seq(200);
+        p.set_timestamp(1793000000000ull);
+        std::string bytes, error;
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEncodeRequest encode;
+        *encode.mutable_payload() = p;
+        v1::SparkplugEncodeReply reply;
+        sparkplug->Encode(&c, encode, &reply);
+        Client& rogue = fleet.make("rogue");
+        ok(fleet.connected(rogue), "something publishes as the node, out of sequence");
+        rogue.publish("spBv1.0/plant/NDATA/gw-1", reply.payload(), MQ_QOS_1);
+    }
+    ok(run([&] { return find(v1::SPARKPLUG_NDATA, [](const v1::SparkplugMessage& m) { return m.gap(); }); }),
+       "  delivered marked gap");
+    ok(run([&] { return seen(watcher, "spBv1.0/plant/NBIRTH/gw-1") > before; }),
+       "  and once the reorder window passes, the node is asked to rebirth, and is born again");
+
+    // A death whose bdSeq is not the live session's - an old Will, say - is no death.
+    {
+        v1::SparkplugPayload p;
+        p.set_timestamp(1793000000000ull);
+        v1::SparkplugMetric* bd = p.add_metrics();
+        bd->set_name("bdSeq");
+        bd->set_datatype(v1::DATATYPE_UINT64);
+        bd->mutable_value()->set_uint_value(99);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEncodeRequest encode;
+        *encode.mutable_payload() = p;
+        v1::SparkplugEncodeReply reply;
+        sparkplug->Encode(&c, encode, &reply);
+        Client& old = fleet.make("old-will");
+        fleet.connected(old);
+        old.publish("spBv1.0/plant/NDEATH/gw-1", reply.payload(), MQ_QOS_1);
+    }
+    ok(run([&] { return find(v1::SPARKPLUG_NDEATH, [](const v1::SparkplugMessage& m) { return m.stale(); }); }),
+       "an NDEATH of a session already replaced: delivered marked stale");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugNodesRequest request;
+        request.set_host("h");
+        v1::SparkplugNodesReply reply;
+        sparkplug->ListNodes(&c, request, &reply);
+        ok(reply.nodes_size() == 1 && reply.nodes(0).online(), "  and the node is still online");
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostRef ref;
+        ref.set_id("h");
+        v1::Empty none;
+        ok(sparkplug->DeleteHost(&c, ref, &none).ok(), "DeleteHost");
+    }
+    ok(fleet.until([&] {
+           for (const check::Got& g : watcher.got) {
+               if (g.topic == "spBv1.0/STATE/platform" && g.payload.find("\"online\":false") != std::string::npos) return true;
+           }
+           return false;
+       }),
+       "  its STATE made offline first");
+    node.disconnect();
+    run([] { return false; }, 200);
+    consumeContext.TryCancel();
+    reader.join();
+}
+
 v1::Session sessionOf(Server& server, const std::string& clientId) {
     auto admin = v1::Admin::NewStub(server.channel());
     grpc::ClientContext context;
@@ -521,6 +764,7 @@ int main() {
     helloAndToken(server);
     if (server.started) consumeAndPublish(server);
     if (server.started) sparkplugCodec(server);
+    if (server.started) sparkplugHost(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);
     return check::report("api_tests");

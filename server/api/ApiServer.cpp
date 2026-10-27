@@ -327,6 +327,7 @@ AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     }
     s.reconnectWhenAsked = wire.reconnect() == v1::RECONNECT_WHEN_ASKED;
     s.primaryCheckSeconds = wire.primary_check_seconds() ? wire.primary_check_seconds() : 60;
+    s.thisServer = wire.this_server();
     s.willDelaySeconds = wire.will_delay_seconds();
     s.receiveMaximum = (uint16_t)std::min<uint32_t>(wire.receive_maximum(), 65535);
     s.topicAliasMaximum = (uint16_t)std::min<uint32_t>(wire.topic_alias_maximum(), 65535);
@@ -366,6 +367,7 @@ void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
         will->set_retain(info.spec.will.retain);
         propertiesTo(info.spec.will.properties, *will->mutable_properties());
     }
+    s->set_this_server(info.spec.thisServer);
     s->set_will_delay_seconds(info.spec.willDelaySeconds);
     s->set_receive_maximum(info.spec.receiveMaximum);
     s->set_topic_alias_maximum(info.spec.topicAliasMaximum);
@@ -1107,6 +1109,10 @@ public:
             if (_ending) return;
             _queue.emplace_back();
             deliveryTo(id, message, replay, redelivered, _queue.back());
+            // What a host on the connection knew of its aliases, for dress().
+            if (_sparkplug && (!message.sparkplugNames.empty() || message.sparkplugFlags != 0)) {
+                _hosted[id] = std::make_pair(message.sparkplugNames, message.sparkplugFlags);
+            }
             if (_writing || _holding) return;
             _writing = true;
             next = &_queue.front();
@@ -1172,7 +1178,20 @@ private:
         if (!_sparkplug || down == nullptr || !down->has_delivery()) return;
         v1::Delivery& d = *down->mutable_delivery();
         if (d.has_sparkplug() || !sparkplug_codec::isSparkplugTopic(d.topic())) return;
-        sparkplug_codec::decode(d.topic(), d.payload(), *d.mutable_sparkplug());
+        std::pair<std::vector<AppSparkplugName>, uint8_t> hosted;
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            auto at = _hosted.find(d.id());
+            if (at != _hosted.end()) {
+                hosted.first.swap(at->second.first);
+                hosted.second = at->second.second;
+                _hosted.erase(at);
+            }
+        }
+        v1::SparkplugMessage& sparkplug = *d.mutable_sparkplug();
+        sparkplug_codec::decode(d.topic(), d.payload(), sparkplug, hosted.first.empty() ? nullptr : &hosted.first);
+        sparkplug.set_stale((hosted.second & AppMessage::kSparkplugStale) != 0);
+        sparkplug.set_gap((hosted.second & AppMessage::kSparkplugGap) != 0);
     }
 
     bool open(const v1::ConsumeOpen& wire) {
@@ -1257,6 +1276,7 @@ private:
     bool _ending = false;
     bool _finished = false;
     bool _sparkplug = false;
+    std::map<uint64_t, std::pair<std::vector<AppSparkplugName>, uint8_t>> _hosted;   // by delivery id
     grpc::Status _status = grpc::Status::OK;
 };
 
@@ -1531,6 +1551,7 @@ public:
         if (_admin) reply->add_features("admin.listeners");
         if (_messages) reply->add_features("events.handshake");
         reply->add_features("sparkplug.codec");
+        if (_connections) reply->add_features("sparkplug.host");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1771,9 +1792,209 @@ private:
 // Sparkplug: the codec on its own
 // =============================================================================
 
+void hostSpecTo(const AppSparkplugHostSpec& spec, v1::SparkplugHostSpec& wire) {
+    wire.set_id(spec.id);
+    wire.set_connection(spec.connection);
+    wire.set_host_id(spec.hostId);
+    wire.set_group(spec.group);
+    wire.set_rebirth_on_gap(spec.rebirthOnGap);
+    wire.set_reorder_timeout_ms(spec.reorderTimeoutMs);
+    wire.set_rebirth_min_interval_ms(spec.rebirthMinIntervalMs);
+}
+
+void hostInfoTo(const AppSparkplugHostInfo& info, v1::SparkplugHostInfo& wire) {
+    hostSpecTo(info.spec, *wire.mutable_spec());
+    wire.set_online(info.online);
+    wire.set_nodes(info.nodes);
+    wire.set_decode_failures(info.decodeFailures);
+    wire.set_rebirths_requested(info.rebirthsRequested);
+}
+
 class SparkplugService final : public v1::Sparkplug::CallbackService {
 public:
-    explicit SparkplugService(const ApiServerConfig& config) : _config(config) {}
+    SparkplugService(const ApiServerConfig& config, AppConnections* connections, AppHub* hub)
+        : _config(config), _connections(connections), _hub(hub) {}
+
+    // Every host call: the token, and the connections it lives on.
+    bool ready(grpc::CallbackServerContext* context, grpc::ServerUnaryReactor* reactor) {
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+            return false;
+        }
+        if (_connections == nullptr || _hub == nullptr) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::UNAVAILABLE, "this server keeps no connections"));
+            return false;
+        }
+        return true;
+    }
+
+    grpc::ServerUnaryReactor* PutHost(grpc::CallbackServerContext* context, const v1::SparkplugHostSpec* request,
+                                      v1::SparkplugHostInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        AppSparkplugHostSpec spec;
+        spec.id = request->id();
+        spec.connection = request->connection();
+        spec.hostId = request->host_id();
+        spec.group = request->group();
+        spec.rebirthOnGap = request->has_rebirth_on_gap() ? request->rebirth_on_gap() : true;
+        if (request->has_reorder_timeout_ms()) spec.reorderTimeoutMs = request->reorder_timeout_ms();
+        if (request->has_rebirth_min_interval_ms()) spec.rebirthMinIntervalMs = request->rebirth_min_interval_ms();
+        AppSparkplugHostInfo info;
+        std::string error;
+        if (!_connections->putHost(spec, &info, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
+        hostInfoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* GetHost(grpc::CallbackServerContext* context, const v1::SparkplugHostRef* request,
+                                      v1::SparkplugHostInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        AppSparkplugHostInfo info;
+        if (!_connections->getHost(request->id(), info)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, "no host \"" + request->id() + "\""));
+            return reactor;
+        }
+        hostInfoTo(info, *reply);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* ListHosts(grpc::CallbackServerContext* context, const v1::Empty*,
+                                        v1::SparkplugHostList* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        for (const AppSparkplugHostInfo& info : _connections->hosts()) hostInfoTo(info, *reply->add_hosts());
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* DeleteHost(grpc::CallbackServerContext* context, const v1::SparkplugHostRef* request,
+                                         v1::Empty*) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        reactor->Finish(_connections->removeHost(request->id())
+                            ? grpc::Status::OK
+                            : grpc::Status(grpc::StatusCode::NOT_FOUND, "no host \"" + request->id() + "\""));
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* ListNodes(grpc::CallbackServerContext* context, const v1::SparkplugNodesRequest* request,
+                                        v1::SparkplugNodesReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::vector<AppSparkplugNodeInfo> nodes;
+        std::string error;
+        if (!_connections->nodes(request->host(), request->group(), request->node(), nodes, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, error));
+            return reactor;
+        }
+        for (const AppSparkplugNodeInfo& n : nodes) {
+            v1::SparkplugNode* out = reply->add_nodes();
+            out->set_group(n.group);
+            out->set_node(n.node);
+            out->set_online(n.online);
+            if (n.hasBdSeq) out->set_bd_seq(n.bdSeq);
+            if (n.hasSeq) out->set_last_seq(n.lastSeq);
+            out->set_messages(n.messages);
+            out->set_gaps(n.gaps);
+            out->set_rebirths_requested(n.rebirthsRequested);
+            for (const std::string& d : n.devices) out->add_devices(d);
+            for (const AppSparkplugMetricInfo& m : n.metrics) {
+                v1::SparkplugNodeMetric* metric = out->add_metrics();
+                metric->set_name(m.name);
+                metric->set_device(m.device);
+                if (m.hasAlias) metric->set_alias(m.alias);
+                metric->set_datatype((v1::SparkplugDataType)m.datatype);
+                metric->set_timestamp(m.at);
+                switch (m.kind) {
+                case AppSparkplugMetricInfo::Signed: metric->mutable_value()->set_int_value(m.i); break;
+                case AppSparkplugMetricInfo::Unsigned: metric->mutable_value()->set_uint_value(m.u); break;
+                case AppSparkplugMetricInfo::Real:
+                    if (m.datatype == v1::DATATYPE_FLOAT) metric->mutable_value()->set_float_value((float)m.d);
+                    else metric->mutable_value()->set_double_value(m.d);
+                    break;
+                case AppSparkplugMetricInfo::Boolean: metric->mutable_value()->set_boolean_value(m.b); break;
+                default: break;
+                }
+            }
+        }
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* Rebirth(grpc::CallbackServerContext* context, const v1::SparkplugRebirthRequest* request,
+                                      v1::SparkplugCommandReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::string error;
+        if (!_connections->rebirth(request->host(), request->group(), request->node(), request->device(), error)) {
+            reactor->Finish(grpc::Status(error.find("no host") == 0 ? grpc::StatusCode::NOT_FOUND
+                                                                    : grpc::StatusCode::FAILED_PRECONDITION,
+                                         error));
+            return reactor;
+        }
+        reply->set_sent(true);
+        reactor->Finish(grpc::Status::OK);
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* Write(grpc::CallbackServerContext* context, const v1::SparkplugWriteRequest* request,
+                                    v1::SparkplugCommandReply* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::string connection, error;
+        std::vector<AppSparkplugNodeInfo> nodes;
+        if (!_connections->hostConnection(request->host(), connection) ||
+            !_connections->nodes(request->host(), request->group(), request->node(), nodes, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, "no host \"" + request->host() + "\""));
+            return reactor;
+        }
+        // By the alias and at the datatype the birth gave each metric: a command names no metric its node
+        // gave an alias ([tck-id-payloads-alias-data-cmd-requirement]).
+        v1::SparkplugPayload payload;
+        payload.set_timestamp((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch()).count());
+        for (const v1::SparkplugMetric& wanted : request->metrics()) {
+            v1::SparkplugMetric* m = payload.add_metrics();
+            *m = wanted;
+            if (nodes.empty()) continue;
+            for (const AppSparkplugMetricInfo& known : nodes[0].metrics) {
+                if (known.name != wanted.name() || known.device != request->device()) continue;
+                if (m->datatype() == v1::DATATYPE_UNKNOWN) m->set_datatype((v1::SparkplugDataType)known.datatype);
+                if (known.hasAlias) {
+                    m->set_alias(known.alias);
+                    m->clear_name();
+                }
+                break;
+            }
+        }
+        AppPublish message;
+        message.connection = connection;
+        message.topic = "spBv1.0/" + request->group() + (request->device().empty() ? "/NCMD/" : "/DCMD/") +
+                        request->node() + (request->device().empty() ? "" : "/" + request->device());
+        message.qos = 0;
+        message.origin = "sparkplug";
+        if (!sparkplug_codec::encode(payload, false, message.payload, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
+        _hub->publish(message, [reactor, reply](const AppPublishResult& result) {
+            const bool sent = result.outcome == AppPublishOutcome::Accepted ||
+                              result.outcome == AppPublishOutcome::Delivered ||
+                              result.outcome == AppPublishOutcome::NoSubscribers ||
+                              result.outcome == AppPublishOutcome::Stored;
+            reply->set_sent(sent);
+            reactor->Finish(sent ? grpc::Status::OK
+                                 : grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "the host's connection is not up"));
+        });
+        return reactor;
+    }
 
     grpc::ServerUnaryReactor* Decode(grpc::CallbackServerContext* context, const v1::SparkplugDecodeRequest* request,
                                      v1::SparkplugMessage* reply) override {
@@ -1810,6 +2031,8 @@ public:
 
 private:
     const ApiServerConfig& _config;
+    AppConnections* _connections;
+    AppHub* _hub;
 };
 
 class AuthorityService final : public v1::Authority::CallbackService {
@@ -1932,7 +2155,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
-    self.sparkplug.reset(new SparkplugService(self.config));
+    self.sparkplug.reset(new SparkplugService(self.config, connections, messages));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

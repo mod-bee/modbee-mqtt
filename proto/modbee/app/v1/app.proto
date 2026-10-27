@@ -429,6 +429,96 @@ message DeleteGroupReply {
 service Sparkplug {
   rpc Decode(SparkplugDecodeRequest) returns (SparkplugMessage);
   rpc Encode(SparkplugEncodeRequest) returns (SparkplugEncodeReply);
+
+  // A Host Application the server runs, on one of its connections (Connections.Put; this_server for its own
+  // devices). Its STATE becomes that connection's Will - born at each connect with the Will's own timestamp, made
+  // offline before an intended stop, born again if anything says otherwise - and it follows every node's session:
+  // bdSeq, seq, aliases. It asks a node to rebirth when its stream cannot be trusted - a gap the reorder window did
+  // not close, data from a node with no birth, an alias no birth gave, a payload that does not decode, and every
+  // node when its own session begins - at most once a rebirth_min_interval per node. Deliveries on the connection
+  // (ConsumeOpen.sparkplug) come with names and datatypes filled in from the births, and say what the host made of
+  // them (SparkplugMessage.stale, .gap). Kept in the state directory; stays up while the application restarts.
+  rpc PutHost(SparkplugHostSpec) returns (SparkplugHostInfo);
+  rpc GetHost(SparkplugHostRef) returns (SparkplugHostInfo);
+  rpc ListHosts(Empty) returns (SparkplugHostList);
+  rpc DeleteHost(SparkplugHostRef) returns (Empty);           // its STATE made offline first
+  // What the host knows of its nodes now: sessions, devices, every declared metric, and the last value of each
+  // number and bool.
+  rpc ListNodes(SparkplugNodesRequest) returns (SparkplugNodesReply);
+  // Node Control/Rebirth (or, with `device`, Device Control/Rebirth), now - asked by a person, so not limited.
+  rpc Rebirth(SparkplugRebirthRequest) returns (SparkplugCommandReply);
+  // NCMD / DCMD: metrics by name, sent by the alias and at the datatype their birth gave (any datatype). Node and
+  // Device Control metrics too (Next Server, Scan Rate, Reboot).
+  rpc Write(SparkplugWriteRequest) returns (SparkplugCommandReply);
+}
+
+message SparkplugHostSpec {
+  string id = 1;                   // this server's name for it
+  string connection = 2;           // the connection it runs on (one host each)
+  string host_id = 3;              // its Sparkplug Host Application id: spBv1.0/STATE/<host_id>
+  string group = 4;                // the group it follows; "": every group
+  optional bool rebirth_on_gap = 5; // ask for rebirths as above; absent: true
+  optional uint32 reorder_timeout_ms = 6;        // how long a gap waits for the missing message (default 2000; 0: none)
+  optional uint32 rebirth_min_interval_ms = 7;   // per node (default 60000)
+}
+message SparkplugHostRef {
+  string id = 1;
+}
+message SparkplugHostInfo {
+  SparkplugHostSpec spec = 1;
+  bool online = 2;                 // its STATE is born, on a connection that is up
+  uint64 nodes = 3;
+  uint64 decode_failures = 4;
+  uint64 rebirths_requested = 5;
+}
+message SparkplugHostList {
+  repeated SparkplugHostInfo hosts = 1;
+}
+
+message SparkplugNodesRequest {
+  string host = 1;
+  string group = 2;                // "": every group
+  string node = 3;                 // "": every node
+}
+message SparkplugNodesReply {
+  repeated SparkplugNode nodes = 1;
+}
+message SparkplugNode {
+  string group = 1;
+  string node = 2;
+  bool online = 3;
+  optional uint64 bd_seq = 4;
+  optional uint32 last_seq = 5;
+  uint32 messages = 6;
+  uint32 gaps = 7;
+  uint32 rebirths_requested = 8;
+  repeated string devices = 9;
+  repeated SparkplugNodeMetric metrics = 10;
+}
+message SparkplugNodeMetric {
+  string name = 1;
+  string device = 2;               // "" for the node's own
+  optional uint64 alias = 3;
+  SparkplugDataType datatype = 4;
+  SparkplugValue value = 5;        // the last, for a number or a bool; unset otherwise
+  uint64 timestamp = 6;
+}
+
+message SparkplugRebirthRequest {
+  string host = 1;
+  string group = 2;
+  string node = 3;
+  string device = 4;               // "": the node
+}
+message SparkplugWriteRequest {
+  string host = 1;
+  string group = 2;
+  string node = 3;
+  string device = 4;               // "": an NCMD to the node; else a DCMD to it
+  repeated SparkplugMetric metrics = 5; // by name; alias and datatype come from the birth where it gave them
+}
+message SparkplugCommandReply {
+  bool sent = 1;
 }
 
 message SparkplugDecodeRequest {
@@ -453,6 +543,8 @@ message SparkplugMessage {
   bool online = 7;                 // STATE
   uint64 state_timestamp = 8;      // STATE
   string error = 9;                // it could not be read: why (the delivery still has the bytes)
+  bool stale = 10;                 // a host on the connection: an NDEATH of a session already replaced - not a death
+  bool gap = 11;                   // a host on the connection: seq skipped one or more
 }
 
 enum SparkplugKind {
@@ -640,6 +732,10 @@ message ConnectionSpec {
   uint32 receive_maximum = 16;     // QoS 1/2 messages the other broker may have in flight to it; 0: 65535
   uint32 topic_alias_maximum = 17; // 0: none
   uint32 maximum_packet_size = 18; // the largest it takes; 0: no limit
+  // This server itself, as one of its own clients - `servers` not needed: what a Sparkplug host or edge node on the
+  // server's own devices runs on. Over loopback, on the plain listener (or the TLS one), with a login the server
+  // keeps for it - an ordinary one: every topic but the $ ones.
+  bool this_server = 19;
 }
 
 // What a bridge does (EMQX's buffer, HiveMQ Edge, Mosquitto's bridge queue): every publish on the connection is

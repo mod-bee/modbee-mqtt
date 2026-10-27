@@ -36,6 +36,13 @@ static const ApiCommand kApiCommands[] = {
 
     {"sparkplug", "decode", "Sparkplug.Decode", ""},
     {"sparkplug", "encode", "Sparkplug.Encode", ""},
+    {"sparkplug-hosts", "put", "Sparkplug.PutHost", ""},
+    {"sparkplug-hosts", "get", "Sparkplug.GetHost", ""},
+    {"sparkplug-hosts", "list", "Sparkplug.ListHosts", ""},
+    {"sparkplug-hosts", "delete", "Sparkplug.DeleteHost", ""},
+    {"sparkplug", "nodes", "Sparkplug.ListNodes", ""},
+    {"sparkplug", "rebirth", "Sparkplug.Rebirth", ""},
+    {"sparkplug", "write", "Sparkplug.Write", ""},
 
     {"messages", "consume", "Messages.Consume", ""},
     {"messages", "publish", "Messages.Publish", "POST /v1/publish"},

@@ -133,6 +133,14 @@ std::string encodeMessage(const AppMessage& m) {
         put(out, (uint64_t)e.timeMs);
         put(out, (uint64_t)e.reasonCode | ((uint64_t)e.qos << 32));
         put(out, e.detail);
+    } else {
+        // What a Sparkplug host knew of its aliases (written since; an older file's messages end before it).
+        put(out, (uint64_t)m.sparkplugNames.size() | ((uint64_t)m.sparkplugFlags << 56));
+        for (const AppSparkplugName& n : m.sparkplugNames) {
+            put(out, n.alias);
+            put(out, n.name);
+            put(out, (uint64_t)n.datatype);
+        }
     }
     return out;
 }
@@ -167,6 +175,17 @@ bool decodeMessage(const void* data, int size, AppMessage& m) {
         e.qos = (uint32_t)(codes >> 32);
         // Written since handshake-failed events: an older file's events end here.
         if (r.ok && r.at < r.end) e.detail = r.text();
+    } else if (r.ok && r.at < r.end) {
+        const uint64_t head = r.number();
+        m.sparkplugFlags = (uint8_t)(head >> 56);
+        const uint64_t count = head & 0xFFFFFFFFull;
+        for (uint64_t i = 0; i < count && r.ok; i++) {
+            AppSparkplugName n;
+            n.alias = r.number();
+            n.name = r.text();
+            n.datatype = (uint32_t)r.number();
+            m.sparkplugNames.push_back(n);
+        }
     }
     return r.ok;
 }

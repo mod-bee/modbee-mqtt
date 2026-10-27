@@ -503,7 +503,8 @@ bool deflate(const std::string& in, std::string& out) {
 
 bool isSparkplugTopic(const std::string& topic) { return topic.compare(0, 8, "spBv1.0/") == 0; }
 
-bool decode(const std::string& topic, const std::string& payload, v1::SparkplugMessage& out) {
+bool decode(const std::string& topic, const std::string& payload, v1::SparkplugMessage& out,
+            const std::vector<AppSparkplugName>* names) {
     std::vector<std::string> parts;
     size_t start = 0;
     for (size_t i = 0; i <= topic.size(); i++) {
@@ -582,7 +583,18 @@ bool decode(const std::string& topic, const std::string& payload, v1::SparkplugM
     p.set_uuid(w.uuid());
     p.set_body(w.body());
     std::string error;
-    for (const wire::Payload::Metric& m : w.metrics()) metricOf(m, *p.add_metrics(), error);
+    for (wire::Payload::Metric& m : *w.mutable_metrics()) {
+        // Alias only: the name and datatype the birth gave it, before its value is read at that datatype.
+        if (names != nullptr && m.has_alias() && m.name().empty()) {
+            for (const AppSparkplugName& n : *names) {
+                if (n.alias != m.alias()) continue;
+                if (!n.name.empty()) m.set_name(n.name);
+                if (!m.has_datatype() && n.datatype != 0) m.set_datatype(n.datatype);
+                break;
+            }
+        }
+        metricOf(m, *p.add_metrics(), error);
+    }
     if (!error.empty()) out.set_error(error);
     return error.empty();
 }

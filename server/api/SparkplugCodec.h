@@ -21,6 +21,7 @@
 // This is the server's, and lives only where protobuf does.
 
 #include "modbee/app/v1/app.pb.h"
+#include "AppHub.h"
 
 #include <string>
 
@@ -30,8 +31,11 @@ namespace sparkplug_codec {
 bool isSparkplugTopic(const std::string& topic);
 
 // The topic and its payload, read. False - with `out.error` saying why, and
-// what the topic said still filled in - when either cannot be.
-bool decode(const std::string& topic, const std::string& payload, modbee::app::v1::SparkplugMessage& out);
+// what the topic said still filled in - when either cannot be. `names`: what a
+// host knew of the aliases (data carries neither name nor, usually, datatype),
+// filled in where the payload has only the alias.
+bool decode(const std::string& topic, const std::string& payload, modbee::app::v1::SparkplugMessage& out,
+            const std::vector<AppSparkplugName>* names = nullptr);
 
 // A payload's bytes; false, with `error`, for a value its datatype cannot hold.
 bool encode(const modbee::app::v1::SparkplugPayload& payload, bool compress, std::string& out, std::string& error);

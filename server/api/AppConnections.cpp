@@ -7,6 +7,7 @@
 
 #include "Json.h"
 #include "MqttClient.h"
+#include "sparkplug/MqttSparkplugHost.h"
 #include "transport/MqttTcpTransport.h"
 #if MQTT_TLS_SOCKETS
 #include "transport/MqttTlsTransport.h"
@@ -125,6 +126,18 @@ void applyWill(const AppConnectionSpec& spec, MqttConnectionConfig& connection) 
     connection.will.delayInterval = spec.willDelaySeconds;
 }
 
+std::vector<std::string> topicParts(const std::string& topic) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= topic.size(); i++) {
+        if (i == topic.size() || topic[i] == '/') {
+            parts.push_back(topic.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    return parts;
+}
+
 bool writePrivate(const std::string& path, const std::string& text) {
     std::string ignored;
     return server_os::writeFileAtomically(path, text, ignored, 0600);
@@ -158,6 +171,7 @@ std::string toJson(const AppConnectionSpec& s) {
         o.raw("will", w.str());
     }
     o.add("whenAsked", s.reconnectWhenAsked);
+    if (s.thisServer) o.add("thisServer", true);
     o.add("primaryCheck", (long long)s.primaryCheckSeconds);
     o.add("receiveMaximum", (long long)s.receiveMaximum);
     o.add("topicAliasMaximum", (long long)s.topicAliasMaximum);
@@ -207,6 +221,7 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
         s.willDelaySeconds = (uint32_t)w.integer("delay");
     }
     s.reconnectWhenAsked = v.flag("whenAsked");
+    s.thisServer = v.flag("thisServer");
     s.primaryCheckSeconds = (uint32_t)v.integer("primaryCheck", 60);
     s.receiveMaximum = (uint16_t)v.integer("receiveMaximum");
     s.topicAliasMaximum = (uint16_t)v.integer("topicAliasMaximum");
@@ -218,12 +233,90 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
         s.storeMaxBytes = (uint64_t)k.integer("bytes", 64ll << 20);
         s.storeDropOldest = k.flag("dropOldest");
     }
-    return !s.id.empty() && !s.servers.empty();
+    return !s.id.empty() && (!s.servers.empty() || s.thisServer);
 }
 
 bool sameSpec(const AppConnectionSpec& a, const AppConnectionSpec& b) { return toJson(a) == toJson(b); }
 
 } // namespace
+
+// =============================================================================
+// A SPARKPLUG HOST ON A CONNECTION
+// =============================================================================
+//
+// The library's host does the protocol - STATE, sessions, seq, aliases - on
+// the connection's own client. This decides when to ask for a rebirth, with
+// limits, and tells the connection what each alias of the message it is about
+// to hand on meant: the library sees a message first (a client's hooks come
+// before its handler), so its tables are this message's.
+
+struct AppConnections::Host {
+    AppSparkplugHostSpec spec;
+    std::unique_ptr<MqttSparkplugHost> library;
+    // What the message being received means, for received() straight after.
+    std::vector<AppSparkplugName> names;
+    uint8_t flags = 0;
+    bool fresh = false;
+    std::map<std::string, uint32_t> gapsSeen;                // node -> its gaps at its last message
+    std::map<std::string, Clock::time_point> lastAsked;      // node -> its last rebirth request
+    std::map<std::string, mq_time_t> reorderAnswered;        // node -> the gap already answered
+    uint64_t rebirths = 0;
+    bool wasBorn = false;
+    uint32_t failures = 0;                                   // decode failures already answered
+
+    static std::string keyOf(const char* group, const char* node) {
+        return std::string(group ? group : "") + "/" + (node ? node : "");
+    }
+
+    // A rebirth, unless this node was asked within the limit (or a person asks).
+    bool ask(const char* group, const char* node, bool force) {
+        const std::string key = keyOf(group, node);
+        const Clock::time_point now = Clock::now();
+        auto last = lastAsked.find(key);
+        if (!force && last != lastAsked.end() &&
+            now - last->second < std::chrono::milliseconds(spec.rebirthMinIntervalMs)) {
+            return false;
+        }
+        if (!library->requestRebirth(group, node)) return false;
+        lastAsked[key] = now;
+        rebirths++;
+        return true;
+    }
+
+    static void inbound(void* context, const MqttSparkplugInbound& in) {
+        Host& h = *static_cast<Host*>(context);
+        h.names.clear();
+        h.flags = 0;
+        h.fresh = true;
+        const MqttSparkplugTrackedNode* node = h.library->findNode(in.group, in.node);
+        const bool data = in.type == MqttSparkplugType::NData || in.type == MqttSparkplugType::DData;
+        bool unknownAlias = false;
+        for (size_t i = 0; in.payload != nullptr && i < in.payload->metricCount; i++) {
+            const MqttSparkplugMetric& m = in.payload->metrics[i];
+            if (!m.hasAlias) continue;
+            AppSparkplugName n;
+            n.alias = m.alias;
+            const char* name = node ? node->metricName(m.alias) : nullptr;
+            if (name) n.name = name;
+            n.datatype = node ? (uint32_t)node->metricType(m.alias) : 0;
+            if (!name && data) unknownAlias = true;
+            h.names.push_back(n);
+        }
+        bool gap = false;
+        if (node != nullptr) {
+            if (in.type == MqttSparkplugType::NDeath && node->online) h.flags |= AppMessage::kSparkplugStale;
+            uint32_t& seen = h.gapsSeen[keyOf(in.group, in.node)];
+            if (node->gaps > seen) {
+                h.flags |= AppMessage::kSparkplugGap;
+                gap = true;
+            }
+            seen = node->gaps;
+        }
+        if (!h.spec.rebirthOnGap) return;
+        const bool noSession = (data || in.type == MqttSparkplugType::DBirth) && (node == nullptr || !node->online);
+        if ((gap && h.spec.reorderTimeoutMs == 0) || unknownAlias || noSession) h.ask(in.group, in.node, false);
+    }
+};
 
 // =============================================================================
 // ONE CONNECTION
@@ -340,11 +433,36 @@ struct AppConnections::Connection {
         if (message.properties) m->properties.copyForForwarding(*message.properties);
         m->brokerTimeMs = utcNowMs();
         m->connection = self.spec.id;
+        if (self.host) {
+            Host& h = *self.host;
+            if (h.fresh) {
+                m->sparkplugNames.swap(h.names);
+                m->sparkplugFlags = h.flags;
+            }
+            h.fresh = false;
+            // A payload the library could not read: its node is asked again.
+            if (h.library->decodeFailures() != h.failures) {
+                h.failures = h.library->decodeFailures();
+                const std::vector<std::string> parts = topicParts(m->topic);
+                if (h.spec.rebirthOnGap && parts.size() >= 4 && parts[0] == "spBv1.0" && parts[1] != "STATE") {
+                    h.ask(parts[1].c_str(), parts[3].c_str(), false);
+                }
+            }
+        }
         self.owner->_hub.connectionMessage(self.spec.id, m);
     }
 
-    const AppEndpoint& endpoint(uint32_t index) const { return spec.servers[index % spec.servers.size()]; }
-    uint16_t portOf(const AppEndpoint& e) const { return e.port ? e.port : (spec.tls ? 8883 : 1883); }
+    // This server itself, as reachThisServer() says now; or one of `servers`.
+    AppEndpoint here;
+    bool hereTls = false;
+    const AppEndpoint& endpoint(uint32_t index) const {
+        return spec.thisServer || spec.servers.empty() ? here : spec.servers[index % spec.servers.size()];
+    }
+    bool usesTls() const { return spec.thisServer ? hereTls : spec.tls; }
+    uint16_t portOf(const AppEndpoint& e) const { return e.port ? e.port : (usesTls() ? 8883 : 1883); }
+
+    // Last, so it goes before the client it is attached to.
+    std::unique_ptr<Host> host;
 
     void setState(AppConnectionState next, const std::string& error = std::string()) {
         if (next == state && error == lastError) return;
@@ -370,6 +488,7 @@ bool AppConnections::start(std::string& error) {
     if (!_outbox.open(_directory, _syncFull, error)) return false;
     if (!_directory.empty()) {
         server_os::makeDirectory(_directory, 0700);
+        if (!loadHosts(error)) return false;
         if (!load(error)) return false;
     }
     _hub.attachConnections(this);
@@ -450,6 +569,19 @@ void AppConnections::open(Connection& c) {
         connection.password.assign(c.spec.password.begin(), c.spec.password.end());
         connection.hasPassword = true;
     }
+    if (c.spec.thisServer) {
+        ThisServer where;
+        if (_thisServer && _thisServer(where)) {
+            c.here = AppEndpoint{where.host, where.port};
+            c.hereTls = where.tls;
+            if (where.hasLogin) {
+                connection.userName = where.user.c_str();
+                connection.hasUserName = true;
+                connection.password.assign(where.password.begin(), where.password.end());
+                connection.hasPassword = true;
+            }
+        }
+    }
     applyWill(c.spec, connection);
     connection.receiveMaximum = c.spec.receiveMaximum;
     connection.topicAliasMaximum = c.spec.topicAliasMaximum;
@@ -458,8 +590,10 @@ void AppConnections::open(Connection& c) {
     connection.host = first.host.c_str();
     connection.port = c.portOf(first);
 #if MQTT_TLS_SOCKETS
-    if (c.spec.tls) {
+    if (c.usesTls()) {
         MqttTlsTransport* tls = new MqttTlsTransport();
+        // This server, over loopback: its own certificate, not checked.
+        if (c.spec.thisServer) tls->setInsecureNoCertificateValidation();
         if (!c.spec.caPem.empty()) tls->setCaCertificate(c.spec.caPem.c_str());
         if (!c.spec.certificatePem.empty() && !_directory.empty()) {
             const std::string base = _directory + "/" + c.spec.id;
@@ -494,9 +628,67 @@ void AppConnections::open(Connection& c) {
     c.state = AppConnectionState::Connecting;
     c.nextAttempt = Clock::now();
     c.filtersChanged = true;
+    startHost(c);
+}
+
+void AppConnections::startHost(Connection& c) {
+    c.host.reset();
+    for (const auto& one : _hosts) {
+        if (one.second.connection != c.spec.id) continue;
+        std::unique_ptr<Host> h(new Host());
+        h->spec = one.second;
+        h->library.reset(new MqttSparkplugHost(c.client));
+        h->library->hostId(h->spec.hostId.c_str());
+        h->library->watch(h->spec.group.empty() ? nullptr : h->spec.group.c_str());
+        h->library->reorderTimeout(h->spec.reorderTimeoutMs);
+        h->library->actAsPrimary(false);          // rebirths are asked here, with limits
+        h->library->onMessage(&Host::inbound, h.get());
+        h->library->connect();                     // its STATE is this connection's Will from now on
+        c.host = std::move(h);
+        return;
+    }
+}
+
+void AppConnections::serviceHost(Connection& c) {
+    if (!c.host) return;
+    Host& h = *c.host;
+    // A gap the reorder window did not close: asked before the library's own
+    // pass forgets it.
+    if (h.spec.rebirthOnGap && h.spec.reorderTimeoutMs != 0) {
+        const mq_time_t now = mq_millis();
+        for (size_t i = 0; i < h.library->nodeCount(); i++) {
+            const MqttSparkplugTrackedNode* node = h.library->nodeAt(i);
+            if (node == nullptr || !node->reordering) continue;
+            if (mq_elapsed(node->reorderStartedAt, now) < h.spec.reorderTimeoutMs) continue;
+            mq_time_t& answered = h.reorderAnswered[Host::keyOf(node->group.c_str(), node->node.c_str())];
+            if (answered == node->reorderStartedAt) continue;
+            answered = node->reorderStartedAt;
+            h.ask(node->group.c_str(), node->node.c_str(), false);
+        }
+    }
+    h.library->poll();
+    // Its own session begun: every node it knows is asked again - what it
+    // missed while it was away.
+    const bool born = h.library->isBorn() && c.client.isConnected();
+    if (born && !h.wasBorn && h.spec.rebirthOnGap) {
+        for (size_t i = 0; i < h.library->nodeCount(); i++) {
+            const MqttSparkplugTrackedNode* node = h.library->nodeAt(i);
+            if (node != nullptr) h.ask(node->group.c_str(), node->node.c_str(), false);
+        }
+    }
+    h.wasBorn = born;
 }
 
 void AppConnections::close(Connection& c) {
+    // A host's STATE dies first, on purpose rather than by its Will.
+    if (c.host) {
+        c.host->library->disconnect();
+        for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
+            c.client.poll();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        c.host.reset();
+    }
     if (c.client.isConnected()) c.client.disconnect();
     for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
         c.client.poll();
@@ -524,6 +716,7 @@ void AppConnections::close(Connection& c) {
 void AppConnections::service(Connection& c) {
     const Clock::time_point now = Clock::now();
     c.client.poll();
+    serviceHost(c);
     // CONFIRM_DELIVERED past its deadline: kept, and sent when it can be.
     for (size_t i = 0; i < c.waiting.size(); i++) {
         if (now < c.waiting[i].deadline) continue;
@@ -550,6 +743,21 @@ void AppConnections::service(Connection& c) {
         c.state != AppConnectionState::Waiting && c.state != AppConnectionState::Refused &&
         (c.asked || now >= c.nextAttempt)) {
         c.asked = false;
+        if (c.spec.thisServer) {
+            ThisServer where;
+            if (!_thisServer || !_thisServer(where)) {
+                c.nextAttempt = now + std::chrono::seconds(1);
+                c.setState(AppConnectionState::BackingOff, "this server has no listener to reach it on");
+                return;
+            }
+            if (where.tls != c.hereTls) {
+                // TLS turned on or off since it was opened: a transport of the other kind.
+                close(c);
+                open(c);
+                return;
+            }
+            c.here = AppEndpoint{where.host, where.port};
+        }
         const AppEndpoint& e = c.endpoint(c.serverIndex);
         MqttConnectionConfig connection = c.client.connection();
         connection.host = e.host.c_str();
@@ -557,7 +765,7 @@ void AppConnections::service(Connection& c) {
         applyWill(c.spec, connection);
         c.client.reconfigure(connection);
 #if MQTT_TLS_SOCKETS
-        if (c.spec.tls) static_cast<MqttTlsTransport*>(c.transport.get())->configure(e.host.c_str(), c.portOf(e));
+        if (c.usesTls()) static_cast<MqttTlsTransport*>(c.transport.get())->configure(e.host.c_str(), c.portOf(e));
         else
 #endif
             static_cast<MqttTcpTransport*>(c.transport.get())->configure(e.host.c_str(), c.portOf(e));
@@ -596,7 +804,9 @@ void AppConnections::service(Connection& c) {
             } else {
                 // Failed to connect: the next server. Lost after connecting:
                 // the same one first.
-                if (!c.reachedThisAttempt) c.serverIndex = (c.serverIndex + 1) % (uint32_t)c.spec.servers.size();
+                if (!c.reachedThisAttempt && !c.spec.servers.empty()) {
+                    c.serverIndex = (c.serverIndex + 1) % (uint32_t)c.spec.servers.size();
+                }
                 c.backoffMs = c.backoffMs ? std::min<uint32_t>(c.backoffMs * 2, 30000) : 500;
                 c.nextAttempt = now + std::chrono::milliseconds(c.reachedThisAttempt ? 200 : c.backoffMs);
                 c.setState(AppConnectionState::BackingOff,
@@ -693,8 +903,8 @@ bool AppConnections::put(const AppConnectionSpec& spec, AppConnectionInfo* info,
         error = "a connection needs an id";
         return false;
     }
-    if (spec.servers.empty()) {
-        error = "a connection needs at least one server";
+    if (spec.servers.empty() && !spec.thisServer) {
+        error = "a connection needs at least one server (or this_server)";
         return false;
     }
     call([&] {
@@ -925,6 +1135,273 @@ void AppConnections::forward(Connection& c) {
         c.sent.push_back(std::move(sent));
         c.messagesOut++;
     }
+}
+
+// --- Sparkplug hosts ------------------------------------------------------------
+
+namespace {
+
+AppSparkplugHostInfo hostInfoOf(const AppSparkplugHostSpec& spec, const AppConnections::Host* host,
+                                bool connected) {
+    AppSparkplugHostInfo info;
+    info.spec = spec;
+    if (host == nullptr) return info;
+    info.online = connected && host->library->isBorn();
+    info.nodes = host->library->nodeCount();
+    info.decodeFailures = host->library->decodeFailures();
+    info.rebirthsRequested = host->rebirths;
+    return info;
+}
+
+} // namespace
+
+bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostInfo* info, std::string& error) {
+    if (spec.id.empty() || spec.connection.empty()) {
+        error = "a host needs an id and the connection it runs on";
+        return false;
+    }
+    if (!mq_sparkplugValidId(spec.hostId.c_str())) {
+        error = "host_id \"" + spec.hostId + "\" is not a Sparkplug id (no '/', '+' or '#')";
+        return false;
+    }
+    if (!spec.group.empty() && !mq_sparkplugValidId(spec.group.c_str())) {
+        error = "group \"" + spec.group + "\" is not a Sparkplug id";
+        return false;
+    }
+    bool ok = true;
+    call([&] {
+        for (const auto& one : _hosts) {
+            if (one.first != spec.id && one.second.connection == spec.connection) {
+                error = "the connection \"" + spec.connection + "\" has a host already: \"" + one.first + "\"";
+                ok = false;
+                return;
+            }
+        }
+        auto had = _hosts.find(spec.id);
+        const std::string before = had == _hosts.end() ? std::string() : had->second.connection;
+        _hosts[spec.id] = spec;
+        saveHosts();
+        // Started again where it runs: its STATE born anew, its sessions followed afresh.
+        for (const std::string& id : {before, spec.connection}) {
+            auto at = _connections.find(id);
+            if (at == _connections.end()) continue;
+            Connection& c = *at->second;
+            if (c.host) {
+                c.host->library->disconnect();
+                c.host.reset();
+            }
+            startHost(c);
+        }
+        auto at = _connections.find(spec.connection);
+        if (info) {
+            const bool up = at != _connections.end() && at->second->client.isConnected();
+            *info = hostInfoOf(spec, at != _connections.end() ? at->second->host.get() : nullptr, up);
+        }
+    });
+    return ok;
+}
+
+bool AppConnections::getHost(const std::string& id, AppSparkplugHostInfo& info) const {
+    bool found = false;
+    call([&] {
+        auto spec = _hosts.find(id);
+        if (spec == _hosts.end()) return;
+        auto at = _connections.find(spec->second.connection);
+        const bool up = at != _connections.end() && at->second->client.isConnected();
+        info = hostInfoOf(spec->second, at != _connections.end() ? at->second->host.get() : nullptr, up);
+        found = true;
+    });
+    return found;
+}
+
+std::vector<AppSparkplugHostInfo> AppConnections::hosts() const {
+    std::vector<AppSparkplugHostInfo> out;
+    call([&] {
+        for (const auto& spec : _hosts) {
+            auto at = _connections.find(spec.second.connection);
+            const bool up = at != _connections.end() && at->second->client.isConnected();
+            out.push_back(hostInfoOf(spec.second, at != _connections.end() ? at->second->host.get() : nullptr, up));
+        }
+    });
+    return out;
+}
+
+bool AppConnections::removeHost(const std::string& id) {
+    bool found = false;
+    call([&] {
+        auto spec = _hosts.find(id);
+        if (spec == _hosts.end()) return;
+        auto at = _connections.find(spec->second.connection);
+        if (at != _connections.end() && at->second->host) {
+            Connection& c = *at->second;
+            c.host->library->disconnect();
+            for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
+                c.client.poll();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            c.host.reset();
+        }
+        _hosts.erase(spec);
+        saveHosts();
+        found = true;
+    });
+    return found;
+}
+
+bool AppConnections::nodes(const std::string& host, const std::string& group, const std::string& node,
+                           std::vector<AppSparkplugNodeInfo>& out, std::string& error) const {
+    bool found = false;
+    call([&] {
+        auto spec = _hosts.find(host);
+        if (spec == _hosts.end()) return;
+        found = true;
+        auto at = _connections.find(spec->second.connection);
+        if (at == _connections.end() || !at->second->host) return;
+        const MqttSparkplugHost& library = *at->second->host->library;
+        for (size_t i = 0; i < library.nodeCount(); i++) {
+            const MqttSparkplugTrackedNode* n = library.nodeAt(i);
+            if (n == nullptr || (!group.empty() && n->group != group) || (!node.empty() && n->node != node)) continue;
+            AppSparkplugNodeInfo info;
+            info.group = n->group;
+            info.node = n->node;
+            info.online = n->online;
+            info.hasBdSeq = n->hasBdSeq;
+            info.bdSeq = n->bdSeq;
+            info.hasSeq = n->hasSeq;
+            info.lastSeq = n->lastSeq;
+            info.messages = n->messages;
+            info.gaps = n->gaps;
+            info.rebirthsRequested = n->rebirthsRequested;
+            // The library keeps an alias, not whether there was one: a birth that gave any gave them all
+            // ([tck-id-payloads-alias-birth-requirement]), 0 among them.
+            bool aliases = false;
+            for (size_t m = 0; m < n->metricCount; m++) aliases = aliases || n->metrics[m].alias != 0;
+            for (size_t m = 0; m < n->metricCount; m++) {
+                const MqttSparkplugTrackedMetric& tracked = n->metrics[m];
+                AppSparkplugMetricInfo metric;
+                metric.name = tracked.name;
+                metric.device = tracked.device;
+                metric.alias = tracked.alias;
+                metric.hasAlias = aliases;
+                metric.datatype = (uint32_t)tracked.type;
+                metric.at = tracked.at;
+                // Numbers and bools only: the library keeps text by reference to a buffer it reuses.
+                const MqttSparkplugValue& v = tracked.value;
+                if (tracked.hasValue && !v.isNull) {
+                    switch (v.type) {
+                    case MqttSparkplugDataType::Int8: case MqttSparkplugDataType::Int16:
+                    case MqttSparkplugDataType::Int32: case MqttSparkplugDataType::Int64:
+                        metric.kind = AppSparkplugMetricInfo::Signed;
+                        metric.i = v.as.signedValue;
+                        break;
+                    case MqttSparkplugDataType::UInt8: case MqttSparkplugDataType::UInt16:
+                    case MqttSparkplugDataType::UInt32: case MqttSparkplugDataType::UInt64:
+                    case MqttSparkplugDataType::DateTime:
+                        metric.kind = AppSparkplugMetricInfo::Unsigned;
+                        metric.u = v.as.unsignedValue;
+                        break;
+                    case MqttSparkplugDataType::Float: case MqttSparkplugDataType::Double:
+                        metric.kind = AppSparkplugMetricInfo::Real;
+                        metric.d = v.asNumber();
+                        break;
+                    case MqttSparkplugDataType::Boolean:
+                        metric.kind = AppSparkplugMetricInfo::Boolean;
+                        metric.b = v.as.boolean;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                if (!tracked.device.empty() &&
+                    std::find(info.devices.begin(), info.devices.end(), tracked.device) == info.devices.end()) {
+                    info.devices.push_back(tracked.device);
+                }
+                info.metrics.push_back(metric);
+            }
+            out.push_back(std::move(info));
+        }
+    });
+    if (!found) error = "no host \"" + host + "\"";
+    return found;
+}
+
+bool AppConnections::rebirth(const std::string& host, const std::string& group, const std::string& node,
+                             const std::string& device, std::string& error) {
+    bool sent = false;
+    call([&] {
+        auto spec = _hosts.find(host);
+        if (spec == _hosts.end()) {
+            error = "no host \"" + host + "\"";
+            return;
+        }
+        auto at = _connections.find(spec->second.connection);
+        if (at == _connections.end() || !at->second->host || !at->second->client.isConnected()) {
+            error = "the host's connection is not up";
+            return;
+        }
+        Host& h = *at->second->host;
+        if (device.empty()) {
+            sent = h.ask(group.c_str(), node.c_str(), true);
+        } else {
+            MqttSparkplugValue yes;
+            yes.type = MqttSparkplugDataType::Boolean;
+            yes.as.boolean = true;
+            sent = h.library->commandDevice(group.c_str(), node.c_str(), device.c_str(), "Device Control/Rebirth", yes);
+        }
+        if (!sent) error = "it could not be sent (a group or node that is not a Sparkplug id?)";
+    });
+    return sent;
+}
+
+bool AppConnections::hostConnection(const std::string& host, std::string& connection) const {
+    bool found = false;
+    call([&] {
+        auto spec = _hosts.find(host);
+        if (spec == _hosts.end()) return;
+        connection = spec->second.connection;
+        found = true;
+    });
+    return found;
+}
+
+void AppConnections::saveHosts() {
+    if (_directory.empty()) return;
+    std::string text = "[";
+    bool first = true;
+    for (const auto& one : _hosts) {
+        const AppSparkplugHostSpec& h = one.second;
+        json::Object o;
+        o.add("id", h.id).add("connection", h.connection).add("hostId", h.hostId).add("group", h.group);
+        o.add("rebirthOnGap", h.rebirthOnGap).add("reorderTimeoutMs", (long long)h.reorderTimeoutMs);
+        o.add("rebirthMinIntervalMs", (long long)h.rebirthMinIntervalMs);
+        text += (first ? "\n" : ",\n") + o.str();
+        first = false;
+    }
+    writePrivate(_directory + "/sparkplug-hosts.json", text + "\n]\n");
+}
+
+bool AppConnections::loadHosts(std::string& error) {
+    std::ifstream in(_directory + "/sparkplug-hosts.json");
+    if (!in) return true;
+    std::stringstream text;
+    text << in.rdbuf();
+    json::Value all;
+    if (!json::parse(text.str(), all)) {
+        error = _directory + "/sparkplug-hosts.json: not JSON";
+        return false;
+    }
+    for (const json::Value& v : all.items) {
+        AppSparkplugHostSpec h;
+        h.id = v.str("id");
+        h.connection = v.str("connection");
+        h.hostId = v.str("hostId");
+        h.group = v.str("group");
+        h.rebirthOnGap = v.has("rebirthOnGap") ? v.flag("rebirthOnGap") : true;
+        h.reorderTimeoutMs = (uint32_t)v.integer("reorderTimeoutMs", 2000);
+        h.rebirthMinIntervalMs = (uint32_t)v.integer("rebirthMinIntervalMs", 60000);
+        if (!h.id.empty()) _hosts[h.id] = h;
+    }
+    return true;
 }
 
 void AppConnections::groupsChanged(const std::string& connection) {

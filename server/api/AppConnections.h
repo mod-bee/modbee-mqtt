@@ -52,6 +52,10 @@ struct AppEndpoint {
 struct AppConnectionSpec {
     std::string id;
     std::vector<AppEndpoint> servers;
+    // A connection to this server itself, as one of its own clients: no
+    // servers needed (reachThisServer() says where, and with what login).
+    // What a Sparkplug host or edge node on the server's own devices runs on.
+    bool thisServer = false;
     std::string clientId;
     bool hasUsername = false;
     std::string username;
@@ -97,6 +101,57 @@ struct AppConnectionInfo {
     uint64_t storedExpired = 0;             // their Message Expiry Interval ran out while they waited
 };
 
+// A Sparkplug B Host Application the server runs on one of its connections
+// (the library's MqttSparkplugHost, sharing the connection's client): STATE
+// born and died on it, every node's session followed - bdSeq, seq, aliases -
+// and a rebirth asked for when a node's stream cannot be trusted: a gap that
+// the reorder window did not close, data from a node with no birth, an alias
+// no birth gave, a payload that does not decode, and every node when the
+// host's own session begins - at most once a rebirthMinIntervalMs per node.
+struct AppSparkplugHostSpec {
+    std::string id;                        // this server's name for it
+    std::string connection;                // the connection it runs on
+    std::string hostId;                    // spBv1.0/STATE/<hostId>
+    std::string group;                     // the group it follows; "": every group
+    bool rebirthOnGap = true;
+    uint32_t reorderTimeoutMs = 2000;      // how long a gap waits for the missing message
+    uint32_t rebirthMinIntervalMs = 60000;
+};
+
+struct AppSparkplugHostInfo {
+    AppSparkplugHostSpec spec;
+    bool online = false;                   // its STATE is born on a connection that is up
+    size_t nodes = 0;
+    uint32_t decodeFailures = 0;
+    uint64_t rebirthsRequested = 0;
+};
+
+// One metric a node's births declared, with the last value of a number or a
+// bool (a host follows every metric's value; these are what it can say here).
+struct AppSparkplugMetricInfo {
+    std::string name, device;
+    uint64_t alias = 0;
+    bool hasAlias = false;
+    uint32_t datatype = 0;
+    enum Kind : uint8_t { None, Signed, Unsigned, Real, Boolean } kind = None;
+    int64_t i = 0;
+    uint64_t u = 0;
+    double d = 0;
+    bool b = false;
+    uint64_t at = 0;                       // the value's timestamp (ms since 1970)
+};
+
+struct AppSparkplugNodeInfo {
+    std::string group, node;
+    bool online = false;
+    bool hasBdSeq = false, hasSeq = false;
+    uint64_t bdSeq = 0;
+    uint32_t lastSeq = 0;
+    uint32_t messages = 0, gaps = 0, rebirthsRequested = 0;
+    std::vector<std::string> devices;
+    std::vector<AppSparkplugMetricInfo> metrics;
+};
+
 class AppConnections {
 public:
     // `stateDirectory` holds connections.json (and any TLS material given as
@@ -105,6 +160,20 @@ public:
     // publish is answered, power loss included.
     AppConnections(AppHub& hub, const std::string& stateDirectory, bool syncFull = false);
     ~AppConnections();
+
+    // How a connection to this server itself (AppConnectionSpec::thisServer)
+    // reaches it, asked at each attempt - its listeners may have moved: the
+    // address and port, whether that port is TLS (loopback, so its certificate
+    // is not checked), and the login the server keeps for its own clients.
+    // False: it cannot be reached now. Set before start().
+    struct ThisServer {
+        std::string host = "127.0.0.1";
+        uint16_t port = 0;
+        bool tls = false;
+        bool hasLogin = false;
+        std::string user, password;
+    };
+    void reachThisServer(std::function<bool(ThisServer&)> where) { _thisServer = std::move(where); }
 
     // Opens what was kept, and starts the thread.
     bool start(std::string& error);
@@ -125,20 +194,38 @@ public:
     uint64_t watch(const std::vector<std::string>& ids, std::function<void(const AppConnectionInfo&)> changed);
     void unwatch(uint64_t watcher);
 
+    // --- Sparkplug hosts (AppSparkplugHostSpec) ---
+    bool putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostInfo* info, std::string& error);
+    bool getHost(const std::string& id, AppSparkplugHostInfo& info) const;
+    std::vector<AppSparkplugHostInfo> hosts() const;
+    // Its STATE dies first.
+    bool removeHost(const std::string& id);
+    // What the host knows of its nodes: `group` and `node` narrow it ("": all).
+    bool nodes(const std::string& host, const std::string& group, const std::string& node,
+               std::vector<AppSparkplugNodeInfo>& out, std::string& error) const;
+    // Asked now, whatever the limits say (a person asked). `device` "": the node.
+    bool rebirth(const std::string& host, const std::string& group, const std::string& node,
+                 const std::string& device, std::string& error);
+    // The connection a host runs on, to publish commands on.
+    bool hostConnection(const std::string& host, std::string& connection) const;
+
     // From AppHub: a publish on a connection; a group on one opened or closed.
     void publish(const AppPublish& message, std::function<void(const AppPublishResult&)> done);
     void groupsChanged(const std::string& connection);
 
     struct Connection;
+    struct Host;
 
 private:
     AppHub& _hub;
     std::string _directory;
     bool _syncFull = false;
+    std::function<bool(ThisServer&)> _thisServer;
     ConnectionOutbox _outbox;                 // the manager's thread only
     mutable std::mutex _lock;                 // the maps and the queue
     std::condition_variable _wake;
     std::map<std::string, std::unique_ptr<Connection>> _connections;
+    std::map<std::string, AppSparkplugHostSpec> _hosts;      // by id; each runs on its connection
     std::vector<std::function<void()>> _commands;   // run on the manager's thread
     struct Watcher {
         std::vector<std::string> ids;
@@ -159,6 +246,10 @@ private:
     void announce(Connection& connection);
     void save();
     bool load(std::string& error);
+    void startHost(Connection& connection);   // the host its spec puts on it, if any
+    void serviceHost(Connection& connection);
+    void saveHosts();
+    bool loadHosts(std::string& error);
     void post(std::function<void()> command);
     // Runs `command` on the manager's thread and waits for it: every
     // connection is touched there and nowhere else.

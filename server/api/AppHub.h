@@ -59,6 +59,14 @@ struct AppClientEvent {
     uint32_t qos = 0;
 };
 
+// What a Sparkplug host on a connection knew of one alias when a message came:
+// its metric's name and datatype, from the birth (data names neither).
+struct AppSparkplugName {
+    uint64_t alias = 0;
+    std::string name;
+    uint32_t datatype = 0;
+};
+
 // One message as the application is given it (app.proto Delivery).
 struct AppMessage {
     std::string topic;
@@ -71,6 +79,12 @@ struct AppMessage {
     std::string connection;                      // a managed connection's id; "" for the broker's own clients
     bool isEvent = false;                        // a client event, not a message
     AppClientEvent event;
+    // A Sparkplug message a host saw: what its aliases meant, and what the host
+    // made of it (kSparkplugStale: a death of a session already replaced;
+    // kSparkplugGap: seq skipped).
+    std::vector<AppSparkplugName> sparkplugNames;
+    uint8_t sparkplugFlags = 0;
+    static const uint8_t kSparkplugStale = 1, kSparkplugGap = 2;
 };
 
 enum class AppPick : uint8_t { Publisher, RoundRobin };

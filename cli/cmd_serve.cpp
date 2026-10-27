@@ -43,6 +43,7 @@
 #include <fstream>
 #include <sstream>
 #include <chrono>
+#include <random>
 #include <thread>
 #include "transport/MqttSocketSupport.h"   // gethostname, Winsock on Windows
 
@@ -464,6 +465,19 @@ int cmdServe(int argc, char** argv) {
         return 2;
     }
 #endif
+    // THE SERVER'S OWN LOGIN, for the connections it keeps to itself (a
+    // Sparkplug host or edge node on its own devices): made fresh at each
+    // start, known to nothing outside the process, an ordinary login - every
+    // topic but the $ ones - with no limit on its sessions.
+    const std::string internalUser = "modbee-mqtt-internal";
+    std::string internalPassword;
+    {
+        std::random_device random;
+        static const char digits[] = "0123456789abcdef";
+        for (int i = 0; i < 48; i++) internalPassword.push_back(digits[random() & 15]);
+    }
+    bool internalLogin = false;
+    config.broker.unlimitedLogins.push_back(internalUser);
     if (file.authentication.authority.enabled) {
 #if defined(MODBEE_HAVE_APP_API)
         AuthorityConfig a;
@@ -479,6 +493,8 @@ int cmdServe(int argc, char** argv) {
         a.maxPending = (size_t)s.maxPending;
         config.broker.maxSessionsPerLogin = (uint32_t)file.authentication.maxSessionsPerLogin;
         config.broker.maxRetainedPerLogin = (uint32_t)file.authentication.maxRetainedPerLogin;
+        a.logins.push_back(std::make_pair(internalUser, internalPassword));
+        internalLogin = true;
         authority.reset(new Authority(a));
         extensions.add(authority.get());
 #endif
@@ -506,13 +522,19 @@ int cmdServe(int argc, char** argv) {
             (i == 0 && file.authentication.hasAdmin ? g.admins : g.logins)
                 .push_back(std::make_pair(a.username, a.password));
         }
+        g.logins.push_back(std::make_pair(internalUser, internalPassword));
+        internalLogin = true;
         gate.reset(new AuthGate(g));
         extensions.add(gate.get());
     } else {
         for (const MqttAccount& account : file.authentication.accounts) {
             accounts.add(account.username, account.password);
         }
-        if (accounts.count() > 0) extensions.add(&accounts);
+        if (accounts.count() > 0) {
+            accounts.add(internalUser, internalPassword);
+            internalLogin = true;
+            extensions.add(&accounts);
+        }
     }
     // SESSIONS, last: the logins are in place before a restored Will is
     // published, and it is told of every change the others cause.
@@ -572,6 +594,19 @@ int cmdServe(int argc, char** argv) {
         std::string why;
         if (!read) why = "api: a tls file could not be read";
         connections.reset(new AppConnections(*hub, file.api.stateDirectory, file.sessions.syncFull));
+        connections->reachThisServer([&server, internalLogin, internalUser, internalPassword](
+                                         AppConnections::ThisServer& where) {
+            where.port = server.port() != 0 ? server.port() : server.tlsPort();
+            where.tls = server.port() == 0;
+            // Loopback, unless the listener is bound to one address only.
+            std::string address = where.tls ? server.servedTls().address : server.address();
+            if (where.tls && address.empty()) address = server.address();
+            where.host = address.empty() || address == "0.0.0.0" || address == "*" ? "127.0.0.1" : address;
+            where.hasLogin = internalLogin;
+            where.user = internalUser;
+            where.password = internalPassword;
+            return where.port != 0;
+        });
         if (read && !connections->start(why)) read = false;
         ApiServer::Services s;
         s.authority = authority.get();
