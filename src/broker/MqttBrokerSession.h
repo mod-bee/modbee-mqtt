@@ -357,6 +357,16 @@ public:
         _maxQueuedBytesTotal = totalMax;
     }
     size_t queuedBytes() const { return _queuedBytes; }
+#if defined(MQTT_PLATFORM_HOST)
+    // Messages queued now, here and - through `total` - in every session.
+    void attachQueuedCount(size_t* total) { _queuedCountTotal = total; }
+    size_t queuedCount() const { return _queuedCount; }
+    // The cap on messages held, changed while the broker runs. Lowered, the
+    // queue keeps what it holds and refuses (and counts) new messages until it
+    // is under the cap; raised, a queue already built grows now - between two
+    // polls, where nothing holds one of its entries.
+    void setQueueLimit(size_t maxQueued);
+#endif
     // Done with an entry, however it ended - delivered, acknowledged, expired
     // or dropped. Its bytes go back to the budget, and a payload buffer that
     // grew large is given back rather than kept for the next message.
@@ -524,6 +534,10 @@ private:
     std::unordered_map<std::string, uint32_t>* _loginCounts = nullptr;
     size_t _maxQueuedBytes = 0;
     size_t* _queuedBytesTotal = nullptr;
+#if defined(MQTT_PLATFORM_HOST)
+    size_t _queuedCount = 0;
+    size_t* _queuedCountTotal = nullptr;
+#endif
     size_t _maxQueuedBytesTotal = 0;
     bool withinBudget(size_t bytes) const;
     void charge(MqttBrokerDelivery& entry);

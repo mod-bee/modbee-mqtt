@@ -13,6 +13,17 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **`serve` takes everything an application needs at start as flags**, so it needs no file: `--api unix:<path>` /
+  `tcp://host:port` (repeatable), `--api-token-file`, `--authority`, `--authority-timeout-ms`, `--events`,
+  `--queue-bytes`, `--queue-bytes-total`.
+- **Queue caps change live** (`Admin.PutListeners`, `PUT /v1/listeners`): `queue` (messages per session),
+  `queue_bytes` (per session) and `queue_bytes_total` (the whole server), beside max connections and max packet, all
+  or nothing; `Listeners` says them. A queue already over a lowered cap keeps what it holds and refuses new
+  messages, counted as dropped, until it drains below it; raised, a queue grows at once.
+- **`Stats` says what is queued now**: `queued_messages` and `queued_bytes`, every session together.
+- **The stored settings over the Application API**: `Admin.GetSettings`, `CheckSettings`, `SetSettings`,
+  `ApplySettings`, `ResetSettings` (`GET`/`PATCH`/`PUT /v1/settings`, `POST /v1/settings:check`, `:reset`) - what
+  `modbee-mqtt config` does over MQTT, wherever a login database keeps them.
 - **Per-session counters** (Application API, `Admin.ListSessions`): `messages_in`, `messages_out`, `bytes_in`,
   `bytes_out`, `last_activity_ms` and `connects` for each session, the connection that is up included - so an
   application can say whether a device is talking. They carry over when the same client starts clean while its

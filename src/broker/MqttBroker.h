@@ -385,6 +385,10 @@ struct MqttBrokerStatus {
     size_t connections = 0;       // live now
     size_t sessions = 0;          // held now, connected or not
     size_t retained = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    size_t queuedMessages = 0;    // held for sessions now, every session together
+    size_t queuedBytes = 0;
+#endif
 };
 
 // One network connection. Not one session: a session outlives this.
@@ -627,6 +631,12 @@ public:
     // be sent (maximumPacketSize, and the buffers that hold it). A connection
     // already up keeps what its CONNACK told it.
     void setMaximumPacketSize(uint32_t bytes);
+
+    // What a session may hold (maxQueuedPerSession, maxQueuedBytesPerSession,
+    // maxQueuedBytesTotal; bytes 0: no cap), from now on. A queue already over
+    // a lowered cap keeps what it holds and refuses new messages, counted as
+    // dropped, until it drains below it.
+    void setQueueLimits(size_t messagesPerSession, size_t bytesPerSession, size_t bytesTotal);
 
     // Stops accepting from `listener` - its socket is about to change, or go.
     // The connections it lent stay up; addListener() takes it back.
@@ -972,6 +982,9 @@ private:
     // Bumped by the SESSIONS themselves; see attachSubscriptionRevision().
     uint32_t _subscriptionRevision = 0;
     size_t _queuedBytes = 0;             // every session's queue, together
+#if defined(MQTT_PLATFORM_HOST)
+    size_t _queuedMessages = 0;          // and in messages
+#endif
     std::unordered_map<std::string, uint32_t> _sessionsPerLogin;
     uint32_t _indexBuiltAt = 0xFFFFFFFFu;
 

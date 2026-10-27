@@ -441,6 +441,83 @@ public:
         return true;
     }
 
+    // --- Settings: the login database's config.* ---
+
+    static void problemsFrom(const json::Value& list, google::protobuf::RepeatedPtrField<v1::SettingProblem>& out) {
+        for (const json::Value& p : list.items) {
+            v1::SettingProblem* problem = out.Add();
+            problem->set_path(p.str("path"));
+            problem->set_message(p.str("message"));
+            problem->set_line((uint32_t)p.integer("line"));
+            problem->set_warning(p.flag("warning"));
+        }
+    }
+
+    // A config.* request; false, with `status`, when there is no settings store or it would not answer.
+    bool settings(const std::string& command, const v1::SettingsChange* change, json::Value& answer,
+                  grpc::Status& status) {
+        if (_s.logins == nullptr) {
+            status = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                  "settings are kept in the login database (serve --data, or authentication: database)");
+            return false;
+        }
+        json::Object q;
+        q.add("command", command);
+        if (change != nullptr) {
+            if (!change->set().empty()) {
+                json::Object set;
+                for (const auto& kv : change->set()) set.add(kv.first, kv.second);
+                q.raw("set", set.str());
+            }
+            if (change->remove_size() > 0) {
+                std::vector<std::string> remove(change->remove().begin(), change->remove().end());
+                q.raw("remove", json::array(remove));
+            }
+            if (change->has_document()) q.add("document", change->document());
+            if (change->restart()) q.add("restart", true);
+        }
+        if (!json::parse(_s.logins->admin(q.str()), answer)) {
+            status = grpc::Status(grpc::StatusCode::INTERNAL, "the settings store did not answer");
+            return false;
+        }
+        return true;
+    }
+
+    void getSettings(v1::Settings* reply, Done done) {
+        json::Value answer;
+        grpc::Status status;
+        if (!settings("config.get", nullptr, answer, status)) return done(status);
+        if (!answer.flag("ok")) return done(grpc::Status(grpc::StatusCode::INTERNAL, answer.str("error")));
+        reply->set_source(answer.str("source"));
+        reply->set_file(answer.str("file"));
+        reply->set_document(answer.str("document"));
+        for (const auto& f : answer["overrides"].fields) (*reply->mutable_overrides())[f.first] = f.second.text;
+        for (const json::Value& p : answer["pinned"].items) reply->add_pinned(p.text);
+        problemsFrom(answer["problems"], *reply->mutable_problems());
+        reply->set_restart_required(answer.flag("restart_required"));
+        done(grpc::Status::OK);
+    }
+
+    void changeSettings(const std::string& command, const v1::SettingsChange& request, v1::SettingsResult* reply,
+                        Done done) {
+        json::Value answer;
+        grpc::Status status;
+        if (!settings(command, &request, answer, status)) return done(status);
+        problemsFrom(answer["problems"], *reply->mutable_problems());
+        reply->set_restart_required(answer.flag("restart_required"));
+        reply->set_restarting(answer.flag("restarting"));
+        reply->set_tls_applied(answer.flag("tls_applied"));
+        // A check answers with the problems; a change that would not load is refused, saying why.
+        if (!answer.flag("ok") && command != "config.check") {
+            std::string why = answer.str("error", "the settings were not stored");
+            for (const v1::SettingProblem& p : reply->problems()) {
+                if (!p.warning()) why += "; " + (p.path().empty() ? std::string() : p.path() + ": ") + p.message();
+            }
+            return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, why));
+        }
+        done(grpc::Status::OK);
+    }
+
     void listLogins(const v1::ListRequest& request, v1::ListLoginsReply* reply, Done done) {
         json::Object q;
         q.add("command", "user.list").add("prefix", request.prefix()).add("after", request.page_token());
@@ -724,6 +801,9 @@ public:
         reply->set_max_connections(_s.server->maxConnections());
         reply->set_max_connections_ceiling(_s.server->maxConnectionsCeiling());
         reply->set_max_packet(_s.server->maxPacket());
+        reply->set_queue((uint32_t)_s.server->maxQueued());
+        reply->set_queue_bytes(_s.server->maxQueuedBytes());
+        reply->set_queue_bytes_total(_s.server->maxQueuedBytesTotal());
         if (_s.server->port() != 0) {
             v1::ListenerInfo* plain = reply->add_listeners();
             plain->set_kind(v1::LISTENER_PLAIN);
@@ -806,6 +886,21 @@ public:
             }
             change.maxPacket = request.max_packet();
         }
+        if (request.has_queue()) {
+            if (request.queue() < 1 || request.queue() > 1000000) {
+                return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "queue: 1 to 1000000 messages"));
+            }
+            change.setQueue = true;
+            change.queue = request.queue();
+        }
+        if (request.has_queue_bytes()) {
+            change.setQueueBytes = true;
+            change.queueBytes = (size_t)request.queue_bytes();
+        }
+        if (request.has_queue_bytes_total()) {
+            change.setQueueBytesTotal = true;
+            change.queueBytesTotal = (size_t)request.queue_bytes_total();
+        }
         std::string error;
         if (!_s.server->changeListeners(change, error)) {
             const bool taken = error.find("in use") != std::string::npos ||
@@ -828,6 +923,8 @@ public:
         reply->set_refused_connects(status.total.refused);
         reply->set_shards((uint32_t)status.shards);
         reply->set_started_ms(_startedMs);
+        reply->set_queued_messages(status.total.queuedMessages);
+        reply->set_queued_bytes(status.total.queuedBytes);
         if (_s.authority) {
             const AuthorityStatus a = _s.authority->status();
             reply->set_authority_asked(a.asked);
@@ -1416,6 +1513,15 @@ public:
     MODBEE_ADMIN_CALL(PutTls, v1::ServerTls, v1::Listeners, _core.putTls(*request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(PutListeners, v1::ListenersChange, v1::Listeners,
                       _core.putListeners(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(GetSettings, v1::Empty, v1::Settings, _core.getSettings(reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(CheckSettings, v1::SettingsChange, v1::SettingsResult,
+                      _core.changeSettings("config.check", *request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(SetSettings, v1::SettingsChange, v1::SettingsResult,
+                      _core.changeSettings("config.set", *request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ApplySettings, v1::SettingsChange, v1::SettingsResult,
+                      _core.changeSettings("config.apply", *request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ResetSettings, v1::SettingsChange, v1::SettingsResult,
+                      _core.changeSettings("config.reset", *request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(Stats, v1::Empty, v1::StatsReply, _core.stats(reply, MODBEE_FINISH))
 
 #undef MODBEE_FINISH
@@ -1931,9 +2037,14 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
     // "<collection>/<name>[:verb]", the name percent-decoded (a login may hold '/').
     const std::string rest = path.substr(4);
     const size_t slash = rest.find('/');
-    const std::string collection = rest.substr(0, slash);
+    std::string collection = rest.substr(0, slash);
     std::string name = slash == std::string::npos ? "" : rest.substr(slash + 1);
     std::string verb;
+    // "<collection>:verb", with no name: settings:check.
+    if (slash == std::string::npos && collection.find(':') != std::string::npos) {
+        name = collection.substr(collection.find(':'));
+        collection = collection.substr(0, collection.find(':'));
+    }
     const size_t colon = name.rfind(':');
     if (colon != std::string::npos) {
         verb = name.substr(colon + 1);
@@ -2057,6 +2168,23 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
             if (read(*r)) {
                 auto out = made<v1::Listeners>();
                 run(r, out, [=](Done done) { core->putListeners(*r, out.get(), done); });
+            }
+        }
+    } else if (collection == "settings") {
+        if (method == "GET" && name.empty() && verb.empty()) {
+            auto out = made<v1::Settings>();
+            run(nullptr, out, [=](Done done) { core->getSettings(out.get(), done); });
+        } else {
+            const char* command = method == "PATCH" && verb.empty()             ? "config.set"
+                                  : method == "PUT" && verb.empty()             ? "config.apply"
+                                  : method == "POST" && verb == "check"         ? "config.check"
+                                  : method == "POST" && verb == "reset"         ? "config.reset"
+                                                                                : nullptr;
+            auto r = made<v1::SettingsChange>();
+            if (command != nullptr && name.empty() && (body.empty() || read(*r))) {
+                auto out = made<v1::SettingsResult>();
+                const std::string which = command;
+                run(r, out, [=](Done done) { core->changeSettings(which, *r, out.get(), done); });
             }
         }
     } else if (collection == "stats" && method == "GET") {

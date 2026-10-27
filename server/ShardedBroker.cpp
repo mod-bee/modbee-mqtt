@@ -250,6 +250,8 @@ struct ShardedBroker::Shard {
         uint16_t tlsPort = 0;
         size_t maxConnections = 0;
         uint32_t maxPacket = 0;
+        bool setQueue = false;              // all three, each shard's share of the total
+        size_t queue = 0, queueBytes = 0, queueBytesTotal = 0;
     };
     std::mutex changeLock;
     std::deque<Change> changes;
@@ -1002,6 +1004,10 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
     _maxConnections = config.maxConnectionsTotal ? config.maxConnectionsTotal
                                                  : _shards[0]->broker.config().maxConnections * count;
     _maxPacket = _shards[0]->broker.config().maximumPacketSize;
+    _maxQueued = _shards[0]->broker.config().maxQueuedPerSession;
+    _maxQueuedBytes = _shards[0]->broker.config().maxQueuedBytesPerSession;
+    _maxQueuedBytesTotal = config.maxQueuedBytesTotal ? config.maxQueuedBytesTotal
+                                                      : _shards[0]->broker.config().maxQueuedBytesTotal * count;
     {
         std::lock_guard<std::mutex> guard(_tlsLock);
         _tlsServed = config.tls;
@@ -1199,6 +1205,10 @@ bool ShardedBroker::changeListeners(const ListenerChange& change, std::string& e
         error = "max packet is 64 to 268435455 bytes";
         return false;
     }
+    if (change.setQueue && (change.queue < 1 || change.queue > 1000000)) {
+        error = "messages queued per session is 1 to 1000000";
+        return false;
+    }
 
     // The TLS material, when TLS is turned on or given new material.
     const bool tlsMaterial = change.setTls && change.tls.enabled &&
@@ -1259,6 +1269,11 @@ bool ShardedBroker::changeListeners(const ListenerChange& change, std::string& e
         c.tlsPort = tlsPort;
         c.maxConnections = perShardLimit;
         c.maxPacket = change.maxPacket;
+        c.setQueue = change.setQueue || change.setQueueBytes || change.setQueueBytesTotal;
+        c.queue = change.setQueue ? change.queue : _maxQueued.load();
+        c.queueBytes = change.setQueueBytes ? change.queueBytes : _maxQueuedBytes.load();
+        const size_t total = change.setQueueBytesTotal ? change.queueBytesTotal : _maxQueuedBytesTotal.load();
+        c.queueBytesTotal = total == 0 ? 0 : (total + _shards.size() - 1) / _shards.size();
         {
             std::lock_guard<std::mutex> guard(shard.changeLock);
             shard.changes.push_back(c);
@@ -1278,6 +1293,9 @@ bool ShardedBroker::changeListeners(const ListenerChange& change, std::string& e
     }
     if (change.maxConnections != 0) _maxConnections = change.maxConnections;
     if (change.maxPacket != 0) _maxPacket = change.maxPacket;
+    if (change.setQueue) _maxQueued = change.queue;
+    if (change.setQueueBytes) _maxQueuedBytes = change.queueBytes;
+    if (change.setQueueBytesTotal) _maxQueuedBytesTotal = change.queueBytesTotal;
     return true;
 }
 
@@ -1291,6 +1309,7 @@ void ShardedBroker::Shard::takeChanges() {
     }
     for (const Change& c : now) {
         if (c.maxPacket != 0) broker.setMaximumPacketSize(c.maxPacket);
+        if (c.setQueue) broker.setQueueLimits(c.queue, c.queueBytes, c.queueBytesTotal);
         if (c.maxConnections != 0 && broker.setMaxConnections(c.maxConnections)) {
             listener.grow(c.maxConnections);
 #if MQTT_TLS_SOCKETS
@@ -1358,6 +1377,8 @@ ShardedBrokerStatus ShardedBroker::status() const {
         t.adopted += s.adopted;
         t.connections += s.connections;
         t.sessions += s.sessions;
+        t.queuedMessages += s.queuedMessages;
+        t.queuedBytes += s.queuedBytes;
         t.retained = s.retained;     // replicated: every shard holds the same set
         out.mailboxFull += shard->mailboxFull.load(std::memory_order_relaxed);
         out.skipped += shard->skipped.load(std::memory_order_relaxed);

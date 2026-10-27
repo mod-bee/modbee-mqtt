@@ -273,6 +273,23 @@ void listenersLive(Server& server) {
     {
         grpc::ClientContext context;
         authorize(context);
+        v1::ListenersChange caps;
+        caps.set_queue(5);
+        caps.set_queue_bytes(4096);
+        caps.set_queue_bytes_total(1u << 20);
+        v1::Listeners now;
+        ok(admin->PutListeners(&context, caps, &now).ok() && now.queue() == 5 && now.queue_bytes() == 4096 &&
+               now.queue_bytes_total() == (1u << 20),
+           "the three queue caps, live, and Listeners says them");
+        grpc::ClientContext statsContext;
+        authorize(statsContext);
+        v1::StatsReply stats;
+        ok(admin->Stats(&statsContext, v1::Empty(), &stats).ok() && stats.queued_messages() == 0,
+           "Stats says what is queued now: nothing");
+    }
+    {
+        grpc::ClientContext context;
+        authorize(context);
         v1::ListenersChange tooMany;
         tooMany.set_max_connections(reply.max_connections_ceiling() + 1);
         v1::Listeners refused;

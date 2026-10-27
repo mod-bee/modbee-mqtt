@@ -533,6 +533,16 @@ service Admin {
   rpc PutListeners(ListenersChange) returns (Listeners);
 
   rpc Stats(Empty) returns (StatsReply);
+
+  // The settings kept in the login database (serve --data, or authentication: database): what `modbee-mqtt config`
+  // reads and changes. Validated as the file is; applied at the next start - or at once, with `restart` - but for
+  // the TLS material, which is applied live. Authentication is the file's and the flags' alone. Without a login
+  // database: FAILED_PRECONDITION.
+  rpc GetSettings(Empty) returns (Settings);
+  rpc CheckSettings(SettingsChange) returns (SettingsResult);   // would these be accepted? the problems, if not
+  rpc SetSettings(SettingsChange) returns (SettingsResult);     // `set` and `remove` single settings
+  rpc ApplySettings(SettingsChange) returns (SettingsResult);   // `document`: a whole modbee.yaml, in place of the file
+  rpc ResetSettings(SettingsChange) returns (SettingsResult);   // back to the file (or the defaults) alone
 }
 
 message Empty {}
@@ -672,12 +682,20 @@ message ListenersChange {
   ServerTls tls = 3;                   // with tls_port: the certificate to serve, as PutTls
   optional uint64 max_connections = 4; // the whole server's, up to Listeners.max_connections_ceiling
   optional uint32 max_packet = 5;      // bytes, 64 to 268435455; a connection already up keeps what it was told
+  // What a session may hold, as `serve --queue`, `--queue-bytes`, `--queue-bytes-total`. A queue already over a
+  // lowered cap keeps what it holds and refuses new messages, counted as dropped, until it drains below it.
+  optional uint32 queue = 6;             // messages per session, 1 to 1000000
+  optional uint64 queue_bytes = 7;       // bytes per session; 0: no cap
+  optional uint64 queue_bytes_total = 8; // bytes in every session together, the whole server's; 0: no cap
 }
 message Listeners {
   repeated ListenerInfo listeners = 1;
   uint64 max_connections = 2;
   uint64 max_connections_ceiling = 3;  // how far max_connections can be raised live: the room kept for sessions at start
   uint32 max_packet = 4;
+  uint32 queue = 5;
+  uint64 queue_bytes = 6;
+  uint64 queue_bytes_total = 7;
 }
 message ListenerInfo {
   Listener kind = 1;
@@ -685,6 +703,34 @@ message ListenerInfo {
   uint32 port = 3;
   string certificate_subject = 4;  // TLS
   int64 certificate_expires_ms = 5;
+}
+
+message Settings {
+  string source = 1;                   // "file", or "database": a document stored in place of the file
+  string file = 2;                     // the file the server started with; "" for none
+  string document = 3;                 // the YAML in force, secrets left out
+  map<string, string> overrides = 4;   // single settings stored over it, by path ("broker.port": "1884")
+  repeated string pinned = 5;          // paths the environment sets, which win
+  repeated SettingProblem problems = 6;
+  bool restart_required = 7;           // the running server is behind what is stored
+}
+message SettingsChange {
+  map<string, string> set = 1;         // path to value, as modbee.yaml names it; a list comma-separated
+  repeated string remove = 2;          // stored single settings to drop
+  optional string document = 3;        // ApplySettings, CheckSettings: a whole modbee.yaml
+  bool restart = 4;                    // restart once it is stored, if it needs one
+}
+message SettingsResult {
+  repeated SettingProblem problems = 1;   // CheckSettings: why not; the others: warnings
+  bool restart_required = 2;
+  bool restarting = 3;
+  bool tls_applied = 4;                // the TLS material changed, and the listeners serve it now
+}
+message SettingProblem {
+  string path = 1;
+  string message = 2;
+  uint32 line = 3;                     // in the document; 0: not about one place
+  bool warning = 4;                    // reported, but the settings still load
 }
 
 message StatsReply {
@@ -701,4 +747,6 @@ message StatsReply {
   uint64 authority_stale = 11;     // answered from an expired decision while the authority was away
   uint32 shards = 12;
   int64 started_ms = 13;
+  uint64 queued_messages = 14;     // held for sessions right now, every session together
+  uint64 queued_bytes = 15;
 }

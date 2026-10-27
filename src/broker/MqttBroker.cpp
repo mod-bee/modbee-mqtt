@@ -207,6 +207,9 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     _routeGeneration = 0;
     _subscriptionRevision = 0;
     _queuedBytes = 0;
+#if defined(MQTT_PLATFORM_HOST)
+    _queuedMessages = 0;
+#endif
     _sessionsPerLogin.clear();
     _indexBuiltAt = 0xFFFFFFFFu;   // stale until the first route()
 
@@ -250,6 +253,9 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
         session.attachSubscriptionRevision(&_subscriptionRevision);
         session.limitQueueBytes(_config.maxQueuedBytesPerSession, &_queuedBytes,
                                 _config.maxQueuedBytesTotal);
+#if defined(MQTT_PLATFORM_HOST)
+        session.attachQueuedCount(&_queuedMessages);
+#endif
         session.attachLoginCounts(&_sessionsPerLogin);
 #if defined(MQTT_PLATFORM_HOST)
         session.attachIndex(&_sessionIndex, (uint32_t)(&session - _sessions.data()));
@@ -675,6 +681,8 @@ void MqttBroker::pollEvents(mq_time_t now) {
         _retained.sweep(now, &_status.retained);
     }
     _status.connections = _liveConnections;
+    _status.queuedMessages = _queuedMessages;
+    _status.queuedBytes = _queuedBytes;
 }
 
 // Remaining time, in milliseconds, of an interval given in SECONDS that began
@@ -4409,6 +4417,16 @@ bool MqttBroker::setMaxConnections(size_t limit) {
     _config.maxConnections = limit;
     pauseListeners(false);      // room again, if it was full
     return true;
+}
+
+void MqttBroker::setQueueLimits(size_t messagesPerSession, size_t bytesPerSession, size_t bytesTotal) {
+    _config.maxQueuedPerSession = messagesPerSession ? messagesPerSession : 1;
+    _config.maxQueuedBytesPerSession = bytesPerSession;
+    _config.maxQueuedBytesTotal = bytesTotal;
+    for (MqttBrokerSession& session : _sessions) {
+        session.setQueueLimit(_config.maxQueuedPerSession);
+        session.limitQueueBytes(bytesPerSession, &_queuedBytes, bytesTotal);
+    }
 }
 
 void MqttBroker::setMaximumPacketSize(uint32_t bytes) {

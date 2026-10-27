@@ -150,9 +150,10 @@ struct ShardedTlsConfig {
 
 struct ShardedBrokerConfig {
     MqttBrokerConfig broker;           // per shard; maxConnections and maxSessions are per shard too
-    // The whole server's maxConnections, as it was asked for, for saying so;
-    // 0: broker.maxConnections times the shards.
+    // The whole server's maxConnections and maxQueuedBytesTotal, as they were
+    // asked for, for saying so; 0: the broker's, times the shards.
     size_t maxConnectionsTotal = 0;
+    size_t maxQueuedBytesTotal = 0;
     std::string address = "0.0.0.0";
     bool plain = true;                 // the plain-TCP listener; false for TLS only
     uint16_t port = 1883;              // 0: an ephemeral port, shared by every shard
@@ -228,6 +229,10 @@ public:
         ShardedTlsConfig tls;
         size_t maxConnections = 0;      // the whole server's; 0: unchanged
         uint32_t maxPacket = 0;         // bytes; 0: unchanged
+        // What a session may hold: messages, bytes, and bytes in every
+        // session together (the whole server's). Bytes 0: no cap.
+        bool setQueue = false, setQueueBytes = false, setQueueBytesTotal = false;
+        size_t queue = 0, queueBytes = 0, queueBytesTotal = 0;
     };
     // All of it, or - false, with `error` - none of it: a port that is taken,
     // material that will not load, more connections than there is room for.
@@ -239,6 +244,9 @@ public:
     // shard kept at the start (MqttBrokerConfig::connectionCapacity).
     size_t maxConnectionsCeiling() const;
     uint32_t maxPacket() const { return _maxPacket; }
+    size_t maxQueued() const { return _maxQueued; }                   // messages, per session
+    size_t maxQueuedBytes() const { return _maxQueuedBytes; }         // per session; 0: no cap
+    size_t maxQueuedBytesTotal() const { return _maxQueuedBytesTotal; }   // the whole server's; 0: no cap
 
     // Each shard's share of `total` connections (or sessions): a quarter more
     // than an even share, since the hash spreads them evenly on average, not
@@ -260,6 +268,7 @@ private:
     std::atomic<uint16_t> _tlsPort{0};
     std::atomic<size_t> _maxConnections{0};
     std::atomic<uint32_t> _maxPacket{0};
+    std::atomic<size_t> _maxQueued{0}, _maxQueuedBytes{0}, _maxQueuedBytesTotal{0};
     bool _everyShardListens = true;
     std::mutex _changeLock;                // one change of TLS or listeners at a time
     std::string _lastError;

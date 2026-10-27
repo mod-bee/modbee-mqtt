@@ -311,7 +311,18 @@ void MqttBrokerSession::charge(MqttBrokerDelivery& entry) {
     entry.charged = bytesOf(entry);
     _queuedBytes += entry.charged;
     if (_queuedBytesTotal) *_queuedBytesTotal += entry.charged;
+#if defined(MQTT_PLATFORM_HOST)
+    _queuedCount++;
+    if (_queuedCountTotal) ++*_queuedCountTotal;
+#endif
 }
+
+#if defined(MQTT_PLATFORM_HOST)
+void MqttBrokerSession::setQueueLimit(size_t maxQueued) {
+    _maxQueued = maxQueued ? maxQueued : 1;
+    if (!_queue.empty() && _queue.size() < _maxQueued) _queue.resize(_maxQueued);
+}
+#endif
 
 void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
 #if defined(MQTT_PLATFORM_HOST)
@@ -329,6 +340,10 @@ void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
         if (_queuedBytesTotal) {
             *_queuedBytesTotal -= entry.charged < *_queuedBytesTotal ? entry.charged : *_queuedBytesTotal;
         }
+#if defined(MQTT_PLATFORM_HOST)
+        if (_queuedCount > 0) _queuedCount--;
+        if (_queuedCountTotal && *_queuedCountTotal > 0) --*_queuedCountTotal;
+#endif
         entry.charged = 0;
     }
     entry.release();
@@ -337,6 +352,13 @@ void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
 
 MqttBrokerDelivery* MqttBrokerSession::reserveDelivery(size_t bytes) {
     reserveQueue();
+#if defined(MQTT_PLATFORM_HOST)
+    // A cap lowered while it runs: the slots are still there, the count is not.
+    if (_queuedCount >= _maxQueued) {
+        messagesDropped++;
+        return nullptr;
+    }
+#endif
     if (!withinBudget(bytes)) {
         messagesDropped++;
         return nullptr;

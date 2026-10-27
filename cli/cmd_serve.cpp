@@ -65,6 +65,8 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"max-sessions", 0, true, "sessions, whole server (default = connections)"},
         {"max-packet", 0, true, "largest packet accepted, bytes (default 65536)"},
         {"queue", 0, true, "messages held per session (default 64)"},
+        {"queue-bytes", 0, true, "bytes held per session (default 1048576, 0 no cap)"},
+        {"queue-bytes-total", 0, true, "bytes held in every session together, whole server (default 67108864, 0 no cap)"},
         {"subscriptions", 0, true, "subscriptions per session (default 32)"},
         {"max-retained", 0, true, "retained topics kept, whole server (default 10000)"},
         {"username", 0, true, "require this MQTT user name of every client (with --password)"},
@@ -77,6 +79,11 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"pin", 0, false, "pin each shard's thread to a core"},
         {"status-every", 0, true, "seconds between status lines (default 5, 0 off)"},
         {"metrics-port", 0, true, "serve Prometheus /metrics on this port (9464 by convention)"},
+        {"api", 0, true, "serve the Application API here: unix:<path> or tcp://host:port (repeat for both)"},
+        {"api-token-file", 0, true, "a file holding the token every API call must carry"},
+        {"authority", 0, false, "logins are decided by the application, over the API (Authority.Serve)"},
+        {"authority-timeout-ms", 0, true, "how long a CONNECT waits for the application's answer (default 2000)"},
+        {"events", 0, false, "publish client events on $modbee/events/... (and to API consumers)"},
         {"help", 0, false, "show this help"},
     };
     return specs;
@@ -234,7 +241,10 @@ int cmdServe(int argc, char** argv) {
         !flag("queue", 64, 1, 1000000, queue) ||
         !flag("subscriptions", 32, 1, 100000, subscriptions) ||
         !flag("max-retained", 10000, 0, 10000000, retained) ||
-        !flag("status-every", 5, 0, 86400, b.statusEvery)) {
+        !flag("status-every", 5, 0, 86400, b.statusEvery) ||
+        !flag("queue-bytes", 1048576, 0, 1LL << 40, b.queueBytes) ||
+        !flag("queue-bytes-total", 67108864, 0, 1LL << 44, b.queueBytesTotal) ||
+        !flag("authority-timeout-ms", 2000, 50, 60000, file.authentication.authority.timeoutMs)) {
         std::fprintf(stderr, "modbee-mqtt serve: %s\n", args.error().c_str());
         return 2;
     }
@@ -290,6 +300,25 @@ int cmdServe(int argc, char** argv) {
         file.sessions.directory = args.get("sessions-directory");
         if (!args.has("sessions-store")) file.sessions.store = SessionStore::File;
     }
+    // THE APPLICATION API, AND WHAT IT DECIDES, from flags alone: an application
+    // that runs this server needs no file (internal/APP-API-SPEC.md).
+    if (args.has("api")) file.api.grpc = args.all("api");
+    if (args.has("api-token-file")) {
+        std::string token;
+        if (!readWholeFile(args.get("api-token-file"), token)) {
+            std::fprintf(stderr, "modbee-mqtt serve: cannot read --api-token-file %s\n",
+                         args.get("api-token-file").c_str());
+            return 2;
+        }
+        while (!token.empty() && (token.back() == '\n' || token.back() == '\r' || token.back() == ' ')) token.pop_back();
+        if (token.empty()) {
+            std::fprintf(stderr, "modbee-mqtt serve: --api-token-file %s is empty\n", args.get("api-token-file").c_str());
+            return 2;
+        }
+        file.api.token = token;
+    }
+    if (args.has("authority") || args.has("authority-timeout-ms")) file.authentication.authority.enabled = true;
+    if (args.has("events")) file.events.enabled = true;
     if (args.has("address")) b.address = args.get("address");
     if (args.has("no-plain")) b.plain = false;
     if (args.has("pin")) b.pinThreads = true;
@@ -348,6 +377,7 @@ int cmdServe(int argc, char** argv) {
     config.broker.maxQueuedPerSession = b.queue;
     config.broker.maxQueuedBytesPerSession = (size_t)b.queueBytes;
     config.broker.maxQueuedBytesTotal = (size_t)((b.queueBytesTotal + (long long)count - 1) / (long long)count);
+    config.maxQueuedBytesTotal = (size_t)b.queueBytesTotal;
     config.broker.maxSubscriptionsPerSession = b.subscriptions;
     config.broker.maximumSessionExpiry = (uint32_t)b.maxSessionExpiry;
     config.broker.connectTimeoutMs = (mq_time_t)(b.connectTimeout * 1000);
