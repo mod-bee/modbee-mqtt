@@ -184,4 +184,10 @@ public:
     // peerName() is.
     virtual const char* peerCertificateName() const { return ""; }
     virtual const char* peerCertificateFingerprint() const { return ""; }
+
+    // Why a connection someone else opened ended before anything was said on
+    // it, in the engine's words: a TLS handshake that failed ("TLS handshake
+    // failed: ... certificate verify failed"), so whoever tidies it away can
+    // say so - the client cannot, having never connected. Empty otherwise.
+    virtual const char* handshakeFailure() const { return ""; }
 };

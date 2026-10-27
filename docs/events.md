@@ -35,13 +35,14 @@ modbee-mqtt serve: client events published on $modbee/events/...
 | Topic | When | Fields |
 | --- | --- | --- |
 | `$modbee/events/started` | The server has started | `event`, `time` |
-| `$modbee/events/connected` | A client has connected | `event`, `clientid`, `username`, `resumed`, `time` |
+| `$modbee/events/connected` | A client has connected | `event`, `clientid`, `username`, `resumed`, `address` (where it came from, `"10.0.4.7:51544"`), `time` |
 | `$modbee/events/disconnected` | Its connection has gone | the same, and `reason` |
 | `$modbee/events/subscribed` | It was granted a subscription | the same, and `filter`, `qos` |
 | `$modbee/events/unsubscribed` | It removed a subscription it had | the same, and `filter` |
 | `$modbee/events/publish-refused` | A PUBLISH its rules do not allow was refused | `event`, `clientid`, `username`, `topic`, `reason` (what it was told, e.g. 135 Not authorized), `time` |
 | `$modbee/events/subscribe-refused` | A SUBSCRIBE its rules do not allow was refused | the same, with `filter` instead of `topic` |
-| `$modbee/events/connect-refused` | The server turned a CONNECT away itself: it is full (`reason` 137 Server busy), or the login already holds all its sessions (151 Quota exceeded) | `event`, `clientid`, `username`, `reason`, `time` |
+| `$modbee/events/connect-refused` | The server turned a CONNECT away itself: it is full (`reason` 137 Server busy), or the login already holds all its sessions (151 Quota exceeded) | `event`, `clientid`, `username`, `reason`, `address`, `time` |
+| `$modbee/events/handshake-failed` | A TLS handshake failed before any CONNECT: a client certificate missing or not trusted, a protocol or cipher neither end shares, something that is not TLS on the TLS port. A connection that closes without sending anything - a port check - is not one | `event`, `clientid` (always `""`: it never said), `username` (`""`), `address`, `detail` (the TLS engine's words: `"TLS handshake failed: error:0A0000C7:SSL routines::peer did not return a certificate"`), `time` |
 
 ```json
 {"event":"subscribed","clientid":"pump-07","username":"pump-07","filter":"plant/pump-07/cmd/SETPOINT","qos":1,"time":1791278042000}

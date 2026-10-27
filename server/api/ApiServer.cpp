@@ -165,6 +165,7 @@ void deliveryTo(uint64_t id, const AppMessage& m, bool replay, bool redelivered,
         case AppClientEvent::PublishRefused: event->set_kind(v1::CLIENT_EVENT_PUBLISH_REFUSED); break;
         case AppClientEvent::SubscribeRefused: event->set_kind(v1::CLIENT_EVENT_SUBSCRIBE_REFUSED); break;
         case AppClientEvent::ConnectRefused: event->set_kind(v1::CLIENT_EVENT_CONNECT_REFUSED); break;
+        case AppClientEvent::HandshakeFailed: event->set_kind(v1::CLIENT_EVENT_HANDSHAKE_FAILED); break;
         default: event->set_kind(v1::CLIENT_EVENT_UNSPECIFIED); break;
         }
         event->set_client_id(m.event.clientId);
@@ -175,6 +176,7 @@ void deliveryTo(uint64_t id, const AppMessage& m, bool replay, bool redelivered,
         event->set_filter(m.event.filter);
         event->set_qos(m.event.qos);
         event->set_address(m.event.address);
+        event->set_detail(m.event.detail);
         return;
     }
     v1::Delivery* d = down.mutable_delivery();
@@ -1359,6 +1361,7 @@ public:
         if (_connections) reply->add_features("connections.subscriptions");
         if (_admin) reply->add_features("admin");
         if (_admin) reply->add_features("admin.listeners");
+        if (_messages) reply->add_features("events.handshake");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }

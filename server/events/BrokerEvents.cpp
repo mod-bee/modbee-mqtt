@@ -51,6 +51,7 @@ const char* BrokerEvents::topicFor(MqttBrokerClientEventKind kind) {
     case MqttBrokerClientEventKind::PublishRefused: return "$modbee/events/publish-refused";
     case MqttBrokerClientEventKind::SubscribeRefused: return "$modbee/events/subscribe-refused";
     case MqttBrokerClientEventKind::ConnectRefused: return "$modbee/events/connect-refused";
+    case MqttBrokerClientEventKind::HandshakeFailed: return "$modbee/events/handshake-failed";
     }
     return "$modbee/events/unknown";
 }
@@ -72,6 +73,10 @@ std::string BrokerEvents::document(const MqttBrokerClientEvent& e, uint64_t time
     // A clean start drops every subscription the client had, with no unsubscribed events; a resumed
     // session keeps them without new subscribed ones. A reader keeping subscriptions needs to know which.
     if (e.kind == MqttBrokerClientEventKind::Connected) out += std::string(",\"resumed\":") + (e.resumed ? "true" : "false");
+    // Where it came from: a client connected or turned away, and one whose TLS handshake failed - which has no
+    // client id to go by, only its address and what the TLS engine said.
+    if (e.address.length != 0) out += ",\"address\":" + quote(text(e.address));
+    if (e.kind == MqttBrokerClientEventKind::HandshakeFailed) out += ",\"detail\":" + quote(text(e.detail));
     return out + ",\"time\":" + std::to_string(timeMillis) + "}";
 }
 
@@ -96,8 +101,9 @@ void BrokerEvents::prepare(uint32_t shard, MqttBroker& broker) {
 
 void BrokerEvents::onEvent(void* context, const MqttBrokerClientEvent& event) {
     Shard& shard = *static_cast<Shard*>(context);
-    // A connection refused before it had a session has no client to speak of.
-    if (event.clientId.length == 0) return;
+    // A connection refused before it had a session has no client to speak of - except one whose TLS handshake
+    // failed, which never had a client id to give: its address is what there is.
+    if (event.clientId.length == 0 && event.kind != MqttBrokerClientEventKind::HandshakeFailed) return;
     Pending p;
     p.topic = topicFor(event.kind);
     p.clientId = text(event.clientId);

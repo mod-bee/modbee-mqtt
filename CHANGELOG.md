@@ -13,6 +13,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **A failed TLS handshake is a client event** (platform builds): `$modbee/events/handshake-failed`, and
+  `CLIENT_EVENT_HANDSHAKE_FAILED` over the Application API, with the address and the TLS engine's own words
+  (`ClientEvent.detail`) - a client certificate missing or untrusted, a protocol neither end shares, HTTP on the TLS
+  port - so an application can see a device that never got as far as CONNECT. A port check that sends nothing is
+  not one.
 - **Listeners and limits changed live** (Application API, `Admin.PutListeners`, `PUT /v1/listeners`): the plain and
   TLS ports, either listener on or off (TLS turned on with its certificate), max connections and max packet - all or
   nothing, without a restart. A listener that moves keeps its connections; one turned off closes them (`0x98`).
@@ -32,6 +37,8 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Client events say where a client came from**: `connected` and `connect-refused` carry `address`, and so does
+  `ClientEvent.address` over the Application API, which the contract promised for CONNECTED and was always empty.
 - **Managed connections say why they cannot connect**: `ConnectionInfo.last_error` reads "cannot connect to plant.local:
   connection refused" (timed out, no route to host, a name that does not resolve, a TLS handshake that failed) — the
   transport's own words, from the socket's error — instead of "could not connect".

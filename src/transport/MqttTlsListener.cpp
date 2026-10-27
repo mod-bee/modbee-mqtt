@@ -32,6 +32,7 @@ void MqttAcceptedTlsTransport::adopt(int socket, void* ssl, const char* peerName
     _peerName = peerName ? peerName : "";
     _peerClosed = false;
     _secured = false;
+    _handshakeFailed = false;
     _lastError.clear();
     _peerCertificateName.clear();
     _peerCertificateFingerprint.clear();
@@ -133,9 +134,22 @@ bool MqttAcceptedTlsTransport::finishHandshake() {
     // opened a port and sent something that is not TLS at all. The broker sees
     // peerClosed() and tidies the slot away without a Will, because nothing
     // ever CONNECTed on it.
-    _handshaking = false;
-    fail("TLS handshake failed");
+    handshakeFailed();
     return false;
+}
+
+// The handshake failed - in finishHandshake(), or in a read that drove it.
+void MqttAcceptedTlsTransport::handshakeFailed() {
+    _handshaking = false;
+    // Only a peer that sent something tried a handshake. One that connected
+    // and closed without a byte - a port check, a load balancer's probe - is
+    // tidied away the same, but there is nothing about it worth reporting.
+#if MQTT_TLS_ENGINE_WOLFSSL
+    _handshakeFailed = true;
+#else
+    _handshakeFailed = BIO_number_read(SSL_get_rbio((SSL*)_ssl)) > 0;
+#endif
+    fail("TLS handshake failed");
 }
 
 size_t MqttAcceptedTlsTransport::readable() {
@@ -191,7 +205,10 @@ size_t MqttAcceptedTlsTransport::decrypt(uint8_t* into, size_t length) {
         return 0;
     }
     _peerClosed = true;
-    fail("TLS connection lost");
+    // Still shaking hands: the first read drives the handshake as often as
+    // finishHandshake() does, and fails it as often.
+    if (_handshaking && !_secured) handshakeFailed();
+    else fail("TLS connection lost");
     return 0;
 }
 

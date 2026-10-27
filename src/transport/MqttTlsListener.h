@@ -110,6 +110,7 @@ public:
     const char* peerCertificateFingerprint() const override {
         return _peerCertificateFingerprint.c_str();
     }
+    const char* handshakeFailure() const override { return _handshakeFailed ? _lastError.c_str() : ""; }
 
     bool inUse() const { return _socket >= 0; }
 
@@ -122,9 +123,11 @@ public:
     const std::string& lastError() const { return _lastError; }
 
 private:
+    void handshakeFailed();
     int _socket = -1;
     void* _ssl = nullptr;       // SSL* / WOLFSSL*
     bool _handshaking = false;
+    bool _handshakeFailed = false;
     bool _secured = false;
     bool _peerClosed = false;
     std::string _peerName;

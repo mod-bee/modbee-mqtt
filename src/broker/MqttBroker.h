@@ -208,6 +208,7 @@ enum class MqttBrokerClientEventKind : uint8_t {
     PublishRefused,                    // filter: the topic; reasonCode: what the PUBACK said (or would have)
     SubscribeRefused,                  // filter: the filter; reasonCode: what the SUBACK said
     ConnectRefused,                    // the server is full, or the login holds all its sessions; reasonCode
+    HandshakeFailed,                   // a TLS handshake failed, before any CONNECT: address, detail; no client id
 };
 
 struct MqttBrokerClientEvent {
@@ -218,6 +219,10 @@ struct MqttBrokerClientEvent {
     uint8_t qos = 0;                   // Subscribed: the QoS granted
     uint8_t reasonCode = 0;            // Disconnected: what we sent, or 0; a refusal: why
     bool resumed = false;              // Connected: an existing session was resumed (CONNACK session present)
+#if defined(MQTT_PLATFORM_HOST)
+    MqttSpan address;                  // where the connection came from ("10.0.4.7:51544"), where there is one
+    MqttSpan detail;                   // HandshakeFailed: why, in the TLS engine's words
+#endif
 };
 
 typedef void (*MqttBrokerClientEventFn)(void* context, const MqttBrokerClientEvent& event);
@@ -774,7 +779,7 @@ private:
 #if defined(MQTT_PLATFORM_HOST)
     // A refusal, for a client that may have no session yet (a CONNECT turned away).
     void refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
-                      const MqttSpan& filter, uint8_t reasonCode);
+                      const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection = nullptr);
 #endif
 
     // Assigned client identifiers are "auto-<n>". Per broker instance, never a

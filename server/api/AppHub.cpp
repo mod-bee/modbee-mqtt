@@ -59,6 +59,7 @@ AppClientEvent eventOf(const std::string& topic, const std::string& payload) {
                : kind == "publish-refused"   ? AppClientEvent::PublishRefused
                : kind == "subscribe-refused" ? AppClientEvent::SubscribeRefused
                : kind == "connect-refused"   ? AppClientEvent::ConnectRefused
+               : kind == "handshake-failed"  ? AppClientEvent::HandshakeFailed
                                           : AppClientEvent::Unknown;
     json::Value value;
     if (!json::parse(payload, value)) return event;
@@ -68,6 +69,7 @@ AppClientEvent eventOf(const std::string& topic, const std::string& payload) {
     // A refused publish names its topic; the event carries it where a filter goes.
     if (event.filter.empty()) event.filter = value.str("topic");
     event.address = value.str("address");
+    event.detail = value.str("detail");
     event.timeMs = value.integer("time");
     event.resumed = value.flag("resumed");
     event.reasonCode = (uint32_t)value.integer("reason");

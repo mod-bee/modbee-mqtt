@@ -309,7 +309,8 @@ message ClientEvent {
   uint32 reason_code = 6;          // DISCONNECTED: what the broker sent, or 0 when the client went itself; a refusal: why
   string filter = 7;               // SUBSCRIBED / UNSUBSCRIBED / SUBSCRIBE_REFUSED; PUBLISH_REFUSED: its topic
   uint32 qos = 8;                  // SUBSCRIBED: the QoS granted
-  string address = 9;              // CONNECTED
+  string address = 9;              // CONNECTED, CONNECT_REFUSED, HANDSHAKE_FAILED: where it came from, "10.0.4.7:51544"
+  string detail = 11;              // HANDSHAKE_FAILED: why, in the TLS engine's words
 }
 
 enum ClientEventKind {
@@ -325,6 +326,10 @@ enum ClientEventKind {
   CLIENT_EVENT_PUBLISH_REFUSED = 6;
   CLIENT_EVENT_SUBSCRIBE_REFUSED = 7;
   CLIENT_EVENT_CONNECT_REFUSED = 8;
+  // A TLS handshake failed before any CONNECT: an untrusted or missing client certificate, a protocol or cipher
+  // neither end shares, something that is not TLS on the TLS port. No client id - only `address` and `detail`. A
+  // connection closed without sending anything (a port check) is not one.
+  CLIENT_EVENT_HANDSHAKE_FAILED = 9;
 }
 
 message PublishRequest {

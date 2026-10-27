@@ -380,12 +380,18 @@ void MqttBroker::clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSes
     event.qos = qos;
     event.reasonCode = reasonCode;
     event.resumed = resumed;
+#if defined(MQTT_PLATFORM_HOST)
+    if (kind == MqttBrokerClientEventKind::Connected && session.connected &&
+        session.connectionSlot < _connections.size() && _connections[session.connectionSlot].transport != nullptr) {
+        event.address = mq_topicSpan(_connections[session.connectionSlot].transport->peerName());
+    }
+#endif
     _onClientEvent(_clientEventContext, event);
 }
 
 #if defined(MQTT_PLATFORM_HOST)
 void MqttBroker::refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
-                              const MqttSpan& filter, uint8_t reasonCode) {
+                              const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection) {
     if (_onClientEvent == nullptr) return;
     MqttBrokerClientEvent event;
     event.kind = kind;
@@ -393,6 +399,12 @@ void MqttBroker::refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& cl
     event.userName = userName;
     event.filter = filter;
     event.reasonCode = reasonCode;
+    if (connection != nullptr && connection->transport != nullptr) {
+        event.address = mq_topicSpan(connection->transport->peerName());
+        if (kind == MqttBrokerClientEventKind::HandshakeFailed) {
+            event.detail = mq_topicSpan(connection->transport->handshakeFailure());
+        }
+    }
     _onClientEvent(_clientEventContext, event);
 }
 #endif
@@ -1612,6 +1624,16 @@ void MqttBroker::closeConnection(MqttBrokerConnection& connection,
     if (!connection.inUse()) return;
     connection.closing = true;
 
+#if defined(MQTT_PLATFORM_HOST)
+    // Gone before a CONNECT because its TLS handshake failed: an untrusted or
+    // missing client certificate, a protocol neither end shares, something
+    // that is not TLS on the TLS port. The client cannot say why; this can.
+    if (!connection.connectSeen && connection.transport != nullptr &&
+        connection.transport->handshakeFailure()[0] != '\0') {
+        refusalEvent(MqttBrokerClientEventKind::HandshakeFailed, MqttSpan(), MqttSpan(), MqttSpan(), 0, &connection);
+    }
+#endif
+
     bool wroteDisconnect = false;
 
     if (sendDisconnect && connection.version == MqttVersion::V5 &&
@@ -2267,7 +2289,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         _status.refused++;
 #if defined(MQTT_PLATFORM_HOST)
         refusalEvent(MqttBrokerClientEventKind::ConnectRefused, request.clientId,
-                     request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_SERVER_BUSY);
+                     request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_SERVER_BUSY, &connection);
 #endif
         closeConnection(connection,
                         (uint8_t)(isBusyV5 ? MQ_REASON_SERVER_BUSY
@@ -2634,7 +2656,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
             _status.refused++;
 #if defined(MQTT_PLATFORM_HOST)
             refusalEvent(MqttBrokerClientEventKind::ConnectRefused, clientId,
-                         request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_QUOTA_EXCEEDED);
+                         request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_QUOTA_EXCEEDED, &connection);
 #endif
             closeConnection(connection, code, false, false);
             return;
@@ -2650,7 +2672,7 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
             _status.refused++;
 #if defined(MQTT_PLATFORM_HOST)
             refusalEvent(MqttBrokerClientEventKind::ConnectRefused, clientId,
-                         request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_SERVER_BUSY);
+                         request.hasUserName ? request.userName : MqttSpan(), MqttSpan(), MQ_REASON_SERVER_BUSY, &connection);
 #endif
             closeConnection(connection, (uint8_t)(isV5 ? MQ_REASON_SERVER_BUSY : MQ_RETURN_SERVER_UNAVAILABLE), false, false);
             return;
