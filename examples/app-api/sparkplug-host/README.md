@@ -1,7 +1,7 @@
 # A Sparkplug host through the Application API
 
 A Sparkplug B 3.0 **Host Application** on a broker it does not own, with no
-MQTT library: `modbee serve` holds the MQTT connection for it
+MQTT library: `modbee-mqtt serve` holds the MQTT connection for it
 ([Connections](../../../docs/app-api.md#connections-to-other-brokers)), hands
 over what arrives on it, and publishes for it - a QoS 1 publish answered only
 once the remote broker has acknowledged it. And the Eclipse Sparkplug TCK's
@@ -25,7 +25,7 @@ there).
 docker build -t modbee-sparkplug-tck tck/
 docker run -d --name modbee-tck --memory 1g -p 127.0.0.1:11883:1883 modbee-sparkplug-tck
 
-modbee serve --config modbee.yaml        # with api: grpc: [unix:/tmp/modbee-api.sock]
+modbee-mqtt serve --config modbee.yaml        # with api: grpc: [unix:/tmp/modbee-api.sock]
 
 npm install
 MODBEE_API=unix:/tmp/modbee-api.sock npm run tck

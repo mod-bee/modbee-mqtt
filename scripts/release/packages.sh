@@ -5,14 +5,14 @@
 # ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 #
 # THE .deb AND .rpm PACKAGES, for x86-64 and ARM64, from the static binaries
-# build-linux.sh left in dist/: /usr/bin/modbee and nothing else to set up
-# (nfpm.yaml) - `sudo modbee service install` does that. Runs on any x86-64
+# build-linux.sh left in dist/: /usr/bin/modbee-mqtt and nothing else to set up
+# (nfpm.yaml) - `sudo modbee-mqtt service install` does that. Runs on any x86-64
 # Linux, from the repository's root:
 #
 #   sh scripts/release/packages.sh 0.1.0
 #
-# Leaves in dist/: modbee_<v>-1_amd64.deb, modbee_<v>-1_arm64.deb,
-# modbee-<v>-1.x86_64.rpm, modbee-<v>-1.aarch64.rpm.
+# Leaves in dist/: modbee-mqtt_<v>-1_amd64.deb, modbee-mqtt_<v>-1_arm64.deb,
+# modbee-mqtt-<v>-1.x86_64.rpm, modbee-mqtt-<v>-1.aarch64.rpm.
 
 set -eu
 
@@ -30,7 +30,7 @@ if [ ! -x "$tools/nfpm" ]; then
 fi
 
 for arch in x86_64 arm64; do
-    binary=dist/modbee-$version-linux-$arch
+    binary=dist/modbee-mqtt-$version-linux-$arch
     test -f "$binary" || { echo "packages: no $binary - run build-linux.sh first" >&2; exit 1; }
     # nfpm's names (Go's); it writes each format's own - amd64 is x86_64 in an .rpm.
     case $arch in x86_64) goarch=amd64 ;; arm64) goarch=arm64 ;; esac

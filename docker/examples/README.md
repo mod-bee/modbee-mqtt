@@ -21,7 +21,7 @@ online. The ModBee platform needs this.
 - **Logins and retained messages survive** restarts and upgrades (volumes).
 - **Upgrade** with `docker compose pull && docker compose up -d`.
 - **Every setting** is in `modbee.yaml`, explained line by line;
-  `docker compose exec modbee modbee check` validates it.
+  `docker compose exec modbee modbee-mqtt check` validates it.
 
 ## Download one folder with curl
 

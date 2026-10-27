@@ -41,12 +41,12 @@ compose file) - add it and restart NPM if it is not there.
 ## Add a device
 
 ```bash
-docker compose exec modbee modbee user add tank-01 \
+docker compose exec modbee modbee-mqtt user add tank-01 \
   --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 ```
 
 It prints the device's password, once. Many devices of one kind can register
-themselves with one key instead (`modbee key create`):
+themselves with one key instead (`modbee-mqtt key create`):
 [docs/logins.md](../../../docs/logins.md).
 
 ## Check it works
@@ -69,5 +69,5 @@ docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h <your domain> \
 | | |
 | --- | --- |
 | Upgrade | `docker compose pull && docker compose up -d` - logins and retained messages stay (volume `modbee-data`) |
-| Back up the logins | `docker compose exec modbee modbee backup` - a copy in the volume's `backups` folder |
+| Back up the logins | `docker compose exec modbee modbee-mqtt backup` - a copy in the volume's `backups` folder |
 | Change a setting | edit `modbee.yaml`, then `docker compose restart modbee` |

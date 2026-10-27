@@ -1,7 +1,7 @@
 # modbee and Kafka on one machine, to try the Kafka pipe.
 #
 #   docker compose -f docker/compose.yml up -d
-#   modbee pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
+#   modbee-mqtt pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
 #
 # Plain MQTT on 1883 and metrics on 9464. For a server on the internet with a
 # certificate, use a folder of docker/examples/ instead (docs/docker.md).

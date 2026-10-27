@@ -2,10 +2,10 @@
 # and Windows (x64), tests each build, signs every file, and publishes a
 # GitHub release with the notes from CHANGELOG.md and the files to download.
 #
-#   modbee_<v>-1_amd64.deb, modbee_<v>-1_arm64.deb   Debian, Ubuntu: modbee installed
-#   modbee-<v>-1.x86_64.rpm, modbee-<v>-1.aarch64.rpm RHEL, Rocky, Alma, Fedora: the same
-#   modbee-<v>-linux-x86_64, modbee-<v>-linux-arm64  one static binary (musl), any Linux
-#   modbee-<v>-windows-x86_64.exe                    one file, also a Windows service
+#   modbee-mqtt_<v>-1_amd64.deb, modbee-mqtt_<v>-1_arm64.deb   Debian, Ubuntu: modbee installed
+#   modbee-mqtt-<v>-1.x86_64.rpm, modbee-mqtt-<v>-1.aarch64.rpm RHEL, Rocky, Alma, Fedora: the same
+#   modbee-mqtt-<v>-linux-x86_64, modbee-mqtt-<v>-linux-arm64  one static binary (musl), any Linux
+#   modbee-mqtt-<v>-windows-x86_64.exe                    one file, also a Windows service
 #   *.cdx.json                                       each binary's CycloneDX SBOM
 #   SHA256SUMS, SHA256SUMS.sigstore.json             the checksums, signed (cosign, keyless)
 #
@@ -146,7 +146,7 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          $exe = "build\cli\Release\modbee.exe"
+          $exe = "build\cli\Release\modbee-mqtt.exe"
           & $exe --version | Tee-Object -FilePath version.txt
           foreach ($part in 'Kafka pipe: librdkafka.*ssl', 'sasl_scram', 'zstd', 'Application API: gRPC') {
             if (-not (Select-String -Path version.txt -Pattern $part)) { Write-Error "--version lacks: $part"; exit 1 }
@@ -159,8 +159,8 @@ jobs:
           Write-Host "needs: $($dlls -join ', ')"
           $foreign = $dlls | Where-Object {
             $_ -match '^(VCRUNTIME|MSVCP|ucrtbase|api-ms-win-crt)' -or -not (Test-Path "$env:SystemRoot\System32\$_") }
-          if ($foreign) { Write-Error "modbee.exe needs DLLs not part of Windows: $($foreign -join ', ')"; exit 1 }
-          $name = "modbee-$env:VERSION-windows-x86_64"
+          if ($foreign) { Write-Error "modbee-mqtt.exe needs DLLs not part of Windows: $($foreign -join ', ')"; exit 1 }
+          $name = "modbee-mqtt-$env:VERSION-windows-x86_64"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $exe "dist\$name.exe"
           python scripts/release/sbom.py --installed "$env:VCPKG_INSTALLATION_ROOT\installed\$env:TRIPLET" `
@@ -197,15 +197,15 @@ jobs:
       - name: The packages install
         run: |
           docker run --rm -v "$PWD/dist":/dist:ro debian:trixie-slim sh -ec '
-            apt-get install -y /dist/modbee_'"$VERSION"'-1_amd64.deb >/dev/null
-            modbee --version
-            apt-get remove -y modbee >/dev/null
-            test ! -e /usr/bin/modbee'
+            apt-get install -y /dist/modbee-mqtt_'"$VERSION"'-1_amd64.deb >/dev/null
+            modbee-mqtt --version
+            apt-get remove -y modbee-mqtt >/dev/null
+            test ! -e /usr/bin/modbee-mqtt'
           docker run --rm -v "$PWD/dist":/dist:ro fedora:42 sh -ec '
-            dnf install -y -q /dist/modbee-'"$VERSION"'-1.x86_64.rpm
-            modbee --version
-            dnf remove -y -q modbee
-            test ! -e /usr/bin/modbee'
+            dnf install -y -q /dist/modbee-mqtt-'"$VERSION"'-1.x86_64.rpm
+            modbee-mqtt --version
+            dnf remove -y -q modbee-mqtt
+            test ! -e /usr/bin/modbee-mqtt'
       - name: Checksums
         working-directory: dist
         run: |
@@ -242,26 +242,26 @@ jobs:
 
           | For | x86-64 | ARM 64-bit (Raspberry Pi 4/5, ARM servers) |
           |---|---|---|
-          | **Debian, Ubuntu** | \`modbee_${VERSION}-1_amd64.deb\` | \`modbee_${VERSION}-1_arm64.deb\` |
-          | **RHEL, Rocky, Alma, Fedora** | \`modbee-$VERSION-1.x86_64.rpm\` | \`modbee-$VERSION-1.aarch64.rpm\` |
-          | **Any Linux**: one file, nothing to install | \`modbee-$VERSION-linux-x86_64\` | \`modbee-$VERSION-linux-arm64\` |
-          | **Windows**: one file, also a Windows service | \`modbee-$VERSION-windows-x86_64.exe\` | |
+          | **Debian, Ubuntu** | \`modbee-mqtt_${VERSION}-1_amd64.deb\` | \`modbee-mqtt_${VERSION}-1_arm64.deb\` |
+          | **RHEL, Rocky, Alma, Fedora** | \`modbee-mqtt-$VERSION-1.x86_64.rpm\` | \`modbee-mqtt-$VERSION-1.aarch64.rpm\` |
+          | **Any Linux**: one file, nothing to install | \`modbee-mqtt-$VERSION-linux-x86_64\` | \`modbee-mqtt-$VERSION-linux-arm64\` |
+          | **Windows**: one file, also a Windows service | \`modbee-mqtt-$VERSION-windows-x86_64.exe\` | |
           | **Docker** | \`ghcr.io/mod-bee/modbee-mqtt:$VERSION\` | the same tag |
 
           \`\`\`sh
-          sudo apt install ./modbee_${VERSION}-1_amd64.deb     # or: sudo dnf install ./modbee-$VERSION-1.x86_64.rpm
-          sudo modbee service install                         # runs it as a service; Windows: the same
-          sudo modbee admin                                   # the admin login
+          sudo apt install ./modbee-mqtt_${VERSION}-1_amd64.deb     # or: sudo dnf install ./modbee-mqtt-$VERSION-1.x86_64.rpm
+          sudo modbee-mqtt service install                         # runs it as a service; Windows: the same
+          sudo modbee-mqtt admin                                   # the admin login
           \`\`\`
 
           Each is the broker, the Kafka pipe, the Application API and the CLI;
-          \`modbee --version\` lists them. The \`.cdx.json\` files are each binary's SBOM:
+          \`modbee-mqtt --version\` lists them. The \`.cdx.json\` files are each binary's SBOM:
           every library inside, with its version and licence.
 
           ## Checking a download
 
           \`\`\`sh
-          gh attestation verify modbee_${VERSION}-1_amd64.deb --repo ${GITHUB_REPOSITORY}
+          gh attestation verify modbee-mqtt_${VERSION}-1_amd64.deb --repo ${GITHUB_REPOSITORY}
           \`\`\`
 
           or against \`SHA256SUMS\`, signed with Sigstore - [docs/releases.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/releases.md).

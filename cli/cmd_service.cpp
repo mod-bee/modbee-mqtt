@@ -3,20 +3,20 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// `modbee service`: `modbee serve` as a service - Windows' Service Control
+// `modbee-mqtt service`: `modbee-mqtt serve` as a service - Windows' Service Control
 // Manager, or systemd on Linux - the same commands on both.
 //
-//   modbee service install [--name modbee] [-- <serve options>]
-//   modbee service start | stop | status | uninstall [--name modbee]
+//   modbee-mqtt service install [--name modbee] [-- <serve options>]
+//   modbee-mqtt service start | stop | status | uninstall [--name modbee]
 //
 // install also starts it. With no serve options it runs
-// `modbee serve --data <folder>` - everything in one folder
-// (cliDataDirectory), set up with `modbee admin` and `modbee config`.
+// `modbee-mqtt serve --data <folder>` - everything in one folder
+// (cliDataDirectory), set up with `modbee-mqtt admin` and `modbee-mqtt config`.
 //
 // WINDOWS:
 // install registers the service with the Service Control Manager - started
 // at boot, restarted by Windows if it ever stops unexpectedly - to run
-// `modbee service run`, which is serve with the arguments given after `--`.
+// `modbee-mqtt service run`, which is serve with the arguments given after `--`.
 // Windows asking it to stop (a stop, a shutdown) is the same as Ctrl+C: serve
 // stops the way it always does, telling every client and keeping what it
 // keeps. Its output goes to a log file (default
@@ -39,13 +39,13 @@ int cmdServe(int argc, char** argv);
 namespace {
 
 struct Options {
-    std::string name = "modbee";
+    std::string name = "modbee-mqtt";
     std::string log;
     std::vector<std::string> serve;      // what follows `--`
 };
 
 const char* kUsage =
-    "usage: modbee service <install|uninstall|start|stop|status> [--name <name>] [--log <file>]\n"
+    "usage: modbee-mqtt service <install|uninstall|start|stop|status> [--name <name>] [--log <file>]\n"
     "                      [-- <serve options, e.g. --config C:\\ModBee\\modbee.yaml>]\n";
 
 bool parse(int argc, char** argv, int from, Options& o) {
@@ -58,7 +58,7 @@ bool parse(int argc, char** argv, int from, Options& o) {
         if ((a == "--name" || a == "--log") && i + 1 < argc) {
             (a == "--name" ? o.name : o.log) = argv[++i];
         } else {
-            std::fprintf(stderr, "modbee service: unknown option %s\n%s", a.c_str(), kUsage);
+            std::fprintf(stderr, "modbee-mqtt service: unknown option %s\n%s", a.c_str(), kUsage);
             return false;
         }
     }
@@ -109,12 +109,12 @@ struct Handles {
 bool openService(const Options& o, DWORD access, Handles& h) {
     h.manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!h.manager) {
-        std::fprintf(stderr, "modbee service: the Service Control Manager: %s\n", lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: the Service Control Manager: %s\n", lastError().c_str());
         return false;
     }
     h.service = OpenServiceA(h.manager, o.name.c_str(), access);
     if (!h.service) {
-        std::fprintf(stderr, "modbee service: \"%s\": %s\n", o.name.c_str(), lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: \"%s\": %s\n", o.name.c_str(), lastError().c_str());
         return false;
     }
     return true;
@@ -152,7 +152,7 @@ int install(Options o) {
         if (o.serve[i - 1] == "--data") data = o.serve[i] = absolute(o.serve[i]);
     }
     if (!data.empty() && !cliMakeDirectories(data)) {
-        std::fprintf(stderr, "modbee service: cannot make the folder %s\n", data.c_str());
+        std::fprintf(stderr, "modbee-mqtt service: cannot make the folder %s\n", data.c_str());
         return 3;
     }
     // The service starts in C:\Windows\System32: a relative path given here
@@ -166,7 +166,7 @@ int install(Options o) {
     Handles h;
     h.manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!h.manager) {
-        std::fprintf(stderr, "modbee service: the Service Control Manager: %s (run as Administrator)\n",
+        std::fprintf(stderr, "modbee-mqtt service: the Service Control Manager: %s (run as Administrator)\n",
                      lastError().c_str());
         return 3;
     }
@@ -175,11 +175,11 @@ int install(Options o) {
                                SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
                                command.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!h.service) {
-        std::fprintf(stderr, "modbee service: cannot install \"%s\": %s\n", o.name.c_str(), lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: cannot install \"%s\": %s\n", o.name.c_str(), lastError().c_str());
         return 3;
     }
     SERVICE_DESCRIPTIONA description;
-    std::string text = "The ModBee MQTT broker (modbee serve).";
+    std::string text = "The ModBee MQTT broker (modbee-mqtt serve).";
     description.lpDescription = &text[0];
     ChangeServiceConfig2A(h.service, SERVICE_CONFIG_DESCRIPTION, &description);
     // Stopped by anything but a request: started again, after 5 s, then 30 s.
@@ -195,14 +195,14 @@ int install(Options o) {
     SERVICE_FAILURE_ACTIONS_FLAG onErrors;
     onErrors.fFailureActionsOnNonCrashFailures = TRUE;
     ChangeServiceConfig2A(h.service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &onErrors);
-    std::printf("modbee service: installed \"%s\" - it starts with Windows, and again if it stops\n  %s\n",
+    std::printf("modbee-mqtt service: installed \"%s\" - it starts with Windows, and again if it stops\n  %s\n",
                 o.name.c_str(), command.c_str());
     const int started = start(o);
     if (started != 0) return started;
     if (!data.empty()) {
         std::printf("  everything it keeps: %s\n", data.c_str());
         const std::string where = data == cliDataDirectory() ? "" : " --data \"" + data + "\"";
-        std::printf("  the admin login, to set it or change its password: modbee admin%s\n", where.c_str());
+        std::printf("  the admin login, to set it or change its password: modbee-mqtt admin%s\n", where.c_str());
     }
     return 0;
 }
@@ -211,14 +211,14 @@ int start(const Options& o) {
     Handles h;
     if (!openService(o, SERVICE_START | SERVICE_QUERY_STATUS, h)) return 3;
     if (!StartServiceA(h.service, 0, nullptr) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
-        std::fprintf(stderr, "modbee service: cannot start \"%s\": %s\n", o.name.c_str(), lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: cannot start \"%s\": %s\n", o.name.c_str(), lastError().c_str());
         return 3;
     }
     if (!waitFor(h.service, SERVICE_RUNNING, 30000)) {
-        std::fprintf(stderr, "modbee service: \"%s\" did not reach running; see its log\n", o.name.c_str());
+        std::fprintf(stderr, "modbee-mqtt service: \"%s\" did not reach running; see its log\n", o.name.c_str());
         return 3;
     }
-    std::printf("modbee service: \"%s\" running\n", o.name.c_str());
+    std::printf("modbee-mqtt service: \"%s\" running\n", o.name.c_str());
     return 0;
 }
 
@@ -227,14 +227,14 @@ int stop(const Options& o, bool quiet = false) {
     if (!openService(o, SERVICE_STOP | SERVICE_QUERY_STATUS, h)) return 3;
     SERVICE_STATUS status;
     if (!ControlService(h.service, SERVICE_CONTROL_STOP, &status) && GetLastError() != ERROR_SERVICE_NOT_ACTIVE) {
-        std::fprintf(stderr, "modbee service: cannot stop \"%s\": %s\n", o.name.c_str(), lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: cannot stop \"%s\": %s\n", o.name.c_str(), lastError().c_str());
         return 3;
     }
     if (!waitFor(h.service, SERVICE_STOPPED, 60000)) {
-        std::fprintf(stderr, "modbee service: \"%s\" did not stop within a minute\n", o.name.c_str());
+        std::fprintf(stderr, "modbee-mqtt service: \"%s\" did not stop within a minute\n", o.name.c_str());
         return 3;
     }
-    if (!quiet) std::printf("modbee service: \"%s\" stopped\n", o.name.c_str());
+    if (!quiet) std::printf("modbee-mqtt service: \"%s\" stopped\n", o.name.c_str());
     return 0;
 }
 
@@ -243,7 +243,7 @@ int status(const Options& o) {
     if (!openService(o, SERVICE_QUERY_STATUS, h)) return 3;
     SERVICE_STATUS s;
     if (!QueryServiceStatus(h.service, &s)) {
-        std::fprintf(stderr, "modbee service: %s\n", lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: %s\n", lastError().c_str());
         return 3;
     }
     std::printf("%s %s\n", o.name.c_str(), stateName(s.dwCurrentState));
@@ -262,10 +262,10 @@ int uninstall(const Options& o) {
     Handles h;
     if (!openService(o, DELETE, h)) return 3;
     if (!DeleteService(h.service)) {
-        std::fprintf(stderr, "modbee service: cannot remove \"%s\": %s\n", o.name.c_str(), lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt service: cannot remove \"%s\": %s\n", o.name.c_str(), lastError().c_str());
         return 3;
     }
-    std::printf("modbee service: removed \"%s\"\n", o.name.c_str());
+    std::printf("modbee-mqtt service: removed \"%s\"\n", o.name.c_str());
     return 0;
 }
 
@@ -319,13 +319,13 @@ void WINAPI serviceMain(DWORD, LPSTR*) {
     // No console: what serve says goes to the log, appended.
     if (std::freopen(log.c_str(), "a", stdout)) std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
     std::freopen(log.c_str(), "a", stderr);
-    std::vector<std::string> args = {"modbee", "serve"};
+    std::vector<std::string> args = {"modbee-mqtt", "serve"};
     args.insert(args.end(), g_run.serve.begin(), g_run.serve.end());
     std::vector<char*> argv;
     for (std::string& a : args) argv.push_back(&a[0]);
     argv.push_back(nullptr);
     report(SERVICE_RUNNING);
-    event(EVENTLOG_INFORMATION_TYPE, "modbee service \"" + g_run.name + "\" started; log: " + log);
+    event(EVENTLOG_INFORMATION_TYPE, "modbee-mqtt service \"" + g_run.name + "\" started; log: " + log);
     int rc = cmdServe((int)args.size(), argv.data());
     // A restart asked for: an error exit, which Windows answers by starting
     // the service again (the failure actions set at install).
@@ -334,11 +334,11 @@ void WINAPI serviceMain(DWORD, LPSTR*) {
     std::fflush(stdout);
     std::fflush(stderr);
     if (restart) {
-        event(EVENTLOG_INFORMATION_TYPE, "modbee service \"" + g_run.name + "\" restarting to apply a setting");
+        event(EVENTLOG_INFORMATION_TYPE, "modbee-mqtt service \"" + g_run.name + "\" restarting to apply a setting");
     } else if (rc == 0) {
-        event(EVENTLOG_INFORMATION_TYPE, "modbee service \"" + g_run.name + "\" stopped");
+        event(EVENTLOG_INFORMATION_TYPE, "modbee-mqtt service \"" + g_run.name + "\" stopped");
     } else {
-        event(EVENTLOG_ERROR_TYPE, "modbee service \"" + g_run.name + "\" stopped with exit code " +
+        event(EVENTLOG_ERROR_TYPE, "modbee-mqtt service \"" + g_run.name + "\" stopped with exit code " +
                                        std::to_string(rc) + "; see " + log);
     }
     if (g_events) DeregisterEventSource(g_events);
@@ -350,10 +350,10 @@ int run(const Options& o) {
     SERVICE_TABLE_ENTRYA table[] = {{&g_run.name[0], serviceMain}, {nullptr, nullptr}};
     if (!StartServiceCtrlDispatcherA(table)) {
         if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
-            std::fprintf(stderr, "modbee service run: only the Service Control Manager starts this; "
-                                 "to run in a console, use modbee serve\n");
+            std::fprintf(stderr, "modbee-mqtt service run: only the Service Control Manager starts this; "
+                                 "to run in a console, use modbee-mqtt serve\n");
         } else {
-            std::fprintf(stderr, "modbee service run: %s\n", lastError().c_str());
+            std::fprintf(stderr, "modbee-mqtt service run: %s\n", lastError().c_str());
         }
         return 2;
     }
@@ -376,14 +376,14 @@ int cmdService(int argc, char** argv) {
     if (action == "stop") return stop(o);
     if (action == "status") return status(o);
     if (action == "run") return run(o);
-    std::fprintf(stderr, "modbee service: unknown action %s\n%s", action.c_str(), kUsage);
+    std::fprintf(stderr, "modbee-mqtt service: unknown action %s\n%s", action.c_str(), kUsage);
     return 2;
 }
 
 #elif defined(__linux__) && defined(MODBEE_HAVE_SERVER)
 
 // LINUX: the same commands, through systemd. install writes the unit
-// (/etc/systemd/system/<name>.service), makes the `modbee` system user and
+// (/etc/systemd/system/<name>.service), makes the `modbee-mqtt` system user and
 // the data folder, and enables and starts it; its output is in the journal.
 
 #include <pwd.h>
@@ -396,12 +396,12 @@ int cmdService(int argc, char** argv) {
 namespace {
 
 struct Options {
-    std::string name = "modbee";
+    std::string name = "modbee-mqtt";
     std::vector<std::string> serve;      // what follows `--`
 };
 
 const char* kUsage =
-    "usage: modbee service <install|uninstall|start|stop|status> [--name <name>]\n"
+    "usage: modbee-mqtt service <install|uninstall|start|stop|status> [--name <name, default modbee-mqtt>]\n"
     "                      [-- <serve options; default --data /var/lib/<name>>]\n";
 
 bool parse(int argc, char** argv, int from, Options& o) {
@@ -414,7 +414,7 @@ bool parse(int argc, char** argv, int from, Options& o) {
         if (a == "--name" && i + 1 < argc) {
             o.name = argv[++i];
         } else {
-            std::fprintf(stderr, "modbee service: unknown option %s\n%s", a.c_str(), kUsage);
+            std::fprintf(stderr, "modbee-mqtt service: unknown option %s\n%s", a.c_str(), kUsage);
             return false;
         }
     }
@@ -445,12 +445,12 @@ bool sh(const std::string& command) { return std::system(command.c_str()) == 0; 
 
 bool ready(const Options& o) {
     if (geteuid() != 0) {
-        std::fprintf(stderr, "modbee service: run it as root (sudo modbee service ...)\n");
+        std::fprintf(stderr, "modbee-mqtt service: run it as root (sudo modbee-mqtt service ...)\n");
         return false;
     }
     struct stat info;
     if (::stat("/run/systemd/system", &info) != 0) {
-        std::fprintf(stderr, "modbee service: this system does not run systemd - run `modbee serve --data %s` "
+        std::fprintf(stderr, "modbee-mqtt service: this system does not run systemd - run `modbee-mqtt serve --data %s` "
                              "under what it has instead\n", cliDataDirectory(o.name).c_str());
         return false;
     }
@@ -460,7 +460,7 @@ bool ready(const Options& o) {
 bool installed(const Options& o) {
     struct stat info;
     if (::stat(unitFile(o).c_str(), &info) == 0) return true;
-    std::fprintf(stderr, "modbee service: \"%s\" is not installed (modbee service install)\n", o.name.c_str());
+    std::fprintf(stderr, "modbee-mqtt service: \"%s\" is not installed (modbee-mqtt service install)\n", o.name.c_str());
     return false;
 }
 
@@ -475,7 +475,7 @@ int install(Options o) {
     char exe[4096] = {0};
     const ssize_t length = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (length <= 0) {
-        std::fprintf(stderr, "modbee service: cannot tell where this modbee is\n");
+        std::fprintf(stderr, "modbee-mqtt service: cannot tell where this modbee is\n");
         return 3;
     }
     if (o.serve.empty()) o.serve = {"--data", cliDataDirectory(o.name)};
@@ -487,15 +487,16 @@ int install(Options o) {
         if (i > 0 && o.serve[i - 1] == "--data") data = o.serve[i];
     }
     // The user it runs as: made once, shared by every instance.
-    if (getpwnam("modbee") == nullptr &&
+    if (getpwnam("modbee-mqtt") == nullptr &&
         !sh("useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "
-            "--comment 'ModBee MQTT' modbee 2>/dev/null || adduser -S -D -H -h /nonexistent -s /sbin/nologin modbee")) {
-        std::fprintf(stderr, "modbee service: cannot make the modbee user\n");
+            "--comment 'ModBee MQTT' modbee-mqtt 2>/dev/null || "
+            "adduser -S -D -H -h /nonexistent -s /sbin/nologin modbee-mqtt")) {
+        std::fprintf(stderr, "modbee-mqtt service: cannot make the modbee-mqtt user\n");
         return 3;
     }
     if (!data.empty()) {
-        if (!cliMakeDirectories(data) || !sh("chown -R modbee:modbee " + shell(data) + " && chmod 0750 " + shell(data))) {
-            std::fprintf(stderr, "modbee service: cannot prepare %s\n", data.c_str());
+        if (!cliMakeDirectories(data) || !sh("chown -R modbee-mqtt:modbee-mqtt " + shell(data) + " && chmod 0750 " + shell(data))) {
+            std::fprintf(stderr, "modbee-mqtt service: cannot prepare %s\n", data.c_str());
             return 3;
         }
     }
@@ -506,7 +507,7 @@ int install(Options o) {
         shown += " " + (a.find_first_of(" \t'\"") == std::string::npos ? a : shell(a));
     }
     std::ofstream unit(unitFile(o).c_str(), std::ios::trunc);
-    unit << "# Written by `modbee service install`; `modbee service uninstall` removes it.\n"
+    unit << "# Written by `modbee-mqtt service install`; `modbee-mqtt service uninstall` removes it.\n"
             "[Unit]\n"
             "Description=ModBee MQTT (" << o.name << ")\n"
             "Documentation=https://github.com/mod-bee/modbee-mqtt\n"
@@ -514,8 +515,8 @@ int install(Options o) {
             "Wants=network-online.target\n"
             "\n"
             "[Service]\n"
-            "User=modbee\n"
-            "Group=modbee\n"
+            "User=modbee-mqtt\n"
+            "Group=modbee-mqtt\n"
             "ExecStart=" << command << "\n"
             // Always: a setting applied with --restart stops it on purpose,
             // and this is what starts it again.
@@ -532,22 +533,22 @@ int install(Options o) {
             "WantedBy=multi-user.target\n";
     unit.close();
     if (!unit) {
-        std::fprintf(stderr, "modbee service: cannot write %s\n", unitFile(o).c_str());
+        std::fprintf(stderr, "modbee-mqtt service: cannot write %s\n", unitFile(o).c_str());
         return 3;
     }
     if (!sh("systemctl daemon-reload && systemctl enable --now " + shell(o.name) + " >/dev/null 2>&1")) {
-        std::fprintf(stderr, "modbee service: systemd would not start it - journalctl -u %s says why\n",
+        std::fprintf(stderr, "modbee-mqtt service: systemd would not start it - journalctl -u %s says why\n",
                      o.name.c_str());
         return 3;
     }
-    std::printf("modbee service: \"%s\" installed and running - it starts at boot, and again if it stops\n",
+    std::printf("modbee-mqtt service: \"%s\" installed and running - it starts at boot, and again if it stops\n",
                 o.name.c_str());
     std::printf("  %s\n", shown.c_str());
     if (!data.empty()) std::printf("  everything it keeps: %s\n", data.c_str());
     std::printf("  its log: journalctl -u %s\n", o.name.c_str());
     if (!data.empty()) {
         const std::string where = data == cliDataDirectory() ? "" : " --data " + data;
-        std::printf("  the admin login, to set it or change its password: sudo modbee admin%s\n", where.c_str());
+        std::printf("  the admin login, to set it or change its password: sudo modbee-mqtt admin%s\n", where.c_str());
     }
     return 0;
 }
@@ -557,18 +558,18 @@ int uninstall(const Options& o) {
     sh("systemctl disable --now " + shell(o.name) + " >/dev/null 2>&1");
     std::remove(unitFile(o).c_str());
     sh("systemctl daemon-reload");
-    std::printf("modbee service: \"%s\" stopped and removed - what it kept is still there\n", o.name.c_str());
+    std::printf("modbee-mqtt service: \"%s\" stopped and removed - what it kept is still there\n", o.name.c_str());
     return 0;
 }
 
 int control(const Options& o, const char* verb, const char* done) {
     if (!ready(o) || !installed(o)) return 3;
     if (!sh(std::string("systemctl ") + verb + " " + shell(o.name))) {
-        std::fprintf(stderr, "modbee service: cannot %s \"%s\" - journalctl -u %s says why\n", verb,
+        std::fprintf(stderr, "modbee-mqtt service: cannot %s \"%s\" - journalctl -u %s says why\n", verb,
                      o.name.c_str(), o.name.c_str());
         return 3;
     }
-    std::printf("modbee service: \"%s\" %s\n", o.name.c_str(), done);
+    std::printf("modbee-mqtt service: \"%s\" %s\n", o.name.c_str(), done);
     return 0;
 }
 
@@ -598,15 +599,15 @@ int cmdService(int argc, char** argv) {
     if (action == "start") return control(o, "start", "running");
     if (action == "stop") return control(o, "stop", "stopped");
     if (action == "status") return status(o);
-    std::fprintf(stderr, "modbee service: unknown action %s\n%s", action.c_str(), kUsage);
+    std::fprintf(stderr, "modbee-mqtt service: unknown action %s\n%s", action.c_str(), kUsage);
     return 2;
 }
 
 #else
 
 int cmdService(int, char**) {
-    std::fprintf(stderr, "modbee service: Linux (systemd) and Windows only - elsewhere, run "
-                         "`modbee serve --data <folder>` under what the system has.\n");
+    std::fprintf(stderr, "modbee-mqtt service: Linux (systemd) and Windows only - elsewhere, run "
+                         "`modbee-mqtt serve --data <folder>` under what the system has.\n");
     return 2;
 }
 

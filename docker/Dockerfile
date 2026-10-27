@@ -1,4 +1,4 @@
-# The modbee-mqtt image: `modbee serve`, the multi-core MQTT broker with the
+# The modbee-mqtt image: `modbee-mqtt serve`, the multi-core MQTT broker with the
 # Kafka pipe. Published as ghcr.io/mod-bee/modbee-mqtt by
 # .github/workflows/docker.yml; docs/docker.md is the manual.
 #
@@ -118,13 +118,13 @@ RUN if [ "${TLS_ENGINE}" = wolfssl ]; then \
     && grep -q "modbee: librdkafka .* found" /tmp/configure.log \
     && grep -q "modbee: gRPC .* found - the Application API is built" /tmp/configure.log \
     && cmake --build /build --target modbee -j"$(nproc)" \
-    && strip /build/cli/modbee \
+    && strip /build/cli/modbee-mqtt \
     && mkdir -p /out/lib \
-    && ldd /build/cli/modbee | awk '$3 ~ /^\/usr\/local\/lib\// { print $3 }' \
+    && ldd /build/cli/modbee-mqtt | awk '$3 ~ /^\/usr\/local\/lib\// { print $3 }' \
         | xargs -r cp -L -t /out/lib/ \
     && strip --strip-unneeded /out/lib/* \
     && ls -l /out/lib \
-    && ldd /build/cli/modbee | awk '$3 ~ /^\/(usr\/)?lib\// { print $3 }' | xargs -r readlink -f \
+    && ldd /build/cli/modbee-mqtt | awk '$3 ~ /^\/(usr\/)?lib\// { print $3 }' | xargs -r readlink -f \
         | xargs -r dpkg -S | cut -d: -f1 | sort -u > /out/packages \
     && test -s /out/packages \
     && echo "runtime packages:" $(cat /out/packages)
@@ -147,9 +147,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /etc/modbee && touch /etc/modbee/modbee.yaml \
     && mkdir -p /var/lib/modbee && chown modbee:modbee /var/lib/modbee
 COPY --from=build /out/lib/ /usr/local/lib/
-COPY --from=build /build/cli/modbee /usr/local/bin/modbee
+COPY --from=build /build/cli/modbee-mqtt /usr/local/bin/modbee-mqtt
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/modbee-entrypoint
-RUN ldconfig && modbee check -C /etc/modbee/modbee.yaml -q
+RUN ldconfig && modbee-mqtt check -C /etc/modbee/modbee.yaml -q
 USER modbee
 EXPOSE 1883 8883 9464 7660
 # A TCP check of the MQTT ports: healthy once EITHER listener accepts a

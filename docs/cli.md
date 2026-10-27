@@ -1,4 +1,4 @@
-# The `modbee` command-line tool
+# The `modbee-mqtt` command-line tool
 
 One binary that publishes, subscribes, benchmarks and runs the broker, built
 on this library's own client. It reports what the **broker said** about every
@@ -6,10 +6,10 @@ operation, not just that something was sent.
 
 ## Getting it
 
-| Where you are | The `modbee` command |
+| Where you are | The `modbee-mqtt` command |
 | --- | --- |
 | **The Docker image** | **Included.** Nothing to install - see below |
-| **This repository, built on Linux or macOS** | Built by default, as `build/cli/modbee` |
+| **This repository, built on Linux or macOS** | Built by default, as `build/cli/modbee-mqtt` |
 | **The Arduino library** | **Not included.** It is a computer program, not part of what a board runs |
 | **Your own CMake project** that adds this library | Not built - your project gets the library alone. `-DMQTT_BUILD_CLI=ON` builds it |
 
@@ -29,12 +29,12 @@ machine from `docker run`, add `--network host`.
 
 ```bash
 cmake -S . -B build && cmake --build build -j
-./build/cli/modbee --help
+./build/cli/modbee-mqtt --help
 sudo cmake --install build          # optional: puts modbee in /usr/local/bin
 ```
 
 On Linux every command is built; on Windows every one but `bench`
-([windows.md](windows.md), with `modbee service` to run `serve` as a Windows
+([windows.md](windows.md), with `modbee-mqtt service` to run `serve` as a Windows
 service). On macOS, `pub`, `sub` and `req` are, and `bench`, `serve` and
 `check` are not.
 `serve` includes the [Kafka pipe](kafka.md) when the librdkafka development
@@ -50,21 +50,21 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 
 | Command | What it does |
 | --- | --- |
-| `modbee pub` | Publish, and print the broker's answer for each message |
-| `modbee sub` | Subscribe, print what the broker granted, then print what arrives |
-| `modbee req` | MQTT 5 request/response: publish with a response topic and correlation data, wait for the matching reply |
-| `modbee bench` | Load generator, Linux only: `conn`, `pub`, `sub` |
-| `modbee serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe. `--data <folder>` keeps everything in that folder - logins, settings, retained messages, sessions - with no `modbee.yaml` |
-| `modbee service` | `serve` as a service - systemd on Linux, a Windows service on Windows: `install` (and start), `start`, `stop`, `status`, `uninstall`. With nothing else, it keeps everything in one folder (`serve --data`) ([releases.md](releases.md#installing-it)) |
-| `modbee admin` | The admin login, set on the server itself - added, or given a new password; it works at once, on a running server too |
-| `modbee check` | Validate a `modbee.yaml` and report every problem with its line |
-| `modbee user` | Device logins on a broker: `list`, `show`, `add`, `set`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart. `add` and `set` take `--fingerprint`, binding a login to one client certificate ([logins.md](logins.md#logging-in-with-a-certificate)) |
-| `modbee key` | Provisioning keys, with which devices register themselves: `create`, `list`, `remove` |
-| `modbee provision` | Register a device with a key from a computer, and print the login it was given |
-| `modbee config` | A broker's settings, kept in its login database: `get`, `set`, `apply`, `check`, `reset` - applied at its next restart, which `--restart` asks for, except the TLS certificate, key and client CA, which apply at once (`broker.tls.cert-pem=@file`; [settings.md](settings.md)) |
-| `modbee backup` | A copy of a broker's login database, and the settings kept in it |
-| `modbee restore` | Put a backup of the login database back, with the broker stopped |
-| `modbee --version` | The version, the TLS engine this build was compiled with - `modbee 0.1.0 (TLS: wolfSSL)` - and what else is inside: the Kafka pipe with its librdkafka's features, and the Application API with its gRPC, or `not built` |
+| `modbee-mqtt pub` | Publish, and print the broker's answer for each message |
+| `modbee-mqtt sub` | Subscribe, print what the broker granted, then print what arrives |
+| `modbee-mqtt req` | MQTT 5 request/response: publish with a response topic and correlation data, wait for the matching reply |
+| `modbee-mqtt bench` | Load generator, Linux only: `conn`, `pub`, `sub` |
+| `modbee-mqtt serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe. `--data <folder>` keeps everything in that folder - logins, settings, retained messages, sessions - with no `modbee.yaml` |
+| `modbee-mqtt service` | `serve` as a service - systemd on Linux, a Windows service on Windows: `install` (and start), `start`, `stop`, `status`, `uninstall`. With nothing else, it keeps everything in one folder (`serve --data`) ([releases.md](releases.md#installing-it)) |
+| `modbee-mqtt admin` | The admin login, set on the server itself - added, or given a new password; it works at once, on a running server too |
+| `modbee-mqtt check` | Validate a `modbee.yaml` and report every problem with its line |
+| `modbee-mqtt user` | Device logins on a broker: `list`, `show`, `add`, `set`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart. `add` and `set` take `--fingerprint`, binding a login to one client certificate ([logins.md](logins.md#logging-in-with-a-certificate)) |
+| `modbee-mqtt key` | Provisioning keys, with which devices register themselves: `create`, `list`, `remove` |
+| `modbee-mqtt provision` | Register a device with a key from a computer, and print the login it was given |
+| `modbee-mqtt config` | A broker's settings, kept in its login database: `get`, `set`, `apply`, `check`, `reset` - applied at its next restart, which `--restart` asks for, except the TLS certificate, key and client CA, which apply at once (`broker.tls.cert-pem=@file`; [settings.md](settings.md)) |
+| `modbee-mqtt backup` | A copy of a broker's login database, and the settings kept in it |
+| `modbee-mqtt restore` | Put a backup of the login database back, with the broker stopped |
+| `modbee-mqtt --version` | The version, the TLS engine this build was compiled with - `modbee-mqtt 0.1.0 (TLS: wolfSSL)` - and what else is inside: the Kafka pipe with its librdkafka's features, and the Application API with its gRPC, or `not built` |
 
 **Exit codes, for scripts:**
 
@@ -95,10 +95,10 @@ Every client command takes the same options.
 ## Publishing
 
 ```bash
-modbee pub -t plant/tank-01/level -m 4.25 -q 1
+modbee-mqtt pub -t plant/tank-01/level -m 4.25 -q 1
 #1 plant/tank-01/level: delivered to the broker
 
-modbee pub -t nowhere/at/all -m x -q 1
+modbee-mqtt pub -t nowhere/at/all -m x -q 1
 #1 nowhere/at/all: accepted, but no matching subscribers
 ```
 
@@ -122,7 +122,7 @@ modbee pub -t nowhere/at/all -m x -q 1
 ## Subscribing
 
 ```bash
-modbee sub -t 'plant/#' -q 1 -v
+modbee-mqtt sub -t 'plant/#' -q 1 -v
 subscribed plant/#: granted
 plant/tank-01/level 4.25
 ```
@@ -145,7 +145,7 @@ plant/tank-01/level 4.25
 ## Request and response
 
 ```bash
-modbee req -t svc/echo -m ping
+modbee-mqtt req -t svc/echo -m ping
 echo:ping
 ```
 
@@ -160,11 +160,11 @@ It needs MQTT 5, because 3.1.1 has neither property.
 ## Serving
 
 ```bash
-modbee serve -C modbee.yaml                              # everything from the file
-modbee serve -c 200000                                   # plain MQTT on 1883, one shard per core
-modbee serve --tls-port 8883 --cert broker.pem --key broker.key
-modbee serve --no-plain --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem
-modbee serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem --client-certificates optional
+modbee-mqtt serve -C modbee.yaml                              # everything from the file
+modbee-mqtt serve -c 200000                                   # plain MQTT on 1883, one shard per core
+modbee-mqtt serve --tls-port 8883 --cert broker.pem --key broker.key
+modbee-mqtt serve --no-plain --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem
+modbee-mqtt serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca devices-ca.pem --client-certificates optional
 ```
 
 - **One broker per core, on one port.** Each shard is an `MqttBroker` on its
@@ -204,13 +204,13 @@ modbee serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca devi
   rotating over every member, and that shard picks one of its own members.
 - **`-C modbee.yaml`** runs a configuration file; flags given as well
   override it. The file's format, and the Kafka pipe it configures, are in
-  [kafka.md](kafka.md). `modbee check -C modbee.yaml` validates a file
+  [kafka.md](kafka.md). `modbee-mqtt check -C modbee.yaml` validates a file
   without starting anything, and exits 0 only if it would load.
 - **`--metrics-port 9464`** (or a `metrics:` section) serves Prometheus
   `/metrics`, `/healthz` (the process answers) and `/readyz` (it is ready
   for clients - [kafka.md](kafka.md#metrics)).
 - **Settings kept in the database.** With `authentication: database:`, what
-  `modbee config` has stored goes over the file, and under the environment
+  `modbee-mqtt config` has stored goes over the file, and under the environment
   and these flags ([settings.md](settings.md#which-value-wins)).
 
 **What a connection costs**, measured on Linux with idle connections:
@@ -228,9 +228,9 @@ the memory, so size the host for it.
 ## Benchmarking
 
 ```bash
-modbee bench conn -c 50000 -T 8 -R 2000 -d 30 --bind 127.0.0.2-127.0.0.5 --rss-pid $(pgrep -x my-broker)
-modbee bench sub  -c 10 -t bench -q 1 -d 60
-modbee bench pub  -c 1000 -r 10 -s 100 -q 1 -d 30
+modbee-mqtt bench conn -c 50000 -T 8 -R 2000 -d 30 --bind 127.0.0.2-127.0.0.5 --rss-pid $(pgrep -x my-broker)
+modbee-mqtt bench sub  -c 10 -t bench -q 1 -d 60
+modbee-mqtt bench pub  -c 1000 -r 10 -s 100 -q 1 -d 30
 ```
 
 - **`conn`** opens N connections at `-R` per second and holds them for `-d`

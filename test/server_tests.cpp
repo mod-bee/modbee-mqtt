@@ -3,11 +3,11 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// THE SERVER (`modbee serve`'s engine), END TO END: one broker per core
+// THE SERVER (`modbee-mqtt serve`'s engine), END TO END: one broker per core
 // behind one port, messages crossing shards, a client id taken over from
 // another shard, and what `sessions: store: file` and `retained: store: file`
 // keep across a restart; and an admin login set beside the running server,
-// as `modbee admin` sets it. Real TCP on loopback, files in the system's
+// as `modbee-mqtt admin` sets it. Real TCP on loopback, files in the system's
 // temporary directory.
 
 #include "TestClient.h"
@@ -46,7 +46,7 @@ struct TempDir {
     }
 };
 
-// A server: shards on threads of their own, extensions as `modbee serve` adds them.
+// A server: shards on threads of their own, extensions as `modbee-mqtt serve` adds them.
 struct Server {
     ShardedBroker broker;
     ShardExtensionChain chain;
@@ -176,10 +176,10 @@ void keptAcrossRestart() {
     }
 }
 
-// `modbee admin`: the login database written by ANOTHER program while the
+// `modbee-mqtt admin`: the login database written by ANOTHER program while the
 // server runs - how the first admin is made, and a lost password replaced.
 void adminSetBeside() {
-    section("an admin set beside the running server (modbee admin)");
+    section("an admin set beside the running server (modbee-mqtt admin)");
     TempDir dir("admin");
     const std::string database = (dir.path / "auth.db").string();
     AuthGateConfig g;
@@ -200,7 +200,7 @@ void adminSetBeside() {
     early.login("admin", "first");
     ok(!fleet.connected(early, 1500), "  nobody logs in as admin");
 
-    // What `modbee admin` does: its own connection to the file.
+    // What `modbee-mqtt admin` does: its own connection to the file.
     const auto setAdmin = [&](const std::string& password) {
         AuthStore other;
         std::string why;

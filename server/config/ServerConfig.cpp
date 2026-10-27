@@ -814,7 +814,7 @@ void readFromKafka(Loader& loader, Section m, const ServerConfig& config, KafkaT
 
 void crossCheck(Loader& loader, ServerConfig& config) {
     // A login database without an admin here is allowed: its admin can be a
-    // login in the database itself, set with `modbee admin` on the server.
+    // login in the database itself, set with `modbee-mqtt admin` on the server.
     const BrokerSection& b = config.broker;
     const bool clientCa = !b.clientCaFile.empty() || !b.clientCaPem.empty();
     if (config.authentication.certificateLogin && config.authentication.database.empty()) {

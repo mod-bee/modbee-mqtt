@@ -145,20 +145,20 @@ node tank-rule.js                  # uses localhost:9094
 
 ### Try it
 
-Act as two devices, with the `modbee` command that is inside the stack. In one
+Act as two devices, with the `modbee-mqtt` command that is inside the stack. In one
 terminal, be the pump, listening for its commands:
 
 ```bash
 cd docker/examples/broker-kafka
-docker compose exec modbee modbee sub -t plant/pump-2/cmd -v
+docker compose exec modbee modbee-mqtt sub -t plant/pump-2/cmd -v
 ```
 
 In a second terminal, be the tank, publishing its level:
 
 ```bash
 cd docker/examples/broker-kafka
-docker compose exec modbee modbee pub -t plant/tank-01/level -m 8.6 -q 1
-docker compose exec modbee modbee pub -t plant/tank-01/level -m 1.5 -q 1
+docker compose exec modbee modbee-mqtt pub -t plant/tank-01/level -m 8.6 -q 1
+docker compose exec modbee modbee-mqtt pub -t plant/tank-01/level -m 1.5 -q 1
 ```
 
 The pump's terminal prints `plant/pump-2/cmd stop`, then

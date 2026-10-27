@@ -12,7 +12,7 @@
 // Every broker built on the library keeps its retained messages in memory,
 // and MQTT allows exactly that. A server is restarted - upgraded, moved, its
 // host rebooted - and a store that comes back empty means every dashboard is
-// blank until each device happens to publish again. So `modbee serve` can
+// blank until each device happens to publish again. So `modbee-mqtt serve` can
 // keep them somewhere else AS WELL:
 //
 //   retained:

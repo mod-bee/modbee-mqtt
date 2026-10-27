@@ -1,5 +1,5 @@
 // A Sparkplug B 3.0 Host Application on a broker it does not own, with no
-// MQTT library: modbee serve holds the MQTT connection (Connections), hands
+// MQTT library: modbee-mqtt serve holds the MQTT connection (Connections), hands
 // over what arrives on it (Messages.Consume), and publishes for it
 // (Messages.Publish, answered once the remote broker has acknowledged).
 //

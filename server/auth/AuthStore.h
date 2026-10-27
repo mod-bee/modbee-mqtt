@@ -96,7 +96,7 @@ public:
     size_t userCount();
     size_t adminCount();                 // enabled logins that are admins
 
-    // Whether another program - `modbee admin`, run beside the server - has
+    // Whether another program - `modbee-mqtt admin`, run beside the server - has
     // written the file since this was last asked; if so, generation() moves,
     // so every shard drops what it cached.
     bool noticeOutsideWrites();

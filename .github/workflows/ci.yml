@@ -87,13 +87,13 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # THE SERVER ON WINDOWS, AS IT SHIPS: modbee.exe with everything - the CLI,
+  # THE SERVER ON WINDOWS, AS IT SHIPS: modbee-mqtt.exe with everything - the CLI,
   # the server, the Kafka pipe and the Application API (librdkafka, gRPC and
   # protobuf from vcpkg, statically linked, cached between runs) - built by
   # MSVC; the published tests; and the Windows service installed, used,
   # stopped and removed on a real Service Control Manager.
   windows-server:
-    name: Windows - modbee.exe with Kafka and the API, and the service
+    name: Windows - modbee-mqtt.exe with Kafka and the API, and the service
     runs-on: windows-latest
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
@@ -139,14 +139,14 @@ jobs:
             "-DVCPKG_TARGET_TRIPLET=$env:TRIPLET" "-DVCPKG_HOST_TRIPLET=$env:TRIPLET" `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DMQTT_BUILD_APP_API=ON | Tee-Object -FilePath configure.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          # Everything, or a red build: a modbee.exe without Kafka or the API
+          # Everything, or a red build: a modbee-mqtt.exe without Kafka or the API
           # would pass every test below and still not be what ships.
           foreach ($part in 'librdkafka .* found', 'gRPC .* found', 'OpenSSL found') {
             if (-not (Select-String -Path configure.txt -Pattern $part)) { Write-Error "not found: $part"; exit 1 }
           }
           cmake --build build --config Release -j 4
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & build\cli\Release\modbee.exe --version | Tee-Object -FilePath version.txt
+          & build\cli\Release\modbee-mqtt.exe --version | Tee-Object -FilePath version.txt
           foreach ($part in 'Kafka pipe: librdkafka.*ssl', 'sasl_scram', 'zstd', 'Application API: gRPC') {
             if (-not (Select-String -Path version.txt -Pattern $part)) { Write-Error "--version lacks: $part"; exit 1 }
           }
@@ -155,7 +155,7 @@ jobs:
       - name: The Windows service
         shell: pwsh
         run: |
-          $m = "build\cli\Release\modbee.exe"
+          $m = "build\cli\Release\modbee-mqtt.exe"
           & $m service install --name modbee-ci -- --port 18850 --shards 2
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & $m service start --name modbee-ci
@@ -181,7 +181,7 @@ jobs:
       - name: The Windows service, set up with the CLI alone
         shell: pwsh
         run: |
-          $m = "build\cli\Release\modbee.exe"
+          $m = "build\cli\Release\modbee-mqtt.exe"
           $data = "$env:ProgramData\ModBee\modbee-setup"
           & $m service install --name modbee-setup
           if ($LASTEXITCODE -ne 0) { Get-Content "$env:ProgramData\ModBee\modbee-setup.log"; exit 1 }
@@ -197,5 +197,5 @@ jobs:
           Write-Host "--- the service's log"
           Get-Content "$env:ProgramData\ModBee\modbee-setup.log"
           if (-not $refused) { Write-Error "a client with no login was let in before the admin was set"; exit 1 }
-          if (-not $accepted) { Write-Error "the admin set with modbee admin could not log in"; exit 1 }
+          if (-not $accepted) { Write-Error "the admin set with modbee-mqtt admin could not log in"; exit 1 }
           if (-not (Test-Path "$data\auth.db")) { Write-Error "nothing kept in $data"; exit 1 }

@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee sub - subscribe and print what arrives.
+// modbee-mqtt sub - subscribe and print what arrives.
 //
 // What a subscription was GRANTED is printed too, because a broker may grant
 // a lower QoS than was asked for, or refuse a filter outright, and a tool that
@@ -86,16 +86,16 @@ int cmdSub(int argc, char** argv) {
     const std::vector<ArgSpec>& specs = subSpecs();
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee sub: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt sub: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help")) {
-        Args::printHelp("modbee sub -t <filter> [-t <filter>...] [options]", specs);
+        Args::printHelp("modbee-mqtt sub -t <filter> [-t <filter>...] [options]", specs);
         return 0;
     }
     const std::vector<std::string> filters = args.all("topic");
     if (filters.empty()) {
-        std::fprintf(stderr, "modbee sub: at least one --topic is required\n");
+        std::fprintf(stderr, "modbee-mqtt sub: at least one --topic is required\n");
         return 2;
     }
 
@@ -103,7 +103,7 @@ int cmdSub(int argc, char** argv) {
     if (!args.getInt("qos", 0, 0, 2, qos) || !args.getInt("count", 0, 0, 1LL << 40, count) ||
         !args.getInt("wait", 0, 0, 86400 * 365, wait) ||
         !args.getInt("retain-handling", 0, 0, 2, retainHandling)) {
-        std::fprintf(stderr, "modbee sub: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt sub: %s\n", args.error().c_str());
         return 2;
     }
 
@@ -111,7 +111,7 @@ int cmdSub(int argc, char** argv) {
     CliClient cli;
     std::string error;
     if (!cli.configure(args, "modbee-sub", error)) {
-        std::fprintf(stderr, "modbee sub: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt sub: %s\n", error.c_str());
         return 2;
     }
 
@@ -134,7 +134,7 @@ int cmdSub(int argc, char** argv) {
         const MqttResult queued = cli.client.subscribeWithOptions(
             filters[index].c_str(), options, &onSubscribed, &outcomes[index]);
         if (queued != MqttResult::Queued) {
-            std::fprintf(stderr, "modbee sub: cannot subscribe to %s: %s\n",
+            std::fprintf(stderr, "modbee-mqtt sub: cannot subscribe to %s: %s\n",
                          filters[index].c_str(), mq_resultName(queued));
             return 2;
         }
@@ -149,11 +149,11 @@ int cmdSub(int argc, char** argv) {
         if (state.limit > 0 && state.received >= state.limit) break;
         if (wait > 0 && mq_millis() - start >= (mq_time_t)wait * 1000) break;
         if (state.answered == filters.size() && state.refused == filters.size()) {
-            std::fprintf(stderr, "modbee sub: every subscription was refused\n");
+            std::fprintf(stderr, "modbee-mqtt sub: every subscription was refused\n");
             break;
         }
         if (!cli.client.isConnected() && cli.client.state() == MqttState::Idle) {
-            std::fprintf(stderr, "modbee sub: connection lost: %s\n",
+            std::fprintf(stderr, "modbee-mqtt sub: connection lost: %s\n",
                          mq_resultName(cli.client.status().lastError));
             lost = true;
             break;

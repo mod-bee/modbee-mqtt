@@ -76,7 +76,7 @@ public:
         if (_producer) rd_kafka_flush(_producer, kFlushTimeoutMs);
         const int left = _producer ? rd_kafka_outq_len(_producer) : 0;
         if (left > 0) {
-            std::fprintf(stderr, "modbee serve: %d retained change(s) were not written to Kafka "
+            std::fprintf(stderr, "modbee-mqtt serve: %d retained change(s) were not written to Kafka "
                                  "topic %s before shutdown\n", left, _topic.c_str());
         }
     }
@@ -116,7 +116,7 @@ private:
         if (message->err == RD_KAFKA_RESP_ERR_NO_ERROR) return;
         RetainedKafka* self = static_cast<RetainedKafka*>(opaque);
         if (self->_failures.fetch_add(1) == 0) {
-            std::fprintf(stderr, "modbee serve: a retained change was not written to Kafka "
+            std::fprintf(stderr, "modbee-mqtt serve: a retained change was not written to Kafka "
                                  "topic %s: %s (counted in the status line)\n",
                          self->_topic.c_str(), rd_kafka_err2str(message->err));
         }
@@ -139,7 +139,7 @@ private:
         rd_kafka_error_t* failure = rd_kafka_produceva(_producer, vu, n);
         if (failure != nullptr) {
             if (_failures.fetch_add(1) == 0) {
-                std::fprintf(stderr, "modbee serve: a retained change was not written to Kafka "
+                std::fprintf(stderr, "modbee-mqtt serve: a retained change was not written to Kafka "
                                      "topic %s: %s (counted in the status line)\n",
                              _topic.c_str(), rd_kafka_error_string(failure));
             }
@@ -216,7 +216,7 @@ private:
         if (event) rd_kafka_event_destroy(event);
         rd_kafka_ConfigResource_destroy(resource);
         if (!policy.empty() && policy.find("compact") == std::string::npos) {
-            std::fprintf(stderr, "modbee serve: warning: Kafka topic %s keeps retained messages but "
+            std::fprintf(stderr, "modbee-mqtt serve: warning: Kafka topic %s keeps retained messages but "
                                  "is not compacted (cleanup.policy=%s) - Kafka will delete those not "
                                  "republished within its retention time. Set cleanup.policy=compact.\n",
                          _topic.c_str(), policy.c_str());

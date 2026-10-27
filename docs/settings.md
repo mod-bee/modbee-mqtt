@@ -2,7 +2,7 @@
 
 A server with a login database ([logins.md](logins.md)) can also keep **its
 settings** in that database, and you can read and change them over MQTT -
-from the `modbee config` command, or from your own platform with nothing but
+from the `modbee-mqtt config` command, or from your own platform with nothing but
 an admin login. Nobody needs a shell on the server or an editor on
 `modbee.yaml`.
 
@@ -22,14 +22,14 @@ it.
 
 ## What it needs
 
-- **A login database.** A server installed with `modbee service install`
-  has one - it runs `modbee serve --data <folder>`, which keeps everything in
+- **A login database.** A server installed with `modbee-mqtt service install`
+  has one - it runs `modbee-mqtt serve --data <folder>`, which keeps everything in
   that folder, no file needed ([releases.md](releases.md#installing-it)).
   Otherwise `authentication: database:` in `modbee.yaml`, or
   `MODBEE_AUTHENTICATION_DATABASE`; the `docker/examples` setups already
   have it. The settings are kept in the same SQLite file as the logins, in a
   table of their own.
-- **An admin login**, as for managing logins (`modbee admin` on the server).
+- **An admin login**, as for managing logins (`modbee-mqtt admin` on the server).
 
 With `--data` and no file, a stored setting is applied over the defaults;
 with a file, over the file.
@@ -66,7 +66,7 @@ it:
 
 | | |
 | --- | --- |
-| 1 | A flag on the command line (`modbee serve -C modbee.yaml -p 1884`) |
+| 1 | A flag on the command line (`modbee-mqtt serve -C modbee.yaml -p 1884`) |
 | 2 | An environment variable (`MODBEE_BROKER_PORT`) |
 | 3 | A stored override (`config.set`) |
 | 4 | The stored document (`config.apply`) - or, when there is none, the file |
@@ -94,7 +94,7 @@ them - the server starts from the file alone, prints each problem, and says
 so:
 
 ```
-modbee serve: the stored settings would not load - starting from /etc/modbee/modbee.yaml alone
+modbee-mqtt serve: the stored settings would not load - starting from /etc/modbee/modbee.yaml alone
 ```
 
 It does not refuse to start, because a broker that will not start over a
@@ -105,11 +105,11 @@ same problems.
 
 ## From the command line
 
-`modbee config` uses the admin login, like `modbee user`. Inside a stack's
+`modbee-mqtt config` uses the admin login, like `modbee-mqtt user`. Inside a stack's
 container it logs in by itself:
 
 ```bash
-docker compose exec modbee modbee config get
+docker compose exec modbee modbee-mqtt config get
 ```
 
 ```
@@ -122,12 +122,12 @@ the running server is behind these settings - restart it to apply them
 
 | Command | Does |
 | --- | --- |
-| `modbee config get` | Where the settings come from, every override, and what the environment pins. `--json` prints the whole answer, the document included |
-| `modbee config set broker.queue=128 broker.max-session-expiry=86400` | Store overrides |
-| `modbee config set --remove broker.queue` | Drop an override, back to the file's value (`--remove` repeats) |
-| `modbee config apply --file new.yaml` | Store a whole document in place of the file |
-| `modbee config check --file new.yaml` or `modbee config check broker.port=1884` | Would these load? Prints every problem, stores nothing |
-| `modbee config reset` | Drop the stored document and every override: back to the file alone |
+| `modbee-mqtt config get` | Where the settings come from, every override, and what the environment pins. `--json` prints the whole answer, the document included |
+| `modbee-mqtt config set broker.queue=128 broker.max-session-expiry=86400` | Store overrides |
+| `modbee-mqtt config set --remove broker.queue` | Drop an override, back to the file's value (`--remove` repeats) |
+| `modbee-mqtt config apply --file new.yaml` | Store a whole document in place of the file |
+| `modbee-mqtt config check --file new.yaml` or `modbee-mqtt config check broker.port=1884` | Would these load? Prints every problem, stores nothing |
+| `modbee-mqtt config reset` | Drop the stored document and every override: back to the file alone |
 
 `set`, `apply` and `reset` take **`--restart`**: once the change is stored,
 the server restarts to apply it ([below](#applying-a-change-the-restart)).
@@ -136,7 +136,7 @@ A setting that does not exist, or a value the file would not accept either,
 is refused with its problem, and nothing is stored:
 
 ```bash
-docker compose exec modbee modbee config set broker.prot=1884
+docker compose exec modbee modbee-mqtt config set broker.prot=1884
 ```
 
 ```
@@ -145,10 +145,10 @@ modbee: the settings were not stored: they would not load
 ```
 
 A setting ending `-pem` takes `@file` for its value - the PEM text of a file
-on the computer `modbee` runs on - because nobody types a certificate:
+on the computer `modbee-mqtt` runs on - because nobody types a certificate:
 
 ```bash
-docker compose exec modbee modbee config set broker.tls.cert-pem=@/tmp/broker.pem broker.tls.key-pem=@/tmp/broker.key
+docker compose exec modbee modbee-mqtt config set broker.tls.cert-pem=@/tmp/broker.pem broker.tls.key-pem=@/tmp/broker.key
 ```
 
 ```
@@ -166,14 +166,14 @@ tls: serving on 8883 (wolfSSL)
   certificate login: on
 ```
 
-`--file` is read by the `modbee` command, on the computer it runs on. For a
-document on your own computer, run `modbee` there against the broker -
-`modbee config apply --file new.yaml -h mqtt.example.com --tls -u admin -P '...'` -
+`--file` is read by the `modbee-mqtt` command, on the computer it runs on. For a
+document on your own computer, run `modbee-mqtt` there against the broker -
+`modbee-mqtt config apply --file new.yaml -h mqtt.example.com --tls -u admin -P '...'` -
 or copy it into the container first:
 
 ```bash
 docker compose cp new.yaml modbee:/tmp/new.yaml
-docker compose exec modbee modbee config apply --file /tmp/new.yaml --restart
+docker compose exec modbee modbee-mqtt config apply --file /tmp/new.yaml --restart
 ```
 
 ---
@@ -322,6 +322,6 @@ nothing stops.
 
 ## Backups
 
-The settings are in the login database, so `modbee backup` and the daily copy
-([logins.md](logins.md#backups)) hold them, and `modbee restore` puts them
+The settings are in the login database, so `modbee-mqtt backup` and the daily copy
+([logins.md](logins.md#backups)) hold them, and `modbee-mqtt restore` puts them
 back with the logins.

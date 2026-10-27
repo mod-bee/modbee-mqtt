@@ -1,6 +1,6 @@
 # The Kafka pipe
 
-`modbee serve` can pass MQTT messages to Apache Kafka and Kafka records back to
+`modbee-mqtt serve` can pass MQTT messages to Apache Kafka and Kafka records back to
 MQTT, **untouched**. The payload bytes are the record's value. The MQTT topic,
 QoS, retain flag and every MQTT 5 property can travel as Kafka headers. A
 message that goes MQTT → Kafka → MQTT comes back as the identical message.
@@ -9,18 +9,18 @@ There is no transformation, no schema registry and no scripting. Sparkplug B is
 MQTT to the pipe: topic and protobuf bytes go through as they are.
 
 ```
- MQTT clients ──MQTT──► modbee serve ══ mqtt-to-kafka ══► Kafka topics
+ MQTT clients ──MQTT──► modbee-mqtt serve ══ mqtt-to-kafka ══► Kafka topics
                         (one broker   ◄═ kafka-to-mqtt ══
                          per core)
 ```
 
-It needs a build with librdkafka (2.x) installed; `modbee serve --help` and the
+It needs a build with librdkafka (2.x) installed; `modbee-mqtt serve --help` and the
 first line it prints say whether the pipe is in. Everything else is
 `modbee.yaml`:
 
 ```bash
-modbee check -C modbee.yaml      # every problem, with its line; exit 0 if it would load
-modbee serve -C modbee.yaml      # flags given as well override the file
+modbee-mqtt check -C modbee.yaml      # every problem, with its line; exit 0 if it would load
+modbee-mqtt serve -C modbee.yaml      # flags given as well override the file
 ```
 
 ---
@@ -43,7 +43,7 @@ have.
 
 ```bash
 docker compose -f docker/compose.yml up -d
-modbee pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
+modbee-mqtt pub -t plant/tank-01/level -m 4.25 -q 1     # the PUBACK means Kafka has it
 ```
 
 ---
@@ -201,11 +201,11 @@ written twice, and retries never reorder a partition. Setting a mapping to
   header becomes a user property. The message republished is the one that was
   produced.
 - **Consumer groups:** one per mapping, `modbee-<id>-group` unless
-  `consumer-group:` says otherwise. Several `modbee serve` processes with the
+  `consumer-group:` says otherwise. Several `modbee-mqtt serve` processes with the
   same file share the group, so Kafka spreads the partitions between them -
   and each record is then published on **only one** of those servers. A device
   connected to another of them does not receive it: servers do not pass MQTT
-  messages between each other (one `modbee serve` is one process; see "Not a
+  messages between each other (one `modbee-mqtt serve` is one process; see "Not a
   multi-machine cluster" in the [README](../README.md#what-it-is-not)). Give
   each server its own `consumer-group:` for every server to publish every
   record.
@@ -226,7 +226,7 @@ written twice, and retries never reorder a partition. Setting a mapping to
 
 **No loops.** A message read from Kafka topic T is never written back to T by
 an mqtt-to-kafka mapping, even when its filters match. It is still written to
-any other topic a mapping sends it to. `modbee check` warns when a file has
+any other topic a mapping sends it to. `modbee-mqtt check` warns when a file has
 such an overlap, because it is rarely intended.
 
 ---
@@ -385,7 +385,7 @@ A change to the material - `cert-pem`, `key-pem`, `client-ca-pem` or
 restart: new handshakes see it, connections already up carry on
 ([settings.md](settings.md#the-tls-material-applied-while-it-runs)).
 - **With a login database, settings can be stored in it** and changed over
-  MQTT - `modbee config set broker.max-session-expiry=86400` - applied at
+  MQTT - `modbee-mqtt config set broker.max-session-expiry=86400` - applied at
   the next restart; the environment still wins over them
   ([settings.md](settings.md)).
 

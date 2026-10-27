@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee pub - publish, and say what happened to every message.
+// modbee-mqtt pub - publish, and say what happened to every message.
 //
 // mosquitto_pub reports that it sent something. This reports what the broker
 // SAID: a QoS 1 or 2 publish ends with the broker's answer, including the
@@ -103,21 +103,21 @@ int cmdPub(int argc, char** argv) {
     const std::vector<ArgSpec>& specs = pubSpecs();
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee pub: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt pub: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help")) {
-        Args::printHelp("modbee pub -t <topic> (-m <text> | -f <file> | -l | -n) [options]", specs);
+        Args::printHelp("modbee-mqtt pub -t <topic> (-m <text> | -f <file> | -l | -n) [options]", specs);
         return 0;
     }
     if (!args.has("topic")) {
-        std::fprintf(stderr, "modbee pub: --topic is required\n");
+        std::fprintf(stderr, "modbee-mqtt pub: --topic is required\n");
         return 2;
     }
     const int sources = (int)args.has("message") + (int)args.has("file") +
                         (int)args.has("stdin-line") + (int)args.has("null");
     if (sources != 1) {
-        std::fprintf(stderr, "modbee pub: give exactly one of --message, --file, --stdin-line, --null\n");
+        std::fprintf(stderr, "modbee-mqtt pub: give exactly one of --message, --file, --stdin-line, --null\n");
         return 2;
     }
 
@@ -126,7 +126,7 @@ int cmdPub(int argc, char** argv) {
         !args.getInt("interval", 0, 0, 86400000, interval) ||
         !args.getInt("wait", 10, 1, 86400, wait) ||
         !args.getInt("expiry", 0, 0, 0xFFFFFFFFll, expiry)) {
-        std::fprintf(stderr, "modbee pub: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt pub: %s\n", args.error().c_str());
         return 2;
     }
 
@@ -139,7 +139,7 @@ int cmdPub(int argc, char** argv) {
     for (const std::string& pair : args.all("user-property")) {
         MqttOwnedProperties::UserProperty property;
         if (!splitUserProperty(pair, property.key, property.value)) {
-            std::fprintf(stderr, "modbee pub: --user-property wants key=value, not '%s'\n", pair.c_str());
+            std::fprintf(stderr, "modbee-mqtt pub: --user-property wants key=value, not '%s'\n", pair.c_str());
             return 2;
         }
         properties.user.push_back(property);
@@ -154,7 +154,7 @@ int cmdPub(int argc, char** argv) {
     } else if (args.has("file")) {
         std::vector<uint8_t> bytes;
         if (!readFile(args.get("file"), bytes)) {
-            std::fprintf(stderr, "modbee pub: cannot read %s\n", args.get("file").c_str());
+            std::fprintf(stderr, "modbee-mqtt pub: cannot read %s\n", args.get("file").c_str());
             return 2;
         }
         payloads.push_back(bytes);
@@ -166,7 +166,7 @@ int cmdPub(int argc, char** argv) {
     CliClient cli;
     std::string error;
     if (!cli.configure(args, "modbee-pub", error)) {
-        std::fprintf(stderr, "modbee pub: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt pub: %s\n", error.c_str());
         return 2;
     }
     if (!cli.connectAndWait((mq_time_t)wait * 1000)) return 3;
@@ -252,7 +252,7 @@ int cmdPub(int argc, char** argv) {
                   (mq_time_t)wait * 1000);
     const size_t unanswered = tally.outcomes.size() - tally.concluded;
     if (unanswered > 0) {
-        std::fprintf(stderr, "modbee pub: %zu message(s) had no answer within %llds\n",
+        std::fprintf(stderr, "modbee-mqtt pub: %zu message(s) had no answer within %llds\n",
                      unanswered, wait);
     }
 

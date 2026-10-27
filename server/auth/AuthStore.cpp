@@ -319,7 +319,7 @@ size_t AuthStore::adminCount() {
 bool AuthStore::noticeOutsideWrites() {
     std::lock_guard<std::mutex> lock(_write);
     if (!_writer) return false;
-    // data_version moves when ANOTHER connection commits - `modbee admin`,
+    // data_version moves when ANOTHER connection commits - `modbee-mqtt admin`,
     // run beside the server - and never for this one's own writes.
     Statement st(_writer, "PRAGMA data_version");
     if (st.step() != SQLITE_ROW) return false;

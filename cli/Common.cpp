@@ -62,7 +62,7 @@ std::string cliDataDirectory(const std::string& service) {
 #if defined(_WIN32)
     const char* programData = std::getenv("ProgramData");
     const std::string base = std::string(programData ? programData : "C:\\ProgramData") + "\\ModBee";
-    return service == "modbee" ? base : base + "\\" + service;
+    return base + "\\" + service;
 #else
     return "/var/lib/" + service;
 #endif
@@ -228,7 +228,7 @@ bool CliClient::configure(Args& args, const char* defaultClientIdPrefix, std::st
         : std::string(defaultClientIdPrefix) + "-" + std::to_string(cliProcessId());
 
     // -u and -P, or else the server's own login from the environment - so
-    // `docker compose exec modbee modbee pub ...` logs in to the server it
+    // `docker compose exec modbee modbee-mqtt pub ...` logs in to the server it
     // runs beside without the password being typed (or shown in `ps`).
     const char* envUser = std::getenv("MODBEE_AUTHENTICATION_USERNAME");
     const char* envPassword = std::getenv("MODBEE_AUTHENTICATION_PASSWORD");

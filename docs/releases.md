@@ -1,27 +1,27 @@
 # Releases
 
 Each release on the [Releases page](https://github.com/mod-bee/modbee-mqtt/releases)
-carries `modbee` ready to run - no compiler, nothing to install beside it -
+carries `modbee-mqtt` ready to run - no compiler, nothing to install beside it -
 and the Docker image is published under the same version.
 
 | For | x86-64 | ARM 64-bit (Raspberry Pi 4/5, ARM servers) |
 |---|---|---|
-| **Debian, Ubuntu** | `modbee_<version>-1_amd64.deb` | `modbee_<version>-1_arm64.deb` |
-| **RHEL, Rocky, Alma, Fedora** | `modbee-<version>-1.x86_64.rpm` | `modbee-<version>-1.aarch64.rpm` |
-| **Any Linux**: one file, nothing to install | `modbee-<version>-linux-x86_64` | `modbee-<version>-linux-arm64` |
-| **Windows**: one file, also a Windows service | `modbee-<version>-windows-x86_64.exe` | |
+| **Debian, Ubuntu** | `modbee-mqtt_<version>-1_amd64.deb` | `modbee-mqtt_<version>-1_arm64.deb` |
+| **RHEL, Rocky, Alma, Fedora** | `modbee-mqtt-<version>-1.x86_64.rpm` | `modbee-mqtt-<version>-1.aarch64.rpm` |
+| **Any Linux**: one file, nothing to install | `modbee-mqtt-<version>-linux-x86_64` | `modbee-mqtt-<version>-linux-arm64` |
+| **Windows**: one file, also a Windows service | `modbee-mqtt-<version>-windows-x86_64.exe` | |
 | **Docker** ([docker.md](docker.md)) | `ghcr.io/mod-bee/modbee-mqtt:<version>` | the same tag |
 
 Beside them: `*.cdx.json`, each binary's SBOM (CycloneDX) - every library
 inside it, with its version and licence - and `SHA256SUMS` with its
 signature, `SHA256SUMS.sigstore.json`.
 
-Every one is the whole of it: the broker (`modbee serve`), the Kafka pipe,
+Every one is the whole of it: the broker (`modbee-mqtt serve`), the Kafka pipe,
 the Application API and every command. It says so itself:
 
 ```
-$ modbee --version
-modbee 0.1.0 (TLS: OpenSSL)
+$ modbee-mqtt --version
+modbee-mqtt 0.1.0 (TLS: OpenSSL)
   Kafka pipe: librdkafka 2.15.1 (gzip snappy ssl sasl regex lz4 sasl_gssapi sasl_plain sasl_scram plugins zstd sasl_oauthbearer)
   Application API: gRPC 1.81.1
 ```
@@ -34,50 +34,50 @@ years ago - with nothing else installed. The packages carry that same binary.
 
 ## Installing it
 
-Put `modbee` on the machine - one of these:
+Put `modbee-mqtt` on the machine - one of these:
 
 ```sh
-sudo apt install ./modbee_0.1.0-1_amd64.deb        # Debian, Ubuntu
-sudo dnf install ./modbee-0.1.0-1.x86_64.rpm       # RHEL, Rocky, Alma, Fedora
-sudo install modbee-0.1.0-linux-x86_64 /usr/local/bin/modbee     # any Linux
+sudo apt install ./modbee-mqtt_0.1.0-1_amd64.deb        # Debian, Ubuntu
+sudo dnf install ./modbee-mqtt-0.1.0-1.x86_64.rpm       # RHEL, Rocky, Alma, Fedora
+sudo install modbee-mqtt-0.1.0-linux-x86_64 /usr/local/bin/modbee-mqtt     # any Linux
 ```
 
-On Windows, rename `modbee-0.1.0-windows-x86_64.exe` to `modbee.exe` and put
+On Windows, rename `modbee-mqtt-0.1.0-windows-x86_64.exe` to `modbee-mqtt.exe` and put
 it where it is to live ([windows.md](windows.md)).
 
 Then the same two commands everywhere (Windows: in an Administrator prompt,
 without `sudo`):
 
 ```sh
-sudo modbee service install      # runs it as a service, now and at every start
-sudo modbee admin                # the admin login: asks for its password
+sudo modbee-mqtt service install      # runs it as a service, now and at every start
+sudo modbee-mqtt admin                # the admin login: asks for its password
 ```
 
 ```
-modbee service: "modbee" installed and running - it starts at boot, and again if it stops
-  /usr/bin/modbee serve --data /var/lib/modbee
-  everything it keeps: /var/lib/modbee
-  its log: journalctl -u modbee
+modbee-mqtt service: "modbee-mqtt" installed and running - it starts at boot, and again if it stops
+  /usr/bin/modbee-mqtt serve --data /var/lib/modbee-mqtt
+  everything it keeps: /var/lib/modbee-mqtt
+  its log: journalctl -u modbee-mqtt
 ```
 
-That is all there is to set up. Everything after is the `modbee` command,
-and all of it is kept in one database in the data folder - `/var/lib/modbee`
-(Windows: `C:\ProgramData\ModBee`):
+That is all there is to set up. Everything after is the `modbee-mqtt` command,
+and all of it is kept in one database in the data folder - `/var/lib/modbee-mqtt`
+(Windows: `C:\ProgramData\ModBee\modbee-mqtt`):
 
 | | |
 |---|---|
-| Devices | `modbee user add tank-01 -u admin -P ...` ([logins.md](logins.md)) |
-| Settings | `modbee config set broker.port=8883 --restart -u admin -P ...` ([settings.md](settings.md)) |
-| The admin's password | `sudo modbee admin` again - on the server, it works at once |
-| The service | `modbee service status`, `stop`, `start`, `uninstall` |
+| Devices | `modbee-mqtt user add tank-01 -u admin -P ...` ([logins.md](logins.md)) |
+| Settings | `modbee-mqtt config set broker.port=8883 --restart -u admin -P ...` ([settings.md](settings.md)) |
+| The admin's password | `sudo modbee-mqtt admin` again - on the server, it works at once |
+| The service | `modbee-mqtt service status`, `stop`, `start`, `uninstall` |
 
 Until there is an admin, the broker runs and lets nobody in, and its log
 says so. Every device needs a login of its own; retained messages and
-sessions are kept across restarts. `modbee service uninstall` (before
+sessions are kept across restarts. `modbee-mqtt service uninstall` (before
 removing the package) stops and removes the service and keeps the data.
 
 `modbee.yaml` is not needed for any of this. It is how the Docker image is
-configured ([docker.md](docker.md)), and `modbee serve -C modbee.yaml` still
+configured ([docker.md](docker.md)), and `modbee-mqtt serve -C modbee.yaml` still
 reads one anywhere.
 
 ---
@@ -90,7 +90,7 @@ repository's release workflow from the tagged commit, and not changed since.
 **GitHub's attestation** - every file has one; with the [GitHub CLI](https://cli.github.com):
 
 ```sh
-gh attestation verify modbee_0.1.0-1_amd64.deb --repo mod-bee/modbee-mqtt
+gh attestation verify modbee-mqtt_0.1.0-1_amd64.deb --repo mod-bee/modbee-mqtt
 ```
 
 **The checksums, signed** - `SHA256SUMS` lists every file, and is signed
@@ -105,7 +105,7 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-On Windows: `Get-FileHash modbee-0.1.0-windows-x86_64.exe` and compare with
+On Windows: `Get-FileHash modbee-mqtt-0.1.0-windows-x86_64.exe` and compare with
 its line in `SHA256SUMS`.
 
 ---

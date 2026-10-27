@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee user / modbee key / modbee backup - managing device logins.
+// modbee-mqtt user / modbee-mqtt key / modbee-mqtt backup - managing device logins.
 //
 // Every command is one request on $modbee/admin/request, answered on
 // $modbee/admin/<clientid>/reply (server/auth/AuthGate.h), so it works the
@@ -75,7 +75,7 @@ int ask(CliClient& cli, const std::string& clientId, json::Object request, json:
     cli.pollUntil([&] { return state.subscribed; }, 10000);
     if (!state.subscribed || state.subscribeResult == MqttResult::NotAuthorized ||
         !mq_accepted(state.subscribeResult)) {
-        std::fprintf(stderr, "modbee: this login is not an admin on that broker "
+        std::fprintf(stderr, "modbee-mqtt: this login is not an admin on that broker "
                              "(or the broker has no login database)\n");
         cli.shutdown();
         g_admin = nullptr;
@@ -87,7 +87,7 @@ int ask(CliClient& cli, const std::string& clientId, json::Object request, json:
     if (!mq_accepted(sent)) {
         // Said, rather than waited out as "no answer": a request the client
         // could not even send never reaches anybody who could reply.
-        std::fprintf(stderr, "modbee: the request (%zu bytes) could not be sent: %s\n", body.size(),
+        std::fprintf(stderr, "modbee-mqtt: the request (%zu bytes) could not be sent: %s\n", body.size(),
                      mq_resultName(sent));
         cli.shutdown();
         g_admin = nullptr;
@@ -97,13 +97,13 @@ int ask(CliClient& cli, const std::string& clientId, json::Object request, json:
     cli.shutdown();
     g_admin = nullptr;
     if (!state.answered) {
-        std::fprintf(stderr, "modbee: no answer - is `authentication: database:` set on that broker?\n");
+        std::fprintf(stderr, "modbee-mqtt: no answer - is `authentication: database:` set on that broker?\n");
         return 1;
     }
     replyText = state.reply;
     json::parse(state.reply, reply);
     if (!reply.flag("ok")) {
-        std::fprintf(stderr, "modbee: %s\n", reply.str("error", "refused").c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", reply.str("error", "refused").c_str());
         return 1;
     }
     return 0;
@@ -127,8 +127,8 @@ void adminBuffers(CliClient& cli) {
 }
 
 const char* kUserUsage =
-    "modbee user <list|show|add|set|remove|enable|disable|approve|reset|password|permissions|admin> [name] [options]";
-const char* kKeyUsage = "modbee key <create|set|list|remove> [name] [options]";
+    "modbee-mqtt user <list|show|add|set|remove|enable|disable|approve|reset|password|permissions|admin> [name] [options]";
+const char* kKeyUsage = "modbee-mqtt key <create|set|list|remove> [name] [options]";
 
 const std::vector<ArgSpec>& adminSpecs() {
     static const std::vector<ArgSpec> specs = withConnectionSpecs({
@@ -153,11 +153,11 @@ const std::vector<ArgSpec>& adminSpecs() {
 
 int prepare(int argc, char** argv, const char* usage, Args& args, CliClient& cli, std::string& clientId) {
     if (!args.parse(argc, argv, 3, adminSpecs())) {
-        std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str());
         return 2;
     }
-    // `modbee user --help`: the action's place holds the help request, as for
-    // `modbee config --help`.
+    // `modbee-mqtt user --help`: the action's place holds the help request, as for
+    // `modbee-mqtt config --help`.
     const bool helpAsked = argc >= 3 && (std::strcmp(argv[2], "--help") == 0 ||
                                          std::strcmp(argv[2], "-h") == 0 ||
                                          std::strcmp(argv[2], "help") == 0);
@@ -168,7 +168,7 @@ int prepare(int argc, char** argv, const char* usage, Args& args, CliClient& cli
     std::string error;
     adminBuffers(cli);
     if (!cli.configure(args, "modbee-admin", error)) {
-        std::fprintf(stderr, "modbee: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", error.c_str());
         return 2;
     }
     clientId = cli.connection.clientId;
@@ -188,7 +188,7 @@ bool data(Args& args, json::Object& request) {
         if (item.empty()) continue;                      // --data '': none
         const size_t eq = item.find('=');
         if (eq == std::string::npos || eq == 0) {
-            std::fprintf(stderr, "modbee: --data takes name=value, not '%s'\n", item.c_str());
+            std::fprintf(stderr, "modbee-mqtt: --data takes name=value, not '%s'\n", item.c_str());
             return false;
         }
         d.add(item.substr(0, eq), item.substr(eq + 1));
@@ -217,7 +217,7 @@ int cmdUser(int argc, char** argv) {
     const std::string name = names.empty() ? "" : names[0];
     const bool needsName = action != "list";
     if (needsName && name.empty()) {
-        std::fprintf(stderr, "usage: modbee user %s <name>\n", action.c_str());
+        std::fprintf(stderr, "usage: modbee-mqtt user %s <name>\n", action.c_str());
         return 2;
     }
 
@@ -288,7 +288,7 @@ int cmdUser(int argc, char** argv) {
         request.add("command", "user." + action).add("username", name);
     } else if (action == "password") {
         if (!args.has("secret")) {
-            std::fprintf(stderr, "usage: modbee user password <name> --secret <password>\n");
+            std::fprintf(stderr, "usage: modbee-mqtt user password <name> --secret <password>\n");
             return 2;
         }
         request.add("command", "user.password").add("username", name).add("password", args.get("secret"));
@@ -298,7 +298,7 @@ int cmdUser(int argc, char** argv) {
     } else if (action == "admin") {
         request.add("command", "user.admin").add("username", name).add("admin", !args.has("no-admin"));
     } else {
-        std::fprintf(stderr, "modbee user: unknown action '%s'\n", action.c_str());
+        std::fprintf(stderr, "modbee-mqtt user: unknown action '%s'\n", action.c_str());
         Args::printHelp(kUserUsage, adminSpecs());
         return 2;
     }
@@ -310,7 +310,7 @@ int cmdUser(int argc, char** argv) {
     }
     if (action == "show") {
         const json::Value& u = reply["user"];
-        std::printf("%s\n  status:          %s\n  password:        %s (never shown again; `modbee user reset` issues a new one)\n"
+        std::printf("%s\n  status:          %s\n  password:        %s (never shown again; `modbee-mqtt user reset` issues a new one)\n"
                     "  may publish:     %s\n  may subscribe:   %s\n  provisioned by:  %s\n  site:            %s\n  admin:           %s\n"
                     "  certificate:     %s\n  data:            %s\n",
                     u.str("username").c_str(),
@@ -323,7 +323,7 @@ int cmdUser(int argc, char** argv) {
                                                  : u.str("fingerprint").c_str(),
                     dataText(u["data"]).c_str());
     } else if (reply.has("password")) {
-        std::printf("%s %s\n  password: %s\n  (shown once - it cannot be read back; `modbee user reset %s` "
+        std::printf("%s %s\n  password: %s\n  (shown once - it cannot be read back; `modbee-mqtt user reset %s` "
                     "issues a new one)\n",
                     action == "reset" ? "reset" : "added", name.c_str(), reply.str("password").c_str(),
                     name.c_str());
@@ -349,18 +349,18 @@ int cmdKey(int argc, char** argv) {
     json::Object request;
     if (action == "create") {
         if (name.empty()) {
-            std::fprintf(stderr, "usage: modbee key create <name> [--approval manual] [--publish F] ...\n");
+            std::fprintf(stderr, "usage: modbee-mqtt key create <name> [--approval manual] [--publish F] ...\n");
             return 2;
         }
         request.add("command", "key.create").add("name", name).add("approval", args.get("approval", "auto"));
         rules(args, request);
         long long n = 0;
         if (args.has("uses")) {
-            if (!args.getInt("uses", 0, 1, 1000000000, n)) { std::fprintf(stderr, "modbee: %s\n", args.error().c_str()); return 2; }
+            if (!args.getInt("uses", 0, 1, 1000000000, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
             request.add("uses", n);
         }
         if (args.has("days")) {
-            if (!args.getInt("days", 0, 1, 36500, n)) { std::fprintf(stderr, "modbee: %s\n", args.error().c_str()); return 2; }
+            if (!args.getInt("days", 0, 1, 36500, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
             request.add("days", n);
         }
         if (args.has("device")) request.add("device", args.get("device"));
@@ -368,7 +368,7 @@ int cmdKey(int argc, char** argv) {
         if (!data(args, request)) return 2;
     } else if (action == "set") {
         if (name.empty() || !args.has("data")) {
-            std::fprintf(stderr, "usage: modbee key set <name> --data name=value [--data ...]\n");
+            std::fprintf(stderr, "usage: modbee-mqtt key set <name> --data name=value [--data ...]\n");
             return 2;
         }
         request.add("command", "key.set").add("name", name);
@@ -376,10 +376,10 @@ int cmdKey(int argc, char** argv) {
     } else if (action == "list") {
         request.add("command", "key.list");
     } else if (action == "remove") {
-        if (name.empty()) { std::fprintf(stderr, "usage: modbee key remove <name>\n"); return 2; }
+        if (name.empty()) { std::fprintf(stderr, "usage: modbee-mqtt key remove <name>\n"); return 2; }
         request.add("command", "key.remove").add("name", name);
     } else {
-        std::fprintf(stderr, "modbee key: unknown action '%s'\n", action.c_str());
+        std::fprintf(stderr, "modbee-mqtt key: unknown action '%s'\n", action.c_str());
         Args::printHelp(kKeyUsage, adminSpecs());
         return 2;
     }
@@ -391,7 +391,7 @@ int cmdKey(int argc, char** argv) {
         std::printf("%s\n", text.c_str());
     } else if (action == "create") {
         std::printf("key %s\n  %s\n  (shown once - flash it into the devices this key is for; they register\n"
-                    "  themselves with it. `modbee key remove %s` stops it working.)\n",
+                    "  themselves with it. `modbee-mqtt key remove %s` stops it working.)\n",
                     name.c_str(), reply.str("key").c_str(), name.c_str());
     } else if (action == "list") {
         std::printf("%-20s %-12s %-9s %-10s %-12s %s\n", "KEY", "SITE", "APPROVAL", "USES LEFT", "DEVICE",
@@ -415,11 +415,11 @@ int cmdKey(int argc, char** argv) {
 int cmdBackup(int argc, char** argv) {
     Args args;
     if (!args.parse(argc, argv, 2, withConnectionSpecs({}))) {
-        std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help")) {
-        Args::printHelp("modbee backup   (a copy of the broker's login database, in its backups folder)",
+        Args::printHelp("modbee-mqtt backup   (a copy of the broker's login database, in its backups folder)",
                         withConnectionSpecs({}));
         return 0;
     }
@@ -427,7 +427,7 @@ int cmdBackup(int argc, char** argv) {
     std::string error;
     adminBuffers(cli);
     if (!cli.configure(args, "modbee-admin", error)) {
-        std::fprintf(stderr, "modbee: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", error.c_str());
         return 2;
     }
     json::Object request;
@@ -441,16 +441,16 @@ int cmdBackup(int argc, char** argv) {
     return 0;
 }
 
-// modbee config <get|set|apply|check|reset> - the server's settings, stored
+// modbee-mqtt config <get|set|apply|check|reset> - the server's settings, stored
 // beside its logins and changed over MQTT (docs/settings.md). Every change is
 // validated by the loader modbee.yaml goes through; refused with its problems.
 //
-//   modbee config get
-//   modbee config set broker.port=1884 broker.max-connections=50000 [--restart]
-//   modbee config set --remove broker.port
-//   modbee config apply --file new.yaml [--restart]
-//   modbee config check --file new.yaml     (or path=value ...)
-//   modbee config reset
+//   modbee-mqtt config get
+//   modbee-mqtt config set broker.port=1884 broker.max-connections=50000 [--restart]
+//   modbee-mqtt config set --remove broker.port
+//   modbee-mqtt config apply --file new.yaml [--restart]
+//   modbee-mqtt config check --file new.yaml     (or path=value ...)
+//   modbee-mqtt config reset
 int cmdConfig(int argc, char** argv) {
     const std::vector<ArgSpec> specs = withConnectionSpecs({
         {"file", 0, true, "apply / check: a whole settings document (YAML, like modbee.yaml)"},
@@ -459,23 +459,23 @@ int cmdConfig(int argc, char** argv) {
     });
     Args args;
     if (!args.parse(argc, argv, 3, specs)) {
-        std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help") || argc < 3 || std::strcmp(argv[2], "--help") == 0 || std::strcmp(argv[2], "help") == 0) {
-        Args::printHelp("modbee config <get|set|apply|check|reset> [path=value ...] [options]", specs);
+        Args::printHelp("modbee-mqtt config <get|set|apply|check|reset> [path=value ...] [options]", specs);
         return argc < 3 ? 2 : 0;
     }
     const std::string action = argv[2];
     if (action != "get" && action != "set" && action != "apply" && action != "check" && action != "reset") {
-        std::fprintf(stderr, "modbee config: get, set, apply, check or reset - not \"%s\"\n", action.c_str());
+        std::fprintf(stderr, "modbee-mqtt config: get, set, apply, check or reset - not \"%s\"\n", action.c_str());
         return 2;
     }
     CliClient cli;
     std::string error;
     adminBuffers(cli);
     if (!cli.configure(args, "modbee-admin", error)) {
-        std::fprintf(stderr, "modbee: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", error.c_str());
         return 2;
     }
     json::Object request;
@@ -485,7 +485,7 @@ int cmdConfig(int argc, char** argv) {
     for (const std::string& p : args.positional()) {
         const size_t eq = p.find('=');
         if (eq == std::string::npos || eq == 0) {
-            std::fprintf(stderr, "modbee config: settings are path=value, like broker.port=1884 (not \"%s\")\n", p.c_str());
+            std::fprintf(stderr, "modbee-mqtt config: settings are path=value, like broker.port=1884 (not \"%s\")\n", p.c_str());
             return 2;
         }
         const std::string path = p.substr(0, eq);
@@ -496,7 +496,7 @@ int cmdConfig(int argc, char** argv) {
         if (pemPath && !value.empty() && value[0] == '@') {
             std::ifstream in(value.substr(1), std::ios::binary);
             if (!in) {
-                std::fprintf(stderr, "modbee config: cannot read %s\n", value.substr(1).c_str());
+                std::fprintf(stderr, "modbee-mqtt config: cannot read %s\n", value.substr(1).c_str());
                 return 2;
             }
             std::ostringstream text;
@@ -511,7 +511,7 @@ int cmdConfig(int argc, char** argv) {
     if (args.has("file")) {
         std::ifstream in(args.get("file"), std::ios::binary);
         if (!in) {
-            std::fprintf(stderr, "modbee config: cannot read %s\n", args.get("file").c_str());
+            std::fprintf(stderr, "modbee-mqtt config: cannot read %s\n", args.get("file").c_str());
             return 2;
         }
         std::ostringstream text;
@@ -519,7 +519,7 @@ int cmdConfig(int argc, char** argv) {
         request.add("document", text.str());
     }
     if (action == "apply" && !args.has("file")) {
-        std::fprintf(stderr, "modbee config apply needs --file\n");
+        std::fprintf(stderr, "modbee-mqtt config apply needs --file\n");
         return 2;
     }
     if (args.has("restart")) request.add("restart", true);
@@ -572,7 +572,7 @@ int cmdConfig(int argc, char** argv) {
     return 0;
 }
 
-// modbee provision <key> [--name N] - what a device does on first boot:
+// modbee-mqtt provision <key> [--name N] - what a device does on first boot:
 // register with a provisioning key and receive its own login. For a device
 // that cannot provision itself (configure it with what this prints), and for
 // trying the flow from a terminal.
@@ -584,17 +584,17 @@ int cmdProvision(int argc, char** argv) {
     });
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help") || args.positional().size() != 1) {
-        Args::printHelp("modbee provision <provisioning key> --name <device>", specs);
+        Args::printHelp("modbee-mqtt provision <provisioning key> --name <device>", specs);
         return args.has("help") ? 0 : 2;
     }
     CliClient cli;
     std::string error;
     if (!cli.configure(args, "modbee-device", error)) {
-        std::fprintf(stderr, "modbee: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", error.c_str());
         return 2;
     }
     // The device's name is its Client Identifier, and the key its password.
@@ -622,7 +622,7 @@ int cmdProvision(int argc, char** argv) {
     cli.pollUntil([&] { return state.answered; }, 15000);
     cli.shutdown();
     if (!state.answered) {
-        std::fprintf(stderr, "modbee: no answer from the broker\n");
+        std::fprintf(stderr, "modbee-mqtt: no answer from the broker\n");
         return 1;
     }
     json::Value reply;
@@ -633,7 +633,7 @@ int cmdProvision(int argc, char** argv) {
         std::printf("provisioned %s\n  username: %s\n  password: %s\n  (shown once - store it in the device)\n",
                     name.c_str(), reply.str("username").c_str(), reply.str("password").c_str());
     } else if (reply.str("status") == "pending") {
-        std::printf("%s is waiting for approval: `modbee user approve %s`, then run this again\n",
+        std::printf("%s is waiting for approval: `modbee-mqtt user approve %s`, then run this again\n",
                     name.c_str(), name.c_str());
     } else {
         std::printf("refused: %s\n", reply.str("reason").c_str());
@@ -641,7 +641,7 @@ int cmdProvision(int argc, char** argv) {
     return reply.str("status") == "ok" ? 0 : 1;
 }
 
-// modbee restore <backup> [--database path] - puts a backup of the login
+// modbee-mqtt restore <backup> [--database path] - puts a backup of the login
 // database back, with the broker STOPPED (it is a file operation, not a
 // request). In Docker:
 //   docker compose stop modbee
@@ -654,11 +654,11 @@ int cmdRestore(int argc, char** argv) {
     };
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help") || args.positional().size() != 1) {
-        Args::printHelp("modbee restore <backup file>   (with the broker stopped)", specs);
+        Args::printHelp("modbee-mqtt restore <backup file>   (with the broker stopped)", specs);
         return args.has("help") ? 0 : 2;
     }
 #if defined(MODBEE_HAVE_SERVER)
@@ -666,18 +666,18 @@ int cmdRestore(int argc, char** argv) {
     const std::string to = args.get("database", "/var/lib/modbee/auth.db");
     std::string error;
     if (!AuthStore::restore(from, to, error)) {
-        std::fprintf(stderr, "modbee restore: %s\n", error.c_str());
+        std::fprintf(stderr, "modbee-mqtt restore: %s\n", error.c_str());
         return 1;
     }
     std::printf("restored %s from %s - start the broker\n", to.c_str(), from.c_str());
     return 0;
 #else
-    std::fprintf(stderr, "modbee restore: this build has no server tier (Linux only)\n");
+    std::fprintf(stderr, "modbee-mqtt restore: this build has no server tier (Linux only)\n");
     return 2;
 #endif
 }
 
-// modbee admin - THE ADMIN LOGIN, SET ON THE SERVER ITSELF.
+// modbee-mqtt admin - THE ADMIN LOGIN, SET ON THE SERVER ITSELF.
 //
 // Not a request over MQTT like every command above: it is how the first
 // admin is made, when there is nobody yet to ask, and how a lost admin
@@ -688,17 +688,17 @@ int cmdRestore(int argc, char** argv) {
 int cmdAdmin(int argc, char** argv) {
     static const std::vector<ArgSpec> specs = {
         {"secret", 0, true, "the password (asked for, unseen, when not given)"},
-        {"data", 0, true, "the server's folder, as `modbee serve --data` (default /var/lib/modbee; Windows: %ProgramData%\\ModBee)"},
+        {"data", 0, true, "the server's folder, as `modbee-mqtt serve --data` (default /var/lib/modbee-mqtt; Windows: %ProgramData%\\ModBee\\modbee-mqtt)"},
         {"database", 'd', true, "the login database itself, as authentication.database in a modbee.yaml"},
         {"help", 0, false, "show this help"},
     };
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee admin: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt admin: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help") || args.positional().size() > 1) {
-        Args::printHelp("modbee admin [<login, default admin>]   (on the server, as root / Administrator)\n\n"
+        Args::printHelp("modbee-mqtt admin [<login, default admin>]   (on the server, as root / Administrator)\n\n"
                         "Adds the admin login, or gives it a new password. It works at once, on a running\n"
                         "server too.",
                         specs);
@@ -709,7 +709,7 @@ int cmdAdmin(int argc, char** argv) {
     bool nameOk = !name.empty() && name.size() <= 256 && name[0] != '$';
     for (char c : name) nameOk = nameOk && (unsigned char)c >= 0x20 && c != 0x7f;
     if (!nameOk) {
-        std::fprintf(stderr, "modbee admin: a login may not be empty, longer than 256, start with $, "
+        std::fprintf(stderr, "modbee-mqtt admin: a login may not be empty, longer than 256, start with $, "
                              "or hold control characters\n");
         return 2;
     }
@@ -724,13 +724,13 @@ int cmdAdmin(int argc, char** argv) {
             std::string again;
             if (!cliReadSecret("Again: ", again)) return 2;
             if (again != secret) {
-                std::fprintf(stderr, "modbee admin: the two were not the same - nothing changed\n");
+                std::fprintf(stderr, "modbee-mqtt admin: the two were not the same - nothing changed\n");
                 return 2;
             }
         }
     }
     if (secret.empty()) {
-        std::fprintf(stderr, "modbee admin: a password is required\n");
+        std::fprintf(stderr, "modbee-mqtt admin: a password is required\n");
         return 2;
     }
 
@@ -742,7 +742,7 @@ int cmdAdmin(int argc, char** argv) {
         struct stat owner;
         if ((::stat(path.c_str(), &owner) == 0 || ::stat(folder.c_str(), &owner) == 0) && owner.st_uid != 0) {
             if (setgid(owner.st_gid) != 0 || setuid(owner.st_uid) != 0) {
-                std::fprintf(stderr, "modbee admin: cannot act as the server's user\n");
+                std::fprintf(stderr, "modbee-mqtt admin: cannot act as the server's user\n");
                 return 1;
             }
         }
@@ -750,13 +750,13 @@ int cmdAdmin(int argc, char** argv) {
 #endif
     const size_t slash = path.find_last_of("/\\");
     if (slash != std::string::npos && slash > 0 && !cliMakeDirectories(path.substr(0, slash))) {
-        std::fprintf(stderr, "modbee admin: cannot make the folder %s\n", path.substr(0, slash).c_str());
+        std::fprintf(stderr, "modbee-mqtt admin: cannot make the folder %s\n", path.substr(0, slash).c_str());
         return 1;
     }
     AuthStore store;
     std::string why;
     if (!store.open(path, 0, why)) {
-        std::fprintf(stderr, "modbee admin: %s: %s (run it as root, or as Administrator on Windows)\n",
+        std::fprintf(stderr, "modbee-mqtt admin: %s: %s (run it as root, or as Administrator on Windows)\n",
                      path.c_str(), why.c_str());
         return 1;
     }
@@ -775,16 +775,16 @@ int cmdAdmin(int argc, char** argv) {
     user.pending = false;
     user.updated = now;
     if (store.putUser(user, true) != AuthResult::Ok) {
-        std::fprintf(stderr, "modbee admin: %s could not be written\n", path.c_str());
+        std::fprintf(stderr, "modbee-mqtt admin: %s could not be written\n", path.c_str());
         return 1;
     }
     store.close();
     std::printf("%s admin login \"%s\" in %s - it works now, no restart\n",
                 existed ? "changed the password of the" : "added the", name.c_str(), path.c_str());
-    std::printf("  for example: modbee user list -u %s -P '<password>'\n", name.c_str());
+    std::printf("  for example: modbee-mqtt user list -u %s -P '<password>'\n", name.c_str());
     return 0;
 #else
-    std::fprintf(stderr, "modbee admin: this build has no server tier\n");
+    std::fprintf(stderr, "modbee-mqtt admin: this build has no server tier\n");
     return 2;
 #endif
 }

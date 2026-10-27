@@ -1,6 +1,6 @@
 # The Application API
 
-Devices speak MQTT to `modbee serve`. **Your application** - a platform
+Devices speak MQTT to `modbee-mqtt serve`. **Your application** - a platform
 backend, a gateway's own software - can speak to it a different way: over
 the Application API, gRPC on a local socket, with no MQTT library at all.
 
@@ -36,11 +36,11 @@ has its Wills published, in order. One that closes first has none.
 
 ## Turning it on
 
-On a server installed with `modbee service install`, one command - TCP on
+On a server installed with `modbee-mqtt service install`, one command - TCP on
 this machine, with a token you choose:
 
 ```bash
-modbee config set api.grpc=tcp://127.0.0.1:7660 api.token=<token> --restart -u admin -P <password>
+modbee-mqtt config set api.grpc=tcp://127.0.0.1:7660 api.token=<token> --restart -u admin -P <password>
 ```
 
 In a `modbee.yaml` (the Docker image's way):
@@ -50,10 +50,10 @@ api:
   grpc: ["unix:/run/modbee/api.sock"]
 ```
 
-`modbee serve` says where it listens:
+`modbee-mqtt serve` says where it listens:
 
 ```
-modbee serve: Application API (gRPC) on unix:/run/modbee/api.sock
+modbee-mqtt serve: Application API (gRPC) on unix:/run/modbee/api.sock
 ```
 
 - **The socket is the lock.** It is made readable and writable by the server's
@@ -253,7 +253,7 @@ api:
 ```
 
 ```
-modbee serve: Application API (REST) on http://127.0.0.1:9464/v1/
+modbee-mqtt serve: Application API (REST) on http://127.0.0.1:9464/v1/
 ```
 
 ```sh
@@ -308,7 +308,7 @@ Logins then come from your application instead of a login database
 (`authentication: database` and `authority` cannot be used together). The
 fixed logins in the file - `username`/`password` (an admin) and `users:` -
 are still decided by the server itself: that is how your application, and the
-`modbee` command, log in without asking themselves.
+`modbee-mqtt` command, log in without asking themselves.
 
 ### What is asked, and when
 

@@ -199,7 +199,7 @@ bool AuthGate::applyTlsLive(const ServerConfig& effective, std::vector<ConfigPro
     std::string error;
     if (tlsFromSettings(effective.broker, wanted, error) && !sameTlsMaterial(wanted, served) &&
         _config.server->replaceTls(wanted, error)) {
-        std::fprintf(stdout, "modbee serve: the TLS material changed - new handshakes get it, connections already up keep theirs\n");
+        std::fprintf(stdout, "modbee-mqtt serve: the TLS material changed - new handshakes get it, connections already up keep theirs\n");
         std::fflush(stdout);
         return true;
     }

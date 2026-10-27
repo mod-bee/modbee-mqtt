@@ -15,8 +15,8 @@
 #       -e VCPKG_DEFAULT_BINARY_CACHE=/cache alpine:3.22 sh scripts/release/build-linux.sh
 #
 # Leaves, in dist/:
-#   modbee-<version>-linux-<arch>            the binary
-#   modbee-<version>-linux-<arch>.cdx.json   its CycloneDX SBOM
+#   modbee-mqtt-<version>-linux-<arch>            the binary
+#   modbee-mqtt-<version>-linux-<arch>.cdx.json   its CycloneDX SBOM
 # from which packages.sh makes the .deb and .rpm.
 #
 # gRPC, protobuf, librdkafka and OpenSSL are built from source by vcpkg, at
@@ -40,7 +40,7 @@ test -f /etc/alpine-release || { echo "build-linux: run this inside Alpine (musl
 
 version=$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -1)
 test -n "$version" || { echo "build-linux: no VERSION in CMakeLists.txt" >&2; exit 1; }
-name=modbee-$version-linux-$arch
+name=modbee-mqtt-$version-linux-$arch
 echo "build-linux: $name"
 
 apk add --no-cache build-base cmake ninja git curl zip unzip tar pkgconf perl \
@@ -75,7 +75,7 @@ done
 cmake --build build-release-linux
 ctest --test-dir build-release-linux --output-on-failure
 
-binary=build-release-linux/cli/modbee
+binary=build-release-linux/cli/modbee-mqtt
 strip "$binary"
 file "$binary"
 file "$binary" | grep -q 'statically linked\|static-pie linked' || { echo "build-linux: not static" >&2; exit 1; }

@@ -38,18 +38,18 @@ Building an app on it: [docs/kafka-apps.md](../../../docs/kafka-apps.md).
 ## Add a device
 
 ```bash
-docker compose exec modbee modbee user add tank-01 \
+docker compose exec modbee modbee-mqtt user add tank-01 \
   --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 ```
 
 It prints the device's password, once. Many devices of one kind can register
-themselves with one key instead (`modbee key create`):
+themselves with one key instead (`modbee-mqtt key create`):
 [docs/logins.md](../../../docs/logins.md).
 
 ## Check it works
 
 ```bash
-docker compose exec modbee modbee pub -t plant/test -m hi -q 1    # "accepted": Kafka has it
+docker compose exec modbee modbee-mqtt pub -t plant/test -m hi -q 1    # "accepted": Kafka has it
 docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server kafka:9092 --topic mqtt-messages --from-beginning --max-messages 1
 ```
@@ -59,6 +59,6 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
 | | |
 | --- | --- |
 | Upgrade | `docker compose pull && docker compose up -d` - logins, retained messages and Kafka's data stay (volumes) |
-| Back up the logins | `docker compose exec modbee modbee backup` - a copy in the volume's `backups` folder |
+| Back up the logins | `docker compose exec modbee modbee-mqtt backup` - a copy in the volume's `backups` folder |
 | Change a setting | edit `modbee.yaml`, then `docker compose restart modbee` |
 | One Kafka node | no replication: a lost disk loses Kafka's data. For more, run your own Kafka cluster and point `bootstrap-servers` at it |

@@ -1,7 +1,7 @@
-# modbee as a .deb and an .rpm: the program, and nothing else - no settings,
-# no scripts, no user. `sudo modbee service install` sets it up as a service,
+# modbee-mqtt as a .deb and an .rpm: the program, and nothing else - no settings,
+# no scripts, no user. `sudo modbee-mqtt service install` sets it up as a service,
 # the same command as on Windows (docs/releases.md). Built by packages.sh.
-name: modbee
+name: modbee-mqtt
 arch: ${MODBEE_ARCH}
 platform: linux
 version: ${MODBEE_VERSION}
@@ -15,18 +15,18 @@ license: AGPL-3.0 with additional ModBee terms
 description: |
   MQTT 5.0 and 3.1.1 broker, with a Kafka pipe and an Application API.
   One static binary: the broker, the Kafka pipe, the Application API and the
-  modbee command. `sudo modbee service install` runs it as a service.
+  modbee-mqtt command. `sudo modbee-mqtt service install` runs it as a service.
 
 contents:
   - src: build-packages/modbee
-    dst: /usr/bin/modbee
+    dst: /usr/bin/modbee-mqtt
     file_info:
       mode: 0755
   - src: LICENSE
-    dst: /usr/share/doc/modbee/LICENSE
+    dst: /usr/share/doc/modbee-mqtt/LICENSE
     file_info:
       mode: 0644
   - src: README.md
-    dst: /usr/share/doc/modbee/README.md
+    dst: /usr/share/doc/modbee-mqtt/README.md
     file_info:
       mode: 0644

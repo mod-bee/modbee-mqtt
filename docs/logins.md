@@ -10,7 +10,7 @@ There are two ways a device gets its login:
 | | How | Best for |
 | --- | --- | --- |
 | **It registers itself** (provisioning) | Every device is flashed with the same *provisioning key*. On first boot it asks the broker for a login, keeps it, and connects as itself | Many devices; devices you cannot easily reach |
-| **You add it** | `modbee user add tank-01` prints a secret; you put it in the device | A few devices; equipment that cannot register itself |
+| **You add it** | `modbee-mqtt user add tank-01` prints a secret; you put it in the device | A few devices; equipment that cannot register itself |
 
 Both are kept in a small database in the broker's data volume, and both can
 be managed from the command line or from your own platform.
@@ -27,55 +27,55 @@ asked once per login, and kept: [app-api.md](app-api.md#logins-decided-by-your-a
 ## The admin login
 
 `MQTT_USERNAME` (default `admin`) and `MQTT_PASSWORD` in `.env` are the
-**admin** login. It is for you, your own apps and services, and the `modbee`
+**admin** login. It is for you, your own apps and services, and the `modbee-mqtt`
 command - not for devices. It may use every topic, and it is the only login
 that can manage the others (until you make another admin).
 
-Inside the stack, the `modbee` command uses it by itself:
+Inside the stack, the `modbee-mqtt` command uses it by itself:
 
 ```bash
-docker compose exec modbee modbee user list
+docker compose exec modbee modbee-mqtt user list
 ```
 
-From any other computer, give it: `modbee user list -h mqtt.example.com --tls -u admin -P '...'`.
+From any other computer, give it: `modbee-mqtt user list -h mqtt.example.com --tls -u admin -P '...'`.
 
 ---
 
 ## Adding a device by hand
 
 ```bash
-docker compose exec modbee modbee user add tank-01 \
+docker compose exec modbee modbee-mqtt user add tank-01 \
   --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 ```
 
 ```
 added tank-01
   password: F3mQBcg8GVsexV2nd2GOTZcE5BtqIN65
-  (shown once - it cannot be read back; `modbee user reset tank-01` issues a new one)
+  (shown once - it cannot be read back; `modbee-mqtt user reset tank-01` issues a new one)
 ```
 
 To choose the password yourself, add `--secret '<password>'`
-(`modbee user password tank-01 --secret ...` changes it later).
+(`modbee-mqtt user password tank-01 --secret ...` changes it later).
 Put `tank-01` and that password into the device (for this library:
 `mqtt.credentials("tank-01", "F3mQ...")`). The `--publish` and `--subscribe`
 rules are [what it may do](#what-a-device-may-do).
 
 **The secret is shown once, and the broker cannot show it again** - it keeps
 only a salted hash of it, so a copy of the database is no use to anyone. If a
-secret is lost, you do not need it back: `modbee user reset tank-01` gives the
+secret is lost, you do not need it back: `modbee-mqtt user reset tank-01` gives the
 device a new one, and the old one stops working.
 
 | Command | Does |
 | --- | --- |
-| `modbee user list` | Every login: status, how it was made, what it may do |
-| `modbee user show tank-01` | One login |
-| `modbee user reset tank-01` | A new secret; the old one stops working and the device is disconnected |
-| `modbee user disable tank-01` / `enable` | Lock it out (disconnected at once) / let it back in |
-| `modbee user permissions tank-01 --publish ... --subscribe ...` | Change what it may do |
-| `modbee user password tank-01 --secret '...'` | A password you choose, for equipment where you must type one |
-| `modbee user admin someone` | Make a login an admin (`--no-admin` to undo) |
-| `modbee user set tank-01 --fingerprint ...` | Change several things at once - `--fingerprint`, `--publish`/`--subscribe`, `--admin`/`--no-admin`, `--secret` - and nothing else |
-| `modbee user remove tank-01` | Delete it (disconnected at once) |
+| `modbee-mqtt user list` | Every login: status, how it was made, what it may do |
+| `modbee-mqtt user show tank-01` | One login |
+| `modbee-mqtt user reset tank-01` | A new secret; the old one stops working and the device is disconnected |
+| `modbee-mqtt user disable tank-01` / `enable` | Lock it out (disconnected at once) / let it back in |
+| `modbee-mqtt user permissions tank-01 --publish ... --subscribe ...` | Change what it may do |
+| `modbee-mqtt user password tank-01 --secret '...'` | A password you choose, for equipment where you must type one |
+| `modbee-mqtt user admin someone` | Make a login an admin (`--no-admin` to undo) |
+| `modbee-mqtt user set tank-01 --fingerprint ...` | Change several things at once - `--fingerprint`, `--publish`/`--subscribe`, `--admin`/`--no-admin`, `--secret` - and nothing else |
+| `modbee-mqtt user remove tank-01` | Delete it (disconnected at once) |
 
 ---
 
@@ -85,7 +85,7 @@ Create a **provisioning key** once, for a site or a product, and name the
 site its devices belong to:
 
 ```bash
-docker compose exec modbee modbee key create site-north --site north \
+docker compose exec modbee modbee-mqtt key create site-north --site north \
   --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 ```
 
@@ -127,10 +127,10 @@ page *13 Provisioning* has the whole of it.
 | --- | --- |
 | A board is replaced | Flash the new one with the same name and a key of the same site. It registers, gets a new login, and the old board's login stops working |
 | A device's flash is wiped | It has no login, so it registers again |
-| You reset a device (`modbee user reset`) | Its stored login is refused, so it registers again by itself - no site visit |
+| You reset a device (`modbee-mqtt user reset`) | Its stored login is refused, so it registers again by itself - no site visit |
 | The broker's login store is lost, or restored from an old backup | Every device's login is refused at once. Each registers again with its key but **keeps its stored login** - it is replaced only when the broker issues a new one - and tries it again every five minutes, so a store that comes back lets the fleet straight back in, with nothing to approve |
 | You disable a device | It stays out: registering again does not undo it |
-| You remove the key (`modbee key remove`) | No new device can register with it; devices already registered keep working |
+| You remove the key (`modbee-mqtt key remove`) | No new device can register with it; devices already registered keep working |
 | You issue a new key for the site | Devices keep working (they log in with their own login, not the key); a new or wiped device registers with the new key |
 | A key of **another** site is used with a device's name | Refused: a key registers again only devices of its own site, so one customer's key cannot take another's device |
 
@@ -145,14 +145,14 @@ not cleared by a refusal, only overwritten by a login the broker has issued.
 
 | Option | Means |
 | --- | --- |
-| `--approval manual` | A new device waits until you approve it: `modbee user list` shows it `pending`, `modbee user approve tank-07` lets it in. Without this, devices are let in straight away |
+| `--approval manual` | A new device waits until you approve it: `modbee-mqtt user list` shows it `pending`, `modbee-mqtt user approve tank-07` lets it in. Without this, devices are let in straight away |
 | `--uses 50` | At most 50 devices may register with it |
 | `--days 30` | It stops working after 30 days |
 | `--site north` | The site its devices belong to: a key registers again only devices of its own site, so one customer's key cannot take another's device. Keys without a site share one - a broker for a single site needs none |
 | `--device tank-07` | It may register only that one device, and every claim uses it up (`--uses 1`: claimed once) - e.g. a key your platform creates for one device it is setting up or replacing |
 | `--data group=north-plant` | A value handed to each device it registers - repeat for more ([below](#what-a-key-hands-its-devices)) |
 
-`modbee key list` shows every key; `modbee key remove site-north` retires one.
+`modbee-mqtt key list` shows every key; `modbee-mqtt key remove site-north` retires one.
 
 ### What a key hands its devices
 
@@ -161,15 +161,15 @@ whoever sets the device up types only the key, the device's name and its
 network. The broker keeps them and hands them out; it does not read them.
 
 ```bash
-docker compose exec modbee modbee key create site-north --site north \
+docker compose exec modbee modbee-mqtt key create site-north --site north \
   --publish 'spBv1.0/north-plant/+/${username}' --publish 'acme/north/${username}/#' \
   --data group=north-plant --data prefix=acme/north
 ```
 
 - **At sign-up** the answer carries them: `"data": {"group": "north-plant", "prefix": "acme/north"}`.
 - **They stay with the device's login**, copied from the key when it registers.
-  `modbee user set tank-07 --data group=... --data prefix=...` changes one
-  device's; `modbee key set site-north --data ...` changes what the key hands
+  `modbee-mqtt user set tank-07 --data group=... --data prefix=...` changes one
+  device's; `modbee-mqtt key set site-north --data ...` changes what the key hands
   devices that register from then on. A set replaces them all; `--data ''`
   clears them.
 - **A device asks again whenever it likes** (its own values only, no new
@@ -187,7 +187,7 @@ Register it from a computer instead, with the same key, and configure the
 device with what comes back:
 
 ```bash
-modbee provision 'site-north.eDjPQ...' --name gateway-3 -h mqtt.example.com --tls
+modbee-mqtt provision 'site-north.eDjPQ...' --name gateway-3 -h mqtt.example.com --tls
 ```
 
 ---
@@ -199,7 +199,7 @@ key and login; a store an earlier version made is refused when the broker
 starts:
 
 ```
-modbee serve: the login store /var/lib/modbee/auth.db was made by an earlier version (schema 1, this one reads 2); remove it and add the logins again
+modbee-mqtt serve: the login store /var/lib/modbee/auth.db was made by an earlier version (schema 1, this one reads 2); remove it and add the logins again
 ```
 
 Remove `auth.db` (and `auth.db-wal`, `auth.db-shm` beside it) from the
@@ -274,7 +274,7 @@ Such a login takes **explicit** rules, because a `${username}` rule never
 fits it:
 
 ```bash
-docker compose exec modbee modbee user add acme/riverbend/pump-plc \
+docker compose exec modbee modbee-mqtt user add acme/riverbend/pump-plc \
   --publish 'acme/riverbend/#' --subscribe 'acme/riverbend/#'
 ```
 
@@ -325,7 +325,7 @@ The CA can be given over MQTT instead, and changed while the broker runs
 Then add the login the certificate names, with its rules, as for any device:
 
 ```bash
-docker compose exec modbee modbee user add tank-01 --publish 'plant/${username}/#'
+docker compose exec modbee modbee-mqtt user add tank-01 --publish 'plant/${username}/#'
 ```
 
 and the device connects over TLS presenting a certificate the CA issued to
@@ -348,7 +348,7 @@ certificate logins separately) and printed to the server's log with the CN,
 where the device came from and the certificate's fingerprint:
 
 ```
-modbee serve: certificate login refused for "tank-01" from 10.0.4.7:51544 (certificate cfb913...84ae): the login is bound to a different certificate (its fingerprint)
+modbee-mqtt serve: certificate login refused for "tank-01" from 10.0.4.7:51544 (certificate cfb913...84ae): the login is bound to a different certificate (its fingerprint)
 ```
 
 ### Binding a login to one certificate
@@ -359,14 +359,14 @@ fingerprint:
 
 ```bash
 openssl x509 -noout -fingerprint -sha256 -in tank-01.crt
-docker compose exec modbee modbee user set tank-01 --fingerprint 'CF:B9:13:...:84:AE'
+docker compose exec modbee modbee-mqtt user set tank-01 --fingerprint 'CF:B9:13:...:84:AE'
 ```
 
 The fingerprint is SHA-256 of the certificate's DER, stored as 64 lowercase
 hexadecimal characters; openssl's own spelling - upper case, colons,
 `sha256 Fingerprint=` in front - is accepted and tidied. Binding a new one
 disconnects a device on any other certificate at once. `--fingerprint ""`
-clears it, and `modbee user add ... --fingerprint` sets it from the start. A
+clears it, and `modbee-mqtt user add ... --fingerprint` sets it from the start. A
 login with a fingerprint can still log in with its password, where it has
 one.
 
@@ -374,7 +374,7 @@ one.
 
 ## From your own platform
 
-Everything above is also a JSON message over MQTT, which is how the `modbee`
+Everything above is also a JSON message over MQTT, which is how the `modbee-mqtt`
 command does it - so a platform, dashboard or script can manage logins with
 nothing but an MQTT connection with an admin login. No REST API, no webhooks.
 
@@ -442,8 +442,8 @@ by hand would be locked out. So:
 
 - **A copy is made every 24 hours** in `/var/lib/modbee/backups/`, and the
   last 7 are kept.
-- **`modbee backup`** makes one now:
-  `docker compose exec modbee modbee backup`.
+- **`modbee-mqtt backup`** makes one now:
+  `docker compose exec modbee modbee-mqtt backup`.
 - **Keep a copy somewhere else**, as for any database:
   `docker compose cp modbee:/var/lib/modbee/backups ./modbee-backups`.
 
@@ -455,7 +455,7 @@ docker compose run --rm --no-deps modbee restore /var/lib/modbee/backups/auth-20
 docker compose start modbee
 ```
 
-`modbee restore` copies through SQLite itself, so a half-written log left
+`modbee-mqtt restore` copies through SQLite itself, so a half-written log left
 beside the old database is dealt with rather than replayed over the backup.
 
 ---
@@ -479,21 +479,21 @@ beside the old database is dealt with rather than replayed over the backup.
 
 ## Without Docker
 
-Installed as a service - `sudo modbee service install`, on Linux or Windows
+Installed as a service - `sudo modbee-mqtt service install`, on Linux or Windows
 ([releases.md](releases.md#installing-it)) - the login database is already
 there, in the data folder. The admin login is set on the server itself:
 
 ```bash
-sudo modbee admin                  # asks for its password; again to change it
+sudo modbee-mqtt admin                  # asks for its password; again to change it
 ```
 
 It works at once, on the running server. Then manage the logins with the
-same `modbee user` and `modbee key` commands, giving the admin login with
+same `modbee-mqtt user` and `modbee-mqtt key` commands, giving the admin login with
 `-u` and `-P` (or `MODBEE_AUTHENTICATION_USERNAME` and `_PASSWORD` in the
 environment). Until there is an admin, nobody can log in.
 
 With a `modbee.yaml` instead, `authentication: database:` names the file, and
-`modbee admin --database <that file>` sets its admin - or the file's
+`modbee-mqtt admin --database <that file>` sets its admin - or the file's
 `username` and `password` (or `password-file`) are an admin of their own.
 
 Without a `database`, `username`/`password` (and a `users:` list) are a fixed

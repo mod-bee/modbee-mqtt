@@ -13,7 +13,7 @@ minor version may change the API or the configuration, and says how here.
 
 ## [0.1.0]
 
-The first release: the library for boards and hosts, and `modbee`, the server
+The first release: the library for boards and hosts, and `modbee-mqtt`, the server
 built from it, as downloads for Linux and Windows and as a Docker image.
 
 ### The library
@@ -27,7 +27,7 @@ built from it, as downloads for Linux and Windows and as a Docker image.
 
 ### The server
 
-- `modbee serve`: one broker per CPU core behind one port, configured with
+- `modbee-mqtt serve`: one broker per CPU core behind one port, configured with
   one `modbee.yaml`; sessions and retained messages that survive a restart;
   device logins and provisioning.
 - The Kafka pipe: MQTT to Kafka and back, messages passed through untouched,
@@ -40,13 +40,13 @@ built from it, as downloads for Linux and Windows and as a Docker image.
 ### Ready to run
 
 - `.deb` and `.rpm` packages, x86-64 and ARM64.
-- Set up with the `modbee` command alone, the same on Linux and Windows:
-  `modbee service install` runs it as a service (systemd, or a Windows
-  service) keeping everything in one folder, and `modbee admin` sets the
+- Set up with the `modbee-mqtt` command alone, the same on Linux and Windows:
+  `modbee-mqtt service install` runs it as a service (systemd, or a Windows
+  service) keeping everything in one folder, and `modbee-mqtt admin` sets the
   admin login. No configuration file.
-- `modbee` for Linux as one static binary that runs on any distribution, and
-  `modbee.exe` for Windows as one file - each with the broker, the Kafka pipe,
-  the Application API and the CLI inside; `modbee --version` lists them.
+- `modbee-mqtt` for Linux as one static binary that runs on any distribution, and
+  `modbee-mqtt.exe` for Windows as one file - each with the broker, the Kafka pipe,
+  the Application API and the CLI inside; `modbee-mqtt --version` lists them.
 - Each attested by GitHub, with a CycloneDX SBOM, and a checksum list signed
   with Sigstore. [docs/releases.md](https://github.com/mod-bee/modbee-mqtt/blob/main/docs/releases.md)
   shows how to check one.

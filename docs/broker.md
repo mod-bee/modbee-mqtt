@@ -33,14 +33,14 @@ walks the whole scenario through, from what the devices do differently
 ## What it is not
 
 Stated plainly, so nobody discovers it at an awkward moment. This is the
-library's broker, with the library's defaults; `modbee serve`, the server
+library's broker, with the library's defaults; `modbee-mqtt serve`, the server
 built on it, sets its own (below the Capacity table) and can keep retained
 messages.
 
 - **No persistence.** A restart loses sessions and retained messages.
   [V5:4.1] permits that, and this broker takes the permission. A program that
   keeps its retained messages elsewhere puts them back after `begin()` with
-  `restoreRetained()`, which stores without publishing; `modbee serve` does
+  `restoreRetained()`, which stores without publishing; `modbee-mqtt serve` does
   that with a file or Kafka, and keeps sessions and their queued messages too
   ([docker.md](docker.md#where-messages-are-kept)).
 - **No clustering.** One process, one box.
@@ -242,12 +242,12 @@ guessing.
 | `maxSessions` | 64 | Including clients currently away. Larger than `maxConnections` on purpose: offline sessions are the normal state of a plant at 3 a.m. |
 | `maxSubscriptionsPerSession` | 32 | |
 | `maxQueuedPerSession` | 64 | Messages held for one client. The retained messages a new subscription is sent go a queue's worth at a time, as the client takes them - all of them, however many [MQTT-3.3.1-9]. |
-| `maxQueuedBytesPerSession`, `maxQueuedBytesTotal` | 0 (no cap) | The same in bytes - one client's queue, and every client's together. Each queued message is its own copy of topic and payload, and an offline session queues too, so the depth alone does not bound memory. A message past either is refused for that subscriber and counted as dropped. `modbee serve` sets 1 MB and 64 MB. |
+| `maxQueuedBytesPerSession`, `maxQueuedBytesTotal` | 0 (no cap) | The same in bytes - one client's queue, and every client's together. Each queued message is its own copy of topic and payload, and an offline session queues too, so the depth alone does not bound memory. A message past either is refused for that subscriber and counted as dropped. `modbee-mqtt serve` sets 1 MB and 64 MB. |
 | `maxRetained` | 256 | Retained topics. A new one past this is delivered but not kept, and refused with `0x97`. From 1024 up, on a host, topics are found through a hash index rather than a walk. |
 | `receiveBufferSize` / `transmitBufferSize` | 8192 | One whole packet each. |
 | `reserveUpFront` | true | Reserve every slot and buffer at `begin()`. False reserves a session's slots on first use and starts each connection's buffers at 512 bytes, growing them only when a packet needs it. The limits are unchanged. |
 
-These are the library's defaults. `modbee serve` sets its own, from
+These are the library's defaults. `modbee-mqtt serve` sets its own, from
 `modbee.yaml` or its flags: `max-packet` 65536 (both buffers and the
 advertised Maximum Packet Size), `max-retained` 10000, `queue` 64,
 `max-session-expiry` 3600 (`maximumSessionExpiry`, below) - and it can

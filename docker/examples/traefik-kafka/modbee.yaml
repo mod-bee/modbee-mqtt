@@ -3,7 +3,7 @@
 # Docker network only. Because Traefik ends TLS, devices can not sign in with a
 # client certificate, and they should check the certificate against the public
 # roots, not pin its key (Let's Encrypt renewals change it).
-# `docker compose exec modbee modbee check` validates this file.
+# `docker compose exec modbee modbee-mqtt check` validates this file.
 
 broker:
   port: 1883

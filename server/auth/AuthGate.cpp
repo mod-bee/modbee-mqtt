@@ -407,7 +407,7 @@ bool AuthGate::certificateLogin(Shard& shard, const MqttBrokerRequest& request, 
         reasonCode = code;
         _refused.fetch_add(1, std::memory_order_relaxed);
         _certificateRefused.fetch_add(1, std::memory_order_relaxed);
-        std::fprintf(stderr, "modbee serve: certificate login refused for \"%s\" from %s (certificate %s): %s\n",
+        std::fprintf(stderr, "modbee-mqtt serve: certificate login refused for \"%s\" from %s (certificate %s): %s\n",
                      name.c_str(), request.peerName ? request.peerName : "?", fingerprint.c_str(), why);
         return false;
     };
@@ -921,7 +921,7 @@ bool AuthGate::backupNow(std::string& path, std::string& error) {
 }
 
 // The gate's own thread. Once a second: whether another program wrote the
-// login file - `modbee admin`, setting the admin beside the running server -
+// login file - `modbee-mqtt admin`, setting the admin beside the running server -
 // so what the shards cached is dropped and the change applies at once. And
 // the backup, every backupEveryHours.
 void AuthGate::backupLoop() {
@@ -937,7 +937,7 @@ void AuthGate::backupLoop() {
             due = std::chrono::steady_clock::now() + every;
             std::string path, error;
             if (!backupNow(path, error)) {
-                std::fprintf(stderr, "modbee serve: the login store backup failed: %s\n", error.c_str());
+                std::fprintf(stderr, "modbee-mqtt serve: the login store backup failed: %s\n", error.c_str());
             }
         }
         lock.lock();

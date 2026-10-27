@@ -5,7 +5,7 @@
 
 #pragma once
 
-// modbee.yaml: what `modbee serve` runs and `modbee check` validates.
+// modbee.yaml: what `modbee-mqtt serve` runs and `modbee-mqtt check` validates.
 //
 // THE FILE IS THE DEFAULT; THE ENVIRONMENT WINS. Every scalar in the schema
 // can be set by an environment variable named after its path - upper case,
@@ -244,7 +244,7 @@ struct AuthenticationSection {
     bool hasAdmin = false;               // accounts[0] came from username/password
 
     // Device logins in a SQLite file, changed live - added, removed,
-    // provisioned - through the admin topics and `modbee user` / `modbee key`.
+    // provisioned - through the admin topics and `modbee-mqtt user` / `modbee-mqtt key`.
     std::string database;
 
     // A client certificate the TLS listener verified IS the login: the login

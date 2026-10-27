@@ -27,12 +27,12 @@ while you try it out - its limits are generous - and remove it when it works.
 ## Add a device
 
 ```bash
-docker compose exec modbee modbee user add tank-01 \
+docker compose exec modbee modbee-mqtt user add tank-01 \
   --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 ```
 
 It prints the device's password, once. Many devices of one kind can register
-themselves with one key instead (`modbee key create`):
+themselves with one key instead (`modbee-mqtt key create`):
 [docs/logins.md](../../../docs/logins.md).
 
 ## Check it works
@@ -57,6 +57,6 @@ docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h <DOMAIN> \
 | | |
 | --- | --- |
 | Upgrade | `docker compose pull && docker compose up -d` - logins, retained messages and the certificate stay (volumes) |
-| Back up the logins | `docker compose exec modbee modbee backup` - a copy in the volume's `backups` folder |
+| Back up the logins | `docker compose exec modbee modbee-mqtt backup` - a copy in the volume's `backups` folder |
 | Change a setting | edit `modbee.yaml`, then `docker compose restart modbee` |
 | Your own app in Docker | join the network `modbee` and connect to `modbee:1883` (plain, inside the server) |

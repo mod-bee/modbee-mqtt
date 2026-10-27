@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee - the command-line tool. One binary, subcommands.
+// modbee-mqtt - the command-line tool. One binary, subcommands.
 
 #include <MqttFeatures.h>    // MQTT_TLS_ENGINE_NAME
 #if defined(MODBEE_HAVE_KAFKA)
@@ -39,9 +39,9 @@ namespace {
 
 void usage() {
     std::printf(
-        "modbee - MQTT 5.0 / 3.1.1 tools built on the ModBee MQTT library\n"
+        "modbee-mqtt - MQTT 5.0 / 3.1.1 tools built on the ModBee MQTT library\n"
         "\n"
-        "usage: modbee <command> [options]      modbee <command> --help\n"
+        "usage: modbee-mqtt <command> [options]      modbee-mqtt <command> --help\n"
         "\n"
         "  pub      publish, and report what the broker said about each message\n"
         "  sub      subscribe and print what arrives (--json for JSON lines)\n"
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     // one a binary got is otherwise invisible - an image built without
     // wolfSSL looks exactly like one built with it until a handshake differs.
     if (std::strcmp(command, "--version") == 0 || std::strcmp(command, "version") == 0) {
-        std::printf("modbee %s (TLS: %s)\n", MODBEE_VERSION, MQTT_TLS_ENGINE_NAME);
+        std::printf("modbee-mqtt %s (TLS: %s)\n", MODBEE_VERSION, MQTT_TLS_ENGINE_NAME);
         // And what else is inside, so a binary can be checked rather than
         // trusted: the release workflow refuses one without both.
 #if defined(MODBEE_HAVE_KAFKA)
@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(command, "service") == 0) return cmdService(argc, argv);
     if (std::strcmp(command, "admin") == 0) return cmdAdmin(argc, argv);
 
-    std::fprintf(stderr, "modbee: unknown command '%s'\n\n", command);
+    std::fprintf(stderr, "modbee-mqtt: unknown command '%s'\n\n", command);
     usage();
     return 2;
 }

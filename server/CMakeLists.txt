@@ -6,7 +6,7 @@
 # and RTTI off like everything else (R8).
 #
 # Dependencies: libyaml, vendored under third_party/ (C, MIT); and librdkafka
-# for the Kafka pipe, used only when it is installed - without it `modbee serve`
+# for the Kafka pipe, used only when it is installed - without it `modbee-mqtt serve`
 # runs the broker alone and says so if a file asks for Kafka.
 
 enable_language(C)
@@ -129,7 +129,7 @@ if(RDKAFKA_FOUND)
     endif()
     message(STATUS "modbee: librdkafka ${RDKAFKA_VERSION} found - the Kafka pipe is built")
 else()
-    message(STATUS "modbee: no librdkafka - modbee serve runs without the Kafka pipe")
+    message(STATUS "modbee: no librdkafka - modbee-mqtt serve runs without the Kafka pipe")
 endif()
 
 # --- what the Application API serves, without gRPC: logins decided by the
@@ -186,5 +186,5 @@ if(MQTT_BUILD_APP_API)
     endif()
     message(STATUS "modbee: gRPC ${gRPC_VERSION} found - the Application API is built")
 else()
-    message(STATUS "modbee: no gRPC - modbee serve runs without the Application API")
+    message(STATUS "modbee: no gRPC - modbee-mqtt serve runs without the Application API")
 endif()

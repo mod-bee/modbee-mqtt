@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee bench - a load generator built on the library's own client.
+// modbee-mqtt bench - a load generator built on the library's own client.
 //
 //   bench conn   open N connections and hold them; measure the broker's
 //                responsiveness under that load with a few probe clients
@@ -731,22 +731,22 @@ const std::vector<ArgSpec>& benchSpecs() {
 int cmdBench(int argc, char** argv) {
     const std::vector<ArgSpec>& specs = benchSpecs();
     if (argc < 3 || std::strcmp(argv[2], "--help") == 0) {
-        Args::printHelp("modbee bench (conn | pub | sub) [options]", specs);
+        Args::printHelp("modbee-mqtt bench (conn | pub | sub) [options]", specs);
         return argc < 3 ? 2 : 0;
     }
     Options options;
     options.mode = argv[2];
     if (options.mode != "conn" && options.mode != "pub" && options.mode != "sub") {
-        std::fprintf(stderr, "modbee bench: mode must be conn, pub or sub\n");
+        std::fprintf(stderr, "modbee-mqtt bench: mode must be conn, pub or sub\n");
         return 2;
     }
     Args args;
     if (!args.parse(argc, argv, 3, specs)) {
-        std::fprintf(stderr, "modbee bench: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt bench: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help")) {
-        Args::printHelp("modbee bench (conn | pub | sub) [options]", specs);
+        Args::printHelp("modbee-mqtt bench (conn | pub | sub) [options]", specs);
         return 0;
     }
     long long port = 1883;
@@ -763,7 +763,7 @@ int cmdBench(int argc, char** argv) {
         !args.getInt("size", 64, 24, 256 * 1024 * 1024, options.size) ||
         !args.getInt("qos", 0, 0, 2, options.qos) ||
         !args.getInt("rss-pid", 0, 0, 1LL << 31, options.rssPid)) {
-        std::fprintf(stderr, "modbee bench: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt bench: %s\n", args.error().c_str());
         return 2;
     }
     options.port = (uint16_t)port;
@@ -776,12 +776,12 @@ int cmdBench(int argc, char** argv) {
     options.pin = args.get("pin", "");
 #if !MQTT_TLS_SOCKETS
     if (options.tls) {
-        std::fprintf(stderr, "modbee bench: this build has no TLS engine\n");
+        std::fprintf(stderr, "modbee-mqtt bench: this build has no TLS engine\n");
         return 2;
     }
 #endif
     if (options.tls && (options.lean || args.has("bind"))) {
-        std::fprintf(stderr, "modbee bench: --tls cannot be combined with --lean or --bind\n");
+        std::fprintf(stderr, "modbee-mqtt bench: --tls cannot be combined with --lean or --bind\n");
         return 2;
     }
     const std::string version = args.get("mqtt-version", "5");
@@ -789,7 +789,7 @@ int cmdBench(int argc, char** argv) {
     if (args.has("bind")) {
         std::string error;
         if (!parseBind(args.get("bind"), options.bindAddresses, error)) {
-            std::fprintf(stderr, "modbee bench: %s\n", error.c_str());
+            std::fprintf(stderr, "modbee-mqtt bench: %s\n", error.c_str());
             return 2;
         }
     }
@@ -942,7 +942,7 @@ int cmdBench(int argc, char** argv) {
 #else  // not Linux
 
 int cmdBench(int, char**) {
-    std::fprintf(stderr, "modbee bench needs Linux (epoll, and Linux's port allocation)\n");
+    std::fprintf(stderr, "modbee-mqtt bench needs Linux (epoll, and Linux's port allocation)\n");
     return 2;
 }
 

@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee serve - the multi-core broker as a daemon.
+// modbee-mqtt serve - the multi-core broker as a daemon.
 //
 // One MqttBroker per core behind one port (server/ShardedBroker.h). Options
 // are flags for now; a YAML file arrives with the Kafka pipe.
@@ -51,7 +51,7 @@ namespace {
 const std::vector<ArgSpec>& serveSpecs() {
     static const std::vector<ArgSpec> specs = {
         {"config", 'C', true, "modbee.yaml to run (flags given as well override it)"},
-        {"data", 0, true, "keep everything in this folder - logins and settings (auth.db), retained messages, sessions; how `modbee service` runs it"},
+        {"data", 0, true, "keep everything in this folder - logins and settings (auth.db), retained messages, sessions; how `modbee-mqtt service` runs it"},
         {"address", 'a', true, "address to listen on (default 0.0.0.0)"},
         {"port", 'p', true, "port (default 1883)"},
         {"no-plain", 0, false, "no plain-TCP listener (TLS only)"},
@@ -130,16 +130,16 @@ int cmdServe(int argc, char** argv) {
     const std::vector<ArgSpec>& specs = serveSpecs();
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee serve: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt serve: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help")) {
-        Args::printHelp("modbee serve [-C modbee.yaml] [options]", specs);
+        Args::printHelp("modbee-mqtt serve [-C modbee.yaml] [options]", specs);
         return 0;
     }
 
     // THE FILE FIRST, then any flag given on the command line on top of it -
-    // so `modbee serve -c modbee.yaml -p 1884` is the file with another port.
+    // so `modbee-mqtt serve -c modbee.yaml -p 1884` is the file with another port.
     ServerConfig file;
     const std::string path = args.has("config") ? args.get("config") : std::string();
     if (!path.empty()) {
@@ -149,19 +149,19 @@ int cmdServe(int argc, char** argv) {
             std::fprintf(stderr, "%s\n", describe(problem, path).c_str());
         }
         if (!ok) {
-            std::fprintf(stderr, "modbee serve: %s would not load (modbee check -c %s)\n",
+            std::fprintf(stderr, "modbee-mqtt serve: %s would not load (modbee-mqtt check -c %s)\n",
                          path.c_str(), path.c_str());
             return 2;
         }
     }
     // --data: EVERYTHING IN ONE FOLDER, and no file needed. The logins, the
-    // admin (`modbee admin`) and the settings (`modbee config`) in its
+    // admin (`modbee-mqtt admin`) and the settings (`modbee-mqtt config`) in its
     // auth.db; retained messages and sessions beside it. Applied before the
     // stored settings are read - they are in that database - and again after,
     // so a stored setting cannot move them elsewhere.
     const std::string data = args.has("data") ? args.get("data") : std::string();
     if (!data.empty() && !cliMakeDirectories(data)) {
-        std::fprintf(stderr, "modbee serve: cannot make the folder %s\n", data.c_str());
+        std::fprintf(stderr, "modbee-mqtt serve: cannot make the folder %s\n", data.c_str());
         return 1;
     }
     const auto keepIn = [&data](ServerConfig& c) {
@@ -197,19 +197,19 @@ int cmdServe(int argc, char** argv) {
                 if (loadEffectiveConfig(text, path.empty() ? "(defaults)" : path, settings, effective, problems)) {
                     file = effective;
                     keepIn(file);
-                    std::printf("modbee serve: settings from the database (%s, %zu override(s))\n",
+                    std::printf("modbee-mqtt serve: settings from the database (%s, %zu override(s))\n",
                                 settings.hasDocument ? "a stored document" : path.empty() ? "the defaults" : "the file",
                                 settings.overrides.size());
                 } else {
                     for (const ConfigProblem& problem : problems) {
                         std::fprintf(stderr, "%s\n", describe(problem, "stored settings").c_str());
                     }
-                    std::fprintf(stderr, "modbee serve: the stored settings would not load - starting from %s alone\n",
+                    std::fprintf(stderr, "modbee-mqtt serve: the stored settings would not load - starting from %s alone\n",
                                  path.empty() ? "the defaults" : path.c_str());
                 }
             }
         } else if (!data.empty()) {
-            std::fprintf(stderr, "modbee serve: %s: %s\n", file.authentication.database.c_str(), why.c_str());
+            std::fprintf(stderr, "modbee-mqtt serve: %s: %s\n", file.authentication.database.c_str(), why.c_str());
             return 1;
         }
     }
@@ -235,7 +235,7 @@ int cmdServe(int argc, char** argv) {
         !flag("subscriptions", 32, 1, 100000, subscriptions) ||
         !flag("max-retained", 10000, 0, 10000000, retained) ||
         !flag("status-every", 5, 0, 86400, b.statusEvery)) {
-        std::fprintf(stderr, "modbee serve: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt serve: %s\n", args.error().c_str());
         return 2;
     }
     b.port = (uint16_t)port;
@@ -248,14 +248,14 @@ int cmdServe(int argc, char** argv) {
     if (args.has("metrics-port")) {
         long long metricsPort = 0;
         if (!args.getInt("metrics-port", 9464, 0, 65535, metricsPort)) {
-            std::fprintf(stderr, "modbee serve: %s\n", args.error().c_str());
+            std::fprintf(stderr, "modbee-mqtt serve: %s\n", args.error().c_str());
             return 2;
         }
         file.metrics.enabled = true;
         file.metrics.port = (uint16_t)metricsPort;
     }
     if (args.has("username") != args.has("password")) {
-        std::fprintf(stderr, "modbee serve: --username and --password go together\n");
+        std::fprintf(stderr, "modbee-mqtt serve: --username and --password go together\n");
         return 2;
     }
     if (args.has("username")) {
@@ -267,7 +267,7 @@ int cmdServe(int argc, char** argv) {
         else if (store == "file") file.retained.store = RetainedStore::File;
         else if (store == "kafka") file.retained.store = RetainedStore::Kafka;
         else {
-            std::fprintf(stderr, "modbee serve: --retained-store is memory, file or kafka, not \"%s\"\n",
+            std::fprintf(stderr, "modbee-mqtt serve: --retained-store is memory, file or kafka, not \"%s\"\n",
                          store.c_str());
             return 2;
         }
@@ -281,7 +281,7 @@ int cmdServe(int argc, char** argv) {
         if (store == "memory") file.sessions.store = SessionStore::Memory;
         else if (store == "file") file.sessions.store = SessionStore::File;
         else {
-            std::fprintf(stderr, "modbee serve: --sessions-store is memory or file, not \"%s\"\n",
+            std::fprintf(stderr, "modbee-mqtt serve: --sessions-store is memory or file, not \"%s\"\n",
                          store.c_str());
             return 2;
         }
@@ -300,18 +300,18 @@ int cmdServe(int argc, char** argv) {
     if (args.has("client-certificates")) {
         b.clientCertificates = args.get("client-certificates");
         if (b.clientCertificates != "required" && b.clientCertificates != "optional") {
-            std::fprintf(stderr, "modbee serve: --client-certificates is required or optional, not \"%s\"\n",
+            std::fprintf(stderr, "modbee-mqtt serve: --client-certificates is required or optional, not \"%s\"\n",
                          b.clientCertificates.c_str());
             return 2;
         }
     }
     const bool pemPair = !b.certificatePem.empty() && !b.keyPem.empty();
     if (b.tls && !pemPair && (b.certificateFile.empty() || b.keyFile.empty())) {
-        std::fprintf(stderr, "modbee serve: TLS needs a certificate and a key (--cert, --key)\n");
+        std::fprintf(stderr, "modbee-mqtt serve: TLS needs a certificate and a key (--cert, --key)\n");
         return 2;
     }
     if (!b.tls && (args.has("cert") || args.has("key") || args.has("client-ca"))) {
-        std::fprintf(stderr, "modbee serve: --cert, --key and --client-ca need --tls-port\n");
+        std::fprintf(stderr, "modbee-mqtt serve: --cert, --key and --client-ca need --tls-port\n");
         return 2;
     }
 
@@ -325,7 +325,7 @@ int cmdServe(int argc, char** argv) {
     {
         std::string why;
         if (!tlsFromSettings(b, config.tls, why)) {
-            std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
+            std::fprintf(stderr, "modbee-mqtt serve: %s\n", why.c_str());
             return 2;
         }
     }
@@ -366,7 +366,7 @@ int cmdServe(int argc, char** argv) {
     }
 #else
     if (wantsKafka || file.retained.store == RetainedStore::Kafka) {
-        std::fprintf(stderr, "modbee serve: the file uses Kafka, but this build has no "
+        std::fprintf(stderr, "modbee-mqtt serve: the file uses Kafka, but this build has no "
                              "Kafka support (librdkafka was not found when it was built)\n");
         return 2;
     }
@@ -380,7 +380,7 @@ int cmdServe(int argc, char** argv) {
         const KafkaClusterConfig* cluster = file.cluster(file.retained.cluster);
         if (cluster == nullptr && file.clusters.size() == 1) cluster = &file.clusters[0];
         if (cluster == nullptr) {
-            std::fprintf(stderr, "modbee serve: retained: store: kafka needs a Kafka cluster "
+            std::fprintf(stderr, "modbee-mqtt serve: retained: store: kafka needs a Kafka cluster "
                                  "(kafka.clusters)\n");
             return 2;
         }
@@ -411,7 +411,7 @@ int cmdServe(int argc, char** argv) {
     std::unique_ptr<Authority> authority;
 #else
     if (file.authentication.authority.enabled || !file.api.grpc.empty()) {
-        std::fprintf(stderr, "modbee serve: the file uses the Application API (api:, authentication: "
+        std::fprintf(stderr, "modbee-mqtt serve: the file uses the Application API (api:, authentication: "
                              "authority:), but this build has none (gRPC was not found when it was built)\n");
         return 2;
     }
@@ -499,7 +499,7 @@ int cmdServe(int argc, char** argv) {
 
     cliInstallSignalHandlers();
     if (!server.start(config)) {
-        std::fprintf(stderr, "modbee serve: %s\n", server.lastError().c_str());
+        std::fprintf(stderr, "modbee-mqtt serve: %s\n", server.lastError().c_str());
         return 3;
     }
 #if defined(MODBEE_HAVE_APP_API)
@@ -533,13 +533,13 @@ int cmdServe(int argc, char** argv) {
         s.logins = gate.get();
         s.server = &server;
         if (!read || !api.start(c, s, why)) {
-            std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
+            std::fprintf(stderr, "modbee-mqtt serve: %s\n", why.c_str());
             server.stop();
             return 3;
         }
     }
 #endif
-    std::printf("modbee serve: %zu shard(s) on %s", server.shardCount(), config.address.c_str());
+    std::printf("modbee-mqtt serve: %zu shard(s) on %s", server.shardCount(), config.address.c_str());
     if (config.plain) std::printf(" port %u", server.port());
     if (config.tls.enabled) {
         std::printf(" tls %u (%s%s)", server.tlsPort(), MQTT_TLS_ENGINE_NAME,
@@ -551,7 +551,7 @@ int cmdServe(int argc, char** argv) {
     if (gate) {
         const bool fileAdmin = file.authentication.hasAdmin && !file.authentication.accounts.empty();
         const size_t admins = gate->store().adminCount();
-        std::printf("modbee serve: MQTT clients must log in - logins in %s (%zu, %zu admin(s))%s%s%s; "
+        std::printf("modbee-mqtt serve: MQTT clients must log in - logins in %s (%zu, %zu admin(s))%s%s%s; "
                     "a login without rules uses %s\n", file.authentication.database.c_str(),
                     gate->store().userCount(), admins, fileAdmin ? ", and admin \"" : "",
                     fileAdmin ? file.authentication.accounts[0].username.c_str() : "", fileAdmin ? "\"" : "",
@@ -560,38 +560,38 @@ int cmdServe(int argc, char** argv) {
         if (!fileAdmin && admins == 0) {
             const std::string where = !data.empty() ? (data == cliDataDirectory() ? "" : " --data " + data)
                                                     : " --database " + file.authentication.database;
-            std::printf("modbee serve: no admin login yet - set one on this server with `modbee admin%s`; "
+            std::printf("modbee-mqtt serve: no admin login yet - set one on this server with `modbee-mqtt admin%s`; "
                         "it works at once, no restart\n", where.c_str());
         }
     } else if (accounts.count() > 0) {
-        std::printf("modbee serve: MQTT clients must log in (%zu user name(s))\n", accounts.count());
+        std::printf("modbee-mqtt serve: MQTT clients must log in (%zu user name(s))\n", accounts.count());
     } else if (file.authentication.authority.enabled) {
         // Said below, with the Application API.
     } else {
-        std::printf("modbee serve: MQTT clients need no user name or password\n");
+        std::printf("modbee-mqtt serve: MQTT clients need no user name or password\n");
     }
     if (gate && file.authentication.certificateLogin) {
-        std::printf("modbee serve: a verified client certificate logs in as the login its CN "
+        std::printf("modbee-mqtt serve: a verified client certificate logs in as the login its CN "
                     "names, without a password (certificate-login)\n");
     }
-    if (events) std::printf("modbee serve: client events published on $modbee/events/...\n");
+    if (events) std::printf("modbee-mqtt serve: client events published on $modbee/events/...\n");
 #if defined(MODBEE_HAVE_APP_API)
     for (const std::string& address : api.listening()) {
-        std::printf("modbee serve: Application API (gRPC) on %s\n", address.c_str());
+        std::printf("modbee-mqtt serve: Application API (gRPC) on %s\n", address.c_str());
     }
     if (hub && file.sessions.store == SessionStore::File) {
         const AppHubStatus h = hub->status();
-        std::printf("modbee serve: consumer groups kept in %s/groups.db: %llu restored, holding %llu message(s)\n",
+        std::printf("modbee-mqtt serve: consumer groups kept in %s/groups.db: %llu restored, holding %llu message(s)\n",
                     file.sessions.directory.c_str(), (unsigned long long)h.restoredGroups,
                     (unsigned long long)h.restoredMessages);
     }
     if (authority) {
-        std::printf("modbee serve: MQTT logins are decided by the application (authority), asked once "
+        std::printf("modbee-mqtt serve: MQTT logins are decided by the application (authority), asked once "
                     "and kept; fixed logins: %zu\n", file.authentication.accounts.size());
     }
 #endif
     if (keeper) {
-        std::printf("modbee serve: retained messages kept in %s: %zu restored",
+        std::printf("modbee-mqtt serve: retained messages kept in %s: %zu restored",
                     keeper->where().c_str(), keeper->loaded() - (size_t)keeper->expired() -
                                              (size_t)keeper->refused());
         if (keeper->expired() > 0) std::printf(", %llu expired while stopped",
@@ -602,7 +602,7 @@ int cmdServe(int argc, char** argv) {
     }
     if (sessions) {
         const SessionKeeperStatus k = sessions->status();
-        std::printf("modbee serve: sessions kept in %s (sync %s): %llu restored",
+        std::printf("modbee-mqtt serve: sessions kept in %s (sync %s): %llu restored",
                     sessions->directory().c_str(), file.sessions.syncFull ? "full" : "normal",
                     (unsigned long long)k.restored);
         if (k.expired > 0) std::printf(", %llu expired while stopped", (unsigned long long)k.expired);
@@ -623,22 +623,22 @@ int cmdServe(int argc, char** argv) {
     if (file.metrics.enabled) {
         std::string why;
         if (!metrics.start(file.metrics.address, file.metrics.port, &renderMetrics, &sources, why)) {
-            std::fprintf(stderr, "modbee serve: %s\n", why.c_str());
+            std::fprintf(stderr, "modbee-mqtt serve: %s\n", why.c_str());
             server.stop();
             return 3;
         }
-        std::printf("modbee serve: metrics on http://%s:%u/metrics\n", file.metrics.address.c_str(),
+        std::printf("modbee-mqtt serve: metrics on http://%s:%u/metrics\n", file.metrics.address.c_str(),
                     metrics.port());
 #if defined(MODBEE_HAVE_APP_API)
         if (file.api.rest && !file.api.grpc.empty()) {
-            std::printf("modbee serve: Application API (REST) on http://%s:%u/v1/\n", file.metrics.address.c_str(),
+            std::printf("modbee-mqtt serve: Application API (REST) on http://%s:%u/v1/\n", file.metrics.address.c_str(),
                         metrics.port());
         }
 #endif
     }
 #if defined(MODBEE_HAVE_KAFKA)
     if (pipe) {
-        std::printf("modbee serve: kafka pipe (librdkafka %s): %zu cluster(s), %zu mqtt-to-kafka, "
+        std::printf("modbee-mqtt serve: kafka pipe (librdkafka %s): %zu cluster(s), %zu mqtt-to-kafka, "
                     "%zu kafka-to-mqtt\n", KafkaPipe::libraryVersion(), file.clusters.size(),
                     file.toKafka.size(), file.fromKafka.size());
     }
@@ -710,7 +710,7 @@ int cmdServe(int argc, char** argv) {
             std::printf("\n");
         }
     }
-    std::printf("modbee serve: stopping\n");
+    std::printf("modbee-mqtt serve: stopping\n");
     metrics.stop();      // first: its REST calls reach the Application API
 #if defined(MODBEE_HAVE_APP_API)
     api.stop();          // before the shards: its calls reach them
@@ -723,7 +723,7 @@ int cmdServe(int argc, char** argv) {
 #else
 
 int cmdServe(int, char**) {
-    std::fprintf(stderr, "modbee serve: this build has no server tier (Linux only)\n");
+    std::fprintf(stderr, "modbee-mqtt serve: this build has no server tier (Linux only)\n");
     return 2;
 }
 

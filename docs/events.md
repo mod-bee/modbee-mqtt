@@ -1,6 +1,6 @@
 # Client events
 
-`modbee serve` can publish **what its clients do** - each one that connects,
+`modbee-mqtt serve` can publish **what its clients do** - each one that connects,
 goes, subscribes or unsubscribes - as small JSON messages on
 `$modbee/events/...`. Anything that can read MQTT, or Kafka through the
 [pipe](kafka.md), can then follow it.
@@ -21,11 +21,11 @@ events:
 ```
 
 or `MODBEE_EVENTS_ENABLED=true` in the environment; `enabled: false` keeps
-it off with the section in place. Off is the default. `modbee serve` says so
+it off with the section in place. Off is the default. `modbee-mqtt serve` says so
 when it is on:
 
 ```
-modbee serve: client events published on $modbee/events/...
+modbee-mqtt serve: client events published on $modbee/events/...
 ```
 
 ---
@@ -94,7 +94,7 @@ not: no login but an admin may use the broker's own `$` topics
 are no topic permissions at all, so any client may.
 
 ```bash
-docker compose exec modbee modbee sub -t '$modbee/events/#' -v
+docker compose exec modbee modbee-mqtt sub -t '$modbee/events/#' -v
 ```
 
 **A `#` subscription never sees them.** MQTT does not match a topic that

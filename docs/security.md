@@ -383,7 +383,7 @@ secure.requestClientCertificate(caPem);   // or asks, verifies one if offered, a
 A certificate that is offered and does not verify fails the handshake either
 way. One that does verify reaches the authorisation hook as its CN and
 fingerprint (`MqttBrokerRequest::certificateName`, [broker.md](broker.md)),
-which is how `modbee serve` lets a certificate be a login
+which is how `modbee-mqtt serve` lets a certificate be a login
 ([logins.md](logins.md#logging-in-with-a-certificate)).
 
 **With a client CA, wolfSSL makes every connection a full handshake.** A
@@ -402,7 +402,7 @@ OpenSSL-named API the transports are written against), `certgen`, `certext`
 and `keygen` (`MqttIdentity`), `tls13`, `session-ticket`, `sni`,
 `curve25519` (the key exchange today's clients offer first), and the
 assembly paths. One difference from OpenSSL remains: across the shards of
-`modbee serve` OpenSSL shares one context and so one session-ticket key,
+`modbee-mqtt serve` OpenSSL shares one context and so one session-ticket key,
 while each wolfSSL shard has its own - a device that reconnects to another
 shard makes a full handshake rather than resuming.
 

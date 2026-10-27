@@ -3,7 +3,7 @@
 // Licensed under the GNU Affero General Public License, Version 3, WITH
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
-// modbee check - validate modbee.yaml without starting anything.
+// modbee-mqtt check - validate modbee.yaml without starting anything.
 //
 // Every error and warning, each with its line, then a one-line summary of
 // what the file would run. Exit 0 if it would load, 1 if it would not, 2 for
@@ -25,11 +25,11 @@ int cmdCheck(int argc, char** argv) {
     };
     Args args;
     if (!args.parse(argc, argv, 2, specs)) {
-        std::fprintf(stderr, "modbee check: %s\n", args.error().c_str());
+        std::fprintf(stderr, "modbee-mqtt check: %s\n", args.error().c_str());
         return 2;
     }
     if (args.has("help")) {
-        Args::printHelp("modbee check [-C modbee.yaml]", specs);
+        Args::printHelp("modbee-mqtt check [-C modbee.yaml]", specs);
         return 0;
     }
     const std::string path = args.get("config", "modbee.yaml");
@@ -59,7 +59,7 @@ int cmdCheck(int argc, char** argv) {
             const bool fileAdmin = config.authentication.hasAdmin && !config.authentication.accounts.empty();
             std::printf("; MQTT: device logins in %s, admin %s%s%s, default-topics %s",
                         config.authentication.database.c_str(), fileAdmin ? "\"" : "",
-                        fileAdmin ? config.authentication.accounts[0].username.c_str() : "from the database (modbee admin)",
+                        fileAdmin ? config.authentication.accounts[0].username.c_str() : "from the database (modbee-mqtt admin)",
                         fileAdmin ? "\"" : "", config.authentication.defaultTopics.c_str());
         } else if (config.authentication.authority.enabled) {
             std::printf("; MQTT: logins decided by the application (authority), %zu fixed",
@@ -87,7 +87,7 @@ int cmdCheck(int argc, char** argv) {
 #else
 
 int cmdCheck(int, char**) {
-    std::fprintf(stderr, "modbee check: this build has no server tier (Linux only)\n");
+    std::fprintf(stderr, "modbee-mqtt check: this build has no server tier (Linux only)\n");
     return 2;
 }
 

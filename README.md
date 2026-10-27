@@ -44,19 +44,19 @@ on Wi-Fi, Ethernet and a modem, with key pinning); and `WiFiClientSecure` or
 ### The server: the broker at scale
 
 `server/`, `cli/` and `docker/`. Linux and Windows, run as a service on both
-(`modbee service install`, [releases.md](docs/releases.md)), and not part of
+(`modbee-mqtt service install`, [releases.md](docs/releases.md)), and not part of
 the Arduino library.
 
 | | |
 | --- | --- |
-| **`modbee serve`** | The broker as a server: one broker per CPU core, behind one port. Configured with one `modbee.yaml` |
+| **`modbee-mqtt serve`** | The broker as a server: one broker per CPU core, behind one port. Configured with one `modbee.yaml` |
 | **Kafka pipe** | MQTT to Apache Kafka and back, with messages passed through untouched. A publisher's PUBACK comes back only once Kafka has the message |
 | **Device logins** | A login per device, added, reset and removed while it runs - or devices that register themselves with a provisioning key for their site - with per-device topic permissions (strict, or open to every topic for a login without rules: `authentication.default-topics`) |
 | **Retained messages that survive a restart** | Kept in memory as always, and in a file or a compacted Kafka topic as well, with one setting |
 | **Application API** | Your application beside the server, over gRPC (and REST for admin): consumer groups sharing devices' messages, publishing to devices, and managing connections, sessions and logins ([app-api.md](docs/app-api.md)) |
-| **`modbee` command** | Publish, subscribe, request/response and benchmark from a terminal |
-| **Downloads** | `.deb` and `.rpm` packages, `modbee` for any Linux (x86-64, ARM64) as one static binary, and `modbee.exe` for Windows - attested, with an SBOM. Then `modbee service install` and `modbee admin`, and it is running ([releases.md](docs/releases.md)) |
-| **Docker image** | `ghcr.io/mod-bee/modbee-mqtt`: the server and the `modbee` command, for amd64 and arm64 |
+| **`modbee-mqtt` command** | Publish, subscribe, request/response and benchmark from a terminal |
+| **Downloads** | `.deb` and `.rpm` packages, `modbee-mqtt` for any Linux (x86-64, ARM64) as one static binary, and `modbee-mqtt.exe` for Windows - attested, with an SBOM. Then `modbee-mqtt service install` and `modbee-mqtt admin`, and it is running ([releases.md](docs/releases.md)) |
+| **Docker image** | `ghcr.io/mod-bee/modbee-mqtt`: the server and the `modbee-mqtt` command, for amd64 and arm64 |
 
 ---
 
@@ -172,7 +172,7 @@ this computer first: [`docker/compose.yml`](docker/compose.yml).
 
 ### From a terminal
 
-The `modbee` command is in the Docker image:
+The `modbee-mqtt` command is in the Docker image:
 
 ```bash
 docker run --rm ghcr.io/mod-bee/modbee-mqtt pub -h broker.example.com -t test/hello -m hi -q 1
@@ -217,7 +217,7 @@ the Arduino library. [cli.md](docs/cli.md) covers both.
 | `examples/arduino/` | Fifteen sketches, each a real application |
 | `examples/cpp/` | Publish, subscribe, a gateway, a broker, a bridge, a broker serving TLS, and a Sparkplug node and host |
 | `server/` | The server tier: one broker per core (`ShardedBroker`), `modbee.yaml`, the Kafka pipe and metrics. Linux |
-| `cli/` | The `modbee` command |
+| `cli/` | The `modbee-mqtt` command |
 | `docker/` | The image (`docker/Dockerfile`) and the compose files |
 | `docs/` | Everything below |
 
@@ -247,7 +247,7 @@ ctest --test-dir build
 ```
 
 That builds the library, the examples and the tests, and, on a host, the
-`modbee` command (`build/cli/modbee`) and the server. The tests (`test/`) need
+`modbee-mqtt` command (`build/cli/modbee-mqtt`) and the server. The tests (`test/`) need
 nothing but a compiler - the wire format, the broker and client end to end over
 loopback, the server across shards and restarts - and GitHub runs them on
 Linux, macOS and Windows. TLS is used if wolfSSL or
@@ -301,7 +301,7 @@ message from Kafka and sends a pump command back
   MQTT-SN gateway in front of a broker ([versions.md](docs/versions.md#mqtt-sn)).
 - **Not a WiFi manager or an OTA updater.** It does MQTT over the network
   connection you already have.
-- **Not a multi-machine cluster.** `modbee serve` uses every core of one
+- **Not a multi-machine cluster.** `modbee-mqtt serve` uses every core of one
   machine. Kafka is how several servers share data.
 - **No streaming publish.** A payload is a buffer. A streamed write could block,
   and a QoS 1 message could not be resent after a reconnect
@@ -330,7 +330,7 @@ message from Kafka and sends a pump command back
 | [settings.md](docs/settings.md) | The server's settings, changed over MQTT and applied at a restart |
 | [events.md](docs/events.md) | What clients do - connect, go, subscribe - as messages, and in Kafka |
 | [kafka-apps.md](docs/kafka-apps.md) | **Your own app on Kafka** - reading device data and sending commands, from Node.js, Python or anything else |
-| [cli.md](docs/cli.md) | The `modbee` command |
+| [cli.md](docs/cli.md) | The `modbee-mqtt` command |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The five layers, and why |
 | [extending.md](docs/extending.md) | Building on it: a PLC wrapper, a new transport, and the design rules |
 

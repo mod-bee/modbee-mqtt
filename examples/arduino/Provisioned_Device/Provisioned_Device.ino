@@ -5,7 +5,7 @@
 // one is lost or a board is replaced. Instead every device is flashed with
 // the SAME provisioning key, created once on the broker:
 //
-//   docker compose exec modbee modbee key create site-north --site north --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
+//   docker compose exec modbee modbee-mqtt key create site-north --site north --publish 'plant/${username}/#' --subscribe 'plant/${username}/cmd'
 //
 // On first boot the device connects with the key, is given a login of its
 // own (its name, and a secret only it holds), keeps it in flash, and connects
@@ -77,7 +77,7 @@ void loop() {
     shown = mqtt.provisionState();
     switch (shown) {
       case MqttProvisionState::Registering: Serial.println("registering with the broker..."); break;
-      case MqttProvisionState::Pending:     Serial.println("waiting for an admin: modbee user approve tank-07"); break;
+      case MqttProvisionState::Pending:     Serial.println("waiting for an admin: modbee-mqtt user approve tank-07"); break;
       case MqttProvisionState::Provisioned: Serial.println("has its own login"); break;
       case MqttProvisionState::Refused:     Serial.print("refused: "); Serial.println(mqtt.provisionReason()); break;
       default: break;

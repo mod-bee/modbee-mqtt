@@ -32,21 +32,21 @@ claiming it.
 
 The broker as a server on Linux or Windows, one broker per CPU core, with a
 pass-through pipe to Apache Kafka. Published as a Docker image, and as
-downloads that `modbee service install` runs as a service on Linux or
+downloads that `modbee-mqtt service install` runs as a service on Linux or
 Windows; none of it is part of the Arduino library.
 
 | | |
 | --- | --- |
 | [docker.md](docker.md) | **Running it**: one command, a stack with a Let's Encrypt certificate, or that stack with Kafka included |
-| [releases.md](releases.md) | **Downloads**: `.deb`, `.rpm`, and `modbee` for any Linux or Windows, ready to run - installing it, and checking a download is genuine |
-| [windows.md](windows.md) | **On Windows**: `modbee.exe service install` and `modbee.exe admin`, and it is running |
+| [releases.md](releases.md) | **Downloads**: `.deb`, `.rpm`, and `modbee-mqtt` for any Linux or Windows, ready to run - installing it, and checking a download is genuine |
+| [windows.md](windows.md) | **On Windows**: `modbee-mqtt.exe service install` and `modbee-mqtt.exe admin`, and it is running |
 | [kafka.md](kafka.md) | `modbee.yaml`, and the Kafka pipe: MQTT to Kafka and back, untouched, and exactly what an acknowledgement means |
 | [app-api.md](app-api.md) | The Application API: your application talks to the server over gRPC - and decides who may log in |
 | [kafka-apps.md](kafka-apps.md) | **Your own app on Kafka**: read your devices' MQTT messages and send them commands, from Node.js, Python or any language - with a working example |
 | [logins.md](logins.md) | **Device logins**: a login per device, managed live; devices that register themselves with a key; what each may publish and subscribe to; backups |
-| [settings.md](settings.md) | **Settings over MQTT**: the server's settings kept beside the logins, read and changed with `modbee config` or from your own platform, applied at a restart it can ask for |
+| [settings.md](settings.md) | **Settings over MQTT**: the server's settings kept beside the logins, read and changed with `modbee-mqtt config` or from your own platform, applied at a restart it can ask for |
 | [events.md](events.md) | **Client events**: who connected, who went, and what each device subscribes to, published on `$modbee/events/...` and kept in Kafka if you like |
-| [cli.md](cli.md) | The `modbee` command: publish, subscribe, request/response, benchmark, serve, and manage logins. In the Docker image; built from source on a computer |
+| [cli.md](cli.md) | The `modbee-mqtt` command: publish, subscribe, request/response, benchmark, serve, and manage logins. In the Docker image; built from source on a computer |
 
 ## Understanding it
 

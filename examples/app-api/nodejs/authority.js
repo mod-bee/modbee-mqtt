@@ -1,6 +1,6 @@
 // An application deciding modbee's MQTT logins, over the Application API.
 //
-// modbee serve, with:
+// modbee-mqtt serve, with:
 //
 //   authentication:
 //     username: platform          # the application's own login: never asked

@@ -1,5 +1,5 @@
 # modbee.yaml for docker/compose.yml - docs/kafka.md describes every key.
-# `modbee check -C modbee.yaml` validates a file without starting anything.
+# `modbee-mqtt check -C modbee.yaml` validates a file without starting anything.
 
 broker:
   port: 1883

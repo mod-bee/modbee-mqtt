@@ -1,8 +1,8 @@
 # Running modbee in Docker
 
-The image is `ghcr.io/mod-bee/modbee-mqtt`: the broker (`modbee serve`), one
+The image is `ghcr.io/mod-bee/modbee-mqtt`: the broker (`modbee-mqtt serve`), one
 broker per CPU core behind one port, with the [Kafka pipe](kafka.md) built in,
-and the [`modbee` command](#the-modbee-command-is-in-the-image) for publishing,
+and the [`modbee-mqtt` command](#the-modbee-mqtt-command-is-in-the-image) for publishing,
 subscribing and testing. It runs on 64-bit Intel/AMD and ARM (a Raspberry Pi 4
 or 5, an ARM cloud server).
 
@@ -43,11 +43,11 @@ docker run -d --name modbee -p 1883:1883 --restart unless-stopped \
   ghcr.io/mod-bee/modbee-mqtt
 ```
 
-Any MQTT client works. The `modbee` command is already inside the container
+Any MQTT client works. The `modbee-mqtt` command is already inside the container
 (and logs in by itself):
 
 ```bash
-docker exec modbee modbee pub -t test/hello -m hi -q 1
+docker exec modbee modbee-mqtt pub -t test/hello -m hi -q 1
 #1 test/hello: accepted, but no matching subscribers
 ```
 
@@ -58,7 +58,7 @@ docker exec modbee modbee pub -t test/hello -m hi -q 1
 ```bash
 git clone https://github.com/mod-bee/modbee-mqtt && cd modbee-mqtt
 docker compose -f docker/compose.yml up -d
-docker compose -f docker/compose.yml exec modbee modbee pub -t plant/tank-01/level -m 4.25 -q 1
+docker compose -f docker/compose.yml exec modbee modbee-mqtt pub -t plant/tank-01/level -m 4.25 -q 1
 ```
 
 That starts modbee and a single Kafka node. The message lands in the Kafka
@@ -104,12 +104,12 @@ docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h mqtt.example.com \
 ```
 
 `MQTT_PASSWORD` is the **admin** login - for you, your own apps and the
-`modbee` command. **Each device gets a login of its own**, added while the
+`modbee-mqtt` command. **Each device gets a login of its own**, added while the
 broker runs and never needing a restart:
 
 ```bash
-docker compose exec modbee modbee user add tank-01 --publish 'plant/${username}/#'   # prints the device's secret
-docker compose exec modbee modbee key create site-north --site north --publish 'plant/${username}/#'   # or: devices register themselves
+docker compose exec modbee modbee-mqtt user add tank-01 --publish 'plant/${username}/#'   # prints the device's secret
+docker compose exec modbee modbee-mqtt key create site-north --site north --publish 'plant/${username}/#'   # or: devices register themselves
 ```
 
 [logins.md](logins.md) explains both, and what each device may do. These
@@ -351,16 +351,16 @@ pinning its key.
 
 ---
 
-## The `modbee` command is in the image
+## The `modbee-mqtt` command is in the image
 
-The image holds the broker and the `modbee` command-line tool
+The image holds the broker and the `modbee-mqtt` command-line tool
 ([cli.md](cli.md)): `pub`, `sub`, `req`, `bench` and `check`. Nothing needs
 installing to use it.
 
 ```bash
 # Inside a running stack: it reaches the broker on localhost:1883
-docker compose exec modbee modbee sub -t 'plant/#' -v
-docker compose exec modbee modbee pub -t plant/tank-01/level -m 4.25 -q 1
+docker compose exec modbee modbee-mqtt sub -t 'plant/#' -v
+docker compose exec modbee modbee-mqtt pub -t plant/tank-01/level -m 4.25 -q 1
 
 # Anywhere, against any broker
 docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h mqtt.example.com -t test -m hi -q 1
@@ -371,8 +371,8 @@ Given a command, the image runs `modbee <command>`; given none, or only
 options such as `--metrics-port 9464`, it runs the broker. To reach a broker
 on the same machine from `docker run`, add `--network host`.
 
-**Logging in:** inside a stack's container, `modbee` uses the server's own
-admin login, so `docker compose exec modbee modbee pub ...` needs no `-u` or
+**Logging in:** inside a stack's container, `modbee-mqtt` uses the server's own
+admin login, so `docker compose exec modbee modbee-mqtt pub ...` needs no `-u` or
 `-P`. From anywhere else, give them: `-u admin -P 'your MQTT_PASSWORD'`.
 
 ---
@@ -399,7 +399,7 @@ services:
 ```
 
 ```
-modbee serve: Application API (gRPC) on tcp://0.0.0.0:7660
+modbee-mqtt serve: Application API (gRPC) on tcp://0.0.0.0:7660
 ```
 
 Your application connects to `127.0.0.1:7660` (from another container on the
@@ -413,7 +413,7 @@ TLS instead of `plain` ([app-api.md](app-api.md#turning-it-on)).
 ## Configuration
 
 modbee reads `/etc/modbee/modbee.yaml`. Every key is in [kafka.md](kafka.md);
-`modbee check` finds mistakes before they matter:
+`modbee-mqtt check` finds mistakes before they matter:
 
 ```bash
 docker compose run --rm modbee check -C /etc/modbee/modbee.yaml
@@ -433,11 +433,11 @@ Passwords never need to be in either: `password-file:` in the YAML, or
 
 **Changing settings over MQTT.** The `docker/examples/` setups keep logins in
 a database, and the settings can be kept there too - changed
-from `modbee config`, or from your own platform, with no shell on the server
+from `modbee-mqtt config`, or from your own platform, with no shell on the server
 and no edit to the file:
 
 ```bash
-docker compose exec modbee modbee config set broker.max-session-expiry=86400 --restart
+docker compose exec modbee modbee-mqtt config set broker.max-session-expiry=86400 --restart
 ```
 
 A stored setting goes over the file and under the environment, and applies
@@ -625,7 +625,7 @@ docker build --build-arg TLS_ENGINE=openssl -t modbee -f docker/Dockerfile .
 ```
 
 Which engine an image has, three ways: `docker run --rm <image> --version`
-prints `modbee 0.1.0 (TLS: wolfSSL)`; `modbee serve`'s start-up line says
+prints `modbee-mqtt 0.1.0 (TLS: wolfSSL)`; `modbee-mqtt serve`'s start-up line says
 `tls 8883 (wolfSSL, ...)`; and the image is labelled,
 `docker inspect -f '{{index .Config.Labels "io.modbee.tls-engine"}}' <image>`.
 TLS 1.2 and 1.3 only. The published

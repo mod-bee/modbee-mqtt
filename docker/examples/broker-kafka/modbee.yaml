@@ -1,5 +1,5 @@
 # modbee.yaml for docker/examples/broker-kafka - docs/kafka.md describes every key.
-# `docker compose exec modbee modbee check` validates this file.
+# `docker compose exec modbee modbee-mqtt check` validates this file.
 
 broker:
   port: 1883

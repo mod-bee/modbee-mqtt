@@ -13,7 +13,7 @@ each package it installs, so name, version, licence and source are vcpkg's own
 their code is in the binary.
 
     sbom.py --installed <vcpkg>/installed/<triplet> --version 0.1.0 \\
-            --platform linux-x86_64 --out modbee-0.1.0-linux-x86_64.cdx.json
+            --platform linux-x86_64 --out modbee-mqtt-0.1.0-linux-x86_64.cdx.json
 """
 
 import argparse
@@ -104,16 +104,16 @@ def main():
             "tools": {"components": [{"type": "application", "name": "modbee-mqtt scripts/release/sbom.py"}]},
             "component": {
                 "type": "application",
-                "bom-ref": "modbee",
-                "name": "modbee",
+                "bom-ref": "modbee-mqtt",
+                "name": "modbee-mqtt",
                 "version": args.version,
-                "description": f"modbee {args.version} for {args.platform}: the broker, the Kafka pipe, the Application API and the CLI",
+                "description": f"modbee-mqtt {args.version} for {args.platform}: the broker, the Kafka pipe, the Application API and the CLI",
                 "licenses": [{"license": {"name": "AGPL-3.0 with additional ModBee terms (see LICENSE)"}}],
                 "purl": f"pkg:github/mod-bee/modbee-mqtt@v{args.version}",
             },
         },
         "components": components,
-        "dependencies": [{"ref": "modbee", "dependsOn": [c["bom-ref"] for c in components]}],
+        "dependencies": [{"ref": "modbee-mqtt", "dependsOn": [c["bom-ref"] for c in components]}],
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(bom, f, indent=2)

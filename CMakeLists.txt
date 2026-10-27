@@ -28,7 +28,7 @@ option(MQTT_SANITIZE        "Build with the address and undefined behaviour sani
 option(MQTT_SANITIZE_THREAD "Build with the thread sanitizer (excludes MQTT_SANITIZE)" OFF)
 option(MQTT_NO_EXCEPTIONS   "Build without exceptions or RTTI, as a wrapper would" OFF)
 
-# The `modbee` command-line tool (cli/) and the server tier (server/: one
+# The `modbee-mqtt` command-line tool (cli/) and the server tier (server/: one
 # broker per core behind one port, and the Kafka pipe). Host-only: they live
 # outside src/, so no Arduino build ever sees them, and they are not part of
 # the library a project links. On by default only when this repository is

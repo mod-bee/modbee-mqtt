@@ -75,9 +75,9 @@ void cliInstallSignalHandlers();
 long cliProcessId();
 
 // Where a server installed as the service `service` keeps everything
-// (`modbee serve --data`): /var/lib/<service> on Linux; on Windows
-// %ProgramData%\ModBee, or %ProgramData%\ModBee\<service> for another name.
-std::string cliDataDirectory(const std::string& service = "modbee");
+// (`modbee-mqtt serve --data`): /var/lib/<service> on Linux,
+// %ProgramData%\ModBee\<service> on Windows.
+std::string cliDataDirectory(const std::string& service = "modbee-mqtt");
 
 // The folder and every missing one above it.
 bool cliMakeDirectories(const std::string& path);
