@@ -209,6 +209,57 @@ inline bool setNonBlocking(int socketHandle) {
 #endif
 }
 
+/** A listening socket on `address` ("", "0.0.0.0" or "*": every interface)
+ *  and `port` (0: one the kernel picks), non-blocking, with `backlog`.
+ *  `reusePort`: several sockets share the port (SO_REUSEPORT, Linux). The
+ *  socket, with the port it got in `bound`; -1, with `error`, when the port is
+ *  taken or the address is not an IPv4 one. For a listener changed while it
+ *  runs (useSocket): opened where a failure can still be answered. */
+inline int openListeningSocket(const std::string& address, uint16_t port, bool reusePort, int backlog,
+                               uint16_t& bound, std::string& error) {
+    ensureWinsock();
+    struct sockaddr_in endpoint;
+    memset(&endpoint, 0, sizeof endpoint);
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    if (address.empty() || address == "0.0.0.0" || address == "*") {
+        endpoint.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, address.c_str(), &endpoint.sin_addr) != 1) {
+        error = "the listen address is not a dotted-quad IPv4 address: " + address;
+        return -1;
+    }
+    const int handle = (int)::socket(AF_INET, SOCK_STREAM, 0);
+    if (handle < 0) {
+        error = "could not create a listening socket";
+        return -1;
+    }
+    const int one = 1;
+    setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
+#if defined(SO_REUSEPORT)
+    if (reusePort) setsockopt(handle, SOL_SOCKET, SO_REUSEPORT, (const char*)&one, sizeof one);
+#else
+    (void)reusePort;
+#endif
+    if (::bind(handle, (struct sockaddr*)&endpoint, sizeof endpoint) != 0) {
+        error = "port " + std::to_string((unsigned)port) + " is already in use";
+        MQ_CLOSE(handle);
+        return -1;
+    }
+#if defined(SOMAXCONN)
+    if (backlog > SOMAXCONN) backlog = SOMAXCONN;
+#endif
+    if (backlog < 16) backlog = 16;
+    if (::listen(handle, backlog) != 0 || !setNonBlocking(handle)) {
+        error = "the socket would not listen";
+        MQ_CLOSE(handle);
+        return -1;
+    }
+    struct sockaddr_in actual;
+    socklen_t length = sizeof actual;
+    bound = ::getsockname(handle, (struct sockaddr*)&actual, &length) == 0 ? ntohs(actual.sin_port) : port;
+    return handle;
+}
+
 // Stop a write to a departed peer from killing the process.
 //
 // WRITING TO A SOCKET WHOSE PEER HAS GONE RAISES SIGPIPE, and its default

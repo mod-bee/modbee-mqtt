@@ -174,11 +174,70 @@ void consumeAndPublish(Server& server) {
     reader.join();
 }
 
+// A port no one listens on: one the kernel picked, given back.
+uint16_t freePort() {
+    uint16_t port = 0;
+    std::string error;
+    const int socket = mq_socket::openListeningSocket("127.0.0.1", 0, false, 16, port, error);
+    if (socket >= 0) MQ_CLOSE(socket);
+    return port;
+}
+
+void listenersLive(Server& server) {
+    section("Admin.PutListeners: the port moved and max packet lowered, while devices are connected");
+    auto admin = v1::Admin::NewStub(server.channel());
+    const uint16_t first = server.broker.port();
+    Fleet before(first);
+    Client& early = before.make("early");
+    early.subscribe("echo/early", MQ_QOS_1);
+    ok(before.connected(early) && before.until([&] { return early.subscribed >= 1; }),
+       "a device connects on the first port");
+
+    const uint16_t moved = freePort();
+    v1::ListenersChange change;
+    change.set_port(moved);
+    change.set_max_packet(512);
+    v1::Listeners reply;
+    {
+        grpc::ClientContext context;
+        authorize(context);
+        const grpc::Status status = admin->PutListeners(&context, change, &reply);
+        ok(status.ok() && reply.listeners_size() == 1 && reply.listeners(0).port() == moved &&
+               reply.max_packet() == 512,
+           "PutListeners: the plain listener on another port, max packet 512");
+    }
+    early.publish("echo/early", std::string(1000, 'x'), MQ_QOS_1);
+    ok(before.until([&] { return !early.got.empty(); }) && early.mqtt.isConnected(),
+       "the device on the old port stays connected, and keeps the packet size it was told");
+
+    Fleet after(moved);
+    Client& late = after.make("late");
+    ok(after.connected(late), "a new device connects on the new port");
+    const MqttResult big = late.publish("echo/late", std::string(1000, 'x'), MQ_QOS_1);
+    ok(big == MqttResult::PacketTooLarge || after.until([&] { return late.failed > 0; }),
+       "  and is held to 512 bytes");
+    Fleet gone(first);
+    Client& stray = gone.make("stray");
+    ok(!gone.connected(stray, 1000), "nothing listens on the first port");
+
+    {
+        grpc::ClientContext context;
+        authorize(context);
+        v1::ListenersChange tooMany;
+        tooMany.set_max_connections(reply.max_connections_ceiling() + 1);
+        v1::Listeners refused;
+        equal<int>("more connections than the room kept at start: FAILED_PRECONDITION",
+                   admin->PutListeners(&context, tooMany, &refused).error_code(),
+                   grpc::StatusCode::FAILED_PRECONDITION);
+    }
+}
+
 } // namespace
 
 int main() {
     Server server;
     helloAndToken(server);
     if (server.started) consumeAndPublish(server);
+    if (server.started) listenersLive(server);
     return check::report("api_tests");
 }

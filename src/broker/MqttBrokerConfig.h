@@ -39,6 +39,13 @@ struct MqttBrokerConfig {
     // Connections served at once. The listener's pool must be at least this.
     size_t maxConnections = 32;
 
+    // Room for more, on a host: how far setMaxConnections() can raise
+    // maxConnections while the broker runs (never past maxSessions). The
+    // address space is kept at begin() so the slots never move, but only
+    // maxConnections of them are built; the rest cost nothing until the limit
+    // is raised. 0: maxConnections, and no more. A board ignores it.
+    size_t connectionCapacity = 0;
+
     // Sessions held, including those of clients currently disconnected whose
     // state has not expired. Larger than maxConnections on purpose: offline
     // sessions are the normal state of a plant at three in the morning.

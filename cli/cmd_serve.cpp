@@ -335,12 +335,13 @@ int cmdServe(int argc, char** argv) {
                                       : (size_t)std::max(1u, std::thread::hardware_concurrency());
     // Per shard, with a quarter more than an even share: the hash spreads
     // sessions evenly on average, not exactly.
-    const size_t perShard = (size_t)(b.maxConnections + (long long)count - 1) / count;
-    // One shard has nothing to spread: max-connections means what it says.
-    config.broker.maxConnections = count == 1 ? perShard : perShard + perShard / 4 + 16;
+    config.broker.maxConnections = ShardedBroker::perShard((size_t)b.maxConnections, count);
+    config.maxConnectionsTotal = (size_t)b.maxConnections;
     const long long totalSessions = b.maxSessions > 0 ? b.maxSessions : b.maxConnections;
-    const size_t sessionsPerShard = (size_t)(totalSessions + (long long)count - 1) / count;
-    config.broker.maxSessions = count == 1 ? sessionsPerShard : sessionsPerShard + sessionsPerShard / 4 + 16;
+    config.broker.maxSessions = ShardedBroker::perShard((size_t)totalSessions, count);
+    // Every connection has a session, so max-connections can be raised while
+    // it runs (Admin.PutListeners) as far as max-sessions: the slots are kept.
+    config.broker.connectionCapacity = config.broker.maxSessions;
     config.broker.receiveBufferSize = b.maxPacket;
     config.broker.transmitBufferSize = b.maxPacket;
     config.broker.maximumPacketSize = b.maxPacket;

@@ -598,6 +598,30 @@ public:
     // Wills are published. How many were closed.
     size_t disconnectUser(const MqttSpan& userName, uint8_t reasonCode);
 
+#if defined(MQTT_PLATFORM_HOST)
+    // --- Changed while it runs ---
+    //
+    // How many connections it serves, from 1 up to connectionCapacity(). A
+    // limit lowered below the connections it has closes none of them: new
+    // ones are told 0x89 Server busy until enough have gone. False, and
+    // nothing changed, past the capacity.
+    bool setMaxConnections(size_t limit);
+    size_t connectionCapacity() const { return _config.connectionCapacity; }
+
+    // The largest packet a connection that arrives from now on may send and
+    // be sent (maximumPacketSize, and the buffers that hold it). A connection
+    // already up keeps what its CONNACK told it.
+    void setMaximumPacketSize(uint32_t bytes);
+
+    // Stops accepting from `listener` - its socket is about to change, or go.
+    // The connections it lent stay up; addListener() takes it back.
+    void removeListener(MqttListener& listener);
+
+    // Closes every connection one of `origins` lent (a listener turned off),
+    // with DISCONNECT `reasonCode` and their Wills published. How many.
+    size_t disconnectFrom(const std::vector<const MqttListener*>& origins, uint8_t reasonCode);
+#endif
+
     // --- Hooks ---
     void onAuthorise(MqttBrokerAuthFn handler, void* context);
     void onMessage(MqttBrokerTapFn handler, void* context);

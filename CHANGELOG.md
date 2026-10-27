@@ -13,6 +13,12 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Listeners and limits changed live** (Application API, `Admin.PutListeners`, `PUT /v1/listeners`): the plain and
+  TLS ports, either listener on or off (TLS turned on with its certificate), max connections and max packet - all or
+  nothing, without a restart. A listener that moves keeps its connections; one turned off closes them (`0x98`).
+  Max connections goes as far as the room kept for sessions at start (`--max-sessions`; `Listeners.
+  max_connections_ceiling`), which costs no memory until used; lowered, it closes nobody. A connection already up
+  keeps its packet size. `GetListeners` now also says the limits and the plain listener's address.
 - **Subscription options on a managed connection** (Application API): `ConsumeOpen.subscriptions` sets each
   filter's QoS (0 to 2; a filter in `filters` alone stays QoS 1) and MQTT 5's no-local, retain-as-published and
   retain handling, for how the connection subscribes on the other broker. Groups asking for one filter share one

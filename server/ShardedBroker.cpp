@@ -9,6 +9,7 @@
 
 #include "transport/MqttTlsListener.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -31,6 +32,13 @@ namespace {
 const uint64_t kWakeToken = 0xFFFFFFFFFFFFFFFEull;
 // And the extension's (ShardExtension::waitHandle), for the same reason.
 const uint64_t kExtensionToken = 0xFFFFFFFFFFFFFFFDull;
+
+// The connection slots a shard's broker keeps (MqttBroker::begin): its
+// maxConnections, or the room asked for beyond it, never past its sessions.
+size_t roomOf(const MqttBrokerConfig& config) {
+    const size_t sessions = std::max(config.maxSessions, config.maxConnections);
+    return std::min(std::max(config.maxConnections, config.connectionCapacity), sessions);
+}
 
 // Counters per shard for "might anybody here want this topic": one slot per
 // routing-key hash, 256 kB a shard. Collisions only ever make a shard look
@@ -228,6 +236,28 @@ struct ShardedBroker::Shard {
         (void)context;   // a build without a TLS engine has no listener to give it to
 #endif
     }
+
+    // Changes to its listeners and limits (ShardedBroker::changeListeners),
+    // made on its own thread between two passes of its loop, in order. A
+    // socket is -1 for none: the listener is off, or this shard does not
+    // listen.
+    struct Change {
+        bool plain = false, plainOff = false;
+        int plainSocket = -1;
+        uint16_t plainPort = 0;
+        bool tls = false, tlsOff = false;
+        int tlsSocket = -1;
+        uint16_t tlsPort = 0;
+        size_t maxConnections = 0;
+        uint32_t maxPacket = 0;
+    };
+    std::mutex changeLock;
+    std::deque<Change> changes;
+    std::atomic<bool> changed{false};
+    void takeChanges();
+    // Every listener a connection on this shard may have been lent by: its
+    // own, and each other shard's, through the proxy it is released to.
+    std::vector<const MqttListener*> lenders(bool tls) const;
 
     // inbox[from]: the ring shard `from` writes and this shard reads.
     std::vector<std::unique_ptr<SpscRing<Envelope>>> inbox;
@@ -752,6 +782,7 @@ void ShardedBroker::run(Shard& shard) {
         // Before accepting anything this pass, so a connection that arrives
         // after replaceTls() returned is served the new certificate.
         shard.takeTlsContext();
+        shard.takeChanges();
         shard.broker.poll();
         shard.drain(false);
         if (_extension) _extension->service(shard.index, shard.broker);
@@ -888,6 +919,7 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
 #else
     const bool everyShardListens = false;
 #endif
+    _everyShardListens = everyShardListens;
     uint16_t port = config.port;
     uint16_t tlsPort = config.tls.port;
     for (std::unique_ptr<Shard>& shard : _shards) {
@@ -895,10 +927,12 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
         s.config = config.broker;
         std::snprintf(s.prefix, sizeof s.prefix, "auto-s%u-", s.index);
         s.config.assignedIdPrefix = s.prefix;
+        // The pools grow when max connections is raised (changeListeners).
+        const size_t pool = s.config.maxConnections;
 
         const bool listens = everyShardListens || s.index == 0;
         if (config.plain && listens) {
-            s.listener.configure(config.address.c_str(), port, s.config.maxConnections);
+            s.listener.configure(config.address.c_str(), port, pool);
             s.listener.setReusePort(count > 1);
             if (!s.listener.begin()) {
                 return abandon("shard " + std::to_string(s.index) + ": " + s.listener.lastError());
@@ -909,7 +943,7 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
         if (config.tls.enabled && listens) {
             const ShardedTlsConfig& tls = config.tls;
             const std::string& address = tls.address.empty() ? config.address : tls.address;
-            s.tlsListener.configure(address.c_str(), tlsPort, s.config.maxConnections);
+            s.tlsListener.configure(address.c_str(), tlsPort, pool);
             s.tlsListener.setReusePort(count > 1);
             if (s.index == 0) {
                 if (!tls.certificateFile.empty()) {
@@ -962,8 +996,12 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
         // what, or a message published elsewhere would never be sent here.
         if (_extension != nullptr) _extension->prepare(s.index, s.broker);
     }
+    _address = config.address;
     _port = config.plain ? port : 0;
     _tlsPort = config.tls.enabled ? tlsPort : 0;
+    _maxConnections = config.maxConnectionsTotal ? config.maxConnectionsTotal
+                                                 : _shards[0]->broker.config().maxConnections * count;
+    _maxPacket = _shards[0]->broker.config().maximumPacketSize;
     {
         std::lock_guard<std::mutex> guard(_tlsLock);
         _tlsServed = config.tls;
@@ -994,6 +1032,15 @@ void ShardedBroker::stop() {
         if (shard->thread.joinable()) shard->thread.join();
     }
     for (std::unique_ptr<Shard>& shard : _shards) shard->wake.close();
+    // Sockets a change brought that no pass took.
+    for (std::unique_ptr<Shard>& shard : _shards) {
+        std::lock_guard<std::mutex> guard(shard->changeLock);
+        for (const Shard::Change& change : shard->changes) {
+            if (change.plainSocket >= 0) MQ_CLOSE(change.plainSocket);
+            if (change.tlsSocket >= 0) MQ_CLOSE(change.tlsSocket);
+        }
+        shard->changes.clear();
+    }
 #if MQTT_TLS_SOCKETS
     // A context replaceTls() delivered after the last pass took one.
     for (std::unique_ptr<Shard>& shard : _shards) {
@@ -1010,16 +1057,14 @@ ShardedTlsConfig ShardedBroker::servedTls() const {
     return _tlsServed;
 }
 
-bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) {
+bool ShardedBroker::makeTlsContexts(const ShardedTlsConfig& tls, std::vector<void*>& contexts,
+                                    std::string& error) {
 #if !MQTT_TLS_SOCKETS
     (void)tls;
+    (void)contexts;
     error = "this build has no TLS engine";
     return false;
 #else
-    if (!_running || _tlsPort == 0) {
-        error = "there is no TLS listener running to change - TLS starts with the server";
-        return false;
-    }
     // Built here, on the caller's thread, from a listener that never opens a
     // socket: it exists to turn settings into contexts. One context per
     // shard on an engine that cannot share one between threads, one shared
@@ -1035,21 +1080,27 @@ bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) 
         if (tls.clientCertificateOptional) maker.requestClientCertificate(tls.clientCaPem.c_str());
         else maker.requireClientCertificate(tls.clientCaPem.c_str());
     }
-    std::vector<void*> contexts;
     for (size_t i = 0; i < _shards.size(); i++) {
         void* context = i == 0 ? nullptr : MqttTlsListener::shareContext(contexts[0]);
         if (context == nullptr) context = maker.makeContext();
         if (context == nullptr) {
             error = maker.lastError();
             for (void* made : contexts) MqttTlsListener::dropContext(made);
+            contexts.clear();
             return false;
         }
         contexts.push_back(context);
     }
-    // Delivered, and each shard woken so an idle one swaps now rather than at
-    // its next timeout. A context still waiting from an earlier call was
-    // never served and is dropped.
-    for (size_t i = 0; i < _shards.size(); i++) {
+    return true;
+#endif
+}
+
+void ShardedBroker::deliverTlsContexts(const std::vector<void*>& contexts) {
+#if MQTT_TLS_SOCKETS
+    // Each shard woken so an idle one swaps now rather than at its next
+    // timeout. A context still waiting from an earlier call was never served
+    // and is dropped.
+    for (size_t i = 0; i < _shards.size() && i < contexts.size(); i++) {
         Shard& shard = *_shards[i];
         {
             std::lock_guard<std::mutex> guard(shard.tlsSwapLock);
@@ -1059,6 +1110,20 @@ bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) 
         }
         shard.wake.signal();
     }
+#else
+    (void)contexts;
+#endif
+}
+
+bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) {
+    std::lock_guard<std::mutex> changing(_changeLock);
+    if (!_running || _tlsPort == 0) {
+        error = "there is no TLS listener running to change - turn it on first (changeListeners)";
+        return false;
+    }
+    std::vector<void*> contexts;
+    if (!makeTlsContexts(tls, contexts, error)) return false;
+    deliverTlsContexts(contexts);
     std::lock_guard<std::mutex> guard(_tlsLock);
     const std::string address = _tlsServed.address;
     const uint16_t port = _tlsServed.port;
@@ -1067,7 +1132,206 @@ bool ShardedBroker::replaceTls(const ShardedTlsConfig& tls, std::string& error) 
     _tlsServed.address = address;
     _tlsServed.port = port;
     return true;
+}
+
+// --- Listeners and limits, while running -------------------------------------
+
+size_t ShardedBroker::perShard(size_t total, size_t shards) {
+    if (shards <= 1) return total;
+    const size_t even = (total + shards - 1) / shards;
+    return even + even / 4 + 16;
+}
+
+size_t ShardedBroker::maxConnectionsCeiling() const {
+    if (_shards.empty()) return 0;
+    const size_t room = roomOf(_shards[0]->config);
+    if (_shards.size() == 1) return room;
+    // The largest even share whose perShard() fits the room: e + e/4 <= R
+    // holds for no e above (4R + 3) / 5.
+    if (room <= 16) return 0;
+    size_t even = ((room - 16) * 4 + 3) / 5 + 1;
+    while (even > 0 && even + even / 4 + 16 > room) even--;
+    return even * _shards.size();
+}
+
+bool ShardedBroker::openSockets(uint16_t port, const std::string& address, std::vector<int>& sockets,
+                                uint16_t& bound, std::string& error) {
+    sockets.assign(_shards.size(), -1);
+    bound = port;
+    for (size_t i = 0; i < _shards.size(); i++) {
+        if (!_everyShardListens && i != 0) continue;
+        const size_t pool = roomOf(_shards[i]->config);
+        sockets[i] = mq_socket::openListeningSocket(address, bound, _shards.size() > 1, (int)pool + 1, bound, error);
+        if (sockets[i] < 0) {
+            for (int opened : sockets) {
+                if (opened >= 0) MQ_CLOSE(opened);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ShardedBroker::changeListeners(const ListenerChange& change, std::string& error) {
+    std::lock_guard<std::mutex> changing(_changeLock);
+    if (!_running) {
+        error = "the server is not running";
+        return false;
+    }
+    const ShardedTlsConfig served = servedTls();
+    const bool plainOn = _port != 0, tlsOn = _tlsPort != 0;
+    const bool plainAfter = change.setPlain ? change.plain : plainOn;
+    const bool tlsAfter = change.setTls ? change.tls.enabled : tlsOn;
+    if (!plainAfter && !tlsAfter) {
+        error = "no listener left: neither plain nor TLS";
+        return false;
+    }
+    size_t perShardLimit = 0;
+    if (change.maxConnections != 0) {
+        perShardLimit = perShard(change.maxConnections, _shards.size());
+        if (perShardLimit > roomOf(_shards[0]->config)) {
+            error = "at most " + std::to_string(maxConnectionsCeiling()) +
+                    " connections without a restart: the room kept for sessions at the start (max-sessions)";
+            return false;
+        }
+    }
+    if (change.maxPacket != 0 && (change.maxPacket < 64 || change.maxPacket > 268435455u)) {
+        error = "max packet is 64 to 268435455 bytes";
+        return false;
+    }
+
+    // The TLS material, when TLS is turned on or given new material.
+    const bool tlsMaterial = change.setTls && change.tls.enabled &&
+                             (!change.tls.certificatePem.empty() || !change.tls.certificateFile.empty());
+    ShardedTlsConfig tls = served;
+    if (tlsMaterial) {
+        const std::string address = served.address;
+        tls = change.tls;
+        tls.address = address;
+    }
+    std::vector<void*> contexts;
+    if (change.setTls && change.tls.enabled && (tlsMaterial || !tlsOn)) {
+        if (!tlsMaterial && tls.certificatePem.empty() && tls.certificateFile.empty()) {
+            error = "TLS needs a certificate and its key";
+            return false;
+        }
+        if (!makeTlsContexts(tls, contexts, error)) return false;
+    }
+
+    // The sockets, last: what can still fail before anything changes.
+    std::vector<int> plainSockets(_shards.size(), -1), tlsSockets(_shards.size(), -1);
+    uint16_t plainPort = _port, tlsPort = _tlsPort;
+    const bool plainMoves = change.setPlain && change.plain && (!plainOn || change.port != _port || change.port == 0);
+    const bool tlsMoves = change.setTls && change.tls.enabled && (!tlsOn || change.tls.port != _tlsPort ||
+                                                                  change.tls.port == 0);
+    auto dropContexts = [&] {
+#if MQTT_TLS_SOCKETS
+        for (void* made : contexts) MqttTlsListener::dropContext(made);
 #endif
+    };
+    if (plainMoves && !openSockets(change.port, _address, plainSockets, plainPort, error)) {
+        dropContexts();
+        return false;
+    }
+    if (tlsMoves) {
+        const std::string& address = served.address.empty() ? _address : served.address;
+        if (!openSockets(change.tls.port, address, tlsSockets, tlsPort, error)) {
+            for (int opened : plainSockets) {
+                if (opened >= 0) MQ_CLOSE(opened);
+            }
+            dropContexts();
+            return false;
+        }
+    }
+
+    // Nothing can fail from here.
+    if (!contexts.empty()) deliverTlsContexts(contexts);
+    for (size_t i = 0; i < _shards.size(); i++) {
+        Shard& shard = *_shards[i];
+        Shard::Change c;
+        c.plain = plainMoves || (change.setPlain && !change.plain && plainOn);
+        c.plainOff = change.setPlain && !change.plain && plainOn;
+        c.plainSocket = plainSockets[i];
+        c.plainPort = plainPort;
+        c.tls = tlsMoves || (change.setTls && !change.tls.enabled && tlsOn);
+        c.tlsOff = change.setTls && !change.tls.enabled && tlsOn;
+        c.tlsSocket = tlsSockets[i];
+        c.tlsPort = tlsPort;
+        c.maxConnections = perShardLimit;
+        c.maxPacket = change.maxPacket;
+        {
+            std::lock_guard<std::mutex> guard(shard.changeLock);
+            shard.changes.push_back(c);
+            shard.changed.store(true, std::memory_order_release);
+        }
+        shard.wake.signal();
+    }
+    if (change.setPlain) _port = change.plain ? plainPort : 0;
+    if (change.setTls) {
+        _tlsPort = change.tls.enabled ? tlsPort : 0;
+        std::lock_guard<std::mutex> guard(_tlsLock);
+        const std::string address = _tlsServed.address;
+        _tlsServed = tls;
+        _tlsServed.enabled = change.tls.enabled;
+        _tlsServed.address = address;
+        _tlsServed.port = _tlsPort;
+    }
+    if (change.maxConnections != 0) _maxConnections = change.maxConnections;
+    if (change.maxPacket != 0) _maxPacket = change.maxPacket;
+    return true;
+}
+
+void ShardedBroker::Shard::takeChanges() {
+    if (!changed.load(std::memory_order_acquire)) return;
+    std::deque<Change> now;
+    {
+        std::lock_guard<std::mutex> guard(changeLock);
+        now.swap(changes);
+        changed.store(false, std::memory_order_release);
+    }
+    for (const Change& c : now) {
+        if (c.maxPacket != 0) broker.setMaximumPacketSize(c.maxPacket);
+        if (c.maxConnections != 0 && broker.setMaxConnections(c.maxConnections)) {
+            listener.grow(c.maxConnections);
+#if MQTT_TLS_SOCKETS
+            tlsListener.grow(c.maxConnections);
+#endif
+        }
+        const size_t pool = broker.config().maxConnections;
+        if (c.plain) {
+            broker.removeListener(listener);
+            listener.useSocket(c.plainSocket, c.plainPort, pool);
+            if (c.plainSocket >= 0) broker.addListener(listener);
+            if (c.plainOff) broker.disconnectFrom(lenders(false), 0x98);
+        }
+#if MQTT_TLS_SOCKETS
+        if (c.tls) {
+            takeTlsContext();       // turned on: its context came first
+            broker.removeListener(tlsListener);
+            tlsListener.useSocket(c.tlsSocket, c.tlsPort, pool);
+            if (c.tlsSocket >= 0) broker.addListener(tlsListener);
+            if (c.tlsOff) broker.disconnectFrom(lenders(true), 0x98);
+        }
+#endif
+    }
+}
+
+std::vector<const MqttListener*> ShardedBroker::Shard::lenders(bool tls) const {
+    std::vector<const MqttListener*> out;
+    for (size_t origin = 0; origin < server->_shards.size(); origin++) {
+        const Shard& other = *server->_shards[origin];
+#if MQTT_TLS_SOCKETS
+        const MqttListener* listening = tls ? (const MqttListener*)&other.tlsListener : &other.listener;
+#else
+        if (tls) break;
+        const MqttListener* listening = &other.listener;
+#endif
+        if (origin == index) out.push_back(listening);
+        else if (const RemoteRelease* proxy = proxyFor((uint32_t)origin, const_cast<MqttListener*>(listening))) {
+            out.push_back(proxy);
+        }
+    }
+    return out;
 }
 
 ShardedBrokerStatus ShardedBroker::status() const {

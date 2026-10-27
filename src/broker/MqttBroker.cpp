@@ -179,6 +179,10 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     if (_config.maxConnections > _config.maxSessions) {
         _config.maxConnections = _config.maxSessions;
     }
+#if defined(MQTT_PLATFORM_HOST)
+    if (_config.connectionCapacity < _config.maxConnections) _config.connectionCapacity = _config.maxConnections;
+    if (_config.connectionCapacity > _config.maxSessions) _config.connectionCapacity = _config.maxSessions;
+#endif
 
     // ADVERTISE ONLY WHAT WE CAN HOLD. A Maximum Packet Size larger than the
     // receive buffer would be a promise we break at the worst moment, which is
@@ -211,6 +215,12 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     // connection arriving at a full broker is told 0x89 Server Busy instead of
     // being left to time out. See MqttBrokerConnection::refuseOnly.
     _connections.clear();
+#if defined(MQTT_PLATFORM_HOST)
+    // Room for raising the limit later without moving a slot: reserved, not
+    // built (setMaxConnections).
+    std::vector<MqttBrokerConnection>().swap(_connections);
+    _connections.reserve(_config.connectionCapacity + 1);
+#endif
     _connections.resize(_config.maxConnections + 1);
     for (MqttBrokerConnection& connection : _connections) {
         connection = MqttBrokerConnection();
@@ -330,7 +340,8 @@ bool MqttBroker::addListener(MqttListener& listener) {
     }
     _listeners.push_back(&listener);
 #if defined(MQTT_PLATFORM_HOST)
-    if (_eventDriven && _readiness != nullptr) {
+    // Not while full: pauseListeners(false) adds every listener back.
+    if (_eventDriven && _readiness != nullptr && !_listenersPaused) {
         _readiness->add(listener.waitHandle(), kListenerToken, false);
     }
 #endif
@@ -1251,7 +1262,9 @@ MqttBrokerConnection* MqttBroker::freeConnection() {
     // From the free stack, not a walk (L13). The slot is LOOKED AT here and
     // taken in acceptNew(), only once a transport is actually put in it -
     // most polls find nobody waiting, and the slot must stay free for them.
-    while (!_freeConnections.empty()) {
+    // Slots past the limit are room kept for raising it (setMaxConnections):
+    // the limit is a count, not a range of slots.
+    while (_liveConnections < _config.maxConnections && !_freeConnections.empty()) {
         const uint32_t index = _freeConnections.back();
         if (index < serving && !_connections[index].inUse()) {
             _connections[index].refuseOnly = false;
@@ -4304,6 +4317,55 @@ size_t MqttBroker::disconnectUser(const MqttSpan& userName, uint8_t reasonCode) 
     }
     return closed;
 }
+
+#if defined(MQTT_PLATFORM_HOST)
+bool MqttBroker::setMaxConnections(size_t limit) {
+    if (limit == 0) limit = 1;
+    if (limit > _config.connectionCapacity) return false;
+    const size_t built = _connections.size();
+    if (limit + 1 > built) {
+        // Within what begin() reserved, so no slot moves. The old reserve
+        // becomes a serving slot - refusing someone, it comes back on the
+        // stack when that ends - and the last new one is the reserve.
+        _connections.resize(limit + 1);
+        for (size_t index = limit; index > built; index--) _freeConnections.push_back((uint32_t)(index - 1));
+        if (!_connections[built - 1].inUse()) _freeConnections.push_back((uint32_t)(built - 1));
+    }
+    _config.maxConnections = limit;
+    pauseListeners(false);      // room again, if it was full
+    return true;
+}
+
+void MqttBroker::setMaximumPacketSize(uint32_t bytes) {
+    _config.receiveBufferSize = bytes;
+    _config.transmitBufferSize = bytes;
+    _config.maximumPacketSize = bytes;
+}
+
+void MqttBroker::removeListener(MqttListener& listener) {
+    for (size_t i = 0; i < _listeners.size(); i++) {
+        if (_listeners[i] != &listener) continue;
+        if (_eventDriven && _readiness != nullptr && !_listenersPaused && listener.waitHandle() >= 0) {
+            _readiness->remove(listener.waitHandle());
+        }
+        _listeners.erase(_listeners.begin() + (std::ptrdiff_t)i);
+        return;
+    }
+}
+
+size_t MqttBroker::disconnectFrom(const std::vector<const MqttListener*>& origins, uint8_t reasonCode) {
+    size_t closed = 0;
+    for (MqttBrokerConnection& connection : _connections) {
+        if (!connection.inUse() || connection.closing) continue;
+        bool lent = false;
+        for (const MqttListener* origin : origins) lent = lent || connection.origin == origin;
+        if (!lent) continue;
+        closeConnection(connection, reasonCode, true, true);
+        closed++;
+    }
+    return closed;
+}
+#endif
 
 bool MqttBroker::restoreRetained(const MqttSpan& topic, const MqttSpan& payload, uint8_t qos,
                                  const MqttProperties& properties) {

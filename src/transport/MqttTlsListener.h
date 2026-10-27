@@ -231,6 +231,17 @@ public:
 
     bool begin() override;
     void end() override;
+
+    // Accepts on `socket` from now on (mq_socket::openListeningSocket), in
+    // place of the listening socket it had - the port changed while the
+    // server runs. The connections already handed out are untouched. -1 stops
+    // accepting, as end() does. A pool never configured is sized `maximum`.
+    void useSocket(int socket, uint16_t port, size_t maximum);
+
+    // Holds `maximum` connections from now on, if that is more than it was
+    // configured for: the broker's limit was raised. Never shrinks.
+    void grow(size_t maximum);
+
     MqttTransport* accept() override;
     void release(MqttTransport* transport) override;
     bool isListening() const override { return _socket >= 0; }

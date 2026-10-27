@@ -523,6 +523,9 @@ service Admin {
 
   rpc GetListeners(Empty) returns (Listeners);
   rpc PutTls(ServerTls) returns (Listeners);                 // applied live: new handshakes use it
+  // Ports, listeners on or off, the limits - applied live, all or nothing. A listener whose port moves keeps its
+  // connections; one turned off closes them (MQTT 5: 0x98). Like PutTls, not kept: a restart is as it was started.
+  rpc PutListeners(ListenersChange) returns (Listeners);
 
   rpc Stats(Empty) returns (StatsReply);
 }
@@ -650,8 +653,18 @@ message ServerTls {
   string client_ca_pem = 3;
   bool client_certificate_optional = 4;
 }
+message ListenersChange {
+  optional uint32 port = 1;            // the plain listener's port; 0: off. Absent: as it is
+  optional uint32 tls_port = 2;        // the TLS listener's port; 0: off. On needs a certificate: `tls`, or the one it had
+  ServerTls tls = 3;                   // with tls_port: the certificate to serve, as PutTls
+  optional uint64 max_connections = 4; // the whole server's, up to Listeners.max_connections_ceiling
+  optional uint32 max_packet = 5;      // bytes, 64 to 268435455; a connection already up keeps what it was told
+}
 message Listeners {
   repeated ListenerInfo listeners = 1;
+  uint64 max_connections = 2;
+  uint64 max_connections_ceiling = 3;  // how far max_connections can be raised live: the room kept for sessions at start
+  uint32 max_packet = 4;
 }
 message ListenerInfo {
   Listener kind = 1;

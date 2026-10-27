@@ -174,6 +174,10 @@ modbee-mqtt serve --tls-port 8883 --cert broker.pem --key broker.key --client-ca
   has the design.
 - **`-c` and `--max-sessions` are for the whole server.** Each shard is sized
   for its share, plus a quarter, because the hash spreads evenly on average.
+  An application can raise `-c` while the server runs (`Admin.PutListeners`,
+  [app-api.md](app-api.md#administration-and-rest)) as far as `--max-sessions` - every
+  connection has a session - so set that higher to leave room; the room
+  costs nothing until it is used.
 - **`--username` and `--password`** require that login of every MQTT client.
   For a login per device, changed while the broker runs, use
   `authentication: database:` in the file ([logins.md](logins.md)).

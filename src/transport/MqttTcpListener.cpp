@@ -340,6 +340,29 @@ bool MqttTcpListener::begin() {
     return true;
 }
 
+void MqttTcpListener::grow(size_t maximum) {
+    if (_pool.empty() || maximum + 1 <= _pool.size()) return;
+    _servingCapacity = maximum;
+    const size_t from = _pool.size();
+    _isFree.resize(maximum + 1, 1);
+    for (size_t index = from; index < maximum + 1; index++) {
+        _pool.push_back(new MqttAcceptedTransport());
+        _poolIndex[_pool[index]] = (uint32_t)index;
+        _free.push_back((uint32_t)index);
+    }
+}
+
+void MqttTcpListener::useSocket(int socket, uint16_t port, size_t maximum) {
+    end();
+    if (socket < 0) return;
+    if (_pool.empty()) configure(_address.c_str(), port, maximum);
+    _port = port;
+    _boundPort = port;
+    _socket = socket;
+    _spare = mq_socket::openSpareDescriptor();
+    _lastError.clear();
+}
+
 void MqttTcpListener::end() {
     if (_socket >= 0) {
         MQ_CLOSE(_socket);

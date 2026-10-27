@@ -713,9 +713,13 @@ public:
 
     void listeners(v1::Listeners* reply, Done done) {
         if (_s.server == nullptr) return done(unavailable());
+        reply->set_max_connections(_s.server->maxConnections());
+        reply->set_max_connections_ceiling(_s.server->maxConnectionsCeiling());
+        reply->set_max_packet(_s.server->maxPacket());
         if (_s.server->port() != 0) {
             v1::ListenerInfo* plain = reply->add_listeners();
             plain->set_kind(v1::LISTENER_PLAIN);
+            plain->set_address(_s.server->address());
             plain->set_port(_s.server->port());
         }
         const ShardedTlsConfig tls = _s.server->servedTls();
@@ -754,6 +758,53 @@ public:
         tls.clientCertificateOptional = request.client_certificate_optional();
         std::string error;
         if (!_s.server->replaceTls(tls, error)) return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+        listeners(reply, done);
+    }
+
+    void putListeners(const v1::ListenersChange& request, v1::Listeners* reply, Done done) {
+        if (_s.server == nullptr) return done(unavailable());
+        ShardedBroker::ListenerChange change;
+        if (request.has_port()) {
+            if (request.port() > 65535) return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "port: 0 to 65535"));
+            change.setPlain = true;
+            change.plain = request.port() != 0;
+            change.port = (uint16_t)request.port();
+        }
+        if (request.has_tls_port()) {
+            if (request.tls_port() > 65535) {
+                return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "tls_port: 0 to 65535"));
+            }
+            change.setTls = true;
+            change.tls.enabled = request.tls_port() != 0;
+            change.tls.port = (uint16_t)request.tls_port();
+            if (request.has_tls()) {
+                change.tls.certificatePem = request.tls().certificate_pem();
+                change.tls.keyPem = request.tls().key_pem();
+                change.tls.clientCaPem = request.tls().client_ca_pem();
+                change.tls.clientCertificateOptional = request.tls().client_certificate_optional();
+            }
+        } else if (request.has_tls()) {
+            return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "tls comes with tls_port (or use PutTls)"));
+        }
+        if (request.has_max_connections()) {
+            if (request.max_connections() == 0) {
+                return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "max_connections: at least 1"));
+            }
+            change.maxConnections = (size_t)request.max_connections();
+        }
+        if (request.has_max_packet()) {
+            if (request.max_packet() < 64 || request.max_packet() > 268435455u) {
+                return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "max_packet: 64 to 268435455 bytes"));
+            }
+            change.maxPacket = request.max_packet();
+        }
+        std::string error;
+        if (!_s.server->changeListeners(change, error)) {
+            const bool taken = error.find("in use") != std::string::npos ||
+                               error.find("without a restart") != std::string::npos;
+            return done(grpc::Status(taken ? grpc::StatusCode::FAILED_PRECONDITION : grpc::StatusCode::INVALID_ARGUMENT,
+                                     error));
+        }
         listeners(reply, done);
     }
 
@@ -1305,7 +1356,9 @@ public:
         if (_authority) reply->add_features("authority");
         if (_messages) reply->add_features("messages");
         if (_connections) reply->add_features("connections");
+        if (_connections) reply->add_features("connections.subscriptions");
         if (_admin) reply->add_features("admin");
+        if (_admin) reply->add_features("admin.listeners");
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1352,6 +1405,8 @@ public:
     MODBEE_ADMIN_CALL(DeleteRetained, v1::DeleteRetainedRequest, v1::DeleteReply, _core.deleteRetained(*request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(GetListeners, v1::Empty, v1::Listeners, _core.listeners(reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(PutTls, v1::ServerTls, v1::Listeners, _core.putTls(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(PutListeners, v1::ListenersChange, v1::Listeners,
+                      _core.putListeners(*request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(Stats, v1::Empty, v1::StatsReply, _core.stats(reply, MODBEE_FINISH))
 
 #undef MODBEE_FINISH
@@ -1987,6 +2042,12 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
             if (read(*r)) {
                 auto out = made<v1::Listeners>();
                 run(r, out, [=](Done done) { core->putTls(*r, out.get(), done); });
+            }
+        } else if ((method == "PUT" || method == "PATCH") && name.empty()) {
+            auto r = made<v1::ListenersChange>();
+            if (read(*r)) {
+                auto out = made<v1::Listeners>();
+                run(r, out, [=](Done done) { core->putListeners(*r, out.get(), done); });
             }
         }
     } else if (collection == "stats" && method == "GET") {

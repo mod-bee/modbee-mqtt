@@ -15,8 +15,9 @@ The server answers all five of its services:
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 | `Admin` | **Logins, site keys, sessions, kicks, retained messages, TLS, counters** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
 
-`Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), so an
-application asks rather than guesses.
+`Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), and what
+it added since (`connections.subscriptions`: subscription options on a connection; `admin.listeners`:
+`PutListeners`), so an application asks rather than guesses.
 
 **`System.Attach`** is an instance's presence. Open it with the messages to
 publish should the instance vanish - its Wills, as an MQTT client has one:
@@ -238,6 +239,7 @@ running server, without restarting it:
 | `Kick` | Closes a client's connection, or every connection of a login, with DISCONNECT `0x98` (administrative action); its Will is published. `discard_session` ends the session too |
 | `ListRetained` `DeleteRetained` | Retained messages under a filter, with payloads if asked; deleting is the same as a device publishing an empty retained message to each |
 | `GetListeners` `PutTls` | The listeners, and the TLS certificate they serve - replaced live: new handshakes use it, open connections keep theirs |
+| `PutListeners` | Changed live, all or nothing: the plain and TLS ports (`0` turns one off; turning TLS on brings its certificate in `tls`), `max_connections` and `max_packet`. A listener that moves keeps its connections - they have their sockets already; one turned off closes its own with DISCONNECT `0x98`. `max_connections` goes as far as `max_connections_ceiling`, the room kept for sessions at the start (`--max-sessions`); lowered, it closes nobody and refuses new connections (`0x89`) until enough have gone. A connection already up keeps the packet size its CONNACK told it. A taken port is `FAILED_PRECONDITION`, with nothing changed. Like `PutTls` it is not kept: the next start uses what the server is started with |
 | `Stats` | The server's counters: connections, sessions, messages in and out, logins asked of your application and answered from its cache |
 
 ### REST
@@ -272,7 +274,7 @@ curl -X POST localhost:9464/v1/sessions/pump-1:kick
 | `GET /v1/keys` · `PUT` · `DELETE /v1/keys/{name}` | `ListKeys` · `PutKey` · `DeleteKey` |
 | `GET /v1/sessions?clientIdPrefix=&login=&connectedOnly=` · `POST /v1/sessions/{clientId}:kick` | `ListSessions` · `Kick` |
 | `GET /v1/retained?filter=&payloads=` · `DELETE /v1/retained?filter=` | `ListRetained` · `DeleteRetained` |
-| `GET /v1/listeners` · `PUT /v1/listeners/tls` | `GetListeners` · `PutTls` |
+| `GET /v1/listeners` · `PUT /v1/listeners` · `PUT /v1/listeners/tls` | `GetListeners` · `PutListeners` · `PutTls` |
 | `GET /v1/stats` · `GET /v1/health` | `Stats` · health |
 | `GET /v1/connections` · `GET` · `PUT` · `DELETE /v1/connections/{id}` | `Connections.*` |
 | `GET /v1/groups` · `DELETE /v1/groups/{group}?connection=` | `Messages.ListGroups` · `DeleteGroup` |

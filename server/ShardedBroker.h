@@ -37,8 +37,15 @@
 // refused while the old one is still served - and handed to each shard,
 // which swaps it in on its own thread between two passes of its loop. Every
 // connection already up keeps the context it shook hands with; only new
-// handshakes see the new certificate. The port and the address are what the
-// sockets were bound to, and changing those still needs a restart.
+// handshakes see the new certificate.
+//
+// SO CAN THE LISTENERS AND THE LIMITS (changeListeners): a port moved, a
+// listener turned on or off, max connections, max packet. New sockets are
+// opened on the caller's thread - a port that is taken is refused with
+// nothing changed - and each shard swaps them in on its own thread. A
+// listener whose port moved keeps its connections (they hold their own
+// sockets); one turned off closes them, 0x98 Administrative action. The
+// address stays what the server started with.
 //
 // SHARED SUBSCRIPTIONS. "$share/<name>/<filter>" means one member of the
 // group receives each message - one in the whole server, not one per shard.
@@ -143,6 +150,9 @@ struct ShardedTlsConfig {
 
 struct ShardedBrokerConfig {
     MqttBrokerConfig broker;           // per shard; maxConnections and maxSessions are per shard too
+    // The whole server's maxConnections, as it was asked for, for saying so;
+    // 0: broker.maxConnections times the shards.
+    size_t maxConnectionsTotal = 0;
     std::string address = "0.0.0.0";
     bool plain = true;                 // the plain-TCP listener; false for TLS only
     uint16_t port = 1883;              // 0: an ephemeral port, shared by every shard
@@ -184,6 +194,7 @@ public:
 
     uint16_t port() const { return _port; }        // 0 if there is no plain listener
     uint16_t tlsPort() const { return _tlsPort; }  // 0 if there is no TLS listener
+    const std::string& address() const { return _address; }
     size_t shardCount() const { return _shards.size(); }
     const std::string& lastError() const { return _lastError; }
 
@@ -205,6 +216,35 @@ public:
     // including a shard's own.
     bool replaceTls(const ShardedTlsConfig& tls, std::string& error);
 
+    // --- The listeners and the limits, while running ---
+    struct ListenerChange {
+        bool setPlain = false;          // the plain listener: on `port`, or off
+        bool plain = false;
+        uint16_t port = 0;
+        // The TLS listener: tls.enabled on tls.port, or off. Turning it on
+        // needs its material in `tls`, or what it served before; material
+        // given while it is on replaces it (replaceTls).
+        bool setTls = false;
+        ShardedTlsConfig tls;
+        size_t maxConnections = 0;      // the whole server's; 0: unchanged
+        uint32_t maxPacket = 0;         // bytes; 0: unchanged
+    };
+    // All of it, or - false, with `error` - none of it: a port that is taken,
+    // material that will not load, more connections than there is room for.
+    // Callable from any thread but a shard's own.
+    bool changeListeners(const ListenerChange& change, std::string& error);
+
+    size_t maxConnections() const { return _maxConnections; }   // the whole server's
+    // How far maxConnections can be raised without a restart: the room every
+    // shard kept at the start (MqttBrokerConfig::connectionCapacity).
+    size_t maxConnectionsCeiling() const;
+    uint32_t maxPacket() const { return _maxPacket; }
+
+    // Each shard's share of `total` connections (or sessions): a quarter more
+    // than an even share, since the hash spreads them evenly on average, not
+    // exactly. One shard has nothing to spread: `total` itself.
+    static size_t perShard(size_t total, size_t shards);
+
     // Which shard owns this Client Identifier. Public for tests and tooling.
     static uint32_t ownerOf(const uint8_t* identifier, size_t length, size_t shards);
 
@@ -215,8 +255,13 @@ private:
     friend struct Shard;
     std::unique_ptr<ShareRegistry> _shares;
     std::vector<std::unique_ptr<Shard>> _shards;
-    uint16_t _port = 0;
-    uint16_t _tlsPort = 0;
+    std::string _address;
+    std::atomic<uint16_t> _port{0};
+    std::atomic<uint16_t> _tlsPort{0};
+    std::atomic<size_t> _maxConnections{0};
+    std::atomic<uint32_t> _maxPacket{0};
+    bool _everyShardListens = true;
+    std::mutex _changeLock;                // one change of TLS or listeners at a time
     std::string _lastError;
     std::atomic<bool> _stopping{false};
     std::atomic<size_t> _ended{0};         // shards whose broker has ended
@@ -227,4 +272,8 @@ private:
     bool _running = false;
 
     void run(Shard& shard);
+    bool makeTlsContexts(const ShardedTlsConfig& tls, std::vector<void*>& contexts, std::string& error);
+    void deliverTlsContexts(const std::vector<void*>& contexts);
+    bool openSockets(uint16_t port, const std::string& address, std::vector<int>& sockets, uint16_t& bound,
+                     std::string& error);
 };
