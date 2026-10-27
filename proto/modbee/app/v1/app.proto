@@ -450,6 +450,18 @@ service Sparkplug {
   // NCMD / DCMD: metrics by name, sent by the alias and at the datatype their birth gave (any datatype). Node and
   // Device Control metrics too (Next Server, Scan Rate, Reboot).
   rpc Write(SparkplugWriteRequest) returns (SparkplugCommandReply);
+
+  // Sparkplug Aware (Sparkplug B 3.0 section 10): see SparkplugAwareSetting. Changed live. serve --sparkplug-aware.
+  rpc GetAware(Empty) returns (SparkplugAwareSetting);
+  rpc PutAware(SparkplugAwareSetting) returns (SparkplugAwareSetting);
+}
+
+// Every NBIRTH and DBIRTH the server's clients publish kept, retained, on
+// $sparkplug/certificates/spBv1.0/<group>/NBIRTH/<node> (and .../DBIRTH/<node>/<device>), cleared by its death - so a
+// host that starts late reads every dictionary without asking for a rebirth. Every login may read them, none write
+// them. Turned off, what it put there is cleared.
+message SparkplugAwareSetting {
+  bool enabled = 1;
 }
 
 message SparkplugHostSpec {

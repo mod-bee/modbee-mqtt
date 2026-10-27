@@ -13,6 +13,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Sparkplug Aware** (Sparkplug B 3.0 section 10; `serve --sparkplug-aware`, `sparkplug: aware`, `Sparkplug.PutAware`
+  live): every NBIRTH and DBIRTH kept retained on `$sparkplug/certificates/...`, cleared by its death; every login may
+  read them, none may write them.
 - **A Sparkplug B Host Application in the server** (`Sparkplug.PutHost` ... `DeleteHost`, `ListNodes`, `Rebirth`,
   `Write`; `modbee-mqtt sparkplug-hosts ...`, `sparkplug nodes|rebirth|write`): the library's TCK-tested host on one
   of the server's connections, its STATE that connection's Will. It follows every node's session and asks for

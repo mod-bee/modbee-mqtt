@@ -87,7 +87,7 @@ if(NOT MSVC)
     target_compile_options(modbee-sessions PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
 endif()
 
-add_library(modbee-events STATIC events/BrokerEvents.cpp)
+add_library(modbee-events STATIC events/BrokerEvents.cpp events/SparkplugAware.cpp)
 target_link_libraries(modbee-events PUBLIC modbee-server)
 target_include_directories(modbee-events PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/events)
 target_compile_features(modbee-events PUBLIC cxx_std_17)

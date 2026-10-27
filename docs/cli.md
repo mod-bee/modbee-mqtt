@@ -307,6 +307,8 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt sparkplug nodes` | `Sparkplug.ListNodes` | - |
 | `modbee-mqtt sparkplug rebirth` | `Sparkplug.Rebirth` | - |
 | `modbee-mqtt sparkplug write` | `Sparkplug.Write` | - |
+| `modbee-mqtt sparkplug-aware get` | `Sparkplug.GetAware` | - |
+| `modbee-mqtt sparkplug-aware set` | `Sparkplug.PutAware` | - |
 | `modbee-mqtt messages consume` | `Messages.Consume` | - |
 | `modbee-mqtt messages publish` | `Messages.Publish` | `POST /v1/publish` |
 | `modbee-mqtt groups list` | `Messages.ListGroups` | `GET /v1/groups` |

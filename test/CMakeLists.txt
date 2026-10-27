@@ -41,7 +41,7 @@ endif()
 # The Application API (gRPC), where it is built.
 if(TARGET modbee-api AND TARGET modbee-retained)
     add_executable(api_tests api_tests.cpp)
-    target_link_libraries(api_tests PRIVATE modbee-api modbee-retained)
+    target_link_libraries(api_tests PRIVATE modbee-api modbee-retained modbee-events)
     target_compile_features(api_tests PRIVATE cxx_std_17)
     if(MSVC)
         target_compile_options(api_tests PRIVATE /W4 /utf-8)

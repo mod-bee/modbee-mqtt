@@ -15,6 +15,7 @@
 #include "AppHub.h"
 #include "AppAdmin.h"
 #include "AppConnections.h"
+#include "SparkplugAware.h"
 #include "ApiServer.h"
 #include "modbee/app/v1/app.grpc.pb.h"
 
@@ -38,6 +39,7 @@ const char* const kToken = "api-tests-token";
 struct Server {
     AppHub hub{AppHubConfig()};
     AppAdmin admin;
+    SparkplugAware aware;
     std::unique_ptr<AppConnections> connections;
     ShardExtensionChain chain;
     ShardedBroker broker;
@@ -48,6 +50,7 @@ struct Server {
     Server() {
         chain.add(&hub);
         chain.add(&admin);
+        chain.add(&aware);
         ShardedBrokerConfig c;
         c.address = "127.0.0.1";
         c.port = 0;
@@ -73,6 +76,8 @@ struct Server {
         s.admin = &admin;
         s.server = &broker;
         s.connections = connections.get();
+        s.sparkplugAware = [this] { return aware.enabled(); };
+        s.setSparkplugAware = [this](bool on) { aware.enable(on); };
         std::string why;
         started = api.start(a, s, why);
         if (!started) std::printf("    api: %s\n", why.c_str());
@@ -632,6 +637,54 @@ void sparkplugHost(Server& server) {
     reader.join();
 }
 
+void sparkplugAware(Server& server) {
+    section("Sparkplug Aware: births kept on $sparkplug/certificates/..., cleared by deaths, turned on and off live");
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    auto set = [&](bool on) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugAwareSetting setting;
+        setting.set_enabled(on);
+        v1::SparkplugAwareSetting now;
+        return sparkplug->PutAware(&c, setting, &now).ok() && now.enabled() == on;
+    };
+    ok(set(true), "PutAware: on");
+    Fleet fleet(server.broker.port());
+    Client& node = fleet.make("aware-node");
+    ok(fleet.connected(node), "an edge node connects");
+    const std::string nbirth("\x08\x01\x18\x00", 4), dbirth("\x08\x02\x18\x01", 4);
+    node.publish("spBv1.0/plant/NBIRTH/n1", nbirth, MQ_QOS_1);
+    node.publish("spBv1.0/plant/DBIRTH/n1/pump", dbirth, MQ_QOS_1);
+    fleet.until([&] { return node.completed >= 2; });
+    Client& late = fleet.make("late-host");
+    late.subscribe("$sparkplug/certificates/#", MQ_QOS_0);
+    ok(fleet.connected(late) && fleet.until([&] { return late.got.size() >= 2; }),
+       "a host that subscribes later is sent both births");
+    bool same = late.got.size() >= 2;
+    for (const check::Got& g : late.got) {
+        if (g.topic == "$sparkplug/certificates/spBv1.0/plant/NBIRTH/n1") same = same && g.payload == nbirth && g.retain;
+        else if (g.topic == "$sparkplug/certificates/spBv1.0/plant/DBIRTH/n1/pump") same = same && g.payload == dbirth && g.retain;
+        else same = false;
+    }
+    ok(same, "  retained, at their topics, the bytes as the node sent them");
+    node.publish("spBv1.0/plant/NDEATH/n1", std::string("\x08\x03", 2), MQ_QOS_1);
+    fleet.until([&] { return node.completed >= 3; });
+    Client& after = fleet.make("after-death");
+    after.subscribe("$sparkplug/certificates/#", MQ_QOS_0);
+    fleet.connected(after);
+    fleet.until([&] { return false; }, 400);
+    ok(after.got.empty(), "the NDEATH clears the node's and its device's");
+    node.publish("spBv1.0/plant/NBIRTH/n2", nbirth, MQ_QOS_1);
+    fleet.until([&] { return node.completed >= 4; });
+    ok(set(false), "PutAware: off");
+    fleet.until([&] { return false; }, 300);
+    Client& off = fleet.make("when-off");
+    off.subscribe("$sparkplug/certificates/#", MQ_QOS_0);
+    fleet.connected(off);
+    fleet.until([&] { return false; }, 400);
+    ok(off.got.empty(), "  and clears what it kept");
+}
+
 v1::Session sessionOf(Server& server, const std::string& clientId) {
     auto admin = v1::Admin::NewStub(server.channel());
     grpc::ClientContext context;
@@ -765,6 +818,7 @@ int main() {
     if (server.started) consumeAndPublish(server);
     if (server.started) sparkplugCodec(server);
     if (server.started) sparkplugHost(server);
+    if (server.started) sparkplugAware(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);
     return check::report("api_tests");

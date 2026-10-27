@@ -228,6 +228,11 @@ struct MqttAccount {
 // Logins decided by the APPLICATION, over the Application API (api:), instead
 // of a login database: every CONNECT not a fixed login is asked of it once and
 // the answer kept (server/api/Authority.h). An authority: section turns it on.
+// sparkplug: Sparkplug B the server does itself.
+struct SparkplugSection {
+    bool aware = false;          // keep every birth on $sparkplug/certificates/... (Sparkplug Aware)
+};
+
 struct AuthoritySection {
     bool enabled = false;
     long long timeoutMs = 2000;          // a CONNECT asked waits this long for an answer
@@ -301,6 +306,7 @@ struct ServerConfig {
     BrokerSection broker;
     MetricsSection metrics;
     EventsSection events;
+    SparkplugSection sparkplug;
     RetainedSection retained;
     SessionsSection sessions;
     AuthenticationSection authentication;

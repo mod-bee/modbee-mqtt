@@ -351,6 +351,8 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
         return safeName(clientId) && topic == mine;
     }
     if (isFixedAdmin(username)) return true;
+    // Sparkplug Aware: every login may read the births the server keeps there; none may write them.
+    if (topic.compare(0, 24, "$sparkplug/certificates/") == 0) return !publish;
     for (const auto& login : _config.logins) {
         // A fixed login from the config: any topic, except the $ ones.
         if (login.first == username) return topic.empty() || topic[0] != '$';

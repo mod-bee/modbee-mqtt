@@ -1812,8 +1812,38 @@ void hostInfoTo(const AppSparkplugHostInfo& info, v1::SparkplugHostInfo& wire) {
 
 class SparkplugService final : public v1::Sparkplug::CallbackService {
 public:
-    SparkplugService(const ApiServerConfig& config, AppConnections* connections, AppHub* hub)
-        : _config(config), _connections(connections), _hub(hub) {}
+    SparkplugService(const ApiServerConfig& config, AppConnections* connections, AppHub* hub,
+                     const ApiServer::Services& services)
+        : _config(config), _connections(connections), _hub(hub), _services(services) {}
+
+    grpc::ServerUnaryReactor* GetAware(grpc::CallbackServerContext* context, const v1::Empty*,
+                                       v1::SparkplugAwareSetting* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+        } else if (!_services.sparkplugAware) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::UNAVAILABLE, "this server has no Sparkplug Aware"));
+        } else {
+            reply->set_enabled(_services.sparkplugAware());
+            reactor->Finish(grpc::Status::OK);
+        }
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* PutAware(grpc::CallbackServerContext* context, const v1::SparkplugAwareSetting* request,
+                                       v1::SparkplugAwareSetting* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!allowed(context, _config.token)) {
+            reactor->Finish(refusedToken());
+        } else if (!_services.setSparkplugAware) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::UNAVAILABLE, "this server has no Sparkplug Aware"));
+        } else {
+            _services.setSparkplugAware(request->enabled());
+            reply->set_enabled(_services.sparkplugAware());
+            reactor->Finish(grpc::Status::OK);
+        }
+        return reactor;
+    }
 
     // Every host call: the token, and the connections it lives on.
     bool ready(grpc::CallbackServerContext* context, grpc::ServerUnaryReactor* reactor) {
@@ -2033,6 +2063,7 @@ private:
     const ApiServerConfig& _config;
     AppConnections* _connections;
     AppHub* _hub;
+    const ApiServer::Services& _services;
 };
 
 class AuthorityService final : public v1::Authority::CallbackService {
@@ -2155,7 +2186,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
-    self.sparkplug.reset(new SparkplugService(self.config, connections, messages));
+    self.sparkplug.reset(new SparkplugService(self.config, connections, messages, self.services));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

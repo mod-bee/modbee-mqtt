@@ -25,6 +25,7 @@
 #include "AuthGate.h"
 #include "TlsSettings.h"
 #include "BrokerEvents.h"
+#include "SparkplugAware.h"
 #include "SessionKeeper.h"
 #if defined(MODBEE_HAVE_APP_API)
 #include "Authority.h"
@@ -85,6 +86,7 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"authority", 0, false, "logins are decided by the application, over the API (Authority.Serve)"},
         {"authority-timeout-ms", 0, true, "how long a CONNECT waits for the application's answer (default 2000)"},
         {"events", 0, false, "publish client events on $modbee/events/... (and to API consumers)"},
+        {"sparkplug-aware", 0, false, "keep every Sparkplug birth on $sparkplug/certificates/... (Sparkplug Aware)"},
         {"set", 0, true, "any setting by its place in modbee.yaml: --set broker.max-keepalive=60 (repeatable)"},
         {"help", 0, false, "show this help"},
     };
@@ -337,6 +339,7 @@ int cmdServe(int argc, char** argv) {
     }
     if (args.has("authority") || args.has("authority-timeout-ms")) file.authentication.authority.enabled = true;
     if (args.has("events")) file.events.enabled = true;
+    if (args.has("sparkplug-aware")) file.sparkplug.aware = true;
     if (args.has("address")) b.address = args.get("address");
     if (args.has("no-plain")) b.plain = false;
     if (args.has("pin")) b.pinThreads = true;
@@ -445,6 +448,9 @@ int cmdServe(int argc, char** argv) {
         events.reset(new BrokerEvents());
         extensions.add(events.get());
     }
+    // SPARKPLUG AWARE: always there, so the API can turn it on while it runs.
+    SparkplugAware aware(file.sparkplug.aware);
+    extensions.add(&aware);
     // Logins: a live database of device logins (AuthGate), or a fixed list
     // from the file (ShardAccounts), or none.
     ShardAccounts accounts;
@@ -615,6 +621,8 @@ int cmdServe(int argc, char** argv) {
         s.admin = admin.get();
         s.logins = gate.get();
         s.server = &server;
+        s.sparkplugAware = [&aware] { return aware.enabled(); };
+        s.setSparkplugAware = [&aware](bool on) { aware.enable(on); };
         if (!read || !api.start(c, s, why)) {
             std::fprintf(stderr, "modbee-mqtt serve: %s\n", why.c_str());
             server.stop();

@@ -19,6 +19,7 @@
 // never touches a broker.
 
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,9 @@ public:
         AppAdmin* admin = nullptr;           // sessions and retained messages, on the shards
         AuthGate* logins = nullptr;          // the login database, where logins are kept here
         ShardedBroker* server = nullptr;     // its listeners, TLS and status
+        // Sparkplug Aware, read and changed while it runs (server/events/SparkplugAware.h).
+        std::function<bool()> sparkplugAware;
+        std::function<void(bool)> setSparkplugAware;
     };
     bool start(const ApiServerConfig& config, const Services& services, std::string& error);
 

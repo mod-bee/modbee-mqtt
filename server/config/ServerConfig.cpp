@@ -1055,6 +1055,11 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     if (events.present()) out.events.enabled = true;
     events.flag("enabled", out.events.enabled);
     if (events.present()) events.finish();
+
+    // Read whether or not the section is there, so MODBEE_SPARKPLUG_AWARE alone turns it on.
+    Section sparkplug = top.child("sparkplug");
+    sparkplug.flag("aware", out.sparkplug.aware);
+    if (sparkplug.present()) sparkplug.finish();
     // Who may connect. One login for every device -
     //   authentication: {username: devices, password: ...}
     // - or a list, one per device. Read whether or not the section is there,
