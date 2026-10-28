@@ -154,7 +154,7 @@ struct MqttConnectionConfig {
     // 5.0 only. How many QoS>0 publishes we will accept at once, and how many
     // aliases we will accept. Both are what WE offer; what we may use is in
     // MqttCapabilities, from the peer's answer.
-    uint16_t receiveMaximum = 0;         // 0 leaves the default of 65535
+    uint16_t receiveMaximum = 0;         // 0: what the session can track (MQTT_SESSION_MAX_INBOUND_QOS2); never more
     uint16_t topicAliasMaximum = 0;
     uint32_t maximumPacketSize = 0;      // 0: the receive buffer's size (MqttClientConfig); never more than it
 

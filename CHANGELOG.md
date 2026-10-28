@@ -256,7 +256,9 @@ minor version may change the API or the configuration, and says how here.
   than its table holds (`MQTT_SESSION_MAX_INBOUND_QOS2`, 16) - which a broker may send, the client allowing 65,535 in
   flight - each new one was taken for a duplicate: acknowledged with a PUBREC and never delivered. 200 publishers at
   50 msg/s QoS 2 into one subscriber lost 8% against our broker and 6% against Mosquitto. Every one is delivered now;
-  only a known identifier is a duplicate.
+  only a known identifier is a duplicate. And at 5.0 the client states the table's size as its Receive Maximum
+  (255 on a host, 16 on a board; a smaller `receiveMaximum` is kept), so a broker never has more in flight than it can
+  tell apart and each stays exactly once.
 - **A client with a small receive buffer could be shut out by one large message.** At MQTT 5 the client left Maximum
   Packet Size out of CONNECT unless told one, while its receive buffer (4 KiB by default) is a hard limit: a larger
   PUBLISH ended the connection with `0x95`, and a retained message, or one queued in its session, came again on

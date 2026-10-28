@@ -420,10 +420,19 @@ void MqttClient::sendConnect() {
             MQ_PROPERTIES(packet, connect).sessionExpiryInterval = _connection.sessionExpiryInterval;
             MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
         }
-        if (_connection.receiveMaximum != 0) {
-            MQ_PROPERTIES(packet, connect).receiveMaximum = _connection.receiveMaximum;
-            MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_RECEIVE_MAXIMUM);
+        // NO MORE IN FLIGHT TOWARDS US THAN WE CAN TELL APART. Unstated, the
+        // Receive Maximum is 65,535, and a broker under load may then have more
+        // QoS 2 messages awaiting their PUBREL than the session's table holds
+        // (MQTT_SESSION_MAX_INBOUND_QOS2): one not remembered is still
+        // delivered, but a resend of it after a reconnect would be delivered
+        // again. Stated, a broker keeps to it [V5:MQTT-3.3.4-9], and every one
+        // is exactly once. A smaller one asked for is kept.
+        uint16_t receiveMaximum = (uint16_t)MQTT_SESSION_MAX_INBOUND_QOS2;
+        if (_connection.receiveMaximum != 0 && _connection.receiveMaximum < receiveMaximum) {
+            receiveMaximum = _connection.receiveMaximum;
         }
+        MQ_PROPERTIES(packet, connect).receiveMaximum = receiveMaximum;
+        MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_RECEIVE_MAXIMUM);
         // What the alias table can actually hold, not what was asked for: the
         // broker may use every alias up to the number advertised here, and one
         // above the table's size would be refused with 0x94 - a protocol error

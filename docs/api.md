@@ -840,7 +840,7 @@ uint16_t keepAlive  = 60;               // seconds; 0 disables it
 uint32_t sessionExpiryInterval = 0;     // 5.0 only
 bool     hasSessionExpiry      = false;
 
-uint16_t receiveMaximum     = 0;        // 0 leaves the default of 65,535
+uint16_t receiveMaximum     = 0;        // 0: what the session tracks - 255 on a host, 16 on a board
 uint16_t topicAliasMaximum  = 0;        // how many aliases WE will accept, up to MQTT_MAX_ALIASES (8)
 uint32_t maximumPacketSize  = 0;        // 0: receiveBufferSize; never more than it
 
