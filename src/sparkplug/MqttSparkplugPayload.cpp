@@ -2372,13 +2372,20 @@ bool readCell(const uint8_t* body, size_t length, MqttSparkplugDataType type,
             case MqttSparkplugDataType::Int32:
             case MqttSparkplugDataType::UInt8:
             case MqttSparkplugDataType::UInt16:
-            case MqttSparkplugDataType::UInt32:
                 fits = field == MQ_SP_F_DATASETVALUE_INT && wireType == MQ_PB_VARINT;
                 if (fits) {
                     const uint64_t raw = reader.varint();
                     if (isSignedType(type)) out.as.signedValue = decodeSigned(type, raw);
                     else out.as.unsignedValue = raw & 0xFFFFFFFFu;
                 }
+                break;
+            case MqttSparkplugDataType::UInt32:
+                // Either field. Eclipse Tahu's Java (Ignition's) writes a
+                // UInt32 cell in long_value, Tahu's Python in int_value; a
+                // table from Ignition with a UInt32 column was refused whole.
+                fits = (field == MQ_SP_F_DATASETVALUE_INT || field == MQ_SP_F_DATASETVALUE_LONG) &&
+                       wireType == MQ_PB_VARINT;
+                if (fits) out.as.unsignedValue = reader.varint() & 0xFFFFFFFFu;
                 break;
             case MqttSparkplugDataType::Int64:
             case MqttSparkplugDataType::UInt64:
