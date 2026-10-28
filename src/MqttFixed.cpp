@@ -53,7 +53,7 @@ bool MqttByteArea::entries(size_t count) noexcept {
     if (count <= _entries) return true;
     if (count > kMaxEntries) return false;
     uint32_t* offset = (uint32_t*)mq_allocLarge(count * sizeof(uint32_t));
-    uint16_t* length = (uint16_t*)mq_allocLarge(count * sizeof(uint16_t));
+    uint32_t* length = (uint32_t*)mq_allocLarge(count * sizeof(uint32_t));
     if (!offset || !length) {
         mq_freeLarge(offset);
         mq_freeLarge(length);
@@ -77,7 +77,7 @@ MqttByteArea::Entry MqttByteArea::put(const uint8_t* bytes, size_t length) noexc
     for (size_t entry = 0; entry < _entries; entry++) {
         if (_length[entry] != kFree) continue;
         _offset[entry] = (uint32_t)_used;
-        _length[entry] = (uint16_t)length;
+        _length[entry] = (uint32_t)length;
         if (length) memcpy(_bytes + _used, bytes, length);
         _used += length;
         return (Entry)entry;
@@ -114,7 +114,7 @@ void MqttAreaBytes::assign(const uint8_t* first, const uint8_t* last) noexcept {
     if (!_area) {
         drop();
         _view = first;
-        _size = (uint16_t)length;
+        _size = (uint32_t)length;
         return;
     }
     // Bytes from the same area move when an entry is released, so they are
@@ -125,7 +125,7 @@ void MqttAreaBytes::assign(const uint8_t* first, const uint8_t* last) noexcept {
     _entry = length ? _area->put(first, length) : MqttByteArea::kNone;
     if (fromArea && old < MqttByteArea::kFailed) _area->release(old);
     _view = nullptr;
-    _size = held() ? (uint16_t)length : 0;
+    _size = held() ? (uint32_t)length : 0;
 }
 
 void MqttAreaBytes::drop() noexcept {

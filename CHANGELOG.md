@@ -178,6 +178,10 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **On a board, a message over 64 kB went out cut to its last 16 bits of length.** The board build's byte area and its
+  views (`MqttByteArea`, `MqttAreaBytes`, `MQTT_LEAN`) kept a length in 16 bits: an NBIRTH of a thousand metrics
+  (67,093 bytes) was published as its first 1,557 bytes, which no host could decode, and every rebirth repeated it.
+  Lengths are 32-bit now (4 bytes more per queue entry).
 - **A Sparkplug edge node or host put on a connection that reconnects only when asked never birthed, and said
   nothing**: putting its Will on the connection ends the session, and that connection waited to be asked. Refused
   now, saying why - and such a connection is not changed to reconnect only when asked while one runs on it.

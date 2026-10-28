@@ -437,7 +437,11 @@ public:
     const uint8_t* at(Entry entry) const noexcept { return _bytes + _offset[entry]; }
 
 private:
-    static const uint16_t kFree = 0xFFFF;
+    // 32-bit, like the offsets. A 16-bit length capped a message at 64 kB
+    // (an NBIRTH of a thousand metrics is 67 kB), and the view below cut a
+    // longer one to its low 16 bits without a word: a 67,093-byte birth went
+    // out as its first 1,557 bytes and no host could read it.
+    static const uint32_t kFree = 0xFFFFFFFFu;
     uint8_t* _bytes = nullptr;
     size_t _capacity = 0;
     size_t _used = 0;
@@ -445,7 +449,7 @@ private:
     // Offsets are 32-bit: an area for a large queue, or for two messages of
     // more than 32 kB, is past what 16 bits can address.
     uint32_t* _offset = nullptr;
-    uint16_t* _length = nullptr;
+    uint32_t* _length = nullptr;
     size_t _entries = 0;
 };
 
@@ -464,7 +468,7 @@ public:
     MqttAreaBytes() noexcept = default;
     template <typename Byte>
     MqttAreaBytes(const Byte* first, const Byte* last) noexcept
-        : _view((const uint8_t*)first), _size((uint16_t)(last - first)) {
+        : _view((const uint8_t*)first), _size((uint32_t)(last - first)) {
         static_assert(sizeof(Byte) == 1, "bytes or characters");
     }
     MqttAreaBytes(const MqttAreaBytes& other) noexcept
@@ -519,7 +523,7 @@ private:
 
     MqttByteArea* _area = nullptr;
     const uint8_t* _view = nullptr;
-    uint16_t _size = 0;
+    uint32_t _size = 0;   // not 16 bits: see MqttByteArea::kFree
     MqttByteArea::Entry _entry = MqttByteArea::kNone;   // or kFailed
 };
 
