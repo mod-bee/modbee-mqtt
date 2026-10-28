@@ -3126,6 +3126,9 @@ void MqttSparkplugNode::handleState(const uint8_t* payload, size_t length) {
     _sawPrimaryHostOnline = false;
 
     advanceServer();
+    // Counted, for an owner whose connection picks the server (a shared
+    // client has no list of its own here): see serverWalks().
+    _serverWalks++;
 
     // Disconnect, then come back - on the NEXT server. Both halves are
     // required, and the second one has to be driven because an intentional

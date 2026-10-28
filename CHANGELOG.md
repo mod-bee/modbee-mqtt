@@ -178,6 +178,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **The server's edge node stayed on a server its primary host had left.** On a connection with several servers, a
+  valid offline STATE ended the node's session and the connection reconnected to the same server, where the host was
+  still offline; the Eclipse Sparkplug TCK (MultipleBrokerTest) failed it. The node now reports the walk
+  (`MqttSparkplugNode::serverWalks()`), the connection moves to the next server, and it does not probe back to the
+  first while an edge node on it follows a primary host.
 - **A connection took packets of at most 64 KiB, so the server's Sparkplug host never received a large birth.** A
   1500-metric NBIRTH (123 kB) was dropped by the other broker for this connection, and the host asked for it again for
   ever. Connections now take up to 16 MiB (`maximum_packet_size` lowers it), with buffers that start at 64 KiB and

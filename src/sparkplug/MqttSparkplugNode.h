@@ -839,6 +839,11 @@ public:
     // Packet Size (its CONNACK, at 5.0): a birth among them leaves the node
     // unborn, and lastPayloadError() says Overflow.
     uint32_t tooLargeForServer() const { return _tooLargeForServer; }
+    // Times the primary host's offline STATE made the node end its session to
+    // try the NEXT server [tck-id-operational-behavior-primary-application-
+    // state-with-multiple-servers-walk]. A node on a shared client cannot
+    // choose the server itself: the client's owner watches this and moves on.
+    uint32_t serverWalks() const { return _serverWalks; }
 
     // Births and deaths published, for a function block to show.
     uint32_t birthCount() const { return _birthCount; }
@@ -1312,6 +1317,7 @@ private:
     uint32_t _birthCount = 0;
 
     uint32_t _tooLargeForServer = 0;
+    uint32_t _serverWalks = 0;
     MqttSparkplugCommandFn _commandHandler = nullptr;
     MqttSparkplugCommandContextFn _commandContextHandler = nullptr;
     void* _commandContext = nullptr;

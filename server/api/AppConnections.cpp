@@ -419,6 +419,7 @@ struct AppConnections::EdgeNode {
     // MqttSparkplugNode::publishRecords asks) - lost with the link before then,
     // it goes again after the next birth, is_historical as before.
     std::vector<std::pair<uint64_t, Clock::time_point>> sentHistory;
+    uint32_t walksSeen = 0;      // the node's serverWalks() last acted on
     uint64_t sentUpTo = 0;
     // WHAT OUTLIVES A RESTART (AppConnections::saveEdgeState): the bdSeq last
     // used, so a node started again moves on from it rather than from zero,
@@ -573,6 +574,7 @@ struct AppConnections::Connection {
     // first is checked half as often (a load balancer that takes TCP for a
     // broker that is down would otherwise move the connection every minute).
     bool switchedBack = false;
+    bool walkOwed = false;       // its edge node left this server for its primary host: the next one
     uint32_t primaryFailures = 0;
     // Store and forward: the other broker said quota exceeded (0x97) - nothing
     // more is sent until then, and what it refused goes again.
@@ -1044,6 +1046,16 @@ void AppConnections::serviceEdgeNode(Connection& c) {
     MqttSparkplugNode& node = *e.library;
     node.epochNow((uint64_t)utcNowMs());
     node.poll();
+    // The node ended its session because its primary host went offline here:
+    // Sparkplug sends it to the NEXT server
+    // [tck-id-operational-behavior-primary-application-state-with-multiple-servers-walk],
+    // and the server is this connection's to choose. It reconnected to the
+    // same one, where the host was still offline, until the Eclipse TCK
+    // (MultipleBrokerTest) said so.
+    if (node.serverWalks() != e.walksSeen) {
+        e.walksSeen = node.serverWalks();
+        c.walkOwed = true;
+    }
     saveEdgeState(e, false);
     // A host's writes reach the application on the connection, as NCMD and
     // DCMD; the node's own queue of them is let go.
@@ -1439,8 +1451,12 @@ void AppConnections::service(Connection& c) {
             } else {
                 // Failed to connect: the next server. Lost after connecting:
                 // the same one first.
-                if (!c.reachedThisAttempt && !c.spec.servers.empty()) {
+                if ((!c.reachedThisAttempt || c.walkOwed) && !c.spec.servers.empty()) {
                     c.serverIndex = (c.serverIndex + 1) % (uint32_t)c.spec.servers.size();
+                }
+                if (c.walkOwed) {
+                    c.walkOwed = false;
+                    c.backoffMs = 1000;
                 }
                 std::chrono::milliseconds wait = jittered(c.backoffMs);
                 // Quota exceeded, connection rate exceeded: asking again soon is the problem.
@@ -1478,7 +1494,11 @@ void AppConnections::service(Connection& c) {
     }
 
     // --- Back to the first server, once it answers ---
-    if (c.serverIndex != 0 && c.spec.primaryCheckSeconds != 0) {
+    // Not while an edge node on it follows a primary host: where to be is then
+    // the host's STATE, and a server that merely answers may be one the host
+    // has left - the node would sit there unborn.
+    const bool followsHost = c.edge && !c.edge->spec.primaryHostId.empty();
+    if (c.serverIndex != 0 && c.spec.primaryCheckSeconds != 0 && !followsHost) {
         if (!c.probe && now >= c.nextProbe) {
             const AppEndpoint& first = c.endpoint(0);
             c.probe.reset(new MqttTcpTransport());
