@@ -627,6 +627,11 @@ What the host does for you:
   rest), so a lossy link gets a rebirth, not a storm of them - each answer is
   the node's largest message, on the link that is already losing messages.
   `requestRebirth()`, the application's own call, is never held.
+- **Marks what died.** An NDEATH (whose bdSeq matches) makes the node
+  offline (`offlineAt`, the host's UTC time) and every metric of it and its
+  devices `stale` (`staleAt`); a DDEATH does it to the device's metrics, at
+  the DDEATH's timestamp, and `deviceOnline(device)` turns false. The last
+  values stay readable; only a new birth makes them current again.
 - **Keeps history out of the live picture.** A metric marked `is_historical`
   reaches `onMessage()` but does not change what `read()` returns: an hour of
   replayed history must not overwrite the reading from a minute ago.

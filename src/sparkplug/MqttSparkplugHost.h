@@ -214,6 +214,16 @@ struct MqttSparkplugTrackedMetric {
     bool hasValue = false;
     uint64_t at = 0;
 
+    // STALE: the last value is still here, and no longer current. Section
+    // 12.47 (Host Application session termination): after an NDEATH a host
+    // MUST mark every metric of the NBIRTH, and every device's, as STALE
+    // "using the current Host Application's system UTC time"; after a DDEATH
+    // the device's metrics "using the timestamp in the DDEATH payload". Only
+    // a birth makes a metric current again - data from a node or device that
+    // died without a new birth is not trusted to say otherwise.
+    bool stale = false;
+    uint64_t staleAt = 0;
+
     // A span value's bytes - text, bytes, an array, a dataset, a template -
     // and `value` points here. It pointed into the host's decode buffer, which
     // the next message reuses, so read() of a String could return another
@@ -250,6 +260,14 @@ struct MqttSparkplugTrackedNode {
                                            const char* device = nullptr) const;
 
     bool online = false;
+    // When the node was marked offline by its NDEATH: the host's UTC time
+    // ([tck-id-operational-behavior-edge-node-termination-host-action-ndeath-node-offline]).
+    uint64_t offlineAt = 0;
+
+    // Whether a device of this node is online: born (it has metrics from a
+    // DBIRTH) and neither it nor its node has died since. False for a device
+    // this node never birthed.
+    bool deviceOnline(const char* device) const;
 
     // [tck-id-topics-nbirth-bdseq-matching] correlates a death with its birth.
     // The timestamp explicitly must NOT be used for this

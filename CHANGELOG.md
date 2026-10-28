@@ -178,6 +178,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug host: a death marks the device or node offline and its metrics stale.** The Eclipse Sparkplug TCK
+  (Host profile, EdgeSessionTerminationTest) failed five statements: after a DDEATH the device MUST be offline and
+  its metrics STALE at the DDEATH's timestamp, after an NDEATH the node, its devices and every metric at the host's
+  UTC time. `MqttSparkplugTrackedMetric::stale` / `staleAt`, `MqttSparkplugTrackedNode::offlineAt` and
+  `deviceOnline()`; only a birth makes a metric current again.
 - **Sparkplug: at MQTT 5.0 an intentional disconnect publishes its NDEATH first.** It sent only DISCONNECT with the
   Will reason code and left the NDEATH to the broker; the Eclipse Sparkplug TCK (SessionTerminationTest) failed it on
   [tck-id-operational-behavior-edge-node-intentional-disconnect-ndeath] - an NDEATH MUST be published before the

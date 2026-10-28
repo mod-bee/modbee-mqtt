@@ -426,6 +426,17 @@ bool MqttSparkplugHost::read(const char* group, const char* node,
     return readDevice(group, node, nullptr, name, into);
 }
 
+bool MqttSparkplugTrackedNode::deviceOnline(const char* device) const {
+    if (!online || device == nullptr || *device == '\0') return false;
+    bool any = false;
+    for (size_t m = 0; m < metricCount; m++) {
+        if (metrics[m].device != device) continue;
+        if (metrics[m].stale) return false;
+        any = true;
+    }
+    return any;
+}
+
 bool MqttSparkplugHost::readDevice(const char* group, const char* node,
                                    const char* device, const char* name,
                                    MqttSparkplugValue& into) const {
@@ -882,6 +893,9 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
         }
 
         MqttSparkplugTrackedMetric& entry = tracked.metrics[(size_t)slot];
+        // Born: current again, whatever the slot held before.
+        entry.stale = false;
+        entry.staleAt = 0;
         const bool renamed = entry.name != metric.name || entry.device != device;
         entry.name = metric.name;
         entry.alias = metric.alias;
@@ -1173,6 +1187,34 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
                 tracked.online = false;
                 tracked.hasSeq = false;
                 tracked.reordering = false;
+                // [tck-id-operational-behavior-edge-node-termination-host-action-ndeath-node-offline],
+                // -ndeath-node-tags-stale, -ndeath-devices-offline and
+                // -ndeath-devices-tags-stale: the node offline, and every
+                // metric of it and of its devices stale, at the host's own
+                // UTC time. The TCK asked; the host had only `online`.
+                const uint64_t now = hostUtcNow();
+                tracked.offlineAt = now;
+                for (size_t m = 0; m < tracked.metricCount; m++) {
+                    if (tracked.metrics[m].stale) continue;
+                    tracked.metrics[m].stale = true;
+                    tracked.metrics[m].staleAt = now;
+                }
+            }
+        } else if (parts.type == MqttSparkplugType::DDeath) {
+            // [tck-id-operational-behavior-edge-node-termination-host-action-ddeath-devices-offline]
+            // and -ddeath-devices-tags-stale: the device offline and its
+            // metrics stale, at the DDEATH's own timestamp.
+            const uint64_t at = _inbound.hasTimestamp ? _inbound.timestamp : hostUtcNow();
+            const char* wanted = deviceId != nullptr ? deviceId : "";
+            for (size_t m = 0; m < tracked.metricCount; m++) {
+                MqttSparkplugTrackedMetric& entry = tracked.metrics[m];
+                if (entry.device != wanted || entry.stale) continue;
+                entry.stale = true;
+                entry.staleAt = at;
+            }
+            if (_inbound.hasSeq) {
+                trackSequence(tracked, (uint8_t)_inbound.seq, parts.group,
+                              parts.node);
             }
         } else if (parts.type != MqttSparkplugType::DDeath && !tracked.online) {
             // DATA, OR A DEVICE BIRTH, FROM A NODE WITH NO BIRTH ON RECORD: a
