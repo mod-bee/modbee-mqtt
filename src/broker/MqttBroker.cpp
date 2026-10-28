@@ -2637,12 +2637,24 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
         MqttBrokerConnection* previous = connectionForSession(*session);
         if (previous != nullptr && previous != &connection) {
             _status.takeovers++;
-            // The Will is NOT published: this is not the client vanishing, it
-            // is the same client arriving again. [V5:MQTT-3.1.4-3] says the
-            // existing connection is closed, and the Will belongs to the
-            // session that is continuing.
-            closeConnection(*previous, MQ_REASON_SESSION_TAKEN_OVER, true, false);
+            // THE DISPLACED CONNECTION'S WILL IS OWED, as for any close the
+            // client did not ask for. [V5:3.1.4] goes on: "If the existing
+            // Client has a Will Message, that Will Message is published as
+            // described in section 3.1.2.5" - once the Will Delay has passed
+            // or the session has ended [V5:MQTT-3.1.2-8]. Scheduling it here
+            // and cancelling it on the resume below gives exactly that: a
+            // reconnect inside a Will Delay keeps the session and cancels the
+            // Will; one that starts clean, or with no delay to wait out,
+            // publishes it now. This used to discard it in every case, so a
+            // device whose dead link was only noticed when it came back never
+            // reported going away - Mosquitto, EMQX and HiveMQ all publish it.
+            closeConnection(*previous, MQ_REASON_SESSION_TAKEN_OVER, true, true);
             session = sessionFor(clientId);   // the close may have released it
+            if (session != nullptr && session->will.scheduled &&
+                (session->will.delayInterval == 0 || request.cleanStart || foreign ||
+                 session->version != connection.version)) {
+                publishWill(*session);
+            }
         }
     }
 

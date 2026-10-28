@@ -500,7 +500,7 @@ inside a tap handler does not re-enter the delivery path.
 | **No Local** | per subscription |
 | **Subscription Identifiers** | collected across matching subscriptions, delivered on one copy |
 | **QoS 0/1/2** | including exactly-once with method A |
-| **Wills** | stored at CONNECT, delayed, cancelled by a reconnect, discarded on a clean DISCONNECT, published on a reset or a keepalive timeout |
+| **Wills** | stored at CONNECT, delayed, cancelled by a reconnect, discarded on a clean DISCONNECT, published on a reset, a keepalive timeout, or a takeover - unless the new connection resumes the session inside the Will Delay |
 | **Keepalive** | closed at 1.5× the interval in force |
 | **Flow control** | both directions, with the peer's Receive Maximum honoured |
 | **Topic aliases** | inbound always, outbound on request |
