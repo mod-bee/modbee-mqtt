@@ -178,6 +178,10 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug host: birth metrics without an alias were ignored.** Aliases are optional, and Eclipse Tahu's JavaScript
+  client (and its Java one by default) never sends them; the host tracked only aliased metrics, so such a node's
+  values could not be read and `Sparkplug.Write` refused a write to one ("DATATYPE_UNKNOWN is not a scalar") - the TCK's
+  own edge node births `TCK_metric/Int32` without one. They are tracked by name now.
 - **Sparkplug host: a death marks the device or node offline and its metrics stale.** The Eclipse Sparkplug TCK
   (Host profile, EdgeSessionTerminationTest) failed five statements: after a DDEATH the device MUST be offline and
   its metrics STALE at the DDEATH's timestamp, after an NDEATH the node, its devices and every metric at the host's

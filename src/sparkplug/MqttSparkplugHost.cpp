@@ -496,6 +496,14 @@ uint32_t aliasHash(uint64_t alias) {
 // The position of a tracked metric by alias, or by name and device: by the
 // index on a host, in a line on a board (or where the index could not be
 // built). The same answer either way.
+// Where a metric sits in the alias index. One with no alias (0) is placed by
+// its name, so a birth of a thousand of them does not pile into one probe
+// chain; nothing looks one up by alias.
+uint32_t aliasSlotHash(const MqttSparkplugTrackedMetric& metric) {
+    return metric.alias != 0 ? aliasHash(metric.alias)
+                             : nameHash(metric.name.c_str(), metric.device.c_str());
+}
+
 long trackedAlias(const MqttSparkplugTrackedNode& tracked, uint64_t alias) {
 #if MQ_SP_HOST_INDEX
     if (tracked.byAlias.usable()) {
@@ -801,7 +809,7 @@ MqttSparkplugDataType MqttSparkplugTrackedNode::metricType(
 void MqttSparkplugHost::indexMetrics(MqttSparkplugTrackedNode& tracked) {
 #if MQ_SP_HOST_INDEX
     const bool aliases = tracked.byAlias.rebuild(tracked.metricCount, [&](size_t at) {
-        return aliasHash(tracked.metrics[at].alias);
+        return aliasSlotHash(tracked.metrics[at]);
     });
     const bool names = tracked.byName.rebuild(tracked.metricCount, [&](size_t at) {
         return nameHash(tracked.metrics[at].name.c_str(),
@@ -856,14 +864,23 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
     const char* device = deviceId != nullptr ? deviceId : "";
     for (size_t index = 0; index < payload.metricCount; index++) {
         const MqttSparkplugMetric& metric = payload.metrics[index];
-        if (!metric.hasAlias || metric.name == nullptr) continue;
+        // A BIRTH METRIC WITHOUT AN ALIAS IS STILL A METRIC. Aliases are
+        // optional - [tck-id-payloads-alias-birth-requirement] says only that
+        // a birth that uses one carries the name too - and Eclipse Tahu's
+        // JavaScript client never uses them, nor does its Java one unless
+        // told to. These were skipped, so such a node's metrics could not be
+        // read, and a write to one (Sparkplug.Write) was refused for want of
+        // a datatype: the Eclipse TCK's own edge node births
+        // TCK_metric/Int32 without one.
+        if (metric.name == nullptr) continue;
 
         // An alias declared twice replaces the earlier entry rather than
         // adding a second. [tck-id-payloads-alias-uniqueness] says it cannot
         // happen on a conformant node, but a host is reading someone else's
         // traffic and two entries for one alias would make which name wins
         // depend on search order.
-        long slot = trackedAlias(tracked, metric.alias);
+        long slot = metric.hasAlias ? trackedAlias(tracked, metric.alias)
+                                    : trackedName(tracked, metric.name, deviceId);
         bool added = false;
 
         // A LIMIT, OUT OF MEMORY: said (metricsRefused(), outOfMemory()), not
@@ -898,7 +915,7 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
         entry.staleAt = 0;
         const bool renamed = entry.name != metric.name || entry.device != device;
         entry.name = metric.name;
-        entry.alias = metric.alias;
+        entry.alias = metric.hasAlias ? metric.alias : 0;
         entry.type = metric.value.type;
         entry.device = device;
 #if MQ_SP_HOST_INDEX
@@ -906,7 +923,7 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
         // name into the name index (the old name's slot no longer matches).
         // Either may find the index full, and it is then built again.
         bool ok = true;
-        if (added) ok = tracked.byAlias.insert(aliasHash(metric.alias), (size_t)slot);
+        if (added) ok = tracked.byAlias.insert(aliasSlotHash(entry), (size_t)slot);
         if (ok && (added || renamed)) {
             ok = tracked.byName.insert(nameHash(metric.name, device), (size_t)slot);
         }
