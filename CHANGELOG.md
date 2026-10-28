@@ -248,6 +248,10 @@ minor version may change the API or the configuration, and says how here.
 - **Sparkplug: `Node Control/Rebirth` is born without an alias.** The Eclipse Sparkplug TCK failed the node on
   [tck-id-operational-behavior-data-commands-rebirth-name-aliases]: an NBIRTH MUST NOT give it one, so a host that never
   saw the birth can still ask for a rebirth by name. A request by the old alias (0xFFFFFFFE) is still honoured.
+- **`modbee-mqtt sub` could not show a message over 4 KiB** - a Sparkplug birth, often. Its client kept the library's
+  4 KiB receive buffer, so at 3.1.1 such a message ended the command ("packet too large") and at 5.0 the broker
+  discarded it unseen; `--maximum-packet-size` was stated to the broker without sizing the buffer. `pub`, `sub` and
+  `req` now take messages up to 1 MiB, or what `--maximum-packet-size` says.
 - **The client lost QoS 2 messages under load, silently.** With more inbound QoS 2 messages awaiting their PUBREL
   than its table holds (`MQTT_SESSION_MAX_INBOUND_QOS2`, 16) - which a broker may send, the client allowing 65,535 in
   flight - each new one was taken for a duplicate: acknowledged with a PUBREC and never delivered. 200 publishers at

@@ -137,6 +137,10 @@ plant/tank-01/level 4.25
 - A Will and MQTT 5's connect limits, on `pub`, `sub` and `req`: `--will-topic`,
   `--will-message`, `--will-qos`, `--will-retain`, `--will-delay`;
   `--receive-maximum`, `--topic-alias-maximum`, `--maximum-packet-size`.
+- **Messages up to 1 MiB** are received and shown; `--maximum-packet-size`
+  raises (or lowers) that and is what the broker is told at 5.0. A larger
+  message is discarded by the broker at 5.0; at 3.1.1, which cannot say so, it
+  ends the command with "packet too large".
 - **Binary payloads, such as Sparkplug B protobuf, print as base64** rather
   than wrecking the terminal.
 - **With `--json`, each message is one line.** Text payloads appear as

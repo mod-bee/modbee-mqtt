@@ -5,6 +5,7 @@
 
 #include "Common.h"
 
+#include <algorithm>
 #include <cstdlib>
 
 #include <csignal>
@@ -228,6 +229,17 @@ bool CliClient::configure(Args& args, const char* defaultClientIdPrefix, std::st
     connection.receiveMaximum = (uint16_t)receiveMaximum;
     connection.topicAliasMaximum = (uint16_t)aliasMaximum;
     connection.maximumPacketSize = (uint32_t)packetMaximum;
+    // THE RECEIVE BUFFER IS THE LARGEST MESSAGE THIS COMMAND CAN SHOW. The
+    // library's 4 KiB default is a board's figure; left there, `sub` could not
+    // show a Sparkplug birth of any size - at 3.1.1 the connection ended with
+    // "packet too large", at 5.0 the broker discarded it unseen. 1 MiB here
+    // (EMQX's own limit; our server's is 64 KiB), or what
+    // --maximum-packet-size asks for, which also sizes the buffer now rather
+    // than only being stated.
+    // MQTT's own ceiling is 268,435,455 bytes of remaining length plus a
+    // five-byte header; nothing larger can arrive, so nothing larger is held.
+    behaviour.receiveBufferSize = packetMaximum != 0 ? (size_t)std::min<long long>(packetMaximum, 268435460ll)
+                                                     : (size_t)1 << 20;
 
     const std::string host = args.get("host", "localhost");
     connection.host = host;
