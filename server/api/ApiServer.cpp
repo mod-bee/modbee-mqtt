@@ -895,6 +895,7 @@ public:
         reply->set_queue((uint32_t)_s.server->maxQueued());
         reply->set_queue_bytes(_s.server->maxQueuedBytes());
         reply->set_queue_bytes_total(_s.server->maxQueuedBytesTotal());
+        reply->set_connect_rate(_s.server->connectRate());
         if (_s.server->port() != 0) {
             v1::ListenerInfo* plain = reply->add_listeners();
             plain->set_kind(v1::LISTENER_PLAIN);
@@ -991,6 +992,10 @@ public:
         if (request.has_queue_bytes_total()) {
             change.setQueueBytesTotal = true;
             change.queueBytesTotal = (size_t)request.queue_bytes_total();
+        }
+        if (request.has_connect_rate()) {
+            change.setConnectRate = true;
+            change.connectRate = request.connect_rate();
         }
         std::string error;
         if (!_s.server->changeListeners(change, error)) {

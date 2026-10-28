@@ -1344,6 +1344,7 @@ void MqttBroker::releaseConnectionSlot(MqttBrokerConnection& connection) {
 
 void MqttBroker::pauseListeners(bool pause) {
     if (pause == _listenersPaused || !_eventDriven || _readiness == nullptr) return;
+    if (!pause && _acceptHeld) return;      // a slot came free, but the accept limit still holds
     for (MqttListener* listener : _listeners) {
         if (listener == nullptr || listener->waitHandle() < 0) continue;
         if (pause) _readiness->remove(listener->waitHandle());
@@ -1354,6 +1355,13 @@ void MqttBroker::pauseListeners(bool pause) {
 #endif
 
 void MqttBroker::acceptNew() {
+#if defined(MQTT_PLATFORM_HOST)
+    if (_acceptHeld) {
+        if (mq_isFuture(mq_millis(), _acceptHeldUntil)) return;
+        _acceptHeld = false;
+        pauseListeners(false);
+    }
+#endif
     for (MqttListener* listener : _listeners) {
         if (listener == nullptr || !listener->isListening()) continue;
 
@@ -1390,8 +1398,22 @@ void MqttBroker::acceptNew() {
                 return;
             }
 
+#if defined(MQTT_PLATFORM_HOST)
+            mq_time_t retryInMs = 0;
+            if (_acceptLimit != nullptr && !_acceptLimit->take(retryInMs)) {
+                _acceptHeld = true;
+                _acceptHeldUntil = mq_millis() + (retryInMs ? retryInMs : 1);
+                pauseListeners(true);
+                return;
+            }
+#endif
             MqttTransport* transport = listener->accept();
-            if (transport == nullptr) break;
+            if (transport == nullptr) {
+#if defined(MQTT_PLATFORM_HOST)
+                if (_acceptLimit != nullptr) _acceptLimit->giveBack();
+#endif
+                break;
+            }
 
             slot->recycle();
             slot->transport = transport;

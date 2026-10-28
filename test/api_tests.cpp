@@ -1280,6 +1280,15 @@ void listenersLive(Server& server) {
         ok(admin->Stats(&statsContext, v1::Empty(), &stats).ok() && stats.queued_messages() == 0,
            "Stats says what is queued now: nothing");
     }
+    for (uint32_t rate : {250u, 0u}) {
+        grpc::ClientContext context;
+        authorize(context);
+        v1::ListenersChange change;
+        change.set_connect_rate(rate);
+        v1::Listeners now;
+        ok(admin->PutListeners(&context, change, &now).ok() && now.connect_rate() == rate,
+           rate ? "connect_rate 250 a second, live, and Listeners says it" : "  and 0, no limit");
+    }
     {
         grpc::ClientContext context;
         authorize(context);

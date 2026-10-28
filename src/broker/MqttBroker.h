@@ -290,6 +290,22 @@ typedef bool (*MqttBrokerShareGateFn)(void* context, const MqttSpan& shareName,
                                       const MqttSpan& filter);
 
 #if defined(MQTT_PLATFORM_HOST)
+// HOW FAST NEW CONNECTIONS ARE TAKEN, one budget for every broker of a server.
+// Asked before each accept(): false says none may be taken yet, and in how
+// many milliseconds one may. The connections waiting stay in the kernel's
+// backlog - a client sees a slow connect, not a refusal it would back off
+// from - and the broker stops watching its listeners until then, so it does
+// not wake for them with nothing it may do.
+class MqttAcceptLimit {
+public:
+    virtual ~MqttAcceptLimit() {}
+    virtual bool take(mq_time_t& retryInMs) = 0;
+    // A taken turn that found no connection waiting.
+    virtual void giveBack() = 0;
+};
+#endif
+
+#if defined(MQTT_PLATFORM_HOST)
 // --- A session a store kept, to put back (host only) ---
 //
 // What MqttBroker::restoreSession() is handed at start-up: everything
@@ -638,6 +654,10 @@ public:
     // dropped, until it drains below it.
     void setQueueLimits(size_t messagesPerSession, size_t bytesPerSession, size_t bytesTotal);
 
+    // How fast new connections are taken (MqttAcceptLimit); null: as fast as
+    // they come. The limit is the caller's and must outlive the broker.
+    void setAcceptLimit(MqttAcceptLimit* limit) { _acceptLimit = limit; }
+
     // Stops accepting from `listener` - its socket is about to change, or go.
     // The connections it lent stay up; addListener() takes it back.
     void removeListener(MqttListener& listener);
@@ -874,6 +894,10 @@ private:
     // wake for it at once on every pass with nothing it could do.
     bool _listenersPaused = false;
     void pauseListeners(bool pause);
+    // Paused by the accept limit rather than for want of a slot, until then.
+    MqttAcceptLimit* _acceptLimit = nullptr;
+    bool _acceptHeld = false;
+    mq_time_t _acceptHeldUntil = 0;
 
     // --- One broker per core ---
     MqttBrokerEgressFn _onEgress = nullptr;

@@ -486,6 +486,13 @@ named `kafka-password`.
   (measured: a million connections in 3.6 GB). TLS done by Traefik or NPM
   costs the broker nothing extra. The compose files cap modbee at 2 GB; raise
   `mem_limit` for a fleet of more than a few hundred thousand.
+- **Reconnect storms:** when the broker restarts, or a cell tower comes back,
+  every device reconnects at once. `broker: max-connect-rate` (1000 a second by
+  default, the whole server's) takes them at that pace; the rest wait in the
+  kernel's backlog and see a slower connect, not a refusal, so none falls into
+  a long backoff, and the TLS handshakes arrive at a rate the CPU can serve.
+  Raise it on a big machine; `0` takes them as fast as they come. Changed live
+  with `modbee-mqtt listeners set --connect-rate`.
 - **Open files:** one per connection. The compose files set `nofile` to a
   million; with `docker run`, add `--ulimit nofile=1048576:1048576`.
 - **Health:** the image checks its own MQTT ports, so `docker ps` shows

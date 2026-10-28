@@ -13,6 +13,12 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **New connections a second, whole server** (`serve --max-connect-rate`, `broker: max-connect-rate`, default 1000;
+  `Admin.PutListeners` `connect_rate`, live; `0` no limit). A reconnect storm - the broker restarted, a tower back
+  after an outage, a fleet's power returning - is taken at that rate, a second's worth at once, and the rest wait in
+  the kernel's backlog: a slower connect, not a refusal a client would back off from, and TLS handshakes and session
+  restores at a pace the server can serve. One budget for every shard; the shards stop watching their listeners while
+  it is spent, so nothing spins. As EMQX's `max_conn_rate` and HiveMQ's overload protection.
 - **Cellular-grade connections, in the library.** Every address of a host name is raced (RFC 8305: families
   interleaved, 250 ms head start), so a broken IPv6 route or a dead A record costs 250 ms, not the connect timeout.
   **The last good DNS answer** for each name is used when a fresh lookup fails or takes over 1.8 s (RFC 8767) - for

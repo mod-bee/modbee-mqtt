@@ -64,6 +64,9 @@ struct BrokerSection {
     std::string clientCertificates = "required";
     size_t shards = 0;                 // 0: one per core
     long long maxConnections = 100000; // whole server
+    // New connections taken a second, whole server (ShardedBrokerConfig::
+    // connectRate); 0: no limit.
+    long long maxConnectRate = 1000;
     long long maxSessions = 0;         // 0: = maxConnections
     uint32_t maxPacket = 65536;
     size_t queue = 1000;               // messages held per session (its slots grow as a backlog needs)

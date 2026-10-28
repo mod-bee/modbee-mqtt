@@ -166,6 +166,14 @@ struct ShardedBrokerConfig {
     size_t mailboxCapacity = 65536;
     bool pinThreads = false;           // one shard per core, pinned
     ShardExtension* extension = nullptr;   // not owned; must outlive stop()
+    // NEW CONNECTIONS A SECOND, the whole server's; 0: as fast as they come.
+    // A storm - a broker restart, a tower back after an outage, a fleet's
+    // power returning - is taken at this rate, a second's worth at once, and
+    // the rest wait in the kernel's backlog: each sees a slower connect, not
+    // a refusal, so nothing falls into a long backoff and the TLS handshakes
+    // and session restores that cost the CPU arrive at a pace the server can
+    // serve. EMQX's max_conn_rate; HiveMQ's overload protection.
+    uint32_t connectRate = 0;
 };
 
 struct ShardedBrokerStatus {
@@ -233,6 +241,8 @@ public:
         // session together (the whole server's). Bytes 0: no cap.
         bool setQueue = false, setQueueBytes = false, setQueueBytesTotal = false;
         size_t queue = 0, queueBytes = 0, queueBytesTotal = 0;
+        bool setConnectRate = false;
+        uint32_t connectRate = 0;       // new connections a second; 0: no limit
     };
     // All of it, or - false, with `error` - none of it: a port that is taken,
     // material that will not load, more connections than there is room for.
@@ -247,6 +257,7 @@ public:
     size_t maxQueued() const { return _maxQueued; }                   // messages, per session
     size_t maxQueuedBytes() const { return _maxQueuedBytes; }         // per session; 0: no cap
     size_t maxQueuedBytesTotal() const { return _maxQueuedBytesTotal; }   // the whole server's; 0: no cap
+    uint32_t connectRate() const;                                      // new connections a second; 0: no limit
 
     // Each shard's share of `total` connections (or sessions): a quarter more
     // than an even share, since the hash spreads them evenly on average, not
@@ -258,10 +269,12 @@ public:
 
     struct Shard;
     struct ShareRegistry;
+    struct ConnectRate;
 
 private:
     friend struct Shard;
     std::unique_ptr<ShareRegistry> _shares;
+    std::unique_ptr<ConnectRate> _connectRate;      // every shard's accept limit
     std::vector<std::unique_ptr<Shard>> _shards;
     std::string _address;
     std::atomic<uint16_t> _port{0};

@@ -219,7 +219,10 @@ modbee-mqtt serve --data /var/lib/app/broker --api unix:/run/app/broker.sock --a
   2000 by default), `--events` turns client events on, `--sparkplug-aware`
   keeps every Sparkplug birth on `$sparkplug/certificates/...`
   ([app-api.md](app-api.md#sparkplug-b)), `--queue`, `--queue-bytes` and
-  `--queue-bytes-total` cap what sessions hold. **`--set path=value`** sets
+  `--queue-bytes-total` cap what sessions hold, `--max-connect-rate` how many
+  new connections it takes a second (1000; `0` no limit - a reconnect storm
+  past it waits in the kernel's backlog, a slower connect rather than a
+  refusal). **`--set path=value`** sets
   any other setting by its place in `modbee.yaml` - `--set
   broker.max-keepalive=60`, `--set authentication.max-sessions-per-login=4` -
   checked as the file is, and refused with the reason if it is not a setting
@@ -301,7 +304,7 @@ contract's field names.
 export MODBEE_API=unix:/run/modbee-mqtt/api.sock      # what serve --api was given
 export MODBEE_API_TOKEN_FILE=/etc/modbee-mqtt/api-token
 modbee-mqtt sessions list --client-id-prefix pump-
-modbee-mqtt listeners set --port 1884 --max-packet 131072 --queue 256 --queue-bytes-total 268435456
+modbee-mqtt listeners set --port 1884 --max-packet 131072 --queue 256 --queue-bytes-total 268435456 --connect-rate 2000
 modbee-mqtt tls set --certificate-pem @server.crt --key-pem @server.key
 modbee-mqtt connections put --id cloud --servers '{"host":"broker.example.com","port":8883}' --tls.enabled --client-id gw-1
 modbee-mqtt messages publish --message.topic plant/cmd --message.payload start --confirm delivered

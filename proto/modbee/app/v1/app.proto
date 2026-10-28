@@ -1284,6 +1284,9 @@ message ListenersChange {
   optional uint32 queue = 6;             // messages per session, 1 to 1000000
   optional uint64 queue_bytes = 7;       // bytes per session; 0: no cap
   optional uint64 queue_bytes_total = 8; // bytes in every session together, the whole server's; 0: no cap
+  // New connections taken a second, the whole server's, as `serve --max-connect-rate`; 0: no limit. Past it the
+  // rest wait in the kernel's backlog - a slower connect, not a refusal.
+  optional uint32 connect_rate = 9;
 }
 message Listeners {
   repeated ListenerInfo listeners = 1;
@@ -1293,6 +1296,7 @@ message Listeners {
   uint32 queue = 5;
   uint64 queue_bytes = 6;
   uint64 queue_bytes_total = 7;
+  uint32 connect_rate = 8;             // new connections a second; 0: no limit
 }
 message ListenerInfo {
   Listener kind = 1;

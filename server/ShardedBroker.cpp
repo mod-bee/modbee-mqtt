@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -831,12 +833,51 @@ void ShardedBroker::run(Shard& shard) {
     }
 }
 
-ShardedBroker::ShardedBroker() {}
+// One bucket every shard draws from: `perSecond` tokens a second, holding a
+// second's worth, so a storm starts at once and then goes at the rate.
+struct ShardedBroker::ConnectRate : MqttAcceptLimit {
+    std::mutex lock;
+    std::atomic<uint32_t> perSecond{0};
+    double tokens = 0;
+    std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+
+    void set(uint32_t rate) {
+        std::lock_guard<std::mutex> guard(lock);
+        perSecond = rate;
+        tokens = rate;
+        at = std::chrono::steady_clock::now();
+    }
+    bool take(mq_time_t& retryInMs) override {
+        if (perSecond.load(std::memory_order_relaxed) == 0) return true;
+        std::lock_guard<std::mutex> guard(lock);
+        const double rate = perSecond.load(std::memory_order_relaxed);
+        if (rate == 0) return true;
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        tokens = std::min(rate, tokens + std::chrono::duration<double>(now - at).count() * rate);
+        at = now;
+        if (tokens >= 1) {
+            tokens -= 1;
+            return true;
+        }
+        retryInMs = (mq_time_t)std::ceil((1 - tokens) * 1000.0 / rate);
+        return false;
+    }
+    void giveBack() override {
+        std::lock_guard<std::mutex> guard(lock);
+        const double rate = perSecond.load(std::memory_order_relaxed);
+        if (rate != 0) tokens = std::min(rate, tokens + 1);
+    }
+};
+
+ShardedBroker::ShardedBroker() : _connectRate(new ConnectRate()) {}
+
+uint32_t ShardedBroker::connectRate() const { return _connectRate->perSecond.load(); }
 
 ShardedBroker::~ShardedBroker() { stop(); }
 
 bool ShardedBroker::start(const ShardedBrokerConfig& config) {
     if (_running) return false;
+    _connectRate->set(config.connectRate);
     size_t count = config.shards;
     if (count == 0) count = std::thread::hardware_concurrency();
     if (count == 0) count = 1;
@@ -972,6 +1013,7 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
 #endif
 
         s.broker.begin(s.config);
+        s.broker.setAcceptLimit(_connectRate.get());
         if (config.plain && listens) s.broker.addListener(s.listener);
 #if MQTT_TLS_SOCKETS
         if (config.tls.enabled && listens) s.broker.addListener(s.tlsListener);
@@ -1296,6 +1338,7 @@ bool ShardedBroker::changeListeners(const ListenerChange& change, std::string& e
     if (change.setQueue) _maxQueued = change.queue;
     if (change.setQueueBytes) _maxQueuedBytes = change.queueBytes;
     if (change.setQueueBytesTotal) _maxQueuedBytesTotal = change.queueBytesTotal;
+    if (change.setConnectRate) _connectRate->set(change.connectRate);
     return true;
 }
 
