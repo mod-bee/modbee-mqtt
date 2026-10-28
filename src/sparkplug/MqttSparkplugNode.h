@@ -1296,7 +1296,6 @@ private:
     bool _replayOwed = false;       // the held entries go after this birth
     size_t _replayOwedCount = 0;    // ... this many, at the front of the ring
     mq_time_t _replayOwedAt = 0;
-    bool _leaving = false;          // this end of the session is ours
     uint32_t _replayedCount = 0;
     uint32_t _replayLost = 0;
 

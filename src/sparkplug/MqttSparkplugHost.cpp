@@ -1070,10 +1070,10 @@ bool MqttSparkplugHost::decodeInbound(const uint8_t* data, size_t length) {
         // a million of them.
         const size_t most =
             (_metricLimit > MQ_SP_MAX_METRICS ? _metricLimit : MQ_SP_MAX_METRICS) + 64;
-        const bool small = metrics <= MQ_SP_MAX_METRICS && names <= MQ_SP_NAME_BYTES;
+        const bool fitsDefault = metrics <= MQ_SP_MAX_METRICS && names <= MQ_SP_NAME_BYTES;
         const bool grown = _inbound.capacity() > MQ_SP_MAX_METRICS ||
                            _inbound.nameCapacity() > MQ_SP_NAME_BYTES;
-        if (grown && small) {
+        if (grown && fitsDefault) {
             // Given back once the large messages have stopped, not after the
             // first small one: a node whose births are large and whose data is
             // small would otherwise reallocate on every birth.
@@ -1081,7 +1081,7 @@ bool MqttSparkplugHost::decodeInbound(const uint8_t* data, size_t length) {
                 _smallInARow = 0;
                 _inbound.resize(MQ_SP_MAX_METRICS, MQ_SP_NAME_BYTES);
             }
-        } else if (!small) {
+        } else if (!fitsDefault) {
             _smallInARow = 0;
         }
         if (metrics > most) {

@@ -425,7 +425,6 @@ int cmdServe(int argc, char** argv) {
     // mappings start from kafka.json in the state directory, when the API has
     // changed them before, and otherwise from the file.
     ShardExtensionChain extensions;
-    const bool wantsKafka = !file.toKafka.empty() || !file.fromKafka.empty();
     std::string retainedCluster;
     if (file.retained.store == RetainedStore::Kafka) {
         retainedCluster = file.retained.cluster;
@@ -444,6 +443,7 @@ int cmdServe(int argc, char** argv) {
     kafka.attach(pipe.get());
     extensions.add(pipe.get());
 #else
+    const bool wantsKafka = !file.toKafka.empty() || !file.fromKafka.empty();
     if (wantsKafka || file.retained.store == RetainedStore::Kafka) {
         std::fprintf(stderr, "modbee-mqtt serve: the file uses Kafka, but this build has no "
                              "Kafka support (librdkafka was not found when it was built)\n");
@@ -597,6 +597,9 @@ int cmdServe(int argc, char** argv) {
         admin.reset(new AppAdmin());
         extensions.add(admin.get());
     }
+#endif
+#if !defined(MODBEE_HAVE_APP_API)
+    (void)internalLogin; // only the Application API's connections log in with it
 #endif
     if (!extensions.empty()) config.extension = &extensions;
 

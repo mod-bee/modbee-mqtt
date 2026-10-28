@@ -47,18 +47,19 @@
 
 namespace {
 
-const ApiCommand* findCommand(const std::string& noun, const std::string& verb) {
-    for (size_t i = 0; i < kApiCommandCount; i++) {
-        if (noun == kApiCommands[i].noun && verb == kApiCommands[i].verb) return &kApiCommands[i];
-    }
-    return nullptr;
-}
-
 bool isNoun(const std::string& noun) {
     for (size_t i = 0; i < kApiCommandCount; i++) {
         if (noun == kApiCommands[i].noun) return true;
     }
     return false;
+}
+
+#if defined(MODBEE_HAVE_APP_API)
+const ApiCommand* findCommand(const std::string& noun, const std::string& verb) {
+    for (size_t i = 0; i < kApiCommandCount; i++) {
+        if (noun == kApiCommands[i].noun && verb == kApiCommands[i].verb) return &kApiCommands[i];
+    }
+    return nullptr;
 }
 
 void nounHelp(const std::string& noun) {
@@ -72,6 +73,7 @@ void nounHelp(const std::string& noun) {
     std::printf("\n`modbee-mqtt %s%s --help` lists a command's fields.\n", noun.c_str(),
                 findCommand(noun, "") ? "" : " <verb>");
 }
+#endif
 
 } // namespace
 
