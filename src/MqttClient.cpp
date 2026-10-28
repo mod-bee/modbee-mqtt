@@ -433,8 +433,21 @@ void MqttClient::sendConnect() {
             MQ_PROPERTIES(packet, connect).topicAliasMaximum = aliases;
             MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_TOPIC_ALIAS_MAXIMUM);
         }
-        if (_connection.maximumPacketSize != 0) {
-            MQ_PROPERTIES(packet, connect).maximumPacketSize = _connection.maximumPacketSize;
+        // NEVER MORE THAN THE RECEIVE BUFFER HOLDS. A packet larger than it
+        // cannot be assembled, and the connection ends with 0x95 when one
+        // arrives. Offering nothing (the default) or more than the buffer
+        // invited the broker to send exactly that - and a retained message, or
+        // one queued in a session, comes again on every connect, so a small
+        // device met it each time and never stayed up. Stated, the broker
+        // discards what is too big for this client [V5:MQTT-3.1.2-25] and the
+        // connection lives.
+        uint32_t packetMaximum = _connection.maximumPacketSize;
+        if (_behaviour.receiveBufferSize < 0xFFFFFFFFu &&
+            (packetMaximum == 0 || packetMaximum > _behaviour.receiveBufferSize)) {
+            packetMaximum = (uint32_t)_behaviour.receiveBufferSize;
+        }
+        if (packetMaximum != 0) {
+            MQ_PROPERTIES(packet, connect).maximumPacketSize = packetMaximum;
             MQ_PROPERTIES(packet, connect).markPresent(MQ_PROP_MAXIMUM_PACKET_SIZE);
         }
     }

@@ -842,10 +842,18 @@ bool     hasSessionExpiry      = false;
 
 uint16_t receiveMaximum     = 0;        // 0 leaves the default of 65,535
 uint16_t topicAliasMaximum  = 0;        // how many aliases WE will accept, up to MQTT_MAX_ALIASES (8)
-uint32_t maximumPacketSize  = 0;        // 0 states no limit
+uint32_t maximumPacketSize  = 0;        // 0: receiveBufferSize; never more than it
 
 MqttWillConfig will;
 ```
+
+**Maximum Packet Size is the receive buffer.** At 5.0 the client tells the
+broker the largest packet it takes: `receiveBufferSize`, or `maximumPacketSize`
+if that is smaller. A message too big for it is then discarded by the broker
+for this client [V5:MQTT-3.1.2-25] instead of being sent and ending the
+connection with `0x95` - which, for a retained message or one queued in a
+session, happened again on every connect. At 3.1.1 nothing can be stated, so
+size `receiveBufferSize` for the largest message the client subscribes to.
 
 **On `cleanStart` and sessions.** At 3.1.1, Clean Session 0 keeps the session
 indefinitely. At 5.0, Clean Start 0 **without** a Session Expiry Interval means

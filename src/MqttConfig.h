@@ -156,7 +156,7 @@ struct MqttConnectionConfig {
     // MqttCapabilities, from the peer's answer.
     uint16_t receiveMaximum = 0;         // 0 leaves the default of 65535
     uint16_t topicAliasMaximum = 0;
-    uint32_t maximumPacketSize = 0;      // 0 states no limit
+    uint32_t maximumPacketSize = 0;      // 0: the receive buffer's size (MqttClientConfig); never more than it
 
     MqttWillConfig will;
 
@@ -176,8 +176,10 @@ struct MqttClientConfig {
     size_t queueCapacity = MQTT_QUEUE_CAPACITY;
 
     // The largest packet we will assemble on receive, and the buffer we encode
-    // into. A packet larger than this cannot be received at all, so it is also
-    // what should be offered as our Maximum Packet Size.
+    // into. A packet larger than this cannot be received at all, so at 5.0 it
+    // is offered as our Maximum Packet Size (or a smaller one asked for in
+    // MqttConnectionConfig::maximumPacketSize), and the broker discards what
+    // would not fit rather than sending it to end the connection.
     size_t receiveBufferSize = 4096;
     size_t transmitBufferSize = 4096;
     // Non-zero: both buffers START this small and grow towards the sizes above

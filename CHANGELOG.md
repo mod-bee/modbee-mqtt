@@ -248,6 +248,11 @@ minor version may change the API or the configuration, and says how here.
 - **Sparkplug: `Node Control/Rebirth` is born without an alias.** The Eclipse Sparkplug TCK failed the node on
   [tck-id-operational-behavior-data-commands-rebirth-name-aliases]: an NBIRTH MUST NOT give it one, so a host that never
   saw the birth can still ask for a rebirth by name. A request by the old alias (0xFFFFFFFE) is still honoured.
+- **A client with a small receive buffer could be shut out by one large message.** At MQTT 5 the client left Maximum
+  Packet Size out of CONNECT unless told one, while its receive buffer (4 KiB by default) is a hard limit: a larger
+  PUBLISH ended the connection with `0x95`, and a retained message, or one queued in its session, came again on
+  every connect - a device that never stayed up. The client now states its receive buffer as its Maximum Packet
+  Size (or `MqttConnectionConfig::maximumPacketSize` if smaller), and the broker discards what is too big for it.
 - **A connection displaced by a takeover never had its Will published.** A second CONNECT with the same Client
   Identifier closed the first and discarded its Will, so a device whose dead link the broker only noticed when it came
   back never reported going away. [V5:3.1.4] says the Will is published as for any other close: now it is, unless the
