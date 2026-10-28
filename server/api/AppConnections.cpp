@@ -489,6 +489,14 @@ std::string templateRefOf(const MqttSparkplugValue& value) {
     return std::string((const char*)ref, length);
 }
 
+// A Sparkplug host's or edge node's Will (STATE offline, NDEATH) is put on the
+// connection, which ends its session to take it - and a connection that
+// reconnects only when asked then waited for ever, born never, saying nothing.
+std::string whenAskedRefusal(const AppConnectionSpec& connection, const char* what) {
+    return "the connection \"" + connection.id + "\" reconnects only when asked: a Sparkplug " + what +
+           " puts its Will on it, which needs a connection that reconnects by itself";
+}
+
 // An edge node's file in the state directory: its id hashed (FNV-1a), since an
 // edge node's id may hold what a file name may not. The id is in the file too,
 // and checked.
@@ -1600,6 +1608,22 @@ bool AppConnections::put(const AppConnectionSpec& spec, AppConnectionInfo* info,
                 return;
             }
         }
+        if (spec.reconnectWhenAsked) {
+            for (const auto& h : _hosts) {
+                if (h.second.connection == spec.id) {
+                    error = whenAskedRefusal(spec, "host") + " (\"" + h.first + "\" runs on it)";
+                    ok = false;
+                    return;
+                }
+            }
+            for (const auto& e : _edgeNodes) {
+                if (e.second.connection == spec.id) {
+                    error = whenAskedRefusal(spec, "edge node") + " (\"" + e.first + "\" runs on it)";
+                    ok = false;
+                    return;
+                }
+            }
+        }
         for (const auto& one : _connections) {
             const AppConnectionSpec& other = one.second->spec;
             if (other.kafka && other.link.stateConnection == spec.id && one.first != spec.id &&
@@ -1940,6 +1964,12 @@ bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostI
     }
     bool ok = true;
     call([&] {
+        auto on = _connections.find(spec.connection);
+        if (on != _connections.end() && on->second->spec.reconnectWhenAsked) {
+            error = whenAskedRefusal(on->second->spec, "host");
+            ok = false;
+            return;
+        }
         for (const auto& one : _hosts) {
             if (one.first != spec.id && one.second.connection == spec.connection) {
                 error = "the connection \"" + spec.connection + "\" has a host already: \"" + one.first + "\"";
@@ -2222,6 +2252,12 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
     }
     bool ok = true;
     call([&] {
+        auto on = _connections.find(spec.connection);
+        if (on != _connections.end() && on->second->spec.reconnectWhenAsked) {
+            error = whenAskedRefusal(on->second->spec, "edge node");
+            ok = false;
+            return;
+        }
         for (const auto& one : _hosts) {
             if (one.second.connection == spec.connection) {
                 error = "the connection \"" + spec.connection + "\" has a host on it: one Will each";

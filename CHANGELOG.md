@@ -178,6 +178,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **A Sparkplug edge node or host put on a connection that reconnects only when asked never birthed, and said
+  nothing**: putting its Will on the connection ends the session, and that connection waited to be asked. Refused
+  now, saying why - and such a connection is not changed to reconnect only when asked while one runs on it.
 - **Sparkplug host: after a broker restart, nodes stayed "online" after they died.** Nodes that reconnected before
   the host did birthed unseen; their data read as duplicates and their NDEATH, with a bdSeq the host never saw born, was
   not believed - 157 of 500 nodes in a load test. A primary `MqttSparkplugHost` whose session returns now forgets each
