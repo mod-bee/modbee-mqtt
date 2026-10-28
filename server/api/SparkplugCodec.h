@@ -31,6 +31,11 @@ namespace sparkplug_codec {
 // A spBv1.0/... topic (STATE included), or not one.
 bool isSparkplugTopic(const std::string& topic);
 
+// Text from a Sparkplug payload made fit for a proto3 string: an invalid UTF-8
+// sequence becomes U+FFFD. A proto2 string is not checked, a proto3 one must be,
+// or the whole reply cannot be sent.
+std::string utf8(const std::string& in);
+
 // The topic and its payload, read. False - with `out.error` saying why, and
 // what the topic said still filled in - when either cannot be. `names`: what a
 // host knew of the aliases (data carries neither name nor, usually, datatype),

@@ -178,6 +178,10 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **One node with a non-UTF-8 metric name broke `Sparkplug.ListNodes` for every node.** Sparkplug strings are proto2
+  strings, never checked; the API's are proto3 and must be UTF-8, so the reply could not be sent ("No message
+  returned") for as long as that node was known. Names, devices and text values in it now have invalid sequences
+  replaced with U+FFFD, as `Consume` and `Sparkplug.Decode` already did.
 - **The server's edge node stayed on a server its primary host had left.** On a connection with several servers, a
   valid offline STATE ended the node's session and the connection reconnected to the same server, where the host was
   still offline; the Eclipse Sparkplug TCK (MultipleBrokerTest) failed it. The node now reports the walk

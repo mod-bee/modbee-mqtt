@@ -739,6 +739,8 @@ bool encode(const v1::SparkplugPayload& payload, bool compress, std::string& out
 
 namespace sparkplug_codec {
 
+std::string utf8(const std::string& in) { return text(in); }
+
 bool encodeTemplate(const v1::SparkplugTemplate& value, std::string& out, std::string& error) {
     wire::Payload::Template w;
     if (!templateFor(value, w, error)) return false;

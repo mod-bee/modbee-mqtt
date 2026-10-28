@@ -2631,13 +2631,16 @@ public:
             out->set_messages(n.messages);
             out->set_gaps(n.gaps);
             out->set_rebirths_requested(n.rebirthsRequested);
-            for (const std::string& d : n.devices) out->add_devices(d);
-            for (const std::string& d : n.devicesOnline) out->add_devices_online(d);
+            for (const std::string& d : n.devices) out->add_devices(sparkplug_codec::utf8(d));
+            for (const std::string& d : n.devicesOnline) out->add_devices_online(sparkplug_codec::utf8(d));
             out->set_offline_at(n.offlineAt);
             for (const AppSparkplugMetricInfo& m : n.metrics) {
                 v1::SparkplugNodeMetric* metric = out->add_metrics();
-                metric->set_name(m.name);
-                metric->set_device(m.device);
+                // A name or a text value is what a node sent: a proto2 string, never checked to be
+                // UTF-8. One that was not made the whole ListNodes reply unsendable ("No message
+                // returned"), for every node, as long as that node was known.
+                metric->set_name(sparkplug_codec::utf8(m.name));
+                metric->set_device(sparkplug_codec::utf8(m.device));
                 if (m.hasAlias) metric->set_alias(m.alias);
                 metric->set_datatype((v1::SparkplugDataType)m.datatype);
                 metric->set_timestamp(m.at);
@@ -2656,7 +2659,7 @@ public:
                     std::string why;
                     switch (m.datatype) {
                     case v1::DATATYPE_STRING: case v1::DATATYPE_TEXT: case v1::DATATYPE_UUID:
-                        value->set_string_value(m.bytes);
+                        value->set_string_value(sparkplug_codec::utf8(m.bytes));
                         break;
                     case v1::DATATYPE_BYTES: case v1::DATATYPE_FILE:
                         value->set_bytes_value(m.bytes);
