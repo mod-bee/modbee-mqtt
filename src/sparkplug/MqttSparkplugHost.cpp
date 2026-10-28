@@ -368,6 +368,27 @@ void MqttSparkplugHost::sessionEstablished(bool sessionPresent) {
     // Application MUST publish is a Birth Certificate - which is published
     // after the subscriptions above, so nothing is missed between the two.
     publishBirth();
+
+    // A SESSION AFTER ONE THAT ENDED: what happened while this host was away
+    // is not known. A broker restart drops every client at once; nodes that
+    // reconnected before this host subscribed again birthed (with the next
+    // bdSeq) unseen, so their data read as duplicates of the old session's
+    // sequence numbers and - worse - their eventual NDEATH, carrying a bdSeq
+    // this host never saw born, was not believed: 157 of 500 nodes in a load
+    // test stayed "online" after every one had died. So each node it knows
+    // is no longer taken to be online - not known to be, until it births -
+    // its sequence is forgotten, and it is asked to birth again, as the
+    // server's host already does. A request the client could not queue (five
+    // hundred at once) is made again on that node's next message, which is
+    // what "data from a node with no birth" already does.
+    for (size_t index = 0; index < _nodeCount; index++) {
+        MqttSparkplugTrackedNode& tracked = _nodes[index];
+        tracked.online = false;
+        tracked.hasSeq = false;
+        tracked.reordering = false;
+        tracked.rebirthAsked = false;
+        askRebirth(tracked, tracked.group.c_str(), tracked.node.c_str());
+    }
 }
 
 bool MqttSparkplugHost::publishBirth() {

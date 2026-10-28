@@ -178,6 +178,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug host: after a broker restart, nodes stayed "online" after they died.** Nodes that reconnected before
+  the host did birthed unseen; their data read as duplicates and their NDEATH, with a bdSeq the host never saw born, was
+  not believed - 157 of 500 nodes in a load test. A primary `MqttSparkplugHost` whose session returns now forgets each
+  node's sequence, no longer takes it to be online until it births, and asks it to birth again - on its next message if
+  the request could not be queued at once - as the server's host already did.
 - **Application API: `Sparkplug.Write` to a metric the birth gave no alias went by alias 0.** A birth may alias some
   metrics and not others (the Eclipse TCK's edge node does); the server took "any alias" to mean "all", so the NCMD
   carried alias 0 and no name. The host now keeps, per metric, whether it had an alias, and such a write goes by name.

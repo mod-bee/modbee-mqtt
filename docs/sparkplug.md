@@ -622,6 +622,9 @@ What the host does for you:
   rebirth - and so does a payload it cannot decode from a node it tracks, and
   data from a node whose birth it never saw (a host started after the node, as
   Ignition does).
+- **Asks again after its own outage.** When its session returns (a broker
+  restart, a lost link), a primary host asks every node it knows to birth
+  again: what happened while it was away is not known.
 - **Asks once, not on every message.** Those requests are held to one per node
   every `rebirthHoldoff()` (5 seconds by default; `rebirthsHeld` counts the
   rest), so a lossy link gets a rebirth, not a storm of them - each answer is
