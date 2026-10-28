@@ -39,11 +39,11 @@ std::string commandWords(const ApiCommand& c) {
 } // namespace
 
 int main() {
-    namespace pb = google::protobuf;
-    const pb::FileDescriptor* file = modbee::app::v1::HelloRequest::descriptor()->file();
+    namespace gpb = google::protobuf;
+    const gpb::FileDescriptor* file = modbee::app::v1::HelloRequest::descriptor()->file();
     std::set<std::string> calls;
     for (int s = 0; s < file->service_count(); s++) {
-        const pb::ServiceDescriptor* service = file->service(s);
+        const gpb::ServiceDescriptor* service = file->service(s);
         for (int m = 0; m < service->method_count(); m++) calls.insert(service->name() + "." + service->method(m)->name());
     }
 

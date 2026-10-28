@@ -92,7 +92,7 @@ int cmdApi(int argc, char** argv) {
 
 namespace {
 
-namespace pb = google::protobuf;
+namespace gpb = google::protobuf;
 namespace v1 = modbee::app::v1;
 
 std::string snake(const std::string& kebab) {
@@ -132,31 +132,31 @@ bool valueOf(const std::string& given, std::string& out, std::string& error) {
     return true;
 }
 
-const char* typeName(const pb::FieldDescriptor* f) {
+const char* typeName(const gpb::FieldDescriptor* f) {
     if (f->is_map()) return "key=value";
     switch (f->cpp_type()) {
-    case pb::FieldDescriptor::CPPTYPE_STRING: return f->type() == pb::FieldDescriptor::TYPE_BYTES ? "bytes" : "text";
-    case pb::FieldDescriptor::CPPTYPE_BOOL: return "";
-    case pb::FieldDescriptor::CPPTYPE_ENUM: return "name";
-    case pb::FieldDescriptor::CPPTYPE_MESSAGE: return "JSON";
-    case pb::FieldDescriptor::CPPTYPE_DOUBLE:
-    case pb::FieldDescriptor::CPPTYPE_FLOAT: return "number";
+    case gpb::FieldDescriptor::CPPTYPE_STRING: return f->type() == gpb::FieldDescriptor::TYPE_BYTES ? "bytes" : "text";
+    case gpb::FieldDescriptor::CPPTYPE_BOOL: return "";
+    case gpb::FieldDescriptor::CPPTYPE_ENUM: return "name";
+    case gpb::FieldDescriptor::CPPTYPE_MESSAGE: return "JSON";
+    case gpb::FieldDescriptor::CPPTYPE_DOUBLE:
+    case gpb::FieldDescriptor::CPPTYPE_FLOAT: return "number";
     default: return "integer";
     }
 }
 
 // Every flag a request takes: a field, or a field inside a singular message.
-void fieldHelp(const pb::Descriptor* d, const std::string& prefix, int depth) {
+void fieldHelp(const gpb::Descriptor* d, const std::string& prefix, int depth) {
     for (int i = 0; i < d->field_count(); i++) {
-        const pb::FieldDescriptor* f = d->field(i);
+        const gpb::FieldDescriptor* f = d->field(i);
         const std::string name = prefix + kebab(f->name());
-        const bool inside = f->cpp_type() == pb::FieldDescriptor::CPPTYPE_MESSAGE && !f->is_repeated() && depth < 3;
+        const bool inside = f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_MESSAGE && !f->is_repeated() && depth < 3;
         std::string line = "  --" + name;
         if (typeName(f)[0]) line += std::string(" ") + typeName(f);
         if (f->is_repeated()) line += f->is_map() ? "   (repeat for more)" : "   (repeat for each)";
-        if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_ENUM) {
+        if (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_ENUM) {
             line += "   ";
-            const pb::EnumDescriptor* e = f->enum_type();
+            const gpb::EnumDescriptor* e = f->enum_type();
             for (int v = 0; v < e->value_count(); v++) line += (v ? " | " : "") + e->value(v)->name();
         }
         if (inside) line += "   (or --" + name + ".<field>)";
@@ -166,18 +166,18 @@ void fieldHelp(const pb::Descriptor* d, const std::string& prefix, int depth) {
 }
 
 // The field a flag names, through singular messages; null, with `error`, for none.
-const pb::FieldDescriptor* resolve(const pb::Descriptor* d, const std::string& path, std::string& error) {
+const gpb::FieldDescriptor* resolve(const gpb::Descriptor* d, const std::string& path, std::string& error) {
     const size_t dot = path.find('.');
     const std::string head = snake(path.substr(0, dot));
-    const pb::FieldDescriptor* f = d->FindFieldByName(head);
+    const gpb::FieldDescriptor* f = d->FindFieldByName(head);
     if (f == nullptr) {
         error = "no field \"" + kebab(head) + "\" in " + d->name();
         return nullptr;
     }
     if (dot == std::string::npos) return f;
-    if (f->cpp_type() != pb::FieldDescriptor::CPPTYPE_MESSAGE || f->is_repeated()) {
+    if (f->cpp_type() != gpb::FieldDescriptor::CPPTYPE_MESSAGE || f->is_repeated()) {
         error = "--" + path.substr(0, dot) + " has no fields of its own to name" +
-                (f->is_repeated() && f->cpp_type() == pb::FieldDescriptor::CPPTYPE_MESSAGE
+                (f->is_repeated() && f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_MESSAGE
                      ? ": give each as JSON, --" + path.substr(0, dot) + " '{...}'"
                      : "");
         return nullptr;
@@ -185,7 +185,7 @@ const pb::FieldDescriptor* resolve(const pb::Descriptor* d, const std::string& p
     return resolve(f->message_type(), path.substr(dot + 1), error);
 }
 
-bool enumValue(const pb::EnumDescriptor* e, const std::string& given, int& out) {
+bool enumValue(const gpb::EnumDescriptor* e, const std::string& given, int& out) {
     std::string upper = snake(given);
     for (char& c : upper) c = (char)std::toupper((unsigned char)c);
     for (int i = 0; i < e->value_count(); i++) {
@@ -206,55 +206,55 @@ bool enumValue(const pb::EnumDescriptor* e, const std::string& given, int& out) 
     return false;
 }
 
-bool setScalar(pb::Message& m, const pb::FieldDescriptor* f, const std::string& given, std::string& error) {
-    const pb::Reflection* r = m.GetReflection();
+bool setScalar(gpb::Message& m, const gpb::FieldDescriptor* f, const std::string& given, std::string& error) {
+    const gpb::Reflection* r = m.GetReflection();
     const bool many = f->is_repeated();
     std::string text;
     char* end = nullptr;
     switch (f->cpp_type()) {
-    case pb::FieldDescriptor::CPPTYPE_STRING:
+    case gpb::FieldDescriptor::CPPTYPE_STRING:
         if (!valueOf(given, text, error)) return false;
         many ? r->AddString(&m, f, text) : r->SetString(&m, f, text);
         return true;
-    case pb::FieldDescriptor::CPPTYPE_BOOL: {
+    case gpb::FieldDescriptor::CPPTYPE_BOOL: {
         const bool yes = given == "true" || given == "1" || given == "yes";
         if (!yes && given != "false" && given != "0" && given != "no") break;
         many ? r->AddBool(&m, f, yes) : r->SetBool(&m, f, yes);
         return true;
     }
-    case pb::FieldDescriptor::CPPTYPE_ENUM: {
+    case gpb::FieldDescriptor::CPPTYPE_ENUM: {
         int value = 0;
         if (!enumValue(f->enum_type(), given, value)) break;
         many ? r->AddEnumValue(&m, f, value) : r->SetEnumValue(&m, f, value);
         return true;
     }
-    case pb::FieldDescriptor::CPPTYPE_INT32:
-    case pb::FieldDescriptor::CPPTYPE_INT64: {
+    case gpb::FieldDescriptor::CPPTYPE_INT32:
+    case gpb::FieldDescriptor::CPPTYPE_INT64: {
         const long long n = std::strtoll(given.c_str(), &end, 10);
         if (given.empty() || *end != '\0') break;
-        if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_INT32) {
+        if (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_INT32) {
             many ? r->AddInt32(&m, f, (int32_t)n) : r->SetInt32(&m, f, (int32_t)n);
         } else {
             many ? r->AddInt64(&m, f, (int64_t)n) : r->SetInt64(&m, f, (int64_t)n);
         }
         return true;
     }
-    case pb::FieldDescriptor::CPPTYPE_UINT32:
-    case pb::FieldDescriptor::CPPTYPE_UINT64: {
+    case gpb::FieldDescriptor::CPPTYPE_UINT32:
+    case gpb::FieldDescriptor::CPPTYPE_UINT64: {
         const unsigned long long n = std::strtoull(given.c_str(), &end, 10);
         if (given.empty() || given[0] == '-' || *end != '\0') break;
-        if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_UINT32) {
+        if (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_UINT32) {
             many ? r->AddUInt32(&m, f, (uint32_t)n) : r->SetUInt32(&m, f, (uint32_t)n);
         } else {
             many ? r->AddUInt64(&m, f, (uint64_t)n) : r->SetUInt64(&m, f, (uint64_t)n);
         }
         return true;
     }
-    case pb::FieldDescriptor::CPPTYPE_DOUBLE:
-    case pb::FieldDescriptor::CPPTYPE_FLOAT: {
+    case gpb::FieldDescriptor::CPPTYPE_DOUBLE:
+    case gpb::FieldDescriptor::CPPTYPE_FLOAT: {
         const double n = std::strtod(given.c_str(), &end);
         if (given.empty() || *end != '\0') break;
-        if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_DOUBLE) {
+        if (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_DOUBLE) {
             many ? r->AddDouble(&m, f, n) : r->SetDouble(&m, f, n);
         } else {
             many ? r->AddFloat(&m, f, (float)n) : r->SetFloat(&m, f, (float)n);
@@ -266,31 +266,31 @@ bool setScalar(pb::Message& m, const pb::FieldDescriptor* f, const std::string& 
     }
     if (error.empty()) {
         error = "--" + kebab(f->name()) + " \"" + given + "\" is not " +
-                (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_ENUM ? "one of its names" : "a value it takes");
+                (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_ENUM ? "one of its names" : "a value it takes");
     }
     return false;
 }
 
-bool fromJson(const std::string& text, pb::Message& m, std::string& error) {
-    pb::util::JsonParseOptions options;
-    const auto status = pb::util::JsonStringToMessage(text, &m, options);
+bool fromJson(const std::string& text, gpb::Message& m, std::string& error) {
+    gpb::util::JsonParseOptions options;
+    const auto status = gpb::util::JsonStringToMessage(text, &m, options);
     if (status.ok()) return true;
     error = std::string(status.message());
     return false;
 }
 
 // `value` into the field `path` names; null `value` for a bool flag given alone.
-bool setField(pb::Message& m, const std::string& path, const std::string* value, std::string& error) {
+bool setField(gpb::Message& m, const std::string& path, const std::string* value, std::string& error) {
     const size_t dot = path.find('.');
-    const pb::FieldDescriptor* f = m.GetDescriptor()->FindFieldByName(snake(path.substr(0, dot)));
+    const gpb::FieldDescriptor* f = m.GetDescriptor()->FindFieldByName(snake(path.substr(0, dot)));
     if (f == nullptr) return resolve(m.GetDescriptor(), path, error) != nullptr;   // says why
-    const pb::Reflection* r = m.GetReflection();
+    const gpb::Reflection* r = m.GetReflection();
     if (dot != std::string::npos) {
         if (resolve(m.GetDescriptor(), path, error) == nullptr) return false;
         return setField(*r->MutableMessage(&m, f), path.substr(dot + 1), value, error);
     }
     if (value == nullptr) {
-        if (f->cpp_type() != pb::FieldDescriptor::CPPTYPE_BOOL) {
+        if (f->cpp_type() != gpb::FieldDescriptor::CPPTYPE_BOOL) {
             error = "--" + path + " needs a value";
             return false;
         }
@@ -303,15 +303,15 @@ bool setField(pb::Message& m, const std::string& path, const std::string* value,
             error = "--" + path + " is key=value";
             return false;
         }
-        pb::Message* entry = r->AddMessage(&m, f);
-        const pb::Descriptor* e = f->message_type();
+        gpb::Message* entry = r->AddMessage(&m, f);
+        const gpb::Descriptor* e = f->message_type();
         return setScalar(*entry, e->FindFieldByNumber(1), value->substr(0, equals), error) &&
                setScalar(*entry, e->FindFieldByNumber(2), value->substr(equals + 1), error);
     }
-    if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_MESSAGE) {
+    if (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_MESSAGE) {
         std::string text;
         if (!valueOf(*value, text, error)) return false;
-        pb::Message* into = f->is_repeated() ? r->AddMessage(&m, f) : r->MutableMessage(&m, f);
+        gpb::Message* into = f->is_repeated() ? r->AddMessage(&m, f) : r->MutableMessage(&m, f);
         if (fromJson(text, *into, error)) return true;
         error = "--" + path + ": " + error;
         return false;
@@ -319,8 +319,8 @@ bool setField(pb::Message& m, const std::string& path, const std::string* value,
     return setScalar(m, f, *value, error);
 }
 
-std::string jsonText(const pb::Message& m, bool pretty) {
-    pb::util::JsonPrintOptions options;
+std::string jsonText(const gpb::Message& m, bool pretty) {
+    gpb::util::JsonPrintOptions options;
     options.add_whitespace = pretty;
     options.preserve_proto_field_names = true;     // the names the flags use
 #if (defined(PROTOBUF_VERSION) && PROTOBUF_VERSION >= 5026000) || \
@@ -330,7 +330,7 @@ std::string jsonText(const pb::Message& m, bool pretty) {
     options.always_print_primitive_fields = true;
 #endif
     std::string out;
-    pb::util::MessageToJsonString(m, &out, options);
+    gpb::util::MessageToJsonString(m, &out, options);
     if (!out.empty() && out.back() == '\n') out.pop_back();
     return out;
 }
@@ -404,17 +404,17 @@ int cmdApi(int argc, char** argv) {
     const std::string call = command->call;
     const std::string serviceName = call.substr(0, call.find('.'));
     const std::string methodName = call.substr(call.find('.') + 1);
-    const pb::FileDescriptor* file = v1::HelloRequest::descriptor()->file();
-    const pb::ServiceDescriptor* service = file->FindServiceByName(serviceName);
-    const pb::MethodDescriptor* method = service ? service->FindMethodByName(methodName) : nullptr;
+    const gpb::FileDescriptor* file = v1::HelloRequest::descriptor()->file();
+    const gpb::ServiceDescriptor* service = file->FindServiceByName(serviceName);
+    const gpb::MethodDescriptor* method = service ? service->FindMethodByName(methodName) : nullptr;
     if (method == nullptr) {
         std::fprintf(stderr, "modbee-mqtt %s: the contract has no %s\n", who.c_str(), call.c_str());
         return 2;
     }
     // Consume's stream opens with a ConsumeOpen: that is what a person fills in.
     const bool consume = call == "Messages.Consume";
-    const pb::Descriptor* requestType = consume ? v1::ConsumeOpen::descriptor() : method->input_type();
-    std::unique_ptr<pb::Message> request(pb::MessageFactory::generated_factory()->GetPrototype(requestType)->New());
+    const gpb::Descriptor* requestType = consume ? v1::ConsumeOpen::descriptor() : method->input_type();
+    std::unique_ptr<gpb::Message> request(gpb::MessageFactory::generated_factory()->GetPrototype(requestType)->New());
 
     Options o;
     o.api = environment("MODBEE_API");
@@ -444,12 +444,12 @@ int cmdApi(int argc, char** argv) {
         const bool own = token == "api" || token == "token" || token == "token-file" || token == "api-ca" ||
                          token == "json" || token == "timeout" || token == "count";
         std::string error;
-        const pb::FieldDescriptor* field = own ? nullptr : resolve(requestType, token, error);
+        const gpb::FieldDescriptor* field = own ? nullptr : resolve(requestType, token, error);
         if (!own && field == nullptr) {
             std::fprintf(stderr, "modbee-mqtt %s: --%s: %s (see --help)\n", who.c_str(), token.c_str(), error.c_str());
             return 2;
         }
-        const bool flagAlone = field != nullptr && field->cpp_type() == pb::FieldDescriptor::CPPTYPE_BOOL;
+        const bool flagAlone = field != nullptr && field->cpp_type() == gpb::FieldDescriptor::CPPTYPE_BOOL;
         if (!hasValue && !flagAlone) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "modbee-mqtt %s: --%s needs a value\n", who.c_str(), token.c_str());
@@ -584,11 +584,11 @@ int cmdApi(int argc, char** argv) {
         return status.ok() ? 0 : failed(who, status);
     }
 
-    std::unique_ptr<pb::Message> reply(
-        pb::MessageFactory::generated_factory()->GetPrototype(method->output_type())->New());
+    std::unique_ptr<gpb::Message> reply(
+        gpb::MessageFactory::generated_factory()->GetPrototype(method->output_type())->New());
     const std::string path = "/" + service->full_name() + "/" + method->name();
     const grpc::internal::RpcMethod rpc(path.c_str(), grpc::internal::RpcMethod::NORMAL_RPC);
-    const grpc::Status status = grpc::internal::BlockingUnaryCall<pb::Message, pb::Message>(
+    const grpc::Status status = grpc::internal::BlockingUnaryCall<gpb::Message, gpb::Message>(
         channel.get(), rpc, &context, *request, reply.get());
     if (!status.ok()) return failed(who, status);
     std::printf("%s\n", jsonText(*reply, true).c_str());

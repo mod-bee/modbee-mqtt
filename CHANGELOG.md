@@ -180,7 +180,8 @@ minor version may change the API or the configuration, and says how here.
 
 - **The tree builds again on Windows, macOS, and Linux without the Application API**: a variable named `small` (a
   macro in the Windows headers) broke MSVC, an unused field broke clang's `-Werror`, and two names used only by the
-  Application API were unused warnings - errors under `-Werror` - in a build without gRPC.
+  Application API were unused warnings - errors under `-Werror` - in a build without gRPC. On Windows, `req` and the
+  Kafka options included `unistd.h`, and `cmd_api.cpp` called protobuf `pb`, a name protobuf itself now declares.
 
 - **MQTT.js (Node-RED's client) was disconnected (0x93) by `serve` when it pipelined QoS 1 publishes**: it does not
   keep to the server's Receive Maximum, and on a server of several shards an acknowledgement waits for the others, so

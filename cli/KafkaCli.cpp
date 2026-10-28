@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "KafkaCli.h"
+#include "Common.h"
 
 #include <cstdio>
 #include <iterator>
@@ -54,8 +55,6 @@ bool kafkaAsked(const Args& args, const char* command, bool& refused) {
 
 #include <fstream>
 #include <sstream>
-
-#include <unistd.h>
 
 struct CliKafka::State {
     KafkaClusterConfig cluster;
@@ -217,7 +216,7 @@ bool CliKafka::flush(int ms, size_t& failed) {
 bool CliKafka::openConsumer(const std::vector<std::string>& topics, std::string& error) {
     rd_kafka_conf_t* conf = rd_kafka_conf_new();
     const bool grouped = !_s->group.empty();
-    const std::string group = grouped ? _s->group : "modbee-cli-" + std::to_string((long)::getpid());
+    const std::string group = grouped ? _s->group : "modbee-cli-" + std::to_string(cliProcessId());
     if (!kafkaClusterSettings(conf, _s->cluster, "modbee-cli", error) || !kafkaSet(conf, "group.id", group, error) ||
         !kafkaSet(conf, "enable.auto.commit", grouped ? "true" : "false", error) ||
         !kafkaSet(conf, "auto.offset.reset", _s->fromStart ? "earliest" : "latest", error) ||

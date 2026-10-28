@@ -17,8 +17,6 @@
 #include <cstdio>
 #include <cstring>
 
-#include <unistd.h>
-
 namespace {
 
 struct ReqState {
@@ -76,7 +74,7 @@ int reqKafka(const Args& args, long long qos, long long wait) {
     }
     ReqState state;
     state.json = args.has("json");
-    state.correlation = "modbee-req-" + std::to_string((long)::getpid()) + "-" + std::to_string((unsigned long)mq_millis());
+    state.correlation = "modbee-req-" + std::to_string(cliProcessId()) + "-" + std::to_string((unsigned long)mq_millis());
     g_req = &state;
     const std::string responseTopic = args.get("response-topic", ("modbee/reply/" + state.correlation).c_str());
     MqttOwnedProperties properties;
