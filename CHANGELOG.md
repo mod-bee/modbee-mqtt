@@ -178,6 +178,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **A message larger than `--queue-bytes` (1 MiB) reached nobody**, idle subscribers included, once `--max-packet` was
+  raised past it - a 60,000-row Sparkplug DataSet birth was lost this way. A session holding nothing now takes one
+  message whatever its size (still bounded by the max packet and the whole server's `--queue-bytes-total`).
 - **One node with a non-UTF-8 metric name broke `Sparkplug.ListNodes` for every node.** Sparkplug strings are proto2
   strings, never checked; the API's are proto3 and must be UTF-8, so the reply could not be sent ("No message
   returned") for as long as that node was known. Names, devices and text values in it now have invalid sequences

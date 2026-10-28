@@ -299,7 +299,11 @@ const size_t kKeptPayloadBytes = 256;
 } // namespace
 
 bool MqttBrokerSession::withinBudget(size_t bytes) const {
-    if (_maxQueuedBytes != 0 && _queuedBytes + bytes > _maxQueuedBytes) return false;
+    // A session holding nothing takes one message whatever its size: a message
+    // larger than the per-session cap - the broker's max packet raised past it
+    // - was refused by every session, idle ones too, so it reached nobody. Its
+    // size is still bounded by the max packet, and the total cap still holds.
+    if (_maxQueuedBytes != 0 && _queuedBytes != 0 && _queuedBytes + bytes > _maxQueuedBytes) return false;
     if (_queuedBytesTotal != nullptr && _maxQueuedBytesTotal != 0 &&
         *_queuedBytesTotal + bytes > _maxQueuedBytesTotal) {
         return false;
