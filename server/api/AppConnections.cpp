@@ -2055,6 +2055,7 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
             info.messages = n->messages;
             info.gaps = n->gaps;
             info.rebirthsRequested = n->rebirthsRequested;
+            info.offlineAt = n->offlineAt;
             // The library keeps an alias, not whether there was one: a birth that gave any gave them all
             // ([tck-id-payloads-alias-birth-requirement]), 0 among them.
             bool aliases = false;
@@ -2066,6 +2067,8 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
                 metric.device = tracked.device;
                 metric.alias = tracked.alias;
                 metric.hasAlias = aliases;
+                metric.stale = tracked.stale;
+                metric.staleAt = tracked.staleAt;
                 metric.datatype = (uint32_t)tracked.type;
                 metric.at = tracked.at;
                 const MqttSparkplugValue& v = tracked.value;
@@ -2104,6 +2107,9 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
                     info.devices.push_back(tracked.device);
                 }
                 info.metrics.push_back(metric);
+            }
+            for (const std::string& d : info.devices) {
+                if (n->deviceOnline(d.c_str())) info.devicesOnline.push_back(d);
             }
             out.push_back(std::move(info));
         }

@@ -176,6 +176,8 @@ struct AppSparkplugMetricInfo {
     bool b = false;
     std::string bytes;                     // Span: text, bytes, an array's packed bytes, a DataSet or Template
     uint64_t at = 0;                       // the value's timestamp (ms since 1970)
+    bool stale = false;                    // its node or device died since its birth
+    uint64_t staleAt = 0;                  // when: the DDEATH's timestamp, or the host's time of the NDEATH
 };
 
 struct AppSparkplugNodeInfo {
@@ -185,7 +187,9 @@ struct AppSparkplugNodeInfo {
     uint64_t bdSeq = 0;
     uint32_t lastSeq = 0;
     uint32_t messages = 0, gaps = 0, rebirthsRequested = 0;
+    uint64_t offlineAt = 0;                // the host's UTC time of the NDEATH that took it offline
     std::vector<std::string> devices;
+    std::vector<std::string> devicesOnline;
     std::vector<AppSparkplugMetricInfo> metrics;
 };
 

@@ -178,6 +178,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Application API: `Sparkplug.ListNodes` says what died.** Each node's `offline_at` and `devices_online`, and each
+  metric's `stale` and `stale_at` - what the server's host now keeps (above). The Eclipse Sparkplug TCK's Host profile
+  passes through the API with them: 128 assertions, none failed.
 - **Sparkplug host: birth metrics without an alias were ignored.** Aliases are optional, and Eclipse Tahu's JavaScript
   client (and its Java one by default) never sends them; the host tracked only aliased metrics, so such a node's
   values could not be read and `Sparkplug.Write` refused a write to one ("DATATYPE_UNKNOWN is not a scalar") - the TCK's

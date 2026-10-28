@@ -586,6 +586,8 @@ message SparkplugNode {
   uint32 rebirths_requested = 8;
   repeated string devices = 9;
   repeated SparkplugNodeMetric metrics = 10;
+  uint64 offline_at = 11;          // the host's UTC time (ms) of the NDEATH that took it offline; 0: never
+  repeated string devices_online = 12; // born, and no DDEATH or NDEATH since
 }
 message SparkplugNodeMetric {
   string name = 1;
@@ -594,6 +596,8 @@ message SparkplugNodeMetric {
   SparkplugDataType datatype = 4;
   SparkplugValue value = 5;        // the last; unset when there is none (or it was null)
   uint64 timestamp = 6;
+  bool stale = 7;                  // its device or node died since its birth (the value is the last known)
+  uint64 stale_at = 8;             // when: the DDEATH's timestamp, or the host's time of the NDEATH
 }
 
 message SparkplugRebirthRequest {

@@ -2632,6 +2632,8 @@ public:
             out->set_gaps(n.gaps);
             out->set_rebirths_requested(n.rebirthsRequested);
             for (const std::string& d : n.devices) out->add_devices(d);
+            for (const std::string& d : n.devicesOnline) out->add_devices_online(d);
+            out->set_offline_at(n.offlineAt);
             for (const AppSparkplugMetricInfo& m : n.metrics) {
                 v1::SparkplugNodeMetric* metric = out->add_metrics();
                 metric->set_name(m.name);
@@ -2639,6 +2641,8 @@ public:
                 if (m.hasAlias) metric->set_alias(m.alias);
                 metric->set_datatype((v1::SparkplugDataType)m.datatype);
                 metric->set_timestamp(m.at);
+                metric->set_stale(m.stale);
+                metric->set_stale_at(m.staleAt);
                 switch (m.kind) {
                 case AppSparkplugMetricInfo::Signed: metric->mutable_value()->set_int_value(m.i); break;
                 case AppSparkplugMetricInfo::Unsigned: metric->mutable_value()->set_uint_value(m.u); break;
