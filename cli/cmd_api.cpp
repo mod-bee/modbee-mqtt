@@ -149,7 +149,7 @@ const char* typeName(const gpb::FieldDescriptor* f) {
 void fieldHelp(const gpb::Descriptor* d, const std::string& prefix, int depth) {
     for (int i = 0; i < d->field_count(); i++) {
         const gpb::FieldDescriptor* f = d->field(i);
-        const std::string name = prefix + kebab(f->name());
+        const std::string name = prefix + kebab(std::string(f->name()));
         const bool inside = f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_MESSAGE && !f->is_repeated() && depth < 3;
         std::string line = "  --" + name;
         if (typeName(f)[0]) line += std::string(" ") + typeName(f);
@@ -157,7 +157,7 @@ void fieldHelp(const gpb::Descriptor* d, const std::string& prefix, int depth) {
         if (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_ENUM) {
             line += "   ";
             const gpb::EnumDescriptor* e = f->enum_type();
-            for (int v = 0; v < e->value_count(); v++) line += (v ? " | " : "") + e->value(v)->name();
+            for (int v = 0; v < e->value_count(); v++) line += (v ? " | " : "") + std::string(e->value(v)->name());
         }
         if (inside) line += "   (or --" + name + ".<field>)";
         std::printf("%s\n", line.c_str());
@@ -171,7 +171,7 @@ const gpb::FieldDescriptor* resolve(const gpb::Descriptor* d, const std::string&
     const std::string head = snake(path.substr(0, dot));
     const gpb::FieldDescriptor* f = d->FindFieldByName(head);
     if (f == nullptr) {
-        error = "no field \"" + kebab(head) + "\" in " + d->name();
+        error = "no field \"" + kebab(head) + "\" in " + std::string(d->name());
         return nullptr;
     }
     if (dot == std::string::npos) return f;
@@ -189,7 +189,7 @@ bool enumValue(const gpb::EnumDescriptor* e, const std::string& given, int& out)
     std::string upper = snake(given);
     for (char& c : upper) c = (char)std::toupper((unsigned char)c);
     for (int i = 0; i < e->value_count(); i++) {
-        const std::string& name = e->value(i)->name();
+        const std::string name(e->value(i)->name());
         const bool ends = name.size() > upper.size() && name.compare(name.size() - upper.size(), upper.size(), upper) == 0 &&
                           name[name.size() - upper.size() - 1] == '_';
         if (name == upper || ends) {
@@ -265,7 +265,7 @@ bool setScalar(gpb::Message& m, const gpb::FieldDescriptor* f, const std::string
         break;
     }
     if (error.empty()) {
-        error = "--" + kebab(f->name()) + " \"" + given + "\" is not " +
+        error = "--" + kebab(std::string(f->name())) + " \"" + given + "\" is not " +
                 (f->cpp_type() == gpb::FieldDescriptor::CPPTYPE_ENUM ? "one of its names" : "a value it takes");
     }
     return false;
@@ -471,7 +471,7 @@ int cmdApi(int argc, char** argv) {
     if (o.help) {
         std::printf("usage: modbee-mqtt %s [fields] [--api ADDRESS] [--token-file FILE]\n\n", who.c_str());
         std::printf("%s%s, %s -> %s%s%s\n\n", call.c_str(), consume ? " (opened with ConsumeOpen)" : "",
-                    requestType->name().c_str(), method->output_type()->name().c_str(),
+                    std::string(requestType->name()).c_str(), std::string(method->output_type()->name()).c_str(),
                     command->rest[0] ? ", REST " : "", command->rest);
         if (requestType->field_count() == 0) std::printf("  (no fields)\n");
         fieldHelp(requestType, "", 0);
@@ -586,7 +586,7 @@ int cmdApi(int argc, char** argv) {
 
     std::unique_ptr<gpb::Message> reply(
         gpb::MessageFactory::generated_factory()->GetPrototype(method->output_type())->New());
-    const std::string path = "/" + service->full_name() + "/" + method->name();
+    const std::string path = "/" + std::string(service->full_name()) + "/" + std::string(method->name());
     const grpc::internal::RpcMethod rpc(path.c_str(), grpc::internal::RpcMethod::NORMAL_RPC);
     const grpc::Status status = grpc::internal::BlockingUnaryCall<gpb::Message, gpb::Message>(
         channel.get(), rpc, &context, *request, reply.get());

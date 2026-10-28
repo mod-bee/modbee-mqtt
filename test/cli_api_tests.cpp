@@ -44,7 +44,7 @@ int main() {
     std::set<std::string> calls;
     for (int s = 0; s < file->service_count(); s++) {
         const gpb::ServiceDescriptor* service = file->service(s);
-        for (int m = 0; m < service->method_count(); m++) calls.insert(service->name() + "." + service->method(m)->name());
+        for (int m = 0; m < service->method_count(); m++) calls.insert(std::string(service->name()) + "." + std::string(service->method(m)->name()));
     }
 
     section("every call in app.proto is a command, or says why it is not");
