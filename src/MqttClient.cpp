@@ -1097,7 +1097,18 @@ void MqttClient::handlePublish(const MqttPacket& packet) {
         // So a repeat is still acknowledged - it is just not delivered twice.
         // This is the whole of exactly-once, and skipping it makes QoS 2 an
         // expensive QoS 1.
-        deliver = _session.rememberInbound(publish.packetId);
+        //
+        // ONLY A KNOWN IDENTIFIER IS A DUPLICATE. This took rememberInbound()'s
+        // false for one, and it is also false when the table is full - so with
+        // more than MQTT_SESSION_MAX_INBOUND_QOS2 awaiting their PUBREL, which
+        // a broker under load has every right to send (our Receive Maximum
+        // allows 65,535), each new message was acknowledged and never
+        // delivered: 8% of a 10,000 msg/s QoS 2 stream, silently. Not
+        // remembered, it is still delivered; the cost is a possible second
+        // delivery if the broker sends this same PUBLISH again before its
+        // PUBREL, which it may do only after a reconnect [V5:MQTT-4.4.0-1].
+        deliver = !_session.inboundKnown(publish.packetId);
+        if (deliver) _session.rememberInbound(publish.packetId);
     }
 
     if (deliver) {

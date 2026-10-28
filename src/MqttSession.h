@@ -192,8 +192,9 @@ public:
 
     // --- Inbound QoS 2 ---
     //
-    // True when this identifier was not already known. False means a duplicate
-    // PUBLISH: acknowledge it again, but do NOT deliver it a second time.
+    // True when this identifier is now remembered. False when it was already
+    // known - a duplicate PUBLISH: acknowledge it again, but do NOT deliver it a
+    // second time - or when the table is full; inboundKnown() tells the two apart.
     bool rememberInbound(uint16_t packetId);
     bool inboundKnown(uint16_t packetId) const;
     void forgetInbound(uint16_t packetId);

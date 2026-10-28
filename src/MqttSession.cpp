@@ -213,9 +213,10 @@ bool MqttSession::rememberInbound(uint16_t packetId) {
     if (inboundKnown(packetId)) return false;
 
     if (_inboundCount >= MQTT_SESSION_MAX_INBOUND_QOS2) {
-        // Full. Refusing the oldest would be worse than refusing this one:
-        // forgetting an identifier still awaiting its PUBREL is how a message
-        // gets delivered twice.
+        // Full. Forgetting the oldest would be worse than not remembering this
+        // one: an identifier still awaiting its PUBREL is what stops a message
+        // being delivered twice. The caller delivers it all the same - false
+        // here is NOT "a duplicate"; inboundKnown() is how to ask that.
         return false;
     }
     _inbound[_inboundCount++] = packetId;

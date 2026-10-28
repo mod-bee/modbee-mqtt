@@ -248,6 +248,11 @@ minor version may change the API or the configuration, and says how here.
 - **Sparkplug: `Node Control/Rebirth` is born without an alias.** The Eclipse Sparkplug TCK failed the node on
   [tck-id-operational-behavior-data-commands-rebirth-name-aliases]: an NBIRTH MUST NOT give it one, so a host that never
   saw the birth can still ask for a rebirth by name. A request by the old alias (0xFFFFFFFE) is still honoured.
+- **The client lost QoS 2 messages under load, silently.** With more inbound QoS 2 messages awaiting their PUBREL
+  than its table holds (`MQTT_SESSION_MAX_INBOUND_QOS2`, 16) - which a broker may send, the client allowing 65,535 in
+  flight - each new one was taken for a duplicate: acknowledged with a PUBREC and never delivered. 200 publishers at
+  50 msg/s QoS 2 into one subscriber lost 8% against our broker and 6% against Mosquitto. Every one is delivered now;
+  only a known identifier is a duplicate.
 - **A client with a small receive buffer could be shut out by one large message.** At MQTT 5 the client left Maximum
   Packet Size out of CONNECT unless told one, while its receive buffer (4 KiB by default) is a hard limit: a larger
   PUBLISH ended the connection with `0x95`, and a retained message, or one queued in its session, came again on
