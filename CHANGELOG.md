@@ -178,6 +178,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug: UInt32 is written in `long_value`.** It went in `int_value`, which the specification's table ("uint32")
+  allows a reading of, but the Eclipse Sparkplug TCK fails (its value check takes UInt32 from `long_value` only), and
+  Eclipse Tahu's Java and C libraries and npm `sparkplug-payload` write it there - the last reads it from nowhere
+  else, so our UInt32 metrics arrived as null in Node-RED. Metrics, properties, template parameters and DataSet cells;
+  every decoder here still reads either field.
 - **Sparkplug: a DataSet from Ignition with a UInt32 column was refused whole.** Eclipse Tahu's Java (Ignition's)
   writes a UInt32 cell in `long_value`; the DataSet reader took `int_value` alone. It takes either now.
 - **Sparkplug: every metric carries a timestamp.** The node put a timestamp on the payload only; the Eclipse Sparkplug

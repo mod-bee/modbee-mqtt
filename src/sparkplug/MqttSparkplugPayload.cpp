@@ -237,13 +237,14 @@ size_t propertyScalarSize(const MqttSparkplugProperty& property,
         case MqttSparkplugDataType::Int32:
         case MqttSparkplugDataType::UInt8:
         case MqttSparkplugDataType::UInt16:
-        case MqttSparkplugDataType::UInt32:
             total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_INT);
             total += mq_pbVarintSize(isSignedType(property.type)
                                          ? encodeSigned(property.type,
                                                         property.as.signedValue)
                                          : property.as.unsignedValue);
             break;
+        // UInt32 in long_value, as everywhere: see mq_sparkplugValueField().
+        case MqttSparkplugDataType::UInt32:
         case MqttSparkplugDataType::Int64:
         case MqttSparkplugDataType::UInt64:
         case MqttSparkplugDataType::DateTime:
@@ -308,13 +309,13 @@ void writePropertyScalar(PbWriter& writer,
         case MqttSparkplugDataType::Int32:
         case MqttSparkplugDataType::UInt8:
         case MqttSparkplugDataType::UInt16:
-        case MqttSparkplugDataType::UInt32:
             writer.tag(MQ_SP_F_PROPERTYVALUE_INT, MQ_PB_VARINT);
             writer.varint(isSignedType(property.type)
                               ? encodeSigned(property.type,
                                              property.as.signedValue)
                               : property.as.unsignedValue);
             break;
+        case MqttSparkplugDataType::UInt32:
         case MqttSparkplugDataType::Int64:
         case MqttSparkplugDataType::UInt64:
         case MqttSparkplugDataType::DateTime:
@@ -1110,8 +1111,17 @@ uint32_t mq_sparkplugValueField(MqttSparkplugDataType type) {
         case MqttSparkplugDataType::Int32:
         case MqttSparkplugDataType::UInt8:
         case MqttSparkplugDataType::UInt16:
-        case MqttSparkplugDataType::UInt32:
             return MQ_SP_F_METRIC_INT;
+        // UINT32 IN long_value. The specification's table says only "Google
+        // Protocol Buffer Type: uint32", which read as the uint32 field
+        // int_value - and that is what this wrote until the Eclipse TCK
+        // failed it: its Utils.hasValue() takes a UInt32 from long_value
+        // alone, as Eclipse Tahu's Java and C libraries and the npm
+        // sparkplug-payload (Node-RED's) all write it. sparkplug-payload
+        // also reads it from there alone, so our UInt32 arrived as null in
+        // Node-RED. Tahu's Python writes int_value; every decoder here takes
+        // either field, so both still read.
+        case MqttSparkplugDataType::UInt32:
         case MqttSparkplugDataType::Int64:
         case MqttSparkplugDataType::UInt64:
         case MqttSparkplugDataType::DateTime:
@@ -2241,9 +2251,9 @@ size_t cellBodySize(const MqttSparkplugValue& cell) {
                    mq_pbVarintSize(encodeSigned(cell.type, cell.as.signedValue));
         case MqttSparkplugDataType::UInt8:
         case MqttSparkplugDataType::UInt16:
-        case MqttSparkplugDataType::UInt32:
             return mq_pbTagSize(MQ_SP_F_DATASETVALUE_INT) +
                    mq_pbVarintSize(cell.as.unsignedValue);
+        case MqttSparkplugDataType::UInt32:   // long_value: mq_sparkplugValueField()
         case MqttSparkplugDataType::Int64:
         case MqttSparkplugDataType::UInt64:
         case MqttSparkplugDataType::DateTime:
@@ -2272,10 +2282,10 @@ void writeCell(PbWriter& writer, const MqttSparkplugValue& cell) {
             break;
         case MqttSparkplugDataType::UInt8:
         case MqttSparkplugDataType::UInt16:
-        case MqttSparkplugDataType::UInt32:
             writer.tag(MQ_SP_F_DATASETVALUE_INT, MQ_PB_VARINT);
             writer.varint(cell.as.unsignedValue);
             break;
+        case MqttSparkplugDataType::UInt32:   // long_value: mq_sparkplugValueField()
         case MqttSparkplugDataType::Int64:
         case MqttSparkplugDataType::UInt64:
         case MqttSparkplugDataType::DateTime:
