@@ -380,6 +380,17 @@ key, which is what a plant broker with a self-made certificate wants;
 [security.md](security.md#pinning-when-nobody-signed-for-the-broker) explains it and how to read the key off the
 broker.
 
+### A birth larger than the broker takes
+
+At MQTT 5.0 the broker says how large a message it accepts. An NBIRTH (or
+DBIRTH) larger than that is not sent, and the node stays unborn:
+`lastPayloadError()` is `Overflow` and `tooLargeForServer()` counts it. The
+birth grows with what is declared - about 65 bytes a metric, so a thousand
+metrics is about 67 kB, past `modbee-mqtt serve`'s default `--max-packet` of
+64 kB. Raise the broker's limit, or split the metrics across devices (each
+DBIRTH is its own message). At 3.1.1 the broker cannot say, and a too-large
+birth is dropped by it instead.
+
 ### Knowing what is going on
 
 | | |

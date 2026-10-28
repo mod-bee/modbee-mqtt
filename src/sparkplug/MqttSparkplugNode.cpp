@@ -2256,6 +2256,21 @@ bool MqttSparkplugNode::sendPayload(MqttSparkplugType type,
         return false;
     }
 
+    // LARGER THAN THE SERVER TAKES, REFUSED HERE. A 5.0 server states its
+    // Maximum Packet Size in the CONNACK, and the client then concludes such a
+    // publish PacketTooLarge on a later poll - after this had returned true.
+    // So a node whose NBIRTH was over the limit (a thousand metrics against
+    // modbee-mqtt serve's 64 kB default) counted itself born and sent data no
+    // host could name, while every host asked for the birth again, for ever.
+    // Refused now, it is not born, and lastPayloadError() says Overflow. The
+    // header's own bytes (type, remaining length, topic, properties) are
+    // over-counted, never under.
+    if (!_client.capabilities().allowsPacketSize(wrote + strlen(_topic) + 16)) {
+        _lastPayloadError = MqttSparkplugError::Overflow;
+        _tooLargeForServer++;
+        return false;
+    }
+
     // publishSeries(), not publish().
     //
     // R6 - deterministic publish ordering - is what Sparkplug's seq field

@@ -178,6 +178,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug node: a birth larger than the server takes no longer counts as a birth.** At MQTT 5.0 the server states
+  its Maximum Packet Size; a larger NBIRTH was queued, dropped by the client, and the node counted itself born and sent
+  data no host could name while every host asked for the birth again. It is refused now: the node stays unborn,
+  `lastPayloadError()` says `Overflow`, `tooLargeForServer()` counts it. `modbee-mqtt serve` takes 64 kB unless
+  `--max-packet` says more; a thousand-metric birth is about 67 kB.
 - **Sparkplug host: a birth over 4 kB never arrived.** `MqttSparkplugHost` kept the client's 4 kB receive buffer, so an
   NBIRTH of more than about seventy metrics failed the connection (or, at 5.0, was never sent), the host asked for it
   again for ever and could name none of the node's data. It now takes up to `MQ_SP_HOST_PACKET` (4 MB on a host,
