@@ -387,6 +387,7 @@ broker.
 | `waitingFor()` | Why a connected node has not birthed, or `""` |
 | `lastErrorText()` | Why the link is down |
 | `sequence()`, `birthDeathSequence()` | The current `seq` and `bdSeq` |
+| `resumeBirthDeathSequence(last)` | Before `connect()`: the bdSeq the last session used, kept across a reboot (OpenPLC RETAIN memory, a file) - the next CONNECT uses the one after, where a node started again began at zero and two sessions in a row had the same number. Save `birthDeathSequence()` whenever it changes |
 | `commandsApplied()`, `commandsRefused()` | Writes taken, and writes refused |
 | `birthCount()` | NBIRTHs and DBIRTHs published |
 | `rebirthsHeld()` | Rebirth requests answered by a birth already on its way |

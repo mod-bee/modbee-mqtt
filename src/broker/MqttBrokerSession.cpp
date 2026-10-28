@@ -41,18 +41,18 @@ void MqttBrokerSession::configure(size_t maxSubscriptions, size_t maxQueued,
 
     _subscriptions.clear();
     _subscriptionsUsed = 0;
-    _queue.clear();
+    _queue.release();
     _queueExtent = 0;
     _inbound.clear();
+    _reservedUpFront = reserveNow;
     if (reserveNow) {
         _subscriptions.resize(maxSubscriptions);
-        _queue.resize(maxQueued);
+        _queue.growTo(maxQueued);
         _inbound.reserve(maxQueued);
     } else {
         // Truly empty, not merely cleared: a reconfigure must give the memory
         // back, which is the point of not reserving.
         std::vector<MqttBrokerSubscription>().swap(_subscriptions);
-        std::vector<MqttBrokerDelivery>().swap(_queue);
         std::vector<uint16_t>().swap(_inbound);
     }
 }
@@ -92,7 +92,7 @@ void MqttBrokerSession::adopt(const MqttSpan& clientId) {
     will.clear();
     clearSubscriptions();
     clearInbound();
-    for (MqttBrokerDelivery& entry : _queue) discard(entry);
+    for (size_t index = 0; index < _queue.size(); index++) discard(_queue[index]);
     _queueExtent = 0;
 #if defined(MQTT_PLATFORM_HOST)
     _journal = journal;
@@ -123,7 +123,7 @@ void MqttBrokerSession::release() {
     will.clear();
     clearSubscriptions();
     clearInbound();
-    for (MqttBrokerDelivery& entry : _queue) discard(entry);
+    for (size_t index = 0; index < _queue.size(); index++) discard(_queue[index]);
     _queueExtent = 0;
 #if defined(MQTT_PLATFORM_HOST)
     _journal = journal;
@@ -320,7 +320,7 @@ void MqttBrokerSession::charge(MqttBrokerDelivery& entry) {
 #if defined(MQTT_PLATFORM_HOST)
 void MqttBrokerSession::setQueueLimit(size_t maxQueued) {
     _maxQueued = maxQueued ? maxQueued : 1;
-    if (!_queue.empty() && _queue.size() < _maxQueued) _queue.resize(_maxQueued);
+    if (_reservedUpFront) _queue.growTo(_maxQueued);
 }
 #endif
 
@@ -350,6 +350,26 @@ void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
     if (entry.payload.capacity() > kKeptPayloadBytes) std::vector<uint8_t>().swap(entry.payload);
 }
 
+MqttBrokerDelivery* MqttBrokerSession::freeSlot(size_t& index) {
+    reserveQueue();
+    // The first free one, so what is queued stays at the front and the scans
+    // that run for every message sent (nextUnsent(), findByPacketId()) walk
+    // only as far as the queue goes deep (_queueExtent).
+    for (index = 0; index < _queue.size(); index++) {
+        if (!_queue[index].inUse()) return &_queue[index];
+    }
+#if defined(MQTT_PLATFORM_HOST)
+    // Every slot taken and room under the limit: twice the slots, in new
+    // blocks - nothing already queued moves.
+    if (_queue.size() < _maxQueued) {
+        index = _queue.size();
+        _queue.growTo(2 * index < _maxQueued ? 2 * index : _maxQueued);
+        return &_queue[index];
+    }
+#endif
+    return nullptr;
+}
+
 MqttBrokerDelivery* MqttBrokerSession::reserveDelivery(size_t bytes) {
     reserveQueue();
 #if defined(MQTT_PLATFORM_HOST)
@@ -363,12 +383,12 @@ MqttBrokerDelivery* MqttBrokerSession::reserveDelivery(size_t bytes) {
         messagesDropped++;
         return nullptr;
     }
-    for (size_t index = 0; index < _queue.size(); index++) {
-        MqttBrokerDelivery& entry = _queue[index];
-        if (entry.inUse()) continue;
-        entry.release();      // clean, and keeps the buffers it already grew
+    size_t index = 0;
+    MqttBrokerDelivery* entry = freeSlot(index);
+    if (entry != nullptr) {
+        entry->release();     // clean, and keeps the buffers it already grew
         if (index + 1 > _queueExtent) _queueExtent = index + 1;
-        return &entry;
+        return entry;
     }
     // Full. Counted rather than ignored, exactly as enqueue() does.
     messagesDropped++;
@@ -389,18 +409,22 @@ bool MqttBrokerSession::enqueue(const MqttBrokerDelivery& message) {
         messagesDropped++;
         return false;
     }
-    for (size_t index = 0; index < _queue.size(); index++) {
-        MqttBrokerDelivery& entry = _queue[index];
-        if (!entry.inUse()) {
-            entry = message;
-            entry.sequence = _nextSequence++;
-            charge(entry);
-            if (index + 1 > _queueExtent) _queueExtent = index + 1;
 #if defined(MQTT_PLATFORM_HOST)
-            journalDelivery(entry);
+    if (_queuedCount >= _maxQueued) {        // its blocks may hold a few more than its limit
+        messagesDropped++;
+        return false;
+    }
 #endif
-            return true;
-        }
+    size_t index = 0;
+    if (MqttBrokerDelivery* entry = freeSlot(index)) {
+        *entry = message;
+        entry->sequence = _nextSequence++;
+        charge(*entry);
+        if (index + 1 > _queueExtent) _queueExtent = index + 1;
+#if defined(MQTT_PLATFORM_HOST)
+        journalDelivery(*entry);
+#endif
+        return true;
     }
     // Full. Counted rather than ignored: a queue that silently drops is a
     // queue whose depth nobody ever discovers is wrong.
@@ -426,8 +450,12 @@ bool MqttBrokerSession::queueFull() const {
     // still owed - would ask again on every pass.
     if (!withinBudget(1)) return true;
     if (_queue.empty()) return false;
-    for (const MqttBrokerDelivery& entry : _queue) {
-        if (!entry.inUse()) return false;
+#if defined(MQTT_PLATFORM_HOST)
+    if (_queuedCount >= _maxQueued) return true;
+    if (_queue.size() < _maxQueued) return false;      // room to grow
+#endif
+    for (size_t index = 0; index < _queue.size(); index++) {
+        if (!_queue[index].inUse()) return false;
     }
     return true;
 }
@@ -556,19 +584,18 @@ void MqttBrokerSession::clearInbound() { _inbound.clear(); }
 
 bool MqttBrokerSession::restoreDelivery(const MqttBrokerDelivery& message) {
     reserveQueue();
-    if (!withinBudget(bytesOf(message))) {
+    if (!withinBudget(bytesOf(message)) || _queuedCount >= _maxQueued) {
         messagesDropped++;
         return false;
     }
-    for (size_t index = 0; index < _queue.size(); index++) {
-        MqttBrokerDelivery& entry = _queue[index];
-        if (entry.inUse()) continue;
-        entry = message;
-        entry.charged = 0;
-        charge(entry);
+    size_t index = 0;
+    if (MqttBrokerDelivery* entry = freeSlot(index)) {
+        *entry = message;
+        entry->charged = 0;
+        charge(*entry);
         // Later messages are numbered after every one restored, whatever
         // order the store hands them over in.
-        if (entry.sequence >= _nextSequence) _nextSequence = entry.sequence + 1;
+        if (entry->sequence >= _nextSequence) _nextSequence = entry->sequence + 1;
         if (index + 1 > _queueExtent) _queueExtent = index + 1;
         return true;
     }

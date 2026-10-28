@@ -18,7 +18,7 @@ minor version may change the API or the configuration, and says how here.
   **The last good DNS answer** for each name is used when a fresh lookup fails or takes over 1.8 s (RFC 8767) - for
   at most 24 hours (`setStaleAddressLimit()`), a fresh answer always wins and replaces it at once, and a remembered
   address that is refused is forgotten - so a carrier DNS outage does not stop a reconnect, and a server that moves
-  is followed. Host sockets get `SO_KEEPALIVE` and `TCP_USER_TIMEOUT` (120 s, `setDeadLinkTimeout()`).
+  is followed. Host sockets get `SO_KEEPALIVE` and `TCP_USER_TIMEOUT` (300 s, `setDeadLinkTimeout()`; 120 s ended live connections on a lossy link).
   `MqttClientConfig::firstConnectSpreadMs` spreads a fleet's first connect after a power cut (default off).
   `MqttDevice::connecting()` / `connectInBackground()`, `MqttConnectTask::settle()`, `MqttTransport::connectWithin()`.
 - **Sparkplug B, production-sized.** The host's node and metric tables are hash-indexed on a host (one lookup a
@@ -172,6 +172,20 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **A server edge node's birth carried old values after an outage, and nulls after a restart.** A value set while it
+  was not born went only into its history, which a host files and never shows, so the NBIRTH said the value from
+  before the outage (265 s stale in the cellular rig) and the host kept showing it. It is now the metric's current
+  value as well, and a value set while the node is born but still sending history goes live at once. The bdSeq and
+  every current value are kept in the state directory (`sparkplug-node-<hash>.json`), so a server killed and started
+  again births with what the application last set - and **its bdSeq moves on from the last session's**: it began at
+  zero in every process, so two sessions in a row had the same number and a late Will could kill the new one. The
+  library has `MqttSparkplugNode::resumeBirthDeathSequence()` for a board to do the same from RETAIN memory. The
+  server's edge node now has a replay window of 4096 values.
+- **A burst to one subscriber past 64 messages was dropped.** `modbee-mqtt serve` held 64 messages per session, so a
+  subscriber taking in a whole site - a Sparkplug host on `spBv1.0/#` - lost what arrived in a burst: 2,662 of 4,614
+  values in one link flap in the cellular rig, 0.28% in the 10K benchmark. The default is now 1000, as Mosquitto,
+  EMQX and HiveMQ, and on a host a session's queue grows in blocks of sixteen as a backlog needs them, never moving
+  what is queued - so a device that hardly ever receives holds one block (4.5 kB) where it held 64 slots (18 kB).
 - **A long transfer over a slow link is no longer ended by the keep-alive and retried for ever**: bytes moving
   either way are signs of life, no PINGREQ waits behind a backlog, and "sent" - for the keep-alive and for the
   acknowledgement deadline - means its last byte has left. A Server Keep Alive of 0 no longer turns off dead-link

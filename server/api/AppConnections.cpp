@@ -18,6 +18,7 @@
 #include <set>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -414,8 +415,31 @@ struct AppConnections::EdgeNode {
     // it goes again after the next birth, is_historical as before.
     std::vector<std::pair<uint64_t, Clock::time_point>> sentHistory;
     uint64_t sentUpTo = 0;
+    // WHAT OUTLIVES A RESTART (AppConnections::saveEdgeState): the bdSeq last
+    // used, so a node started again moves on from it rather than from zero,
+    // and every metric's current value with when it was set, so the birth
+    // after a restart carries what the application last gave - not nulls,
+    // which a host would put over the values it had.
+    std::vector<uint64_t> setAtMs;
+    int savedBdSeq = -1;
+    bool valuesChanged = false, saveFailed = false;
+    Clock::time_point savedAt;
     std::string key() const { return "sparkplug-node:" + spec.id; }
     const char* device(const std::string& d) const { return d.empty() ? nullptr : d.c_str(); }
+    // A metric's current value - what the next NDATA, or the next birth,
+    // carries - its text in `values`. Whether it changed.
+    bool setCurrent(size_t index, MqttSparkplugValue value, const std::string& text, uint64_t at) {
+        if (value.isSpan() && !value.isNull) {
+            std::string owned = text;           // a buffer of its own: see `values`
+            values[index].swap(owned);
+            value.as.bytes.data = (const uint8_t*)values[index].data();
+            value.as.bytes.length = (uint32_t)values[index].size();
+        }
+        if (!library->setAt(index, value)) return false;
+        setAtMs[index] = at;
+        valuesChanged = true;
+        return true;
+    }
 };
 
 namespace {
@@ -463,6 +487,20 @@ std::string templateRefOf(const MqttSparkplugValue& value) {
         return std::string();
     }
     return std::string((const char*)ref, length);
+}
+
+// An edge node's file in the state directory: its id hashed (FNV-1a), since an
+// edge node's id may hold what a file name may not. The id is in the file too,
+// and checked.
+std::string edgeStateName(const std::string& id) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char ch : id) {
+        h ^= ch;
+        h *= 1099511628211ull;
+    }
+    char name[48];
+    std::snprintf(name, sizeof name, "sparkplug-node-%016llx.json", (unsigned long long)h);
+    return name;
 }
 
 std::string hexOf(const std::string& bytes) {
@@ -925,6 +963,7 @@ void AppConnections::open(Connection& c) {
 }
 
 void AppConnections::startEdgeNode(Connection& c) {
+    if (c.edge) saveEdgeState(*c.edge, true);
     c.edge.reset();
     for (const auto& one : _edgeNodes) {
         if (one.second.connection != c.spec.id) continue;
@@ -959,7 +998,26 @@ void AppConnections::startEdgeNode(Connection& c) {
         }
         for (const std::string& d : e->spec.devices) node.deviceOnline(d.c_str());
         e->values.resize(node.pointCount());
+        e->setAtMs.resize(node.pointCount());
         e->history = _outbox.totals(e->key()).messages;
+        // Its bdSeq and values from before a restart; then what it kept and
+        // has not sent, the newest of which is each metric's current value.
+        loadEdgeState(*e);
+        for (uint64_t after = 0;;) {
+            std::vector<ConnectionOutbox::Kept> page = _outbox.next(e->key(), after, 1024);
+            if (page.empty()) break;
+            for (const ConnectionOutbox::Kept& k : page) {
+                AppSparkplugSet set;
+                if (!valueOfKept(k.message, set)) continue;
+                const int at = node.indexOf(e->device(k.message.clientId), set.name.c_str());
+                if (at < 0 || node.pointAt((size_t)at)->type != set.value.type) continue;
+                if (set.timestamp >= e->setAtMs[(size_t)at]) e->setCurrent((size_t)at, set.value, set.text, set.timestamp);
+            }
+            after = page.back().id;
+        }
+        // What a link that died unnoticed swallowed, sent again after the next
+        // birth as history (MqttSparkplugNode::replayWindow): 4096 values, 96 kB.
+        node.replayWindow(4096);
         node.connect();                            // its NDEATH is this connection's Will from now on
         c.edge = std::move(e);
         return;
@@ -972,6 +1030,7 @@ void AppConnections::serviceEdgeNode(Connection& c) {
     MqttSparkplugNode& node = *e.library;
     node.epochNow((uint64_t)utcNowMs());
     node.poll();
+    saveEdgeState(e, false);
     // A host's writes reach the application on the connection, as NCMD and
     // DCMD; the node's own queue of them is let go.
     MqttSparkplugValue ignored;
@@ -1026,6 +1085,74 @@ void AppConnections::serviceEdgeNode(Connection& c) {
     if (records.empty() || !node.publishRecords(records.data(), records.size(), true)) return;
     for (uint64_t id : sent) e.sentHistory.push_back(std::make_pair(id, now));
     e.sentUpTo = sent.back();
+}
+
+void AppConnections::saveEdgeState(EdgeNode& e, bool now) {
+    if (_directory.empty()) return;
+    MqttSparkplugNode& node = *e.library;
+    const int bdSeq = node.birthDeathSequence();
+    const bool moved = bdSeq != e.savedBdSeq;
+    if (!moved && !e.valuesChanged) return;
+    // A new bdSeq at once - its CONNECT has gone, and a restart now must not
+    // use it again - values at most once a second, a failed write a second on.
+    const Clock::time_point at = Clock::now();
+    if (!now && at - e.savedAt < std::chrono::seconds(1) && (!moved || e.saveFailed)) return;
+    std::string values = "[";
+    bool first = true;
+    for (const AppSparkplugMetricDeclaration& m : e.spec.metrics) {
+        const int index = node.indexOf(e.device(m.device), m.name.c_str());
+        if (index < 0 || e.setAtMs[(size_t)index] == 0) continue;     // never set
+        const MqttSparkplugValue v = node.valueAt((size_t)index);
+        json::Object o;
+        o.add("device", m.device).add("name", m.name).add("type", (long long)v.type).add("null", v.isNull);
+        if (v.isSpan()) {
+            o.add("text", v.isNull ? std::string() : hexOf(std::string((const char*)v.as.bytes.data, v.as.bytes.length)));
+        } else {
+            o.add("bits", std::to_string(v.as.unsignedValue));
+        }
+        o.add("at", (long long)e.setAtMs[(size_t)index]);
+        values += (first ? "\n" : ",\n") + o.str();
+        first = false;
+    }
+    json::Object o;
+    o.add("id", e.spec.id).add("bdSeq", (long long)bdSeq).raw("values", values + "]");
+    e.savedAt = at;
+    e.saveFailed = !writePrivate(_directory + "/" + edgeStateName(e.spec.id), o.str() + "\n");
+    if (e.saveFailed) return;
+    e.savedBdSeq = bdSeq;
+    e.valuesChanged = false;
+}
+
+void AppConnections::loadEdgeState(EdgeNode& e) {
+    if (_directory.empty()) return;
+    std::ifstream in(_directory + "/" + edgeStateName(e.spec.id));
+    if (!in) return;
+    std::stringstream text;
+    text << in.rdbuf();
+    json::Value v;
+    if (!json::parse(text.str(), v) || v.str("id") != e.spec.id) return;
+    MqttSparkplugNode& node = *e.library;
+    if (v.has("bdSeq")) {
+        const uint8_t last = (uint8_t)v.integer("bdSeq");
+        node.resumeBirthDeathSequence(last);
+        e.savedBdSeq = last;
+    }
+    for (const json::Value& m : v["values"].items) {
+        const int index = node.indexOf(e.device(m.str("device")), m.str("name").c_str());
+        if (index < 0) continue;
+        MqttSparkplugValue value;
+        value.type = (MqttSparkplugDataType)m.integer("type");
+        if (node.pointAt((size_t)index)->type != value.type) continue;   // declared again, as another type
+        value.isNull = m.flag("null");
+        std::string bytes;
+        if (value.isSpan()) {
+            bytes = bytesOfHex(m.str("text"));
+        } else {
+            value.as.unsignedValue = std::strtoull(m.str("bits").c_str(), nullptr, 10);
+        }
+        e.setCurrent((size_t)index, value, bytes, (uint64_t)m.integer("at"));
+    }
+    e.valuesChanged = false;
 }
 
 void AppConnections::startHost(Connection& c) {
@@ -1151,6 +1278,7 @@ void AppConnections::close(Connection& c) {
             c.client.poll();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        if (c.edge) saveEdgeState(*c.edge, true);
         c.host.reset();
         c.edge.reset();
     }
@@ -2121,6 +2249,7 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
             Connection& c = *at->second;
             if (c.edge) {
                 c.edge->library->disconnect();
+                saveEdgeState(*c.edge, true);     // the new one moves on from its bdSeq
                 c.edge.reset();
             }
             startEdgeNode(c);
@@ -2175,6 +2304,7 @@ bool AppConnections::removeEdgeNode(const std::string& id) {
             c.edge.reset();
         }
         _outbox.dropAll("sparkplug-node:" + id);
+        if (!_directory.empty()) std::remove((_directory + "/" + edgeStateName(id)).c_str());
         _edgeNodes.erase(spec);
         saveHosts();
         found = true;
@@ -2202,9 +2332,13 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
             return;
         }
         MqttSparkplugNode& node = *e->library;
-        // History first, in order: born, and every row it kept already sent (some may
-        // still be held, waiting to be trusted - EdgeNode::sentHistory).
-        const bool born = node.isBorn() && e->history <= e->sentHistory.size();
+        // Born: sent now, live, even while what it kept is still going out as
+        // history - that is filed at its own times, and never overwrites the
+        // live picture, so the newest value must go as live data or the host
+        // shows the older one until it next changes. (It waited behind the
+        // history, and was kept as history itself.) A dead link the node has
+        // not noticed yet is the replay window's (startEdgeNode).
+        const bool born = node.isBorn();
         for (AppSparkplugSet& set : values) {
             const int index = node.indexOf(e->device(device), set.name.c_str());
             if (index < 0) {
@@ -2238,19 +2372,18 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
                     sent++;
                     continue;
                 }
-                if (set.value.isSpan() && !set.value.isNull) {
-                    std::string owned = set.text;           // a buffer of its own: see EdgeNode::values
-                    e->values[(size_t)index].swap(owned);
-                    set.value.as.bytes.data = (const uint8_t*)e->values[(size_t)index].data();
-                }
-                if (node.setAt((size_t)index, set.value)) {
+                if (e->setCurrent((size_t)index, set.value, set.text, set.timestamp)) {
                     sent++;
                 } else {
                     refused.push_back(set.name + ": " + mq_sparkplugErrorName(node.lastPayloadError()));
                 }
                 continue;
             }
-            // Not born (or behind what it kept): kept, and sent as history.
+            // Not born: its current value all the same - the NBIRTH carries the
+            // newest, as current, where it carried the one from before the outage
+            // and the newer ones only as history (which a host files and does not
+            // show) - and kept, to go as history once it is born.
+            e->setCurrent((size_t)index, set.value, set.text, set.timestamp);
             uint64_t ignored = 0;
             while (e->history >= e->spec.historyMax && e->spec.historyMax != 0) {
                 if (!_outbox.dropOldest(e->key(), nullptr)) break;

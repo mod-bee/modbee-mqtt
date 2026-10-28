@@ -345,9 +345,11 @@ rules - and only these:
 ### The kernel's backstop
 
 Each dialled socket also gets `SO_KEEPALIVE` (120 s idle, then four probes
-30 s apart), `TCP_USER_TIMEOUT` of 120 s (`setDeadLinkTimeout()`, 0 for the
+30 s apart), `TCP_USER_TIMEOUT` of 300 s (`setDeadLinkTimeout()`, 0 for the
 kernel's own fifteen minutes), where the platform has them. They matter when the MQTT keepalive is off or long: a dead
-path with data outstanding ends within two minutes rather than fifteen.
+path with data outstanding ends within five minutes rather than fifteen. Not shorter: on a lossy cellular link the
+retransmission timer doubles through a burst of loss, so one segment can wait over two minutes for its ACK on a link
+that is passing traffic again, and 120 s ended live connections in the bad-network rig.
 
 ---
 

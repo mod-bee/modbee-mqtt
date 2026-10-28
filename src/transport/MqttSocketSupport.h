@@ -368,7 +368,7 @@ inline void suppressSigPipe(int socketHandle) {
 // connection (TCP_USER_TIMEOUT, Linux). Zero leaves the kernel's default -
 // which, with tcp_retries2 at 15, is the best part of fifteen minutes.
 #ifndef MQTT_TCP_DEAD_LINK_MS
-#define MQTT_TCP_DEAD_LINK_MS 120000
+#define MQTT_TCP_DEAD_LINK_MS 300000
 #endif
 
 // NOT TCP_NOTSENT_LOWAT. It was set here, at 16 kB, so that "the bytes have
@@ -776,10 +776,17 @@ inline void* runLookup(void* argument) {
 //   SO_KEEPALIVE      120 s idle, then a probe every 30 s, four of them. It
 //                     only ever runs on a link the MQTT keepalive leaves idle
 //                     for two minutes, so a keepalive of 60 s never sees it.
-//   TCP_USER_TIMEOUT  MQTT_TCP_DEAD_LINK_MS (120 s) of data unacknowledged and
-//                     the connection is over. Two minutes with no ACK at all
-//                     is a dead path, not a slow one: a slow link acknowledges
-//                     slowly, it does not stop.
+//   TCP_USER_TIMEOUT  MQTT_TCP_DEAD_LINK_MS (300 s) of data unacknowledged and
+//                     the connection is over. It was 120 s, and on a lossy
+//                     cellular link that ended live connections: a burst of
+//                     loss doubles the retransmission timer each time (1, 2,
+//                     4 ... 64 s), so a segment can wait 127 s for the ACK on
+//                     a link that is passing traffic again. Five minutes lets
+//                     the timer reach its 120 s cap and try twice more. A dead
+//                     link with the MQTT keepalive on is found by the
+//                     keepalive long before; this is for one with it off or
+//                     long, or with data still coming in while nothing gets
+//                     out.
 //
 // Each where the platform has it, and silently not where it does not: a
 // refused option leaves the socket exactly as it was before this existed.

@@ -385,6 +385,10 @@ private:
     bool loadHosts(std::string& error);
     void startEdgeNode(Connection& connection);
     void serviceEdgeNode(Connection& connection);
+    // What an edge node keeps across a restart (EdgeNode::savedBdSeq):
+    // written when its bdSeq moves, and at most once a second as values do.
+    void saveEdgeState(EdgeNode& edge, bool now);
+    void loadEdgeState(EdgeNode& edge);
     // A host on a Kafka link: its STATE on the link's state connection.
     void serviceHostState(Connection& connection);
     void serviceLink(Connection& connection);

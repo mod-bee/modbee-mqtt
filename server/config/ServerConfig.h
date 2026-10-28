@@ -66,7 +66,7 @@ struct BrokerSection {
     long long maxConnections = 100000; // whole server
     long long maxSessions = 0;         // 0: = maxConnections
     uint32_t maxPacket = 65536;
-    size_t queue = 64;                 // messages held per session
+    size_t queue = 1000;               // messages held per session (its slots grow as a backlog needs)
     // And the bytes they may hold: one session's queue, and every session's
     // together (the whole server; split evenly between shards). 0 = no cap.
     long long queueBytes = 1048576;

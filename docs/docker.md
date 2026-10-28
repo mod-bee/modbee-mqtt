@@ -564,8 +564,11 @@ asked, up to `broker: max-session-expiry`: **an hour** by default, whatever an
 MQTT 5 client asks for, so a device that reboots or loses its link for a while
 is sent what it missed. `4294967295` keeps sessions until modbee restarts. (A
 3.1.1 client has no interval to ask for: with Clean Session 0 its session is
-kept until the restart.) `broker: queue` (64 by default) is how many messages
-are held for one device.
+kept until the restart.) `broker: queue` (1000 by default, as Mosquitto, EMQX and HiveMQ) is how many
+messages are held for one client - a device that is away, or an application
+taking in a burst - and `queue-bytes` (1 MiB) how many bytes. A session's room
+for them grows sixteen messages at a time as it needs it, so a device that
+hardly ever receives anything holds very little.
 
 **With `sessions: store: file`, they survive a restart** - an upgrade, a
 reboot, or modbee being killed outright:

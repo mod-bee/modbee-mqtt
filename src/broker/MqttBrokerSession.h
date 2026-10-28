@@ -229,6 +229,70 @@ struct MqttBrokerWill {
     void clear() { *this = MqttBrokerWill(); }
 };
 
+// A SESSION'S DELIVERY SLOTS.
+//
+// On a board, one array, reserved once at its limit. On a host, BLOCKS OF
+// kBlock THAT NEVER MOVE: the queue starts at one block and grows a block at a
+// time as a backlog needs it, up to the session's limit. It was one array,
+// reserved whole on the first message - so the limit had to stay small (64),
+// since every session that ever received anything paid for all of it, and a
+// subscriber taking in a whole site (a Sparkplug host on spBv1.0/#) lost what
+// arrived in a burst past 64: 2,662 of 4,614 values in one link flap in the
+// cellular rig. Blocks let the limit be what other brokers' is (1000) while a
+// device that receives a command now and then holds one block. And they never
+// move, so the pointers the broker holds into the queue while it works stay
+// good, as they did with the array reserved once - an array that grew would
+// move under them.
+class MqttDeliverySlots {
+public:
+#if defined(MQTT_PLATFORM_HOST)
+    static const size_t kBlock = 16;
+    MqttDeliverySlots() = default;
+    // Copied whole - a session is copied only where the broker builds its
+    // array of them (std::vector needs it), before any has a message.
+    MqttDeliverySlots(const MqttDeliverySlots& other) { *this = other; }
+    MqttDeliverySlots& operator=(const MqttDeliverySlots& other) {
+        if (this == &other) return *this;
+        release();
+        growTo(other._count);
+        for (size_t index = 0; index < _count; index++) (*this)[index] = other[index];
+        return *this;
+    }
+    size_t size() const { return _count; }
+    MqttBrokerDelivery& operator[](size_t index) { return _blocks[index / kBlock][index % kBlock]; }
+    const MqttBrokerDelivery& operator[](size_t index) const { return _blocks[index / kBlock][index % kBlock]; }
+    // Room for at least `slots`, a whole block at a time; nothing there moves.
+    void growTo(size_t slots) {
+        while (_count < slots) {
+            _blocks.push_back(std::unique_ptr<MqttBrokerDelivery[]>(new MqttBrokerDelivery[kBlock]));
+            _count += kBlock;
+        }
+    }
+    void release() {
+        std::vector<std::unique_ptr<MqttBrokerDelivery[]>>().swap(_blocks);
+        _count = 0;
+    }
+
+private:
+    std::vector<std::unique_ptr<MqttBrokerDelivery[]>> _blocks;
+    size_t _count = 0;
+#else
+    size_t size() const { return _slots.size(); }
+    MqttBrokerDelivery& operator[](size_t index) { return _slots[index]; }
+    const MqttBrokerDelivery& operator[](size_t index) const { return _slots[index]; }
+    // Once, with the whole limit (MqttBrokerSession::reserveQueue).
+    void growTo(size_t slots) {
+        if (_slots.size() < slots) _slots.resize(slots);
+    }
+    void release() { std::vector<MqttBrokerDelivery>().swap(_slots); }
+
+private:
+    std::vector<MqttBrokerDelivery> _slots;
+#endif
+public:
+    bool empty() const { return size() == 0; }
+};
+
 class MqttBrokerSession {
 public:
     // Sized once, at startup. A broker that grew these per client would do its
@@ -363,8 +427,8 @@ public:
     size_t queuedCount() const { return _queuedCount; }
     // The cap on messages held, changed while the broker runs. Lowered, the
     // queue keeps what it holds and refuses (and counts) new messages until it
-    // is under the cap; raised, a queue already built grows now - between two
-    // polls, where nothing holds one of its entries.
+    // is under the cap; raised, it grows to it as a backlog needs - reserved up
+    // front, now, between two polls, where nothing holds one of its entries.
     void setQueueLimit(size_t maxQueued);
 #endif
     // Done with an entry, however it ended - delivered, acknowledged, expired
@@ -512,11 +576,23 @@ private:
     size_t _maxSubscriptions = 0;
     size_t _maxQueued = 0;
     // Reserve the arrays on first use (MqttBrokerConfig::reserveUpFront false).
-    // ALL AT ONCE when they are reserved, never grown afterwards: the broker
-    // holds pointers into both while it works, and an array that moved under
-    // them would leave those pointing at freed memory.
+    // The subscriptions ALL AT ONCE when they are reserved, never grown
+    // afterwards: the broker holds pointers into them while it works, and an
+    // array that moved under them would leave those pointing at freed memory.
+    // The queue the same on a board; on a host, its first block, and more as
+    // freeSlot() needs them - blocks never move (MqttDeliverySlots).
     void reserveSubscriptions() { if (_subscriptions.empty()) _subscriptions.resize(_maxSubscriptions); }
-    void reserveQueue() { if (_queue.empty()) _queue.resize(_maxQueued); }
+    void reserveQueue() {
+#if defined(MQTT_PLATFORM_HOST)
+        if (_queue.empty()) _queue.growTo(_maxQueued < MqttDeliverySlots::kBlock ? _maxQueued : MqttDeliverySlots::kBlock);
+#else
+        if (_queue.empty()) _queue.growTo(_maxQueued);
+#endif
+    }
+    // The first free slot - on a host, a new block's when every one is taken
+    // and the queue is under its limit - and its index. Null when full.
+    MqttBrokerDelivery* freeSlot(size_t& index);
+    bool _reservedUpFront = false;
     std::vector<MqttBrokerSubscription> _subscriptions;
     size_t _subscriptionsUsed = 0;
     uint32_t* _revision = nullptr;
@@ -529,7 +605,7 @@ private:
     void* _confirmContext = nullptr;
 #endif
     void bumpRevision() { if (_revision) (*_revision)++; }
-    std::vector<MqttBrokerDelivery> _queue;
+    MqttDeliverySlots _queue;
     size_t _queuedBytes = 0;
     std::unordered_map<std::string, uint32_t>* _loginCounts = nullptr;
     size_t _maxQueuedBytes = 0;

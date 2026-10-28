@@ -70,7 +70,7 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"max-connections", 'c', true, "connections, whole server (default 100000)"},
         {"max-sessions", 0, true, "sessions, whole server (default = connections)"},
         {"max-packet", 0, true, "largest packet accepted, bytes (default 65536)"},
-        {"queue", 0, true, "messages held per session (default 64)"},
+        {"queue", 0, true, "messages held per session (default 1000)"},
         {"queue-bytes", 0, true, "bytes held per session (default 1048576, 0 no cap)"},
         {"queue-bytes-total", 0, true, "bytes held in every session together, whole server (default 67108864, 0 no cap)"},
         {"subscriptions", 0, true, "subscriptions per session (default 32)"},
@@ -262,7 +262,7 @@ int cmdServe(int argc, char** argv) {
         !flag("max-connections", 100000, 1, 100000000, b.maxConnections) ||
         !flag("max-sessions", 0, 0, 100000000, b.maxSessions) ||
         !flag("max-packet", 65536, 64, 268435455, packet) ||
-        !flag("queue", 64, 1, 1000000, queue) ||
+        !flag("queue", 1000, 1, 1000000, queue) ||
         !flag("subscriptions", 32, 1, 100000, subscriptions) ||
         !flag("max-retained", 10000, 0, 10000000, retained) ||
         !flag("status-every", 5, 0, 86400, b.statusEvery) ||

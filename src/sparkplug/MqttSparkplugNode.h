@@ -800,6 +800,22 @@ public:
     uint8_t sequence() const { return _seq; }
     uint8_t birthDeathSequence() const { return _bdSeq; }
 
+    // THE bdSeq ACROSS A RESTART. Every CONNECT moves bdSeq on by one, but a
+    // node that starts again starts at zero: a gateway killed, a board that
+    // rebooted, made two sessions in a row with the same number - and a host
+    // matching a death to its birth by bdSeq could take the old session's
+    // Will, arriving late, as the death of the new one. Keep
+    // birthDeathSequence() somewhere that outlives the process (OpenPLC's
+    // RETAIN memory, a file) whenever it changes, and give it back here
+    // before connect(): the next CONNECT uses the number after it. False,
+    // changing nothing, once this node has made a CONNECT.
+    bool resumeBirthDeathSequence(uint8_t last) {
+        if (_bdSeqUsed) return false;
+        _bdSeq = last;
+        _bdSeqUsed = true;
+        return true;
+    }
+
     const MqttStatus& status() const { return _client.status(); }
     const char* lastErrorText() const;
 

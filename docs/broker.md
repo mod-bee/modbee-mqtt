@@ -249,14 +249,19 @@ guessing.
 
 These are the library's defaults. `modbee-mqtt serve` sets its own, from
 `modbee.yaml` or its flags: `max-packet` 65536 (both buffers and the
-advertised Maximum Packet Size), `max-retained` 10000, `queue` 64,
+advertised Maximum Packet Size), `max-retained` 10000, `queue` 1000 (its slots in blocks of sixteen, taken as a
+backlog needs them, so the limit costs a session nothing until it is used),
 `max-session-expiry` 3600 (`maximumSessionExpiry`, below) - and it can
 keep retained messages across a restart with `retained: store: file` or
 `kafka` ([kafka.md](kafka.md#every-key-and-the-environment)).
 
 Everything is allocated once at `begin()` and never grows, so the memory the
 broker will use is knowable before it starts rather than discovered on a busy
-afternoon.
+afternoon. On a host with `reserveUpFront` false, a session's queue is the one
+thing that grows: sixteen slots on its first message, more blocks of sixteen as a
+backlog needs them, up to `maxQueuedPerSession` - and blocks never move, so
+nothing the broker holds into the queue is left pointing at freed memory. Its
+bytes are still capped by `maxQueuedBytesPerSession` and `maxQueuedBytesTotal`.
 
 **On a host, some of it can change while it runs** - what `modbee-mqtt serve`
 does for `Admin.PutListeners`. Call these on the broker's own thread, between
