@@ -178,6 +178,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug: every metric carries a timestamp.** The node put a timestamp on the payload only; the Eclipse Sparkplug
+  TCK failed it on [tck-id-payloads-name-birth-data-requirement] (the timestamp MUST be on every metric of NBIRTH,
+  DBIRTH, NDATA and DDATA). Each metric now carries the message's time - about 7 bytes a metric on the wire.
 - **Sparkplug: `Node Control/Rebirth` is born without an alias.** The Eclipse Sparkplug TCK failed the node on
   [tck-id-operational-behavior-data-commands-rebirth-name-aliases]: an NBIRTH MUST NOT give it one, so a host that never
   saw the birth can still ask for a rebirth by name. A request by the old alias (0xFFFFFFFE) is still honoured.

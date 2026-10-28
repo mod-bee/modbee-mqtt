@@ -2105,6 +2105,8 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
         // them and the numbers do not shift when the metric set changes.
         bdSeqMetric.alias = MQ_SP_ALIAS_BDSEQ;
         bdSeqMetric.hasAlias = true;
+        bdSeqMetric.timestamp = payload.timestamp;
+        bdSeqMetric.hasTimestamp = true;
         if (!payload.addMetric(bdSeqMetric)) {
             _lastPayloadError = MqttSparkplugError::TooManyMetrics;
             return false;
@@ -2113,6 +2115,7 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
         // [tck-id-operational-behavior-data-commands-rebirth] Every NBIRTH MUST
         // include a metric named Node Control/Rebirth.
         // -rebirth-datatype: Boolean. -rebirth-value: false in the NBIRTH.
+        //
         // AND NO ALIAS. [tck-id-operational-behavior-data-commands-rebirth-name-aliases]:
         // "When aliases are being used by an Edge Node an NBIRTH message MUST
         // NOT include an alias for the Node Control/Rebirth metric" - so that
@@ -2124,6 +2127,8 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
         MqttSparkplugMetric rebirthMetric;
         rebirthMetric.name = MQ_SP_METRIC_NODE_REBIRTH;
         rebirthMetric.value = mq_spBool(false);
+        rebirthMetric.timestamp = payload.timestamp;
+        rebirthMetric.hasTimestamp = true;
         if (!payload.addMetric(rebirthMetric)) {
             _lastPayloadError = MqttSparkplugError::TooManyMetrics;
             return false;
@@ -2145,6 +2150,8 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
             }
             metric.value = mq_spTemplate(definition.bytes.data(),
                                          (uint32_t)definition.bytes.size());
+            metric.timestamp = payload.timestamp;
+            metric.hasTimestamp = true;
             if (!payload.addMetric(metric)) {
                 _lastPayloadError = MqttSparkplugError::TooManyMetrics;
                 return false;
@@ -2180,6 +2187,15 @@ bool MqttSparkplugNode::addPointMetric(MqttSparkplugPayload& payload,
         metric.hasAlias = true;
     }
     metric.value = stateValue(index);
+
+    // [tck-id-payloads-name-birth-data-requirement] "The timestamp MUST be
+    // included with every metric in all NBIRTH, DBIRTH, NDATA, and DDATA
+    // messages." Only the payload's was, until the Eclipse TCK said so: about
+    // seven bytes a metric, and a host that files values by their metric time
+    // (Ignition's historian does) has one. It is the payload's own - the
+    // moment these values were read for this message.
+    metric.timestamp = payload.timestamp;
+    metric.hasTimestamp = true;
 
     // [tck-id-operational-behavior-data-publish-nbirth-values] For each
     // metric in the NBIRTH, the value MUST be included. A metric never

@@ -45,7 +45,9 @@ Plain MQTT moves bytes on topics anyone can invent. Sparkplug fixes the rest:
 - **Aliases.** After the birth, metrics are sent by number rather than by
   name, which is most of Sparkplug's bandwidth saving. A host keeps the birth
   to turn the numbers back into names; `MqttSparkplugHost` does that for you.
-- **Report by exception.** Data messages (NDATA) carry only what changed.
+- **Report by exception.** Data messages (NDATA) carry only what changed,
+  each metric with its timestamp (the specification requires one on every
+  metric of a birth or data message: about 7 bytes each).
 - **A primary host.** A node can be told to stay quiet until a named SCADA
   host says it is online, and to move to another broker if that host goes
   offline.
