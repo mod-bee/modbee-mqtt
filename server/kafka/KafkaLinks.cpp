@@ -113,6 +113,10 @@ bool KafkaLinks::sectionFor(const std::string& id, const AppKafkaLinkSpec& link,
                 "kafka_topic_pattern), or both";
         return false;
     }
+    if (!link.inPattern.empty() && link.inPattern[0] != '^') {
+        error = "kafka_topic_pattern is a regular expression starting with ^ (\"^plant-.*\"), as Kafka's clients take one";
+        return false;
+    }
     if (!link.inTopics.empty() && !link.inPattern.empty()) {
         error = "kafka_topics or kafka_topic_pattern, not both";
         return false;
@@ -190,7 +194,7 @@ bool KafkaLinks::open(const std::string& id, const AppKafkaLinkSpec& link, AppLo
     std::unique_ptr<Link>& slot = _links[id];
     if (!slot || slot->signature != signature) {
         // Made again: what the old one holds for Kafka is given a few seconds.
-        slot.reset();
+        if (slot) reap(std::move(slot));
         std::unique_ptr<Link> made(new Link());
         made->signature = signature;
         made->section = section;
@@ -217,7 +221,9 @@ bool KafkaLinks::open(const std::string& id, const AppKafkaLinkSpec& link, AppLo
         // What Kafka hands the connection faster than it takes it waits here.
         c.broker.maxQueuedPerSession = 50000;
         c.broker.maxQueuedBytesPerSession = 64u << 20;
-        c.broker.maxRetained = 100000;
+        // Retained messages Kafka's records ask it to keep - each costs room
+        // whether used or not, and a producer could ask for many.
+        c.broker.maxRetained = 1000;
         c.broker.maximumSessionExpiry = 0xFFFFFFFFu;
         c.broker.allowAnonymous = false;
         // Grown as used: the limits above are what it may reach, not what an
@@ -249,7 +255,18 @@ void KafkaLinks::close(const std::string& id) {
         gone = std::move(at->second);
         _links.erase(at);
     }
-    gone.reset();        // its broker stopped outside the lock: the pipe's flush takes a moment
+    reap(std::move(gone));
+}
+
+void KafkaLinks::reap(std::unique_ptr<Link> link) {
+    std::lock_guard<std::mutex> hold(_reaping);
+    if (_reapers.size() >= 16) {
+        // Long done, as a rule: joined, so the list does not grow.
+        for (std::thread& t : _reapers) t.join();
+        _reapers.clear();
+    }
+    std::shared_ptr<Link> owned(link.release());
+    _reapers.emplace_back([owned]() mutable { owned.reset(); });
 }
 
 void KafkaLinks::closeAll() {
@@ -258,6 +275,10 @@ void KafkaLinks::closeAll() {
         std::lock_guard<std::mutex> hold(_lock);
         gone.swap(_links);
     }
+    for (auto& one : gone) reap(std::move(one.second));
+    std::lock_guard<std::mutex> hold(_reaping);
+    for (std::thread& t : _reapers) t.join();
+    _reapers.clear();
 }
 
 bool KafkaLinks::status(const std::string& id, AppKafkaLinkStatus& out) const {

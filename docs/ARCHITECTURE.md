@@ -11,7 +11,7 @@ layer underneath. If you just want to make it work, read
  ┌──────────────────────────────────────────────────────────────────────┐
  │ L4  ABOVE     MqttDevice      one object, the short form             │
  │               MqttTypedBindings · MqttPoller    optional, and built  │
- │               (a Sparkplug layer would live here)  on the raw API    │
+ │               MqttSparkplugNode · MqttSparkplugHost  on the raw API  │
  ├──────────────────────────────────────────────────────────────────────┤
  │ L3  ROLE      MqttClient      the state machine        ← the ONLY    │
  │               MqttBroker      the other end              layers that │

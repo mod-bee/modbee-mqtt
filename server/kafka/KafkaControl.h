@@ -71,6 +71,11 @@ public:
     virtual KafkaPipeStatus status() const = 0;
 };
 
+// A librdkafka setting whose value is a secret (a password, a key, a JAAS or
+// OAUTHBEARER configuration): never given back by the API, and kept when a
+// change gives it empty - as a cluster's password is.
+bool kafkaSecretSetting(const std::string& name);
+
 class KafkaControl {
 public:
     // `file`: the configuration, whose kafka: is where the section starts.

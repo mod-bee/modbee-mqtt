@@ -20,8 +20,8 @@ docker run --rm ghcr.io/mod-bee/modbee-mqtt pub -h broker.example.com -t test -m
 docker run --rm -it ghcr.io/mod-bee/modbee-mqtt sub -h broker.example.com -t 'test/#' -v
 ```
 
-Given a command, the image runs `modbee <command>`; given none, it runs the
-broker. Inside a running compose stack, `docker compose exec modbee modbee ...`
+Given a command, the image runs `modbee-mqtt <command>`; given none, it runs the
+broker. Inside a running compose stack, `docker compose exec modbee modbee-mqtt ...`
 reaches that stack's broker on `localhost`. To reach a broker on your own
 machine from `docker run`, add `--network host`.
 
@@ -30,7 +30,7 @@ machine from `docker run`, add `--network host`.
 ```bash
 cmake -S . -B build && cmake --build build -j
 ./build/cli/modbee-mqtt --help
-sudo cmake --install build          # optional: puts modbee in /usr/local/bin
+sudo cmake --install build          # optional: puts modbee-mqtt in /usr/local/bin
 ```
 
 On Linux every command is built; on Windows every one but `bench`
@@ -216,7 +216,9 @@ modbee-mqtt serve --data /var/lib/app/broker --api unix:/run/app/broker.sock --a
   `--api tcp://host:port` serve the [Application API](app-api.md) (repeat the
   flag for both), `--api-token-file` names the token every call must carry,
   `--authority` has your application decide logins (`--authority-timeout-ms`,
-  2000 by default), `--events` turns client events on, `--queue-bytes` and
+  2000 by default), `--events` turns client events on, `--sparkplug-aware`
+  keeps every Sparkplug birth on `$sparkplug/certificates/...`
+  ([app-api.md](app-api.md#sparkplug-b)), `--queue`, `--queue-bytes` and
   `--queue-bytes-total` cap what sessions hold. **`--set path=value`** sets
   any other setting by its place in `modbee.yaml` - `--set
   broker.max-keepalive=60`, `--set authentication.max-sessions-per-login=4` -

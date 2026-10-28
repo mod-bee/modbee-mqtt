@@ -11,6 +11,24 @@
 #include <fstream>
 #include <sstream>
 
+bool kafkaSecretSetting(const std::string& name) {
+    return name.find("password") != std::string::npos || name.find("secret") != std::string::npos ||
+           name.find("jaas") != std::string::npos || name == "sasl.oauthbearer.config" ||
+           name == "ssl.key.pem" || name == "ssl.keystore.password";
+}
+
+namespace {
+
+// Settings that load code into the server: a librdkafka plugin, an OpenSSL
+// engine. The file may name them - whoever writes it runs the server - but
+// over the API they would let a token holder run any library on the machine.
+bool loadsCode(const std::string& name) {
+    return name == "plugin.library.paths" || name == "ssl.engine.location" || name == "ssl_engine_location" ||
+           name == "ssl.engine.id";
+}
+
+} // namespace
+
 KafkaControl::KafkaControl(const ServerConfig& file, const std::string& stateDirectory,
                            const std::string& retainedCluster, KafkaLive* live)
     : _path(stateDirectory.empty() ? std::string() : stateDirectory + "/kafka.json"),
@@ -81,6 +99,12 @@ KafkaControl::Result KafkaControl::putCluster(const KafkaClusterConfig& cluster,
         error = "a cluster needs an id";
         return Result::Invalid;
     }
+    for (const auto& property : cluster.properties) {
+        if (loadsCode(property.first)) {
+            error = "\"" + property.first + "\" loads a library into the server: set it in modbee.yaml, not over the API";
+            return Result::Invalid;
+        }
+    }
     ServerConfig next = _section;
     KafkaClusterConfig given = cluster;
     auto at = std::find_if(next.clusters.begin(), next.clusters.end(),
@@ -90,6 +114,13 @@ KafkaControl::Result KafkaControl::putCluster(const KafkaClusterConfig& cluster,
         if (given.password.empty() && given.passwordFile.empty() && given.username == at->username) {
             given.password = at->password;
             given.passwordFile = at->passwordFile;
+        }
+        // Nor a secret setting's value: given empty, the one it has.
+        for (auto& property : given.properties) {
+            if (!property.second.empty() || !kafkaSecretSetting(property.first)) continue;
+            for (const auto& had : at->properties) {
+                if (had.first == property.first) property.second = had.second;
+            }
         }
         *at = given;
     } else {

@@ -47,13 +47,23 @@ const char* const kApiVersion = "1.0";
 
 // --- Who may call ------------------------------------------------------------
 
+// The same whatever the bytes: how long it took says nothing of how many matched.
+bool sameSecret(const std::string& a, const std::string& b) {
+    unsigned char differ = a.size() == b.size() ? 0 : 1;
+    const size_t n = std::max(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) {
+        differ |= (unsigned char)((i < a.size() ? a[i] : 0) ^ (i < b.size() ? b[i] : 0));
+    }
+    return differ == 0;
+}
+
 bool allowed(grpc::CallbackServerContext* context, const std::string& token) {
     if (token.empty()) return true;
     const auto& metadata = context->client_metadata();
     const auto found = metadata.find("authorization");
     if (found == metadata.end()) return false;
     const std::string presented(found->second.data(), found->second.size());
-    return presented == "Bearer " + token;
+    return sameSecret(presented, "Bearer " + token);
 }
 
 grpc::Status refusedToken() {
@@ -1775,7 +1785,8 @@ void clusterTo(const KafkaClusterConfig& c, v1::KafkaCluster& out) {
         auth->set_password_file(c.passwordFile);
         auth->set_password_set(!c.password.empty() || !c.passwordFile.empty());   // never the password itself
     }
-    for (const auto& p : c.properties) (*out.mutable_properties())[p.first] = p.second;
+    // A secret setting's value is never given back: empty, and a Put with it empty keeps it.
+    for (const auto& p : c.properties) (*out.mutable_properties())[p.first] = kafkaSecretSetting(p.first) ? "" : p.second;
 }
 
 bool toKafkaFrom(const std::string& id, const v1::KafkaMqttToKafka& m, MqttToKafkaConfig& out, std::string& error) {
@@ -3096,7 +3107,7 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
         response = errorBody(503, "the Application API is not running");
         return 503;
     }
-    if (!self.config.token.empty() && authorization != "Bearer " + self.config.token) {
+    if (!self.config.token.empty() && !sameSecret(authorization, "Bearer " + self.config.token)) {
         response = errorBody(401, "this call needs \"Authorization: Bearer <token>\" (api.token)");
         return 401;
     }

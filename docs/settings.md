@@ -12,6 +12,12 @@ while the broker runs ([logins.md](logins.md)). Settings - ports, limits,
 Kafka mappings - are what a broker is built from when it starts, so they wait
 for the next start rather than half-apply to a running one.
 
+**To change a running server now**, the [Application API](app-api.md) has
+calls of its own: listeners, connection and packet limits and queue caps
+(`Admin.PutListeners`) and client events (`Admin.PutEvents`) - not kept, so
+the next start goes by these settings again - and the Kafka pipe's clusters
+and mappings (`Kafka.*`), which are kept ([kafka.md](kafka.md#changing-it-while-it-runs)).
+
 **The TLS certificate is the exception.** Its certificate, key and client CA
 are applied the moment they are stored, with no restart
 ([below](#the-tls-material-applied-while-it-runs)), because a certificate is
@@ -334,6 +340,6 @@ nothing stops.
 
 ## Backups
 
-The settings are in the login database, so `modbee-mqtt backup` and the daily copy
-([logins.md](logins.md#backups)) hold them, and `modbee-mqtt restore` puts them
+The settings are in the login database, so `modbee-mqtt backup`, `Admin.Backup`
+and the daily copy ([logins.md](logins.md#backups)) hold them, and `modbee-mqtt restore` puts them
 back with the logins.

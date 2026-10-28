@@ -4,6 +4,8 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "ConnectionOutbox.h"
+
+#include <cstdio>
 #include "GroupStore.h"
 #include "ServerOs.h"
 
@@ -81,12 +83,21 @@ std::vector<ConnectionOutbox::Kept> ConnectionOutbox::next(const std::string& co
     s.text(1, connection);
     s.number(2, (int64_t)afterId);
     s.number(3, (int64_t)limit);
+    std::vector<uint64_t> unreadable;
     while (sqlite3_step(s.s) == SQLITE_ROW) {
         Kept k;
         k.id = (uint64_t)sqlite3_column_int64(s.s, 0);
         k.bytes = (size_t)sqlite3_column_int64(s.s, 1);
         const std::string blob = column(s.s, 2);
         if (decodeAppMessage(blob.data(), (int)blob.size(), k.message)) out.push_back(std::move(k));
+        else unreadable.push_back(k.id);
+    }
+    // A row that will never read (a damaged file) is let go: kept, it held its
+    // place at the head for ever, and enough of them stopped everything behind.
+    for (uint64_t id : unreadable) {
+        std::fprintf(stderr, "outbox.db: message %llu of %s could not be read - dropped\n",
+                     (unsigned long long)id, connection.c_str());
+        drop(id);
     }
     return out;
 }

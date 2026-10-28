@@ -376,7 +376,10 @@ one.
 
 Everything above is also a JSON message over MQTT, which is how the `modbee-mqtt`
 command does it - so a platform, dashboard or script can manage logins with
-nothing but an MQTT connection with an admin login. No REST API, no webhooks.
+nothing but an MQTT connection with an admin login. The same logins and
+keys are also calls of the [Application API](app-api.md#administration-and-rest),
+over gRPC or REST (`Admin.PutLogin`, `PUT /v1/logins/{name}`), and commands
+over it (`modbee-mqtt logins put`, `keys put`).
 
 Subscribe to `$modbee/admin/<your client id>/reply`, then publish a request to
 `$modbee/admin/request`:
@@ -444,6 +447,10 @@ by hand would be locked out. So:
   last 7 are kept.
 - **`modbee-mqtt backup`** makes one now:
   `docker compose exec modbee modbee-mqtt backup`.
+- **Over the Application API**, `Admin.Backup` (`modbee-mqtt logins backup`,
+  `POST /v1/backups`) makes one in the same folder and names it; with
+  `contents: true` its bytes come back too, for an application on another
+  machine.
 - **Keep a copy somewhere else**, as for any database:
   `docker compose cp modbee:/var/lib/modbee/backups ./modbee-backups`.
 

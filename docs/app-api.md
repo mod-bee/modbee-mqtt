@@ -5,7 +5,7 @@ backend, a gateway's own software - can speak to it a different way: over
 the Application API, gRPC on a local socket, with no MQTT library at all.
 
 The contract is [`proto/modbee/app/v1/app.proto`](../proto/modbee/app/v1/app.proto).
-The server answers all five of its services:
+The server answers all seven of its services:
 
 | Service | What it is for |
 | --- | --- |
@@ -14,7 +14,8 @@ The server answers all five of its services:
 | `Connections` | **MQTT connections the server keeps to other brokers for your application** - [below](#connections-to-other-brokers) |
 | `Sparkplug` | **Sparkplug B, decoded and encoded** - [below](#sparkplug-b) |
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
-| `Admin` | **Logins, site keys, sessions, kicks, retained messages, TLS, counters** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
+| `Kafka` | **The Kafka pipe's clusters and mappings, changed while it runs** - [below](#kafka) |
+| `Admin` | **Logins, site keys, sessions, kicks, retained messages, listeners, TLS, counters, settings, events, backups** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
 
 Every call is also a command - `modbee-mqtt sessions list`, `modbee-mqtt listeners set --port 1884` - with the
 call's own fields as its flags ([cli.md](cli.md#the-application-api-from-the-command-line)), and the server is
@@ -22,7 +23,7 @@ started with flags alone (`serve --api unix:<path> --api-token-file <file> --aut
 
 `Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), and what
 it added since (`connections.subscriptions`: subscription options on a connection; `admin.listeners`:
-`PutListeners`; `events.handshake`; `sparkplug.codec`; `sparkplug.host`; `sparkplug.edge`; `sparkplug.structures` - the edge node's templates, arrays and DataSets; `sparkplug.aware`; `kafka`), so an application asks rather than guesses.
+`PutListeners`; `events.handshake`; `sparkplug.codec`; `sparkplug.host`; `sparkplug.edge`; `sparkplug.structures` - the edge node's templates, arrays and DataSets; `sparkplug.aware`; `kafka`: the `Kafka` service; `connections.kafka`: a connection over Kafka; `admin.backup`: `Backup`; `events.live`: `GetEvents` and `PutEvents`), so an application asks rather than guesses.
 
 **`System.Attach`** is an instance's presence. Open it with the messages to
 publish should the instance vanish - its Wills, as an MQTT client has one:
@@ -55,6 +56,9 @@ In a `modbee.yaml` (the Docker image's way):
 api:
   grpc: ["unix:/run/modbee/api.sock"]
 ```
+
+Or with flags alone: `modbee-mqtt serve --api unix:/run/modbee/api.sock
+--api-token-file <file>` (`--api` repeats for a socket and a TCP address).
 
 `modbee-mqtt serve` says where it listens:
 
@@ -158,9 +162,11 @@ it, a clock you can trust - and the MQTT 5 properties it was published with.
 
 - **`$` topics** come only when a filter names them (`$modbee/provision/+/request`).
 - **`events: true`** adds client events - connected, disconnected, subscribed,
-  unsubscribed - dealt like the messages: to the instance that gets that
+  unsubscribed, a publish, subscribe or CONNECT refused, a TLS handshake that
+  failed (`ClientEvent.address`, `detail`) - dealt like the messages: to the instance that gets that
   client's messages, in order with them, acknowledged by `id`. The server
-  needs `events: enabled` ([events.md](events.md)).
+  needs `events: enabled`, `serve --events` or `Admin.PutEvents`
+  ([events.md](events.md)).
 - **`exclude_origins`** keeps messages your application published itself
   (with that `origin`) out of the group.
 - **`group: ""`** is a stream of its own, gone when it ends.
@@ -181,7 +187,7 @@ answer comes is up to you (`confirm`):
 
 | `confirm` | Answered |
 | --- | --- |
-| `CONFIRM_ACCEPTED` (the default) | Once the server has taken it: `PUBLISH_ACCEPTED` |
+| `CONFIRM_ACCEPTED` (the default) | Once the server has taken it: `PUBLISH_ACCEPTED`, with how many subscribers it `matched` - no acknowledgement is waited for. Nobody subscribed: `PUBLISH_NO_SUBSCRIBERS` (a retained message is still kept) |
 | `CONFIRM_DELIVERED` | Once **every subscriber it reached has acknowledged it** - PUBACK at QoS 1, PUBCOMP at QoS 2 - on whichever CPU core's share of the server each one is: `PUBLISH_DELIVERED`, with how many it `matched`. Nobody subscribed: `PUBLISH_NO_SUBSCRIBERS` at once |
 
 The wait is bounded by the call's gRPC deadline (ten seconds without one).
@@ -207,7 +213,7 @@ Sparkplug is kept once, here: your application needs no Sparkplug codec of its o
 | **A Host Application, in the server** | `Sparkplug.PutHost` on one of its connections - one to another broker, or `this_server: true` for the server's own devices. Its STATE becomes the connection's Will, born at each connect with the Will's own timestamp, made offline before an intended stop (`DeleteHost`) and born again if anything says otherwise. It follows every node's session - bdSeq, seq, aliases - and asks a node to rebirth when its stream cannot be trusted: a gap the reorder window (`reorder_timeout_ms`, 2000) did not close, data from a node with no birth, an alias no birth gave, a payload that does not decode, and every node when its own session begins - at most once a `rebirth_min_interval_ms` (60000) per node. Kept in the state directory, up while your application restarts |
 | **What it delivers** | On a Consume stream on its connection (`sparkplug: true`), data that carries only aliases arrives with the names and datatypes the births gave them, so an `Int8` reads as one. `stale`: an NDEATH of a session already replaced - not a death. `gap`: seq skipped |
 | **What it knows** | `Sparkplug.ListNodes`: each node's session (online, bdSeq, last seq, messages, gaps, rebirths asked), its devices, every metric its births declared - name, alias, datatype - and the last value of each: numbers, bools, text, bytes, arrays, DataSets and Templates |
-| **An Edge Node, in the server** | `Sparkplug.PutEdgeNode` on one of its connections (a host or an edge node on each: one Will): the library's TCK-tested node - NDEATH the connection's Will with a new bdSeq each session, an NBIRTH and a DBIRTH per device from what it declares (aliases its own, units, ranges, deadbands, writable metrics), NDATA and DDATA as `SetValues` sets them, a rebirth when a host asks, and a `primary_host_id`'s STATE waited for. While it is not born, values set are kept on disk and sent, oldest first, with `is_historical` once it is - Sparkplug's own store and forward (`history_max`, 100000). A host's writes reach your application on the connection, as NCMD and DCMD with names filled in (`ConsumeOpen.sparkplug`). `SetDeviceState` sends a DBIRTH or DDEATH; `RebirthEdgeNode` a new birth. Every metric datatype: numbers, Boolean, String, Text, UUID, Bytes, File, DateTime, the arrays (`array_value`), DataSet (`dataset_value`) and Template |
+| **An Edge Node, in the server** | `Sparkplug.PutEdgeNode` on one of its connections (a host or an edge node on each: one Will): the library's TCK-tested node - NDEATH the connection's Will with a new bdSeq each session, an NBIRTH and a DBIRTH per device from what it declares (aliases its own, units, ranges, deadbands, writable metrics), NDATA and DDATA as `SetValues` sets them, a rebirth when a host asks, and a `primary_host_id`'s STATE waited for. While it is not born, values set are kept on disk and sent, oldest first, with `is_historical` once it is - Sparkplug's own store and forward (`history_max`, 100000). QoS 0, as all Sparkplug data: what it sent leaves the disk only once the node has stayed born for two keep-alives after, and goes again after the next birth if the link dropped first (a historian sees the same timestamp twice, not a gap). A host's writes reach your application on the connection, as NCMD and DCMD with names filled in (`ConsumeOpen.sparkplug`). `SetDeviceState` sends a DBIRTH or DDEATH; `RebirthEdgeNode` a new birth. Every metric datatype: numbers, Boolean, String, Text, UUID, Bytes, File, DateTime, the arrays (`array_value`), DataSet (`dataset_value`) and Template |
 | **PLC structs** | A struct or UDT is a Template. Its definition goes in the edge node's `templates` (a name, and the members with their datatypes and starting values, and any parameters) and is published in every NBIRTH; a metric declared `DATATYPE_TEMPLATE` is an instance, set with a `template_value` whose `template_ref` names a definition - in a birth with every member, in data with those that changed. A member may be a Template too (a struct in a struct), an array or a DataSet. `SetValues` answers `refused` ("name: why") for a value its metric cannot take - an instance of a definition the node does not have, an array metric given a number; the same value again is neither sent nor kept as history |
 | **Sparkplug Aware** | `Sparkplug.PutAware` (or `serve --sparkplug-aware`, `sparkplug: {aware: true}`): every NBIRTH and DBIRTH the server's clients publish kept, retained and byte for byte, on `$sparkplug/certificates/spBv1.0/<group>/NBIRTH/<node>` (`.../DBIRTH/<node>/<device>`), and cleared by its death - an NDEATH clears its devices' too - so a host that starts late reads every dictionary without asking for a rebirth. Every login may read them; none may write them. Turned off live, it clears what it kept |
 | **Commands** | `Sparkplug.Write`: an NCMD (or with `device`, a DCMD) of metrics by name, sent by the alias and at the datatype their birth gave - any datatype, Node and Device Control metrics too (Next Server, Scan Rate, Reboot). `Sparkplug.Rebirth`: now, unlimited - a person asked |
@@ -244,17 +250,20 @@ preference, the client id, login, TLS, keep-alive, session, Will.
 
 | | |
 | --- | --- |
-| **Failover** | An attempt that fails moves to the next server. Connected to any but the first, it checks the first every `primary_check_seconds` (60) and goes back to it once it answers |
+| **Failover** | An attempt that fails moves to the next server. Connected to any but the first, it checks the first every `primary_check_seconds` (60) and goes back to it once it answers; when going back did not last, it checks half as often each time (a load balancer that takes TCP for a broker that is down does not move the connection every minute) |
+| **Reconnecting** | As the library's own client does: a backoff from 1 s doubling to 60 s, each wait drawn at random from all of it (full jitter, so a site's gateways do not come back in step after an outage), started afresh only after a connection that stayed up 30 s - a broker that accepts and drops at once is not asked again every moment. `0x97` quota exceeded and `0x9F` connection rate exceeded wait at least a minute |
 | **Kept** | Written to `connections.json` in `api.state-directory` (`/var/lib/modbee`), readable by the server's user only, and opened again when the server starts. `Put` again with a change reconnects; with none, nothing happens. `Delete` closes and forgets it |
 | **Messages in** | A `Consume` stream with `connection` set to its id: the group's filters become the connection's subscriptions, and what the other broker sends arrives as any delivery does, its `connection` set |
 | **How it subscribes** | QoS 1 for a filter in `filters`. `subscriptions` sets each filter's own: `qos` 0 to 2, and MQTT 5's `no_local`, `retain_as_published` and `retain_handling`. Two groups asking for one filter share one subscription - the higher QoS, and the retained messages if either wants them. Opening the group again with other options subscribes again with them; `ListGroups` shows what each filter has |
 | **Messages out** | `Publish` with `connection` set. `CONFIRM_DELIVERED` answers when **the other broker** has acknowledged it (PUBACK, PUBCOMP); `PUBLISH_NOT_CONNECTED` when the connection is down - nothing was sent |
-| **Store and forward** | `store_and_forward: {enabled: true}` - what a bridge does (EMQX's buffer, HiveMQ Edge, Mosquitto's bridge queue). Every publish on the connection is written to disk (`outbox.db` beside `connections.json`) before it is answered, and leaves only when the other broker has acknowledged it: a connection that is down, a restart or a crash loses none, and they go **in the order they were published**, at QoS 1 or more. Answers: `PUBLISH_ACCEPTED` (up, on its way), `PUBLISH_STORED` (down: kept, sent when it is back), `PUBLISH_DELIVERED` (`CONFIRM_DELIVERED`, acknowledged before the deadline; `STORED` past it). Bounded by `max_messages` (100000) and `max_bytes` (64 MiB); full, `WHEN_FULL_REFUSE` refuses the new one (`0x97`) and `WHEN_FULL_DROP_OLDEST` gives up the oldest. A message whose Message Expiry Interval runs out while it waits is not sent, and one sent late carries what is left of it. `ConnectionInfo` says `stored`, `stored_bytes`, `oldest_stored_ms`, `stored_dropped`, `stored_expired`; `Delete` drops what it holds. `sessions: sync: full` puts each on the disk before it is answered, power loss included |
+| **Store and forward** | `store_and_forward: {enabled: true}` - what a bridge does (EMQX's buffer, HiveMQ Edge, Mosquitto's bridge queue). Every publish on the connection is written to disk (`outbox.db` beside `connections.json`) before it is answered, and leaves only when the other broker has acknowledged it: a connection that is down, a restart or a crash loses none, and they go **in the order they were published**, at QoS 1 or more. Answers: `PUBLISH_ACCEPTED` (up, on its way), `PUBLISH_STORED` (down: kept, sent when it is back), `PUBLISH_DELIVERED` (`CONFIRM_DELIVERED`, acknowledged before the deadline; `STORED` past it). A message the other broker refuses with `0x97` quota exceeded is kept, and nothing more is sent for a while (1 s doubling to a minute); one it refuses for good (not authorised, a topic it will not take) or this connection can never send (retained to a broker without retain, a QoS it does not offer) is given up and answered, so it does not hold up those behind it. Bounded by `max_messages` (100000) and `max_bytes` (64 MiB); full, `WHEN_FULL_REFUSE` refuses the new one (`0x97`) and `WHEN_FULL_DROP_OLDEST` gives up the oldest. A message whose Message Expiry Interval runs out while it waits is not sent, and one sent late carries what is left of it. `ConnectionInfo` says `stored`, `stored_bytes`, `oldest_stored_ms`, `stored_dropped`, `stored_expired`; `Delete` drops what it holds. `sessions: sync: full` puts each on the disk before it is answered, power loss included |
 | **This server itself** | `this_server: true`, no `servers`: a connection to the server's own listener, as one of its clients, with a login the server makes for it at each start - an ordinary one, every topic but the `$` ones. What a Sparkplug host or edge node on the server's own devices runs on |
 | **Over Kafka** | `kafka: {cluster, kafka_topic, kafka_topics, ...}`, no `servers`: Kafka is the link. The connection's client talks to a broker of its own inside the server, bridged to those Kafka topics in the envelope, so everything in this table works on it - a publish acknowledged once Kafka has it, store and forward through a Kafka outage, request/response, a Sparkplug host or edge node. `ConnectionInfo.kafka` says whether Kafka can be reached, records in and out, the lag; `BACKING_OFF` "Kafka cannot be reached" while it cannot. A Sparkplug host on it keeps its STATE on the MQTT connection `state_connection` names - Kafka has no Will. One of `servers`, `this_server` and `kafka`; `FAILED_PRECONDITION` in a build without Kafka; Hello lists `connections.kafka`. [kafka.md](kafka.md#kafka-as-a-connections-link) |
 | **MQTT 5 at CONNECT** | The Will's properties (`will.properties`) and `will_delay_seconds`; `receive_maximum`, `topic_alias_maximum`, `maximum_packet_size` - what this end will take |
 | **`RECONNECT_WHEN_ASKED`** | A connection that drops stays down (`CONNECTION_WAITING`) until `Connections.Reconnect`, which can bring a new Will for the next session - what a Sparkplug edge node needs, its NDEATH carrying a new `bdSeq` each time |
-| **A refused login** | `CONNECTION_REFUSED`, with what the other broker said in `last_error`, and not tried again until `Put` or `Reconnect`: a wrong password sent every second gets a site banned |
+| **A refused login** | `0x86`, `0x87`, `0x8A`, `0x8C` (3.1.1: 4, 5): `CONNECTION_REFUSED`, with what the other broker said in `last_error`, and tried again every five minutes - never given up on, as an account fixed at the broker should come back by itself, but not every second, which gets a site banned. `Put` or `Reconnect` tries at once. Every other refusal backs off as above |
+| **Ids** | Letters, digits and `. _ - : @`, at most 128, not starting with a dot: an id names the files of its TLS material beside `connections.json` |
+| **Packet size** | It tells the other broker the largest packet it takes - 64 KiB, or `maximum_packet_size` if smaller (1 MiB over Kafka) - so at MQTT 5 a larger message is dropped there rather than sent to break the connection. At 3.1.1 it cannot say so |
 
 `Get` and `List` say each one's state, which server it is on, and its counts -
 never its password or key. `Watch` streams every change of state.

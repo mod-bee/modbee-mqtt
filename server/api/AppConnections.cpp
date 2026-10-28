@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <random>
 #include <sstream>
 
 #include "ServerOs.h"
@@ -131,6 +133,45 @@ void applyWill(const AppConnectionSpec& spec, MqttConnectionConfig& connection) 
 // A Sparkplug host's STATE, as the library writes it (QoS 1, retained).
 std::string stateJson(bool online, uint64_t timestamp) {
     return std::string("{\"online\":") + (online ? "true" : "false") + ",\"timestamp\":" + std::to_string(timestamp) + "}";
+}
+
+// How long a backoff of up to `base` waits: anywhere from 100 ms to all of it
+// (full jitter, as the library's client: MqttClient::scheduleReconnect).
+std::chrono::milliseconds jittered(uint32_t base) {
+    static std::mt19937 random{std::random_device{}()};
+    static std::mutex lock;
+    const uint32_t least = std::min<uint32_t>(base, 100);
+    std::lock_guard<std::mutex> guard(lock);
+    return std::chrono::milliseconds(least + random() % (base - least + 1));
+}
+
+const uint32_t kPacketBytes = 65536;       // a connection's buffers: the largest packet either way
+const uint32_t kLinkPacketBytes = 1114112;  // a Kafka link's: Kafka's 1 MiB record, and the packet around it
+const uint32_t kBackoffMaxMs = 60000;      // the library's reconnectMaximumMs
+const uint32_t kStableMs = 30000;          // MQ_RECONNECT_STABLE_MS
+const uint32_t kBusyFloorMs = 60000;       // quota exceeded, connection rate exceeded: not sooner
+const uint32_t kRefusedRetryMs = 300000;   // a refused login, tried again (MqttClientConfig::rejectedCredentialsRetryMs)
+
+// A connection's id names files beside connections.json (its TLS material),
+// so it is a name, not a path: letters, digits and . _ - : @, at most 128,
+// and not starting with a dot - as EMQX names its bridges.
+bool idIsName(const std::string& id) {
+    if (id.empty() || id.size() > 128 || id[0] == '.') return false;
+    for (char ch : id) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                        ch == '.' || ch == '_' || ch == '-' || ch == ':' || ch == '@';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// A CONNACK that refused this login - the only refusal that waits for
+// kRefusedRetryMs (and Put or Reconnect) rather than the backoff. Every other
+// one - unavailable, busy, quota, rate, use another server - backs off.
+bool loginRefusal(uint8_t code, bool v311) {
+    if (v311) return code == MQ_RETURN_BAD_CREDENTIALS || code == MQ_RETURN_NOT_AUTHORIZED;
+    return code == MQ_REASON_BAD_USER_NAME_OR_PASSWORD || code == MQ_REASON_NOT_AUTHORIZED || code == 0x8A /* banned */ ||
+           code == 0x8C /* bad authentication method */;
 }
 
 std::vector<std::string> topicParts(const std::string& topic) {
@@ -363,6 +404,12 @@ struct AppConnections::EdgeNode {
     // library's node keeps a span into them until the next value (a rebirth
     // reads it), so they outlive the call that set them.
     std::vector<std::string> values;
+    // History sent this session, and when: QoS 0, so it leaves the outbox only
+    // once the node has stayed born for two keep-alives after it went (as
+    // MqttSparkplugNode::publishRecords asks) - lost with the link before then,
+    // it goes again after the next birth, is_historical as before.
+    std::vector<std::pair<uint64_t, Clock::time_point>> sentHistory;
+    uint64_t sentUpTo = 0;
     std::string key() const { return "sparkplug-node:" + spec.id; }
     const char* device(const std::string& d) const { return d.empty() ? nullptr : d.c_str(); }
 };
@@ -461,7 +508,21 @@ struct AppConnections::Connection {
     bool reachedThisAttempt = false;           // ...and got to Connected
     bool asked = false;                        // reconnect() wants a new attempt now
     Clock::time_point nextAttempt = Clock::now();
-    uint32_t backoffMs = 0;
+    // The backoff the next failure waits up to (full jitter, nextDelay()): it
+    // doubles to kBackoffMaxMs and starts again only after a connection that
+    // stayed up kStableMs - so a broker that accepts and drops at once is not
+    // asked every 200 ms, and a site's gateways do not come back in step.
+    uint32_t backoffMs = 1000;
+    Clock::time_point upSince;
+    // Back to the first server: how often it went wrong lately - each time, the
+    // first is checked half as often (a load balancer that takes TCP for a
+    // broker that is down would otherwise move the connection every minute).
+    bool switchedBack = false;
+    uint32_t primaryFailures = 0;
+    // Store and forward: the other broker said quota exceeded (0x97) - nothing
+    // more is sent until then, and what it refused goes again.
+    Clock::time_point forwardAfter;
+    uint32_t quotaBackoffMs = 0;
 
     std::map<std::string, uint8_t> subscribed; // what the remote broker has been asked for, with its options
     bool filtersChanged = true;
@@ -519,8 +580,21 @@ struct AppConnections::Connection {
         Connection& self = *s->connection;
         // Not with the client any more: given up to make room while it was on its way.
         const bool held = self.inClient.erase(s->id) > 0;
+        // Quota exceeded is the other broker saying "not now": kept, sent again
+        // once forward() waits out the pause it sets. Any other refusal is final.
+        const bool busy = result == MqttResult::QuotaExceededByPeer;
+        if (busy) {
+            self.quotaBackoffMs = self.quotaBackoffMs ? std::min<uint32_t>(self.quotaBackoffMs * 2, kBackoffMaxMs) : 1000;
+            self.forwardAfter = Clock::now() + jittered(self.quotaBackoffMs);
+        } else if (result == MqttResult::Ok) {
+            self.quotaBackoffMs = 0;
+        }
+        // Cancelled: the client was ended under it (close() - a stop, a Put with
+        // a change). Not acknowledged, so still kept - it used to be dropped,
+        // and every shutdown lost what was on its way.
         const bool lost = result == MqttResult::ConnectionLost || result == MqttResult::SessionLost ||
-                          result == MqttResult::AckTimeout || result == MqttResult::NotConnected;
+                          result == MqttResult::AckTimeout || result == MqttResult::NotConnected ||
+                          result == MqttResult::Cancelled || busy;
         if (held && !lost) {
             self.owner->_outbox.drop(s->id);
             if (self.stored > 0) self.stored--;
@@ -781,7 +855,13 @@ void AppConnections::open(Connection& c) {
     willOf(c, connection);
     connection.receiveMaximum = c.spec.receiveMaximum;
     connection.topicAliasMaximum = c.spec.topicAliasMaximum;
-    connection.maximumPacketSize = c.spec.maximumPacketSize;
+    // What it can take, always said: its receive buffer, or less if the spec
+    // asks. Not saying it let the other broker send a packet the buffer could
+    // not hold - the connection failed, and the message came again with the
+    // next session, for ever. (MQTT 5 only: 3.1.1 cannot say it.)
+    const uint32_t buffer = c.spec.kafka ? kLinkPacketBytes : kPacketBytes;
+    connection.maximumPacketSize =
+        c.spec.maximumPacketSize != 0 ? std::min<uint32_t>(c.spec.maximumPacketSize, buffer) : buffer;
     const AppEndpoint& first = c.endpoint(c.serverIndex);
     connection.host = first.host.c_str();
     connection.port = c.portOf(first);
@@ -820,8 +900,8 @@ void AppConnections::open(Connection& c) {
     if (c.spec.kafka) behaviour.acknowledgementTimeoutMs = 0;
     behaviour.autoReconnect = false;     // the manager decides: which server, and when
     behaviour.queueCapacity = 256;       // room for store and forward's window as well
-    behaviour.receiveBufferSize = 65536;
-    behaviour.transmitBufferSize = 65536;
+    behaviour.receiveBufferSize = buffer;
+    behaviour.transmitBufferSize = buffer;
     c.client.begin(*c.transport, connection, behaviour);
     c.client.onMessage(&Connection::received, &c);
     c.client.onSessionEstablished(&Connection::established, &c);
@@ -887,8 +967,25 @@ void AppConnections::serviceEdgeNode(Connection& c) {
         while (node.commandPendingAt(i) && node.takeAt(i, ignored)) {}
     }
     // Born again: what was kept goes, oldest first, one device at a time.
-    if (e.history == 0 || !node.isBorn()) return;
-    std::vector<ConnectionOutbox::Kept> kept = _outbox.next(e.key(), 0, 64);
+    if (!node.isBorn() || !c.client.isConnected()) {
+        // The session ended before what was sent could be trusted to have arrived.
+        e.sentHistory.clear();
+        e.sentUpTo = 0;
+        return;
+    }
+    const Clock::time_point now = Clock::now();
+    const std::chrono::seconds hold(2 * std::max<uint32_t>(c.spec.keepaliveSeconds, 5));
+    size_t confirmed = 0;
+    while (confirmed < e.sentHistory.size() && now - e.sentHistory[confirmed].second >= hold) {
+        _outbox.drop(e.sentHistory[confirmed].first);
+        confirmed++;
+    }
+    if (confirmed) {
+        e.sentHistory.erase(e.sentHistory.begin(), e.sentHistory.begin() + (long)confirmed);
+        e.history -= std::min<uint64_t>(e.history, confirmed);
+    }
+    if (e.history <= e.sentHistory.size() || e.sentHistory.size() >= 65536) return;
+    std::vector<ConnectionOutbox::Kept> kept = _outbox.next(e.key(), e.sentUpTo, 64);
     std::vector<AppSparkplugSet> sets(kept.size());
     std::vector<MqttSparkplugRecord> records;
     std::vector<uint64_t> sent;
@@ -915,8 +1012,8 @@ void AppConnections::serviceEdgeNode(Connection& c) {
         sent.push_back(kept[i].id);
     }
     if (records.empty() || !node.publishRecords(records.data(), records.size(), true)) return;
-    for (uint64_t id : sent) _outbox.drop(id);
-    e.history -= std::min<uint64_t>(e.history, sent.size());
+    for (uint64_t id : sent) e.sentHistory.push_back(std::make_pair(id, now));
+    e.sentUpTo = sent.back();
 }
 
 void AppConnections::startHost(Connection& c) {
@@ -1104,8 +1201,7 @@ void AppConnections::service(Connection& c) {
 
     // --- Starting an attempt ---
     if (!c.attempting && state == MqttState::Idle &&
-        c.state != AppConnectionState::Waiting && c.state != AppConnectionState::Refused &&
-        (c.asked || now >= c.nextAttempt)) {
+        c.state != AppConnectionState::Waiting && (c.asked || now >= c.nextAttempt)) {
         c.asked = false;
         if (c.spec.thisServer) {
             ThisServer where;
@@ -1161,19 +1257,28 @@ void AppConnections::service(Connection& c) {
         if (state == MqttState::Connected) {
             c.reachedThisAttempt = true;
             c.stateBorn = false;
-            c.backoffMs = 0;
+            c.upSince = now;
             c.filtersChanged = true;
             c.subscribed.clear();
-            c.nextProbe = now + std::chrono::seconds(c.spec.primaryCheckSeconds);
+            c.nextProbe = now + std::chrono::seconds((uint64_t)c.spec.primaryCheckSeconds
+                                                     << std::min<uint32_t>(c.primaryFailures, 6));
             c.setState(AppConnectionState::Connected);
         } else if (state == MqttState::Idle && (was != MqttState::Idle || takenBack) && c.attempting) {
             c.attempting = false;
-            const uint8_t refused = c.client.status().connectReasonCode;
-            const bool loginRefused = !c.reachedThisAttempt && refused != 0 && refused != 0x88 &&
-                                      refused != 0x89 && refused != 0x03 && refused != 0x9C && refused != 0x9D;
-            if (loginRefused) {
-                char why[64];
-                std::snprintf(why, sizeof why, "the server refused the connection (0x%02X)", refused);
+            const uint8_t refused = c.reachedThisAttempt ? 0 : c.client.status().connectReasonCode;
+            const bool stable = c.reachedThisAttempt && now - c.upSince >= std::chrono::milliseconds(kStableMs);
+            // Back on the first server, and it did not last: it is checked less often.
+            if (c.switchedBack && c.serverIndex == 0 && !stable) c.primaryFailures++;
+            if (stable) {
+                c.backoffMs = 1000;                // the network failed; the next try is soon
+                if (c.serverIndex == 0) c.primaryFailures = 0;
+            }
+            c.switchedBack = false;
+            if (loginRefusal(refused, c.spec.protocol == 4)) {
+                // Never for good: an account fixed at the broker comes back by itself.
+                char why[96];
+                std::snprintf(why, sizeof why, "the server refused the login (0x%02X); tried again in 5 minutes", refused);
+                c.nextAttempt = now + std::chrono::milliseconds(kRefusedRetryMs);
                 c.setState(AppConnectionState::Refused, why);
             } else if (c.reachedThisAttempt && c.spec.reconnectWhenAsked) {
                 c.setState(AppConnectionState::Waiting, "the connection was lost");
@@ -1183,8 +1288,13 @@ void AppConnections::service(Connection& c) {
                 if (!c.reachedThisAttempt && !c.spec.servers.empty()) {
                     c.serverIndex = (c.serverIndex + 1) % (uint32_t)c.spec.servers.size();
                 }
-                c.backoffMs = c.backoffMs ? std::min<uint32_t>(c.backoffMs * 2, 30000) : 500;
-                c.nextAttempt = now + std::chrono::milliseconds(c.reachedThisAttempt ? 200 : c.backoffMs);
+                std::chrono::milliseconds wait = jittered(c.backoffMs);
+                // Quota exceeded, connection rate exceeded: asking again soon is the problem.
+                if (refused == MQ_REASON_QUOTA_EXCEEDED || refused == 0x9F) {
+                    wait = std::max(wait, std::chrono::milliseconds(kBusyFloorMs) + jittered(kBusyFloorMs / 2));
+                }
+                c.backoffMs = std::min<uint32_t>(c.backoffMs * 2, kBackoffMaxMs);
+                c.nextAttempt = now + wait;
                 c.setState(AppConnectionState::BackingOff,
                            c.reachedThisAttempt ? std::string("the connection was lost") : whyNotConnected(c));
             }
@@ -1226,12 +1336,14 @@ void AppConnections::service(Connection& c) {
                 c.probe->end();
                 c.probe.reset();
                 c.serverIndex = 0;
+                c.switchedBack = true;
                 c.client.disconnect();
                 c.asked = true;
             } else if (c.probe->connectFailed()) {
                 c.probe->end();
                 c.probe.reset();
-                c.nextProbe = now + std::chrono::seconds(c.spec.primaryCheckSeconds);
+                c.nextProbe = now + std::chrono::seconds((uint64_t)c.spec.primaryCheckSeconds
+                                                         << std::min<uint32_t>(c.primaryFailures, 6));
             }
         }
     }
@@ -1286,6 +1398,11 @@ void AppConnections::announce(Connection& c) {
 bool AppConnections::put(const AppConnectionSpec& spec, AppConnectionInfo* info, std::string& error) {
     if (spec.id.empty()) {
         error = "a connection needs an id";
+        return false;
+    }
+    if (!idIsName(spec.id)) {
+        error = "a connection's id is letters, digits and . _ - : @ (at most 128, not starting with '.'), not \"" +
+                spec.id + "\"";
         return false;
     }
     if (spec.servers.empty() && !spec.thisServer && !spec.kafka) {
@@ -1350,6 +1467,14 @@ bool AppConnections::put(const AppConnectionSpec& spec, AppConnectionInfo* info,
                 ok = false;
                 return;
             }
+            // One Will each: two hosts' STATE on one connection would take it in turns, for ever.
+            if (spec.kafka && !spec.link.stateConnection.empty() && other.kafka && one.first != spec.id &&
+                other.link.stateConnection == spec.link.stateConnection) {
+                error = "\"" + spec.link.stateConnection + "\" carries the STATE of \"" + one.first +
+                        "\" already: one Will each";
+                ok = false;
+                return;
+            }
         }
         std::unique_ptr<Connection>& slot = _connections[spec.id];
         if (!slot || !sameSpec(slot->spec, spec)) {
@@ -1403,6 +1528,11 @@ bool AppConnections::remove(const std::string& id) {
             if (state != _connections.end()) state->second->releaseState();
         }
         const bool kafka = spec.kafka;
+        if (!_directory.empty()) {
+            // Its TLS material, written at each open.
+            std::remove((_directory + "/" + id + ".crt").c_str());
+            std::remove((_directory + "/" + id + ".key").c_str());
+        }
         close(*at->second);
         if (kafka && _links) _links->close(id);
         _connections.erase(at);
@@ -1446,8 +1576,12 @@ uint64_t AppConnections::watch(const std::vector<std::string>& ids,
         id = _nextWatcher++;
         _watchers[id] = Watcher{ids, changed};
     }
-    // Each one's state now, from the manager's thread.
-    post([this, ids, changed] {
+    // Each one's state now, from the manager's thread - unless it was let go first.
+    post([this, id, ids, changed] {
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            if (!_watchers.count(id)) return;
+        }
         for (auto& one : _connections) {
             if (ids.empty() || std::find(ids.begin(), ids.end(), one.first) != ids.end()) {
                 changed(infoOf(*one.second));
@@ -1458,8 +1592,15 @@ uint64_t AppConnections::watch(const std::vector<std::string>& ids,
 }
 
 void AppConnections::unwatch(uint64_t watcher) {
-    std::lock_guard<std::mutex> guard(_lock);
-    _watchers.erase(watcher);
+    {
+        std::lock_guard<std::mutex> guard(_lock);
+        _watchers.erase(watcher);
+    }
+    // announce() calls its copies of the callbacks outside the lock, on the
+    // manager's thread, and watch()'s first call is a command queued there:
+    // one may be under way now. Once a command queued after them has run,
+    // neither can be - and the caller may free what its callback points at.
+    if (std::this_thread::get_id() != _thread.get_id()) call([] {});
 }
 
 void AppConnections::publish(const AppPublish& message, std::function<void(const AppPublishResult&)> done) {
@@ -1565,6 +1706,7 @@ void AppConnections::forward(Connection& c) {
     // rest wait their turn, in order.
     const size_t kWindow = 64;
     if (c.stored <= c.inClient.size() || c.inClient.size() >= kWindow) return;
+    if (Clock::now() < c.forwardAfter) return;          // the other broker's quota, waited out
     const int64_t now = utcNowMs();
     for (ConnectionOutbox::Kept& k : _outbox.next(c.spec.id, 0, kWindow + c.inClient.size())) {
         if (c.inClient.size() >= kWindow) break;
@@ -1592,7 +1734,21 @@ void AppConnections::forward(Connection& c) {
         const MqttResult queued = c.client.publishSeries(
             k.message.topic.c_str(), (const uint8_t*)k.message.payload.data(), k.message.payload.size(), qos,
             k.message.retain, properties, &Connection::forwarded, sent.get());
-        if (queued != MqttResult::Queued && queued != MqttResult::Ok) break;   // the client is full: next pass
+        // No room now - the queue, the send quota, packet identifiers: next pass.
+        if (queued == MqttResult::QueueFull || queued == MqttResult::NotConnected ||
+            queued == MqttResult::QuotaExceeded || queued == MqttResult::NoPacketIdentifier) {
+            break;
+        }
+        if (queued != MqttResult::Queued && queued != MqttResult::Ok) {
+            // Refused for good by this connection (retain or a QoS the other
+            // broker does not offer, a property 3.1.1 cannot carry): it can
+            // never go, and waiting for it stopped everything behind it.
+            _outbox.drop(k.id);
+            c.stored = c.stored ? c.stored - 1 : 0;
+            c.storedBytes -= std::min<uint64_t>(c.storedBytes, k.bytes);
+            c.settle(k.id, resultOf(queued, true));
+            continue;
+        }
         c.inClient.insert(k.id);
         c.sent.push_back(std::move(sent));
         c.messagesOut++;
@@ -2034,7 +2190,9 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
             return;
         }
         MqttSparkplugNode& node = *e->library;
-        const bool born = node.isBorn() && e->history == 0;      // history first, in order
+        // History first, in order: born, and every row it kept already sent (some may
+        // still be held, waiting to be trusted - EdgeNode::sentHistory).
+        const bool born = node.isBorn() && e->history <= e->sentHistory.size();
         for (AppSparkplugSet& set : values) {
             const int index = node.indexOf(e->device(device), set.name.c_str());
             if (index < 0) {
@@ -2271,6 +2429,11 @@ bool AppConnections::load(std::string& error) {
     for (const json::Value& one : all.items) {
         AppConnectionSpec spec;
         if (!fromJson(one, spec)) continue;
+        if (!idIsName(spec.id)) {
+            std::fprintf(stderr, "connections.json: \"%s\" is not a connection id any more (letters, digits and "
+                                 ". _ - : @) - not opened; Put it again under another\n", spec.id.c_str());
+            continue;
+        }
         std::unique_ptr<Connection> c(new Connection());
         c->spec = spec;
         open(*c);

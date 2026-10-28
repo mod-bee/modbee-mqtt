@@ -16,7 +16,8 @@ MQTT to the pipe: topic and protobuf bytes go through as they are.
 
 It needs a build with librdkafka (2.x) installed; `modbee-mqtt serve --help` and the
 first line it prints say whether the pipe is in. Everything else is
-`modbee.yaml`:
+`modbee.yaml` - or the command line and the Application API, while it runs
+([below](#changing-it-while-it-runs)):
 
 ```bash
 modbee-mqtt check -C modbee.yaml      # every problem, with its line; exit 0 if it would load
@@ -258,7 +259,8 @@ such an overlap, because it is rarely intended.
 
 Which devices are connected now, and which topics each one listens on, are
 known only to the broker. `events: enabled: true` publishes them - connected,
-disconnected, subscribed, unsubscribed - on `$modbee/events/...`, and a
+disconnected, subscribed, unsubscribed, and what was refused - on
+`$modbee/events/...`, and a
 mapping makes them durable in Kafka:
 
 ```yaml
@@ -327,7 +329,7 @@ modbee-mqtt connections put --id plant --kafka.cluster main \
 | --- | --- |
 | `cluster` | A cluster from `Kafka.PutCluster` (TLS and login are the cluster's); `""` the only one there is. A cluster a connection uses cannot be deleted. A change to it is taken live. |
 | `kafka_topic` | Written to: every message published on the connection, one record each, in the envelope |
-| `kafka_topics`, `kafka_topic_pattern` | Read from: each record becomes a message on the connection, as its headers say (a record with none comes on the Kafka topic's own name) |
+| `kafka_topics`, `kafka_topic_pattern` | Read from: each record becomes a message on the connection, as its headers say (a record with none comes on the Kafka topic's own name). A pattern is a regular expression starting with `^`, as Kafka's clients take one |
 | `key` | The record key: `topic` (default), `clientid`, `none`, or a template - as for a mapping |
 | `consumer_group` | Default `modbee-conn-<id>`. Starts at the latest offset, like a mapping's |
 | `state_connection` | An MQTT connection for a Sparkplug host's STATE (below) |
@@ -360,10 +362,15 @@ What it means:
   Sparkplug STATE below, or its own heartbeat. A Sparkplug edge node on a
   Kafka connection sends its NDEATH into Kafka when it is deleted or the
   server stops cleanly - by hand, as Sparkplug does on a shared connection.
-- **Its messages are up to 1 MiB**, Kafka's own default record size.
-- **Each costs about 25 MB of memory** while idle - its broker and two Kafka
+- **Its messages are up to 1 MiB**, Kafka's own default record size, and
+  it keeps up to 1,000 retained messages (records with `mqtt-retain: true`).
+- **A record that is not an MQTT message is refused and counted**
+  (`records_in_invalid`), never handed on: a topic or a string property that
+  is not UTF-8 or is longer than MQTT allows - the pipe's mappings too. A
+  client given one would drop the connection, and get it again.
+- **Each costs about 4 MB of memory** while idle - its broker and two Kafka
   clients (measured on a release build) - so it is a link, not a per-device
-  object: a few per server, not thousands.
+  object: tens per server, not thousands.
 
 ### A Sparkplug host on Kafka, its STATE on MQTT
 
@@ -398,16 +405,21 @@ through Kafka.
 ### A bridge with Kafka at one end
 
 On a **board**, Kafka is reached the way a board reaches anything: MQTT, to
-a server whose connection is over Kafka. A board never has a Kafka client
-(librdkafka is host-only), see [bridge.md](bridge.md#kafka-at-one-end).
+a server whose pipe carries its topics on to Kafka. A board never has a Kafka
+client (librdkafka is host-only), and a connection's own broker listens on the
+server's loopback only, see [bridge.md](bridge.md#kafka-at-one-end).
 
-On a **server**, a bridge with a Kafka end *is* a connection over Kafka: the
-library's bridge (or an application relaying Consume to Publish) connects to
-its broker like to any other. The bridge's loop prevention holds over it -
-No Local at 5.0 on the MQTT side, and on the Kafka side a link never reads
-its own records. Tested both ways between two sites over one Kafka topic:
-each message arrives once on the other site, nothing comes back, Kafka holds
-each once.
+On a **server**, there are two ways, and both keep the loop prevention a
+bridge needs. This broker's own topics to and from Kafka are **the pipe**: a
+message read from a Kafka topic is never written back to it. Another broker's
+topics to and from Kafka are an application **relaying two connections** -
+Consume on one, Publish on the other - one of them over Kafka: subscribe the
+MQTT side with `no_local`, and on the Kafka side a connection never reads back
+a record it wrote. A connection's own broker is not reachable from outside the
+server (loopback, a login made at random), so nothing else connects to it.
+Tested both ways between two sites sharing one Kafka topic, with the
+library's bridge on each site's side of a link: each message arrives once on
+the other site, nothing comes back, Kafka holds each once.
 
 ### Testing a link from the command line
 
@@ -459,7 +471,12 @@ host, request/response or store and forward over Kafka.
 
 The pipe sets `linger.ms: 5`, `compression.type: lz4` and
 `message.timeout.ms: 30000`; `properties:` overrides any of them. Topic-level
-librdkafka settings work here too.
+librdkafka settings work here too. Over the API (`Kafka.PutCluster`) two
+kinds are different: a setting whose value is a secret (a password, a key,
+JAAS or OAUTHBEARER configuration) is never given back - an answer has it
+empty, and a Put with it empty keeps it - and `plugin.library.paths` and
+`ssl.engine.location`, which load a library into the server, are refused:
+they belong in the file, which only whoever runs the server writes.
 
 **TLS and SCRAM are tested end to end** against Kafka 4.3 with a SASL_SSL
 listener and SCRAM-SHA-512 (`docker/testing/kafka/run-sasl-ssl.sh`):

@@ -82,7 +82,12 @@ void onMessage(void*, const MqttMessage& message) {
         return;
     }
     if (g_state->verbose) {
-        std::printf("%.*s ", (int)message.topic.length, (const char*)message.topic.data);
+        // A topic is anyone's text: a control character in it would drive the terminal.
+        std::string topic((const char*)message.topic.data, message.topic.length);
+        for (char& ch : topic) {
+            if ((unsigned char)ch < 0x20 || ch == 0x7F) ch = '?';
+        }
+        std::printf("%s ", topic.c_str());
     }
     if (isPrintableText(message.payload.data, message.payload.length)) {
         std::printf("%.*s\n", (int)message.payload.length, (const char*)message.payload.data);

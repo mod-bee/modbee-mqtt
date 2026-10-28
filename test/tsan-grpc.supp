@@ -1,0 +1,16 @@
+# ThreadSanitizer, for the suites that run gRPC (api_tests, test_app_api).
+#
+# The distribution's gRPC, protobuf, abseil and upb are not built with the
+# thread sanitizer, so it cannot see the locks inside them: a message handed to
+# gRPC (StartWrite) and freed on gRPC's own thread after its completion queue
+# says so looks like a race. Every report seen had one of these libraries on a
+# side; with them left out there are none in this repository's code.
+race:libgrpc.so
+race:libgrpc++.so
+race:libgpr.so
+race:grpc::
+race:google::protobuf
+race:libprotobuf.so
+race:absl::
+race:libabsl_*.so
+race:libupb.so

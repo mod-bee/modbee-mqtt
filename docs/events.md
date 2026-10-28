@@ -20,8 +20,8 @@ events:
   enabled: true
 ```
 
-or `MODBEE_EVENTS_ENABLED=true` in the environment; `enabled: false` keeps
-it off with the section in place. Off is the default. `modbee-mqtt serve` says so
+or `MODBEE_EVENTS_ENABLED=true` in the environment, or `modbee-mqtt serve
+--events`; `enabled: false` keeps it off with the section in place. Off is the default. `modbee-mqtt serve` says so
 when it is on:
 
 ```
@@ -33,6 +33,10 @@ modbee-mqtt serve: client events published on $modbee/events/...
 That is not kept - the next start goes by the file and `--events` - so a
 lasting change is the file, the flag, or the stored setting
 (`modbee-mqtt config set events.enabled=true`). Off, no event is made at all.
+
+**An application on the [Application API](app-api.md#reading-every-devices-messages-messagesconsume)**
+gets the same events as `ClientEvent`s on its Consume stream (`events: true`),
+dealt in order with each client's messages, rather than subscribing to them.
 
 ---
 

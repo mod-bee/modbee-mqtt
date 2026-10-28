@@ -270,6 +270,10 @@ struct KafkaPipe::Shard {
     MqttBroker* broker = nullptr;          // set on every call from the shard's thread
     mq_time_t servedAt = 0;
     bool backlog = false;                  // a consumer had more than its budget
+    // In service(): a record being published reaches offer() on this same
+    // thread (the broker's egress), and a plan taken there would free the
+    // mapping and the consumer the record came from. Taken at the next pass.
+    bool inService = false;
     std::atomic<uint64_t> held{0};         // acknowledgements waiting on Kafka
 
     // One Kafka topic on one producer. Its delivery reports count against the
@@ -307,6 +311,22 @@ struct KafkaPipe::Shard {
     std::vector<Topic*> route;
     std::vector<Producer*> routeProducer;
     std::vector<std::unique_ptr<Consumer>> consumers;
+
+    // Every client it made, destroyed before its wake-up descriptor closes:
+    // librdkafka writes to that descriptor, and a number closed is soon
+    // someone else's (a begin() that failed half way used to leave them).
+    ~Shard() {
+        broker = nullptr;
+        for (auto& consumer : consumers) {
+            if (consumer->closing) rd_kafka_queue_destroy(consumer->closing);
+            if (consumer->handle) rd_kafka_destroy(consumer->handle);
+        }
+        for (auto& producer : producers) {
+            for (auto& topic : producer->topics) rd_kafka_topic_destroy(topic->handle);
+            rd_kafka_destroy(producer->handle);
+        }
+        wake.close();
+    }
 
     static void onDelivery(rd_kafka_t*, const rd_kafka_message_t* message, void* opaque);
     static void onError(rd_kafka_t*, int error, const char* reason, void* opaque);
@@ -412,18 +432,8 @@ KafkaPipe::KafkaPipe(const ServerConfig& config) {
 }
 
 KafkaPipe::~KafkaPipe() {
-    for (std::unique_ptr<Shard>& shard : _shards) {
-        shard->broker = nullptr;
-        for (auto& consumer : shard->consumers) {
-            if (consumer->closing) rd_kafka_queue_destroy(consumer->closing);
-            if (consumer->handle) rd_kafka_destroy(consumer->handle);
-        }
-        for (auto& producer : shard->producers) {
-            for (auto& topic : producer->topics) rd_kafka_topic_destroy(topic->handle);
-            rd_kafka_destroy(producer->handle);
-        }
-        shard->wake.close();
-    }
+    // Each shard's clients go with it (~Shard).
+    for (std::unique_ptr<Shard>& shard : _shards) shard->broker = nullptr;
 }
 
 std::shared_ptr<const KafkaPipe::Plan> KafkaPipe::makePlan(const ServerConfig& section) {
@@ -793,7 +803,9 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
     Shard& shard = *_shards[shardIndex];
     shard.broker = &broker;
     // A plan changed since the last message: one atomic read to know.
-    if (shard.generation != _generation.load(std::memory_order_acquire)) shard.reconcile(nullptr);
+    if (!shard.inService && shard.generation != _generation.load(std::memory_order_acquire)) {
+        shard.reconcile(nullptr);
+    }
     const KafkaOrigin* origin = static_cast<const KafkaOrigin*>(message.origin);
     if (origin != nullptr && origin->magic != KafkaOrigin().magic) origin = nullptr;
 
@@ -950,6 +962,20 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
         }
     }
 
+    // EVERY STRING IS AN MQTT STRING: UTF-8, no more than 65,535 bytes. One
+    // that is not would be refused by every client it reached - which drops
+    // the connection as malformed, and gets it again on the next session.
+    const auto mqttString = [](const std::string& text) {
+        return text.size() <= 65535 &&
+               mq_validateUtf8((const uint8_t*)text.data(), text.size()) == MqttError::None;
+    };
+    bool strings = mqttString(contentType) && mqttString(responseTopic);
+    for (const auto& user : users) strings = strings && mqttString(user.first) && mqttString(user.second);
+    for (const std::string& topic : topics) strings = strings && mqttString(topic);
+    if (!strings) {
+        from.counters->invalid.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (!contentType.empty()) { properties.contentType = spanOf(contentType); properties.markPresent(MQ_PROP_CONTENT_TYPE); }
     // A Response Topic is a topic name [MQTT-3.3.2-13]: one from a header that
     // is not - a wildcard, bad UTF-8 - is left off rather than handed to every
@@ -996,7 +1022,8 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
 }
 
 void KafkaPipe::Shard::consume(Consumer& consumer) {
-    FromKafka& from = *consumer.from;
+    const std::shared_ptr<FromKafka> held = consumer.from;    // alive for the whole batch
+    FromKafka& from = *held;
     for (int n = 0; n < kConsumeBudget; n++) {
         rd_kafka_message_t* record = rd_kafka_consumer_poll(consumer.handle, 0);
         if (record == nullptr) return;
@@ -1032,9 +1059,12 @@ void KafkaPipe::service(uint32_t shardIndex, MqttBroker& broker) {
         for (int n = 0; n < 64 && rd_kafka_poll(producer->handle, 0) > 0; n++) {
         }
     }
-    for (std::unique_ptr<Shard::Consumer>& consumer : shard.consumers) {
-        if (consumer->closing == nullptr) shard.consume(*consumer);
+    shard.inService = true;
+    for (size_t i = 0; i < shard.consumers.size(); i++) {
+        Shard::Consumer& consumer = *shard.consumers[i];
+        if (consumer.closing == nullptr) shard.consume(consumer);
     }
+    shard.inService = false;
     shard.retire();
 }
 

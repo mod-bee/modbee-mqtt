@@ -49,6 +49,11 @@ if(TARGET modbee-api AND TARGET modbee-retained)
         target_compile_options(api_tests PRIVATE -Wall -Wextra)
     endif()
     add_test(NAME api_tests COMMAND api_tests)
+    if(MQTT_SANITIZE_THREAD)
+        # gRPC's own libraries are not instrumented (test/tsan-grpc.supp says why).
+        set_tests_properties(api_tests PROPERTIES ENVIRONMENT
+            "TSAN_OPTIONS=suppressions='${PROJECT_SOURCE_DIR}/test/tsan-grpc.supp'")
+    endif()
     set_tests_properties(api_tests PROPERTIES TIMEOUT 300)
 
     # The command line and the API, one to one (cli/ApiCommands.h, docs/cli.md).

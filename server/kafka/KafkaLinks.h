@@ -38,6 +38,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 class KafkaLinks : public AppKafkaLinks {
 public:
@@ -66,6 +68,13 @@ private:
                     std::string& error) const;
     std::string usedBy(const std::string& cluster) const;
     void clustersChanged(const ServerConfig& section);
+    // A link let go: stopped on a thread of its own - its pipe gives Kafka a
+    // few seconds for what it holds, and the connections' thread, which calls
+    // close(), must not wait them out.
+    void reap(std::unique_ptr<Link> link);
+
+    std::mutex _reaping;
+    std::vector<std::thread> _reapers;                    // under _reaping
 
     mutable std::mutex _lock;
     std::vector<KafkaClusterConfig> _clusters;           // under _lock

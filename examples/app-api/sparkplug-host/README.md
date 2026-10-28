@@ -7,6 +7,13 @@ over what arrives on it, and publishes for it - a QoS 1 publish answered only
 once the remote broker has acknowledged it. And the Eclipse Sparkplug TCK's
 Host Application profile, run against it the same way.
 
+**The server has a host of its own now.** `Sparkplug.PutHost` (`modbee-mqtt
+sparkplug-hosts put`) runs the library's TCK-tested host on one of the
+server's connections, and `ConsumeOpen.sparkplug` delivers Sparkplug payloads
+decoded ([app-api.md](../../../docs/app-api.md#sparkplug-b)), so most
+applications need neither this host nor a codec of their own. This example is
+the other way: a host built on nothing but `Connections` and `Messages`.
+
 | File | |
 | --- | --- |
 | `src/api.ts` | The Application API calls it uses: `Connections.Put/Delete/Reconnect/Watch`, `Messages.Consume/Publish` |

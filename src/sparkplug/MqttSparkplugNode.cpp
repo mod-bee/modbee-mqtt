@@ -1245,6 +1245,8 @@ bool MqttSparkplugNode::deviceOffline(const char* deviceId) {
     // number - which is the opposite of NDEATH, where
     // [tck-id-topics-ndeath-seq] says it MUST NOT. Two death messages, opposite
     // rules, and the place that gets it wrong is right here.
+    // Not sent, not spent - as a DBIRTH (publishDeviceBirth).
+    const uint8_t sequenceBefore = _seq;
     nextSequence();
 
     MqttSparkplugPayload& payload = _outbound;
@@ -1254,8 +1256,12 @@ bool MqttSparkplugNode::deviceOffline(const char* deviceId) {
     payload.seq = _seq;
     payload.hasSeq = true;
 
-    return sendPayload(MqttSparkplugType::DDeath, device.id.c_str(), payload,
-                       MQ_QOS_0, false, false);
+    if (sendPayload(MqttSparkplugType::DDeath, device.id.c_str(), payload,
+                    MQ_QOS_0, false, false)) {
+        return true;
+    }
+    _seq = sequenceBefore;
+    return false;
 }
 
 bool MqttSparkplugNode::deviceIsOnline(const char* deviceId) const {
@@ -1344,6 +1350,19 @@ void MqttSparkplugNode::prepareConnect(MqttConnectionConfig& connection) {
     _willArmed = false;
     if (!_active) return;
 
+    // [tck-id-topics-nbirth-bdseq-increment] The bdSeq number MUST start at
+    // zero and increment by one on each new MQTT CONNECT - EACH one, here
+    // where the CONNECT is made. It used to move on only when a born session
+    // ended, so a session that never birthed (waiting for its primary host,
+    // a link that dropped before the NBIRTH went) left the next CONNECT with
+    // the same number - and a stale Will for it, arriving late, could mark
+    // the live session dead.
+    if (_bdSeqUsed) {
+        _bdSeq++;
+        _seq = 0;
+    }
+    _bdSeqUsed = true;
+
     connection.cleanStart = true;
     connection.sessionExpiryInterval = 0;
     // --- The Will: an NDEATH carrying this connection's bdSeq ---
@@ -1417,13 +1436,8 @@ void MqttSparkplugNode::beginClient() {
 }
 
 void MqttSparkplugNode::nextSession() {
-    // [tck-id-topics-nbirth-bdseq-increment] The bdSeq number MUST start at
-    // zero and increment by one on each new MQTT CONNECT.
-    //
-    // So the FIRST connect uses 0 and the second uses 1 - hence the flag rather
-    // than incrementing unconditionally, which would start at 1.
-    if (_bdSeqUsed) _bdSeq++;
-    _bdSeqUsed = true;
+    // The bdSeq moves on in prepareConnect(), once per CONNECT: the first
+    // uses 0, the second 1.
     endBirth();
     _seq = 0;
 }
@@ -1792,12 +1806,10 @@ void MqttSparkplugNode::stateChanged(MqttState state, MqttResult reason) {
         endBirth();
 
         // The next CONNECT needs a new bdSeq in its Will, and the client's
-        // own reconnect will send it - prepareConnect() writes it there, so
-        // autoReconnect can stay on and a shared client needs nothing more.
-        if (_begun) {
-            _bdSeq++;
-            _seq = 0;
-        }
+        // own reconnect will send it - prepareConnect() moves it on and writes
+        // it there, so autoReconnect can stay on and a shared client needs
+        // nothing more.
+        if (_begun) _seq = 0;
     }
 }
 
@@ -2322,8 +2334,12 @@ bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
     const MqttSparkplugType type = device < 0 ? MqttSparkplugType::NData
                                               : MqttSparkplugType::DData;
 
+    const uint8_t sequenceBefore = _seq;
     nextSequence();
-    if (!buildPayload(_outbound, type, device, onlyChanged, false)) return false;
+    if (!buildPayload(_outbound, type, device, onlyChanged, false)) {
+        _seq = sequenceBefore;
+        return false;
+    }
     _outbound.seq = _seq;
     _outbound.hasSeq = true;
 
@@ -2332,11 +2348,12 @@ bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
 
     // [tck-id-topics-ndata-mqtt] QoS 0, retain false. Not configurable.
     if (!sendPayload(type, deviceId, _outbound, MQ_QOS_0, false, false)) {
-        // The sequence number has been spent. That is deliberate: a node that
-        // reused it after a failed publish would send two different messages
-        // with one number, and a Host Application tracking the sequence would
-        // never detect the gap. A gap triggers a rebirth request, which
-        // recovers; a duplicate does not.
+        // NOT SENT, NOT SPENT, as a DBIRTH. A publish the client refused (its
+        // queue full, on a slow link) never reached the wire, so the number
+        // is still free and the next message carries it. Spending it here
+        // left a gap the host answered with a rebirth - a large NBIRTH on the
+        // link that was already full - and the next full queue made another.
+        _seq = sequenceBefore;
         return false;
     }
 
@@ -2421,12 +2438,17 @@ bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
         }
     }
 
+    const uint8_t sequenceBefore = _seq;
     nextSequence();
     _outbound.seq = _seq;
     _outbound.hasSeq = true;
     const char* deviceId = device < 0 ? nullptr : _devices[(size_t)device].id.c_str();
     // [tck-id-topics-ndata-mqtt] QoS 0, retain false - as for every NDATA.
-    if (!sendPayload(type, deviceId, _outbound, MQ_QOS_0, false, false)) return false;
+    // Not sent, not spent (publishChanges).
+    if (!sendPayload(type, deviceId, _outbound, MQ_QOS_0, false, false)) {
+        _seq = sequenceBefore;
+        return false;
+    }
 
     if (!historical) {
         // Live: what went is now the metric's value and its reference, so

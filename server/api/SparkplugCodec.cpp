@@ -25,6 +25,74 @@ namespace {
 const char kCompressed[] = "SPBV1.0_COMPRESSED";
 const size_t kMaxInflated = 16u << 20;      // a payload is at most this, once inflated
 
+// WHAT ONE DECODE MAY BUILD. The payload is anyone's who may publish on
+// spBv1.0/..., and its bytes are not its size once decoded: 16 KiB of DEFLATE
+// inflates to 16 MiB of NULs, which a StringArray made sixteen million strings
+// of - a gigabyte - and the gRPC target ends on bad_alloc. So every array
+// element counts against one budget per decode, and an array past it is kept
+// as its bytes, with why; Templates and PropertySets nest at most kMaxDepth
+// deep (a Consume client's parser stops at 100 levels, and the output nests
+// three for each).
+const size_t kElementBudget = 4u << 20;
+const int kMaxDepth = 16;
+thread_local size_t tElements = 0;
+thread_local int tDepth = 0;
+thread_local int tCalls = 0;
+
+// The outermost call of a decode starts the budget afresh.
+struct DecodeScope {
+    DecodeScope() {
+        if (tCalls++ == 0) {
+            tElements = kElementBudget;
+            tDepth = 0;
+        }
+    }
+    ~DecodeScope() { tCalls--; }
+};
+
+// One level deeper, while it lives; false once past kMaxDepth.
+struct Deeper {
+    const bool ok;
+    Deeper() : ok(++tDepth <= kMaxDepth) {}
+    ~Deeper() { tDepth--; }
+};
+
+// A Sparkplug string is a protobuf (proto2) string, which is not checked to be
+// UTF-8; the API's are proto3 strings, which must be, or a client's parser
+// refuses the whole message and its stream breaks. An invalid sequence becomes
+// U+FFFD.
+std::string text(const std::string& in) {
+    const unsigned char* b = (const unsigned char*)in.data();
+    const size_t n = in.size();
+    size_t i = 0;
+    for (; i < n && b[i] < 0x80; i++) {}
+    if (i == n) return in;                          // ASCII: the common case, untouched
+    std::string out(in, 0, i);
+    while (i < n) {
+        const unsigned char c = b[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        bool ok = len != 0 && i + len <= n;
+        uint32_t cp = len == 1 ? c : len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : (c & 0x07);
+        for (size_t k = 1; ok && k < len; k++) {
+            ok = (b[i + k] & 0xC0) == 0x80;
+            cp = (cp << 6) | (b[i + k] & 0x3F);
+        }
+        // Not overlong, not a surrogate, not past U+10FFFF.
+        if (ok) {
+            ok = (len == 1) || (len == 2 && cp >= 0x80) || (len == 3 && cp >= 0x800 && (cp < 0xD800 || cp > 0xDFFF)) ||
+                 (len == 4 && cp >= 0x10000 && cp <= 0x10FFFF);
+        }
+        if (ok) {
+            out.append(in, i, len);
+            i += len;
+        } else {
+            out += "\xEF\xBF\xBD";
+            i++;
+        }
+    }
+    return out;
+}
+
 // --- Datatypes ----------------------------------------------------------------
 
 bool isArray(uint32_t t) { return t >= v1::DATATYPE_INT8_ARRAY && t <= v1::DATATYPE_DATETIME_ARRAY; }
@@ -106,7 +174,7 @@ void valueOf(uint32_t type, const Scalar& s, v1::SparkplugValue& out) {
     case Scalar::Float: out.set_float_value(s.f); break;
     case Scalar::Double: out.set_double_value(s.d); break;
     case Scalar::Bool: out.set_boolean_value(s.b); break;
-    case Scalar::String: out.set_string_value(s.text); break;
+    case Scalar::String: out.set_string_value(text(s.text)); break;
     case Scalar::Bytes: out.set_bytes_value(s.text); break;
     default: break;
     }
@@ -170,12 +238,27 @@ uint64_t take(const unsigned char* at, size_t width) {
 }
 
 bool unpack(uint32_t t, const std::string& bytes, v1::SparkplugArray& out, std::string& error) {
+    DecodeScope scope;
     const unsigned char* data = (const unsigned char*)bytes.data();
+    // How many elements it is, before any is made.
+    size_t count = 0;
+    if (t == v1::DATATYPE_STRING_ARRAY) {
+        for (char ch : bytes) count += ch == '\0';
+    } else if (t == v1::DATATYPE_BOOLEAN_ARRAY) {
+        count = bytes.size() >= 4 ? (size_t)take(data, 4) : 0;
+    } else if (widthOf(t) != 0) {
+        count = bytes.size() / widthOf(t);
+    }
+    if (count > tElements) {
+        error = "an array of " + std::to_string(count) + " elements: more than one message may decode to";
+        return false;
+    }
+    tElements -= count;
     if (t == v1::DATATYPE_STRING_ARRAY) {
         size_t start = 0;
         for (size_t i = 0; i < bytes.size(); i++) {
             if (bytes[i] != '\0') continue;
-            out.add_strings(bytes.substr(start, i - start));
+            out.add_strings(text(bytes.substr(start, i - start)));
             start = i + 1;
         }
         if (start < bytes.size()) {
@@ -267,10 +350,12 @@ bool metricOf(const wire::Payload::Metric& w, v1::SparkplugMetric& out, std::str
 bool metricFor(const v1::SparkplugMetric& m, wire::Payload::Metric& w, std::string& error);
 
 void propertySetOf(const wire::Payload::PropertySet& w, v1::SparkplugPropertySet& out) {
+    Deeper deeper;
+    if (!deeper.ok) return;                         // nested past kMaxDepth: left out
     for (int i = 0; i < w.keys_size() && i < w.values_size(); i++) {
         const wire::Payload::PropertyValue& pv = w.values(i);
         v1::SparkplugProperty* p = out.add_properties();
-        p->set_key(w.keys(i));
+        p->set_key(text(w.keys(i)));
         p->set_type((v1::SparkplugDataType)pv.type());
         p->set_is_null(pv.is_null());
         if (pv.has_propertyset_value()) {
@@ -311,7 +396,7 @@ bool propertySetFor(const v1::SparkplugPropertySet& set, wire::Payload::Property
 }
 
 void dataSetOf(const wire::Payload::DataSet& w, v1::SparkplugDataSet& out) {
-    for (const std::string& c : w.columns()) out.add_columns(c);
+    for (const std::string& c : w.columns()) out.add_columns(text(c));
     for (uint32_t t : w.types()) out.add_types((v1::SparkplugDataType)t);
     for (const wire::Payload::DataSet::Row& row : w.rows()) {
         v1::SparkplugRow* r = out.add_rows();
@@ -337,13 +422,18 @@ bool dataSetFor(const v1::SparkplugDataSet& d, wire::Payload::DataSet& w, std::s
 }
 
 void templateOf(const wire::Payload::Template& w, v1::SparkplugTemplate& out, std::string& error) {
-    out.set_version(w.version());
-    out.set_template_ref(w.template_ref());
+    Deeper deeper;
+    if (!deeper.ok) {
+        if (error.empty()) error = "Templates nested more than " + std::to_string(kMaxDepth) + " deep";
+        return;
+    }
+    out.set_version(text(w.version()));
+    out.set_template_ref(text(w.template_ref()));
     out.set_is_definition(w.is_definition());
     for (const wire::Payload::Metric& m : w.metrics()) metricOf(m, *out.add_metrics(), error);
     for (const wire::Payload::Template::Parameter& p : w.parameters()) {
         v1::SparkplugParameter* param = out.add_parameters();
-        param->set_name(p.name());
+        param->set_name(text(p.name()));
         param->set_type((v1::SparkplugDataType)p.type());
         valueOf(p.type(), scalarOf(p), *param->mutable_value());
     }
@@ -370,7 +460,7 @@ bool templateFor(const v1::SparkplugTemplate& t, wire::Payload::Template& w, std
 }
 
 bool metricOf(const wire::Payload::Metric& w, v1::SparkplugMetric& out, std::string& error) {
-    out.set_name(w.name());
+    out.set_name(text(w.name()));
     if (w.has_alias()) out.set_alias(w.alias());
     if (w.has_timestamp()) out.set_timestamp(w.timestamp());
     out.set_datatype((v1::SparkplugDataType)w.datatype());
@@ -381,13 +471,13 @@ bool metricOf(const wire::Payload::Metric& w, v1::SparkplugMetric& out, std::str
         const wire::Payload::MetaData& md = w.metadata();
         v1::SparkplugMetaData* m = out.mutable_metadata();
         m->set_is_multi_part(md.is_multi_part());
-        m->set_content_type(md.content_type());
+        m->set_content_type(text(md.content_type()));
         m->set_size(md.size());
         m->set_seq(md.seq());
-        m->set_file_name(md.file_name());
-        m->set_file_type(md.file_type());
-        m->set_md5(md.md5());
-        m->set_description(md.description());
+        m->set_file_name(text(md.file_name()));
+        m->set_file_type(text(md.file_type()));
+        m->set_md5(text(md.md5()));
+        m->set_description(text(md.description()));
     }
     if (w.has_properties()) {
         v1::SparkplugPropertySet set;
@@ -405,7 +495,11 @@ bool metricOf(const wire::Payload::Metric& w, v1::SparkplugMetric& out, std::str
         if (isArray(t)) {
             std::string why;
             if (!unpack(t, w.bytes_value(), *v.mutable_array_value(), why)) {
-                v.set_bytes_value(w.bytes_value());     // kept as it came, and said why
+                // Kept as it came, and said why - unless it is large: an array
+                // past the budget, sent back whole, was a reply bigger than a
+                // gRPC client takes.
+                if (w.bytes_value().size() <= 65536) v.set_bytes_value(w.bytes_value());
+                else v.clear_kind();
                 if (error.empty()) error = "metric " + w.name() + ": " + why;
             }
         } else {
@@ -505,6 +599,7 @@ bool isSparkplugTopic(const std::string& topic) { return topic.compare(0, 8, "sp
 
 bool decode(const std::string& topic, const std::string& payload, v1::SparkplugMessage& out,
             const std::vector<AppSparkplugName>* names) {
+    DecodeScope scope;
     std::vector<std::string> parts;
     size_t start = 0;
     for (size_t i = 0; i <= topic.size(); i++) {
@@ -521,8 +616,14 @@ bool decode(const std::string& topic, const std::string& payload, v1::SparkplugM
         out.set_kind(v1::SPARKPLUG_STATE);
         out.set_host_id(parts[2]);
         // {"online": true, "timestamp": 1700000000000}
-        const bool online = payload.find("\"online\":true") != std::string::npos ||
-                            payload.find("\"online\": true") != std::string::npos;
+        // The value of "online", whatever the spacing - not any "online":true in it.
+        bool online = false;
+        const size_t key = payload.find("\"online\"");
+        if (key != std::string::npos) {
+            size_t v = key + 8;
+            while (v < payload.size() && (payload[v] == ' ' || payload[v] == '\t' || payload[v] == ':')) v++;
+            online = payload.compare(v, 4, "true") == 0;
+        }
         const size_t at = payload.find("\"timestamp\"");
         if (at == std::string::npos) {
             out.set_error("a STATE payload is {\"online\": ..., \"timestamp\": ...}");
@@ -580,7 +681,7 @@ bool decode(const std::string& topic, const std::string& payload, v1::SparkplugM
     }
     if (w.has_timestamp()) p.set_timestamp(w.timestamp());
     if (w.has_seq()) p.set_seq(w.seq());
-    p.set_uuid(w.uuid());
+    p.set_uuid(text(w.uuid()));
     p.set_body(w.body());
     std::string error;
     for (wire::Payload::Metric& m : *w.mutable_metrics()) {
@@ -646,6 +747,7 @@ bool encodeTemplate(const v1::SparkplugTemplate& value, std::string& out, std::s
 }
 
 bool decodeTemplate(const std::string& bytes, v1::SparkplugTemplate& out, std::string& error) {
+    DecodeScope scope;
     wire::Payload::Template w;
     if (!w.ParseFromString(bytes)) {
         error = "not a Template";
@@ -686,6 +788,7 @@ bool encodeValue(uint32_t t, const v1::SparkplugValue& value, std::string& out, 
 }
 
 bool decodeValue(uint32_t t, const std::string& bytes, v1::SparkplugValue& out, std::string& error) {
+    DecodeScope scope;
     if (isArray(t)) return unpack(t, bytes, *out.mutable_array_value(), error);
     if (t == v1::DATATYPE_DATASET) {
         wire::Payload::DataSet w;

@@ -277,7 +277,11 @@ topic to `mqtt-commands`.
   configured in `modbee.yaml`.** As shipped, every MQTT message goes to
   `mqtt-messages`. To send only `plant/#`, or to split topics across several
   Kafka topics, edit the mappings - [kafka.md](kafka.md) has every option -
-  and run `docker compose restart modbee`.
+  and run `docker compose restart modbee`. With the
+  [Application API](docker.md#the-application-api) turned on they can also be
+  changed while it runs, with no restart (`modbee-mqtt kafka-mappings put`);
+  once changed that way they are kept, and win over the file
+  ([kafka.md](kafka.md#changing-it-while-it-runs)).
 - **Many Node.js examples online use the `kafkajs` package.** It works, but it
   is no longer actively developed; Confluent's client used here runs the same
   style of code.

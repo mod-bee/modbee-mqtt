@@ -25,7 +25,7 @@ minor version may change the API or the configuration, and says how here.
   `mqtt-link` header - Kafka has no No Local). A **Sparkplug host** on it keeps its STATE on the MQTT connection
   `state_connection` names, that connection's Will the offline STATE, since Kafka has no Will; `spBv1.0/STATE/#` is
   then not written to Kafka. A cluster a connection uses cannot be deleted, and a change to it is taken live. About
-  25 MB of memory per link. Hello says `connections.kafka`; a build without Kafka answers `FAILED_PRECONDITION`.
+  4 MB of memory per link, idle. Hello says `connections.kafka`; a build without Kafka answers `FAILED_PRECONDITION`.
 - **The envelope, as a contract** (docs/kafka.md): one MQTT message is one Kafka record - the payload untouched, the
   topic, QoS, retain and every MQTT 5 property in `mqtt-*` headers - now with **`mqtt-envelope: 1`** on every
   `headers: all` record, and read by one piece of code everywhere. A record in a version this cannot read is refused
@@ -152,6 +152,49 @@ minor version may change the API or the configuration, and says how here.
   code — so an application can say why a device is not getting through. A board build compiles none of it.
 
 ### Fixed
+
+- **A Kafka mapping changed while records were being read could crash the server** (use after free): a record
+  published into the broker reached the pipe's own offer() on the same thread, which took the new plan there and
+  freed the mapping and consumer the record came from. A change is now taken between passes. Tested: 579 changes
+  while 50,000 records were read, under AddressSanitizer.
+- **A Kafka record that is not an MQTT message is refused and counted** (`invalid`): a topic or a string property
+  that is not UTF-8, or longer than MQTT allows, was handed to every subscriber, whose client dropped the connection
+  as malformed - and got it again on the next session.
+- **Store and forward lost what was on its way at every stop**: up to 64 messages sent and not yet acknowledged were
+  deleted when the server stopped or a connection was changed. They are kept. A message the other broker refuses
+  with `0x97` quota exceeded is kept and sent again after a pause; one that can never be sent on the connection (a
+  retained message to a broker without retain, a QoS it does not offer) is given up and answered, instead of holding
+  up everything behind it; a stored row that cannot be read any more is dropped and logged.
+- **A managed connection's reconnects**: a broker that accepted and dropped it was asked again every 200 ms, and a
+  site's gateways backed off in step. Now as the library's client: full jitter, 1 s doubling to 60 s, started afresh
+  only after 30 s up; `0x97` and `0x9F` wait at least a minute. Only a refused login (`0x86`, `0x87`, `0x8A`, `0x8C`)
+  is `REFUSED` - and tried again every five minutes, never given up on; `0x9F` connection rate exceeded, `0x97`,
+  `0x80` and the rest used to leave a connection `REFUSED` until a person stepped in. Going back to the first server
+  after it failed to last checks it half as often each time.
+- **A managed connection says the largest packet it takes** (its 64 KiB buffer, 1 MiB over Kafka): the other broker
+  could send more than the buffer held, and the connection failed on the same message every session.
+- **A connection's id is a name**: letters, digits and `. _ - : @`. An id with `../` wrote its TLS material outside
+  the state directory. Its files are removed with it.
+- **Kafka clusters over the API**: `plugin.library.paths` and `ssl.engine.location` (which load a library into the
+  server) are refused - the file may still set them - and a secret setting (a password, a key, JAAS) is never
+  given back.
+- **A Sparkplug payload can no longer decode into gigabytes**: 8 KiB of DEFLATE inflated to an eight-million-string
+  array. Every decode has a budget of elements, Templates and PropertySets nest at most 16 deep, and invalid UTF-8
+  in names and strings becomes U+FFFD (proto3 strings must be UTF-8, or a client's stream breaks).
+- **The library's edge node spent a sequence number on an NDATA, DDATA or DDEATH its client refused** (queue full,
+  on a slow link): the host saw a gap and asked for a rebirth - a large NBIRTH on the link that was already full.
+  Not sent, not spent, as the DBIRTH already was. And **bdSeq moves on with every CONNECT**
+  [tck-id-topics-nbirth-bdseq-increment], also after a session that never birthed (waiting for its primary host).
+  The Sparkplug TCK edge profile passes, 6 of 6. 84 bytes.
+- **The server's edge node deleted its history once it was queued**: sent QoS 0, it was lost if the link dropped
+  then. It stays on disk until the node has stayed born for two keep-alives, and goes again after the next birth
+  otherwise.
+- **Connections.Watch**: a stream that ended while a change was being announced could be called after it was
+  freed. The API token is compared in constant time; `sub -v` prints a topic's control characters as `?`.
+- **A Kafka link's broker kept room for 100,000 retained messages** (26 MB each, idle): 1,000 now, about 4 MB a link.
+  A link stopped is let go on a thread of its own, so the others' keep-alives do not wait for its Kafka. Two links
+  cannot share one state connection (each would take its STATE in turn, for ever). A Kafka pipe that failed half way
+  through starting left its librdkafka clients writing to a closed descriptor.
 
 - **A Sparkplug host or edge node sharing a connection could be used after it was freed.** Standing down (a server's
   `DeleteHost`, `DeleteEdgeNode`, or a host put again) it published its offline STATE or NDEATH with a completion

@@ -367,7 +367,7 @@ docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h mqtt.example.com -t tes
 docker run --rm -it ghcr.io/mod-bee/modbee-mqtt sub --tls -h mqtt.example.com -t '#' -v
 ```
 
-Given a command, the image runs `modbee <command>`; given none, or only
+Given a command, the image runs `modbee-mqtt <command>`; given none, or only
 options such as `--metrics-port 9464`, it runs the broker. To reach a broker
 on the same machine from `docker run`, add `--network host`.
 
@@ -407,6 +407,14 @@ network: `modbee:7660`, and no `ports:` needed) with any gRPC library and the
 contract, [`proto/modbee/app/v1/app.proto`](../proto/modbee/app/v1/app.proto).
 A call without the token is refused. To reach it from other machines, give it
 TLS instead of `plain` ([app-api.md](app-api.md#turning-it-on)).
+
+Every call is also a command in the image ([cli.md](cli.md#the-application-api-from-the-command-line)).
+Inside the container the token is already in the environment, so only the
+address is needed:
+
+```bash
+docker compose exec -e MODBEE_API=tcp://127.0.0.1:7660 modbee modbee-mqtt sessions list
+```
 
 ---
 

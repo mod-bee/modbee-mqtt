@@ -168,7 +168,13 @@ from exactly two places:
 2. **A reconnect attempt inside `poll()`** — which is inside your loop.
 
 Everything else — publishing, receiving, the keepalive, servicing the queue —
-is non-blocking on every channel, always.
+is non-blocking in this library, on every channel. **The channel itself may
+not be**: `TinyGsmClient`'s `write()`, `available()` and `connected()` are AT
+command exchanges with the modem, and take hundreds of milliseconds - seconds,
+when the modem's buffer is full on a slow link. On a cellular board, the
+modem's own PPP mode with the board's lwIP sockets (an ordinary `WiFiClient`-
+style client over the PPP interface) avoids that, where the modem and core
+support it.
 
 ### What to do about the second one
 
@@ -221,6 +227,9 @@ medium's connect returns. Never free the medium while `busy()`: hand it to
 `retire()`, which frees it after the attempt. The task exists only while an
 attempt runs. `MQTT_CLIENT`, the OpenPLC block, does all of this on an ESP32.
 A board without threads (`MQTT_CONNECT_TASK` 0) keeps the stall where it was.
+`MqttSparkplugNode` reconnects by itself, so on a cellular modem give it a
+transport wrapped in `MqttConnectTask` this way - it cannot use the
+`autoReconnect(false)` pattern above.
 
 On a **host** none of this applies: `MqttTcpTransport` and `MqttTlsTransport`
 are non-blocking throughout, connect included. The limitation is Arduino's

@@ -220,15 +220,18 @@ between the bridge and everything else the client can do.
 
 A board has no Kafka client, and will not get one: librdkafka is host-only,
 and Kafka's own protocol wants a stable network and a big machine. So a board
-reaches Kafka the way it reaches anything - **over MQTT, to a server whose
-connection is over Kafka** ([kafka.md](kafka.md#kafka-as-a-connections-link)):
-the board's bridge carries its topics to that server, and the server's
-connection carries them on to Kafka, in the envelope, and back.
+reaches Kafka the way it reaches anything - **over MQTT, to a server with
+the [Kafka pipe](kafka.md)**: the board's bridge carries its topics to that
+server, and the pipe's mappings carry them on to Kafka - in the envelope with
+`headers: all` - and back. A [connection whose link is
+Kafka](kafka.md#kafka-as-a-connections-link) is not reachable from a board:
+its broker listens on the server's loopback only.
 
-On a **server**, a bridge with a Kafka end *is* such a connection: the
-connection's own broker, inside the server, is the bridge's remote broker, and
-this bridge connects to it like to any other. The loop prevention above holds
-across it - No Local on the MQTT side, and on the Kafka side a connection
-never reads back a record it wrote, nor writes a record back to the topic it
-came from. Tested both ways between two sites sharing one Kafka topic: each
-message arrives once on the other site, and none comes back.
+On a **server**, the server's own topics reach Kafka through the pipe, which
+never writes a record back to the topic it read it from. To carry another
+broker's topics to Kafka, an application relays two of the server's
+connections - one to that broker, subscribed with No Local, and one [over
+Kafka](kafka.md#kafka-as-a-connections-link), which never reads back a record
+it wrote - and the loop prevention above holds across it. Tested both ways
+between two sites sharing one Kafka topic: each message arrives once on the
+other site, and none comes back.

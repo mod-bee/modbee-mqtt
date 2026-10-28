@@ -49,12 +49,12 @@ the Arduino library.
 
 | | |
 | --- | --- |
-| **`modbee-mqtt serve`** | The broker as a server: one broker per CPU core, behind one port. Configured with one `modbee.yaml` |
-| **Kafka pipe** | MQTT to Apache Kafka and back, with messages passed through untouched. A publisher's PUBACK comes back only once Kafka has the message |
+| **`modbee-mqtt serve`** | The broker as a server: one broker per CPU core, behind one port. Configured with one `modbee.yaml`, or with flags alone (`--data`, `--api`, `--set path=value`) |
+| **Kafka pipe** | MQTT to Apache Kafka and back, with messages passed through untouched. A publisher's PUBACK comes back only once Kafka has the message. Clusters and mappings changed while it runs ([kafka.md](docs/kafka.md)) |
 | **Device logins** | A login per device, added, reset and removed while it runs - or devices that register themselves with a provisioning key for their site - with per-device topic permissions (strict, or open to every topic for a login without rules: `authentication.default-topics`) |
 | **Retained messages that survive a restart** | Kept in memory as always, and in a file or a compacted Kafka topic as well, with one setting |
-| **Application API** | Your application beside the server, over gRPC (and REST for admin): consumer groups sharing devices' messages, publishing to devices, and managing connections, sessions and logins ([app-api.md](docs/app-api.md)) |
-| **`modbee-mqtt` command** | Publish, subscribe, request/response and benchmark from a terminal |
+| **Application API** | Your application beside the server, over gRPC (and REST for admin): consumer groups sharing devices' messages, publishing to devices, connections to other brokers or over Kafka with store and forward, a Sparkplug B host or edge node in the server, and managing sessions, logins, listeners and the Kafka pipe live ([app-api.md](docs/app-api.md)) |
+| **`modbee-mqtt` command** | Publish, subscribe, request/response - to a broker or to Kafka - and benchmark from a terminal; every Application API call as a command ([cli.md](docs/cli.md)) |
 | **Downloads** | `.deb` and `.rpm` packages, `modbee-mqtt` for any Linux (x86-64, ARM64) as one static binary, and `modbee-mqtt.exe` for Windows - attested, with an SBOM. Then `modbee-mqtt service install` and `modbee-mqtt admin`, and it is running ([releases.md](docs/releases.md)) |
 | **Docker image** | `ghcr.io/mod-bee/modbee-mqtt`: the server and the `modbee-mqtt` command, for amd64 and arm64 |
 
@@ -216,7 +216,7 @@ the Arduino library. [cli.md](docs/cli.md) covers both.
 | `src/codec/`, `src/transport/` | The MQTT 3.1.1 and 5.0 codecs, and TCP, TLS, the Arduino `Client` adapter and the listeners |
 | `examples/arduino/` | Fifteen sketches, each a real application |
 | `examples/cpp/` | Publish, subscribe, a gateway, a broker, a bridge, a broker serving TLS, and a Sparkplug node and host |
-| `server/` | The server tier: one broker per core (`ShardedBroker`), `modbee.yaml`, the Kafka pipe and metrics. Linux |
+| `server/` | The server tier: one broker per core (`ShardedBroker`), `modbee.yaml`, the Kafka pipe, the Application API and metrics. Linux and Windows |
 | `cli/` | The `modbee-mqtt` command |
 | `docker/` | The image (`docker/Dockerfile`) and the compose files |
 | `docs/` | Everything below |
@@ -293,6 +293,11 @@ other.
 message from Kafka and sends a pump command back
 ([kafka-apps.md](docs/kafka-apps.md)).
 
+`examples/app-api/`: the Application API from Node.js - a consumer group
+member and logins decided by the application (`nodejs/`), and a Sparkplug B
+host on a broker you do not own that passes the Eclipse TCK
+(`sparkplug-host/`) ([app-api.md](docs/app-api.md)).
+
 ---
 
 ## What it is not
@@ -320,17 +325,18 @@ message from Kafka and sends a pump command back
 | [broker.md](docs/broker.md) | A broker in your own program |
 | [bridge.md](docs/bridge.md) | Two brokers and a mapping |
 | [typed-values.md](docs/typed-values.md) | Bind a variable; read it back with a quality |
-| [sparkplug.md](docs/sparkplug.md) | Sparkplug B: an edge node, a host application, and what each does for you |
+| [sparkplug.md](docs/sparkplug.md) | Sparkplug B: an edge node, a host application, and what each does for you - on a board, or in the server |
 | [versions.md](docs/versions.md) | MQTT 3.1.1 and 5.0: what differs |
 | [security.md](docs/security.md) | TLS, and what "it connected" does and does not prove |
 | [footprint.md](docs/footprint.md) | Flash and RAM, measured |
 | [docker.md](docs/docker.md) | **Running the server**: one command, a stack with a certificate, or that stack with Kafka |
-| [kafka.md](docs/kafka.md) | `modbee.yaml` and the Kafka pipe |
+| [kafka.md](docs/kafka.md) | `modbee.yaml` and the Kafka pipe, and connections whose link is Kafka |
+| [app-api.md](docs/app-api.md) | **The Application API**: your application talks to the server over gRPC or REST - messages, connections, Sparkplug B, Kafka, administration, and logins it decides |
 | [logins.md](docs/logins.md) | **Device logins**: a login per device, devices that register themselves, permissions, backups |
 | [settings.md](docs/settings.md) | The server's settings, changed over MQTT and applied at a restart |
 | [events.md](docs/events.md) | What clients do - connect, go, subscribe - as messages, and in Kafka |
 | [kafka-apps.md](docs/kafka-apps.md) | **Your own app on Kafka** - reading device data and sending commands, from Node.js, Python or anything else |
-| [cli.md](docs/cli.md) | The `modbee-mqtt` command |
+| [cli.md](docs/cli.md) | The `modbee-mqtt` command, and the Application API from the command line |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The five layers, and why |
 | [extending.md](docs/extending.md) | Building on it: a PLC wrapper, a new transport, and the design rules |
 

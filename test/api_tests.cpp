@@ -18,6 +18,9 @@
 #include "SparkplugAware.h"
 #include "ApiServer.h"
 #include "modbee/app/v1/app.grpc.pb.h"
+#include "modbee/sparkplug/v1/wire.pb.h"
+
+#include <zlib.h>
 
 #include <grpcpp/grpcpp.h>
 
@@ -404,6 +407,45 @@ void sparkplugCodec(Server& server) {
         v1::PublishReply reply;
         equal<int>("a metric its datatype cannot carry: INVALID_ARGUMENT", messages->Publish(&c, publish, &reply).error_code(),
                    grpc::StatusCode::INVALID_ARGUMENT);
+    }
+    {
+        // A DEFLATE bomb: a few kilobytes that inflate to 8 MiB of NULs, a
+        // StringArray of eight million empty strings - which decoded to about
+        // half a gigabyte. Refused, said why, and the server is still here.
+        modbee::sparkplug::v1::Payload inner;
+        modbee::sparkplug::v1::Payload::Metric* m = inner.add_metrics();
+        m->set_name("bomb");
+        m->set_datatype(v1::DATATYPE_STRING_ARRAY);
+        m->set_bytes_value(std::string(8u << 20, '\0'));
+        const std::string plain = inner.SerializeAsString();
+        uLongf size = compressBound((uLong)plain.size());
+        std::string packed(size, '\0');
+        compress2((Bytef*)&packed[0], &size, (const Bytef*)plain.data(), (uLong)plain.size(), Z_BEST_COMPRESSION);
+        packed.resize(size);
+        modbee::sparkplug::v1::Payload outer;
+        outer.set_uuid("SPBV1.0_COMPRESSED");
+        outer.set_body(packed);
+        modbee::sparkplug::v1::Payload::Metric* algorithm = outer.add_metrics();
+        algorithm->set_name("algorithm");
+        algorithm->set_datatype(v1::DATATYPE_STRING);
+        algorithm->set_string_value("DEFLATE");
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDecodeRequest decode;
+        decode.set_topic("spBv1.0/plant/NDATA/bomb");
+        decode.set_payload(outer.SerializeAsString());
+        v1::SparkplugMessage read;
+        const grpc::Status status = sparkplug->Decode(&c, decode, &read);
+        std::printf("  note  the bomb: %zu bytes, 8 MiB inflated\n", decode.payload().size());
+        ok(status.ok(), "  the answer comes (no reply too large to take)");
+        ok(read.payload().metrics_size() == 1 && read.payload().metrics(0).value().array_value().strings_size() == 0,
+           "a DEFLATE bomb: its array is not expanded");
+        ok(!read.error().empty(), "  and the answer says why");
+        grpc::ClientContext h;
+        authorize(h);
+        v1::HelloRequest hello;
+        v1::HelloReply reply;
+        ok(v1::System::NewStub(server.channel())->Hello(&h, hello, &reply).ok(), "  the server answers on");
     }
 }
 

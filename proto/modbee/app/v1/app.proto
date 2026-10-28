@@ -823,7 +823,9 @@ message KafkaCluster {
   repeated string bootstrap_servers = 2;   // host:port
   KafkaClusterTls tls = 3;                 // set: TLS
   KafkaClusterAuthentication authentication = 4;
-  map<string, string> properties = 5;      // librdkafka settings, exactly as written ("linger.ms")
+  // librdkafka settings, exactly as written ("linger.ms"). A secret one (a password, a key, JAAS) comes back empty,
+  // and a Put with it empty keeps it; plugin.library.paths and ssl.engine.location are refused here (the file only).
+  map<string, string> properties = 5;
 }
 message KafkaClusterTls {
   string ca = 1;                           // files on the server

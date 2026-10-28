@@ -17,6 +17,16 @@ Examples: [`Sparkplug_Edge_Node`](../examples/arduino/Sparkplug_Edge_Node)
 [`sparkplug_host`](../examples/cpp/sparkplug_host) (a host, and a pair that
 talk to each other).
 
+**On a server**, `modbee-mqtt serve` runs the same host and edge node for an
+application that has no Sparkplug code of its own, through the
+[Application API](app-api.md#sparkplug-b): a host (`Sparkplug.PutHost`,
+`modbee-mqtt sparkplug-hosts put`) or an edge node (`Sparkplug.PutEdgeNode`,
+`modbee-mqtt sparkplug-nodes put`) on one of its connections - to another
+broker, to the server itself, or [over Kafka](kafka.md#a-sparkplug-host-on-kafka-its-state-on-mqtt) -
+payloads decoded and encoded for it, and Sparkplug Aware
+(`serve --sparkplug-aware`). `modbee-mqtt sub -t 'spBv1.0/#' --sparkplug`
+prints what goes by, decoded ([cli.md](cli.md#subscribing)).
+
 ---
 
 ## What Sparkplug adds to MQTT
@@ -458,7 +468,9 @@ becomes the metric's live value and its last published one, so report by
 exception does not send it twice. QoS 0 like every data message: keep what
 must not be lost until you have seen the node stay born afterwards.
 
-`MqttSparkplugHistory` is the bounded ring that goes with it: `begin(depth)`
+`MqttSparkplugHistory` is the bounded ring that goes with it - **in RAM**:
+a reboot or a power cut empties it; a program that must keep it across one
+keeps it itself (on OpenPLC, in retained variables). `begin(depth)`
 allocates `depth` events of 24 bytes with `mq_allocLarge()` (PSRAM first),
 `add()` drops the oldest when full and counts it in `lost()`, `peek()` /
 `drop()` take them oldest first, and `placeOnClock(utcNow, uptimeNow)` moves
