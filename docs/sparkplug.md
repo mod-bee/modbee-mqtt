@@ -444,8 +444,10 @@ once per probe interval and only while values are held.
 `primaryHost()`, `only()` and `keepAlive()` may be called again after a
 `disconnect()`; the next `connect()` uses them and births with the next bdSeq.
 `rebind(MqttTransport&)` moves the node to another transport you built - the
-declarations, aliases, devices and write queues stay. With 5.0 the
-`disconnect()` before it makes the broker publish the NDEATH.
+declarations, aliases, devices and write queues stay. `disconnect()`
+publishes the NDEATH and waits for the broker's acknowledgement before the
+DISCONNECT; with 5.0 the DISCONNECT also asks the broker to publish the Will,
+so a host sees the same death twice (one bdSeq) and treats it as one.
 
 ### Arrays, structs and tables
 

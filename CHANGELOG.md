@@ -178,6 +178,10 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug: at MQTT 5.0 an intentional disconnect publishes its NDEATH first.** It sent only DISCONNECT with the
+  Will reason code and left the NDEATH to the broker; the Eclipse Sparkplug TCK (SessionTerminationTest) failed it on
+  [tck-id-operational-behavior-edge-node-intentional-disconnect-ndeath] - an NDEATH MUST be published before the
+  connection ends, at either version. The DISCONNECT still carries 0x04, so the broker publishes the Will as well.
 - **Sparkplug: UInt32 is written in `long_value`.** It went in `int_value`, which the specification's table ("uint32")
   allows a reading of, but the Eclipse Sparkplug TCK fails (its value check takes UInt32 from `long_value` only), and
   Eclipse Tahu's Java and C libraries and npm `sparkplug-payload` write it there - the last reads it from nowhere

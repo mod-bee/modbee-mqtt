@@ -1583,38 +1583,39 @@ void MqttSparkplugNode::disconnect() {
         endBirth();
         return;
     }
-    if (_client.activeVersion() == MqttVersion::V311) {
-        // [tck-id-payloads-ndeath-will-message-publisher-disconnect-mqtt311]
-        // If the Edge Node is using MQTT 3.1.1 and it sends an MQTT DISCONNECT
-        // packet, the Edge Node MUST publish an NDEATH message to the MQTT
-        // Server BEFORE it sends the MQTT DISCONNECT packet.
-        //
-        // Because a DISCONNECT tells the server NOT to publish the Will, so
-        // without this a clean shutdown looks like a node that is still there.
-        //
-        // AND THE ORDER IS THE WHOLE POINT. publishSeries() queues; the bytes
-        // leave on a later poll(). Calling disconnect() on the next line sent
-        // the DISCONNECT first and the NDEATH never went at all. So the
-        // disconnect waits for the publish to CONCLUDE - at QoS 1, which means
-        // the server has acknowledged it, not merely that we wrote it.
-        _disconnectAfterDeath = true;
-        _deathAskedAt = mq_millis();
-        if (!publishNodeDeath()) {
-            // Nothing could be queued, so there is nothing to wait for and
-            // hanging on to the session would be worse than a missing death
-            // certificate.
-            _disconnectAfterDeath = false;
-            _client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
-        }
-    } else {
-        // [-disconnect-mqtt50] If the Edge Node is using MQTT 5.0 ... the MQTT
-        // v5.0 Disconnect with Will Message reason code MUST be set in the
-        // DISCONNECT packet.
-        //
-        // Then the SERVER publishes the NDEATH, which is better: it is the one
-        // already registered, carrying the right bdSeq, and it cannot be lost
-        // between our publish and our disconnect.
-        _client.disconnect(MQ_REASON_DISCONNECT_WITH_WILL);
+    // [tck-id-operational-behavior-edge-node-intentional-disconnect-ndeath]
+    // When an Edge Node disconnects intentionally, it MUST publish an NDEATH
+    // before terminating the connection - at EITHER version.
+    //
+    // [tck-id-payloads-ndeath-will-message-publisher-disconnect-mqtt311] At
+    // 3.1.1 that is the only death a host sees: a DISCONNECT tells the server
+    // NOT to publish the Will, so without it a clean shutdown looks like a
+    // node that is still there.
+    //
+    // [-disconnect-mqtt50] At 5.0 the DISCONNECT then carries the Disconnect
+    // with Will Message reason code as well, so the server publishes the
+    // registered NDEATH too - the same bdSeq twice, which a host reads as one
+    // death. This version sent only the reason code and let the server
+    // publish the Will, and the Eclipse TCK (SessionTerminationTest) failed
+    // it: at the DISCONNECT no NDEATH had been published.
+    //
+    // AND THE ORDER IS THE WHOLE POINT. publishSeries() queues; the bytes
+    // leave on a later poll(). Calling disconnect() on the next line sent
+    // the DISCONNECT first and the NDEATH never went at all. So the
+    // disconnect waits for the publish to CONCLUDE - at QoS 1, which means
+    // the server has acknowledged it, not merely that we wrote it.
+    //
+    // Only on a session that is up: one still being opened has no Will
+    // registered and nobody who saw it born, and must not wait ten seconds
+    // for an acknowledgement that cannot come.
+    _disconnectAfterDeath = _client.isConnected();
+    _deathAskedAt = mq_millis();
+    if (!_disconnectAfterDeath || !publishNodeDeath()) {
+        // Nothing could be queued, so there is nothing to wait for and
+        // hanging on to the session would be worse than a missing death
+        // certificate (at 5.0 the reason code still has the Will sent).
+        _disconnectAfterDeath = false;
+        _client.disconnect(goodbyeReason());
     }
     endBirth();
 }
@@ -1666,8 +1667,16 @@ void MqttSparkplugNode::deathTrampoline(void* context, MqttResult result,
     if (node->_shared) {
         node->_restartAfterDeath = true;   // from poll(), not inside the client's
     } else {
-        node->_client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+        node->_client.disconnect(node->goodbyeReason());
     }
+}
+
+// The DISCONNECT after an NDEATH this node published itself: at 5.0 with the
+// Will reason code, which [tck-id-payloads-ndeath-will-message-publisher-disconnect-mqtt50]
+// requires of any DISCONNECT an edge node sends.
+uint8_t MqttSparkplugNode::goodbyeReason() const {
+    return _client.activeVersion() == MqttVersion::V311 ? MQ_REASON_NORMAL_DISCONNECTION
+                                                        : MQ_REASON_DISCONNECT_WITH_WILL;
 }
 
 void MqttSparkplugNode::cycleSession() {
@@ -1717,30 +1726,27 @@ void MqttSparkplugNode::poll() {
         mq_elapsed(_deathAskedAt, mq_millis()) > 10000) {
         _disconnectAfterDeath = false;
         if (_shared) {
-            restartShared(MQ_REASON_NORMAL_DISCONNECTION);
+            restartShared(goodbyeReason());
         } else {
-            _client.disconnect(MQ_REASON_NORMAL_DISCONNECTION);
+            _client.disconnect(goodbyeReason());
         }
     }
 
     // A shared client's session ends from here, never from inside its poll:
-    // the NDEATH first at 3.1.1, the Will by reason code at 5.0.
+    // the NDEATH first at either version (disconnect()), and at 5.0 the Will
+    // by reason code as well.
     if (_cycleOwed && !_disconnectAfterDeath) {
         _cycleOwed = false;
-        if (_client.activeVersion() == MqttVersion::V311) {
-            _disconnectAfterDeath = true;
-            _deathAskedAt = mq_millis();
-            if (!publishNodeDeath()) {
-                _disconnectAfterDeath = false;
-                restartShared(MQ_REASON_NORMAL_DISCONNECTION);
-            }
-        } else {
-            restartShared(MQ_REASON_DISCONNECT_WITH_WILL);
+        _disconnectAfterDeath = true;
+        _deathAskedAt = mq_millis();
+        if (!publishNodeDeath()) {
+            _disconnectAfterDeath = false;
+            restartShared(goodbyeReason());
         }
     }
     if (_restartAfterDeath) {
         _restartAfterDeath = false;
-        restartShared(MQ_REASON_NORMAL_DISCONNECTION);
+        restartShared(goodbyeReason());
     }
 
     // A shared client restarts from here, never from inside its own poll -

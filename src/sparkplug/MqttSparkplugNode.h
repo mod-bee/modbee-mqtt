@@ -937,6 +937,7 @@ private:
     // `awaited`: as MqttSparkplugHost::publishDeath - a shared client's
     // node stands down without the completion, and may be destroyed then.
     bool publishNodeDeath(bool awaited = true);
+    uint8_t goodbyeReason() const;
     bool subscribeCommands();
 
     void advanceServer();
