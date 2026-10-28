@@ -579,6 +579,9 @@ void readCluster(Loader& loader, Section c, KafkaClusterConfig& out) {
         auth.choice("mechanism", out.mechanism, kMechanisms);
         auth.text("username", out.username);
         auth.secret("password", out.password);
+        // Kept as a name, so the file is read again at the next start, as
+        // when the setting came from modbee.yaml.
+        if (auth.find("password") == nullptr) auth.text("password-file", out.passwordFile);
         auth.finish();
         if ((out.mechanism == "plain" || out.mechanism.compare(0, 5, "scram") == 0) &&
             (out.username.empty() || out.password.empty())) {
@@ -1276,4 +1279,200 @@ std::string describe(const ConfigProblem& problem, const std::string& fileName) 
     if (!problem.path.empty()) text += problem.path + ": ";
     text += problem.message;
     return text;
+}
+
+// =============================================================================
+// THE KAFKA SECTION, WRITTEN BACK
+// =============================================================================
+
+namespace {
+
+std::string quoted(const std::string& text) {
+    std::string out = "\"";
+    for (unsigned char c : text) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char escaped[8];
+                std::snprintf(escaped, sizeof escaped, "\\u%04x", c);
+                out += escaped;
+            } else {
+                out += (char)c;
+            }
+        }
+    }
+    return out + "\"";
+}
+
+std::string list(const std::vector<std::string>& items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); i++) out += (i ? "," : "") + quoted(items[i]);
+    return out + "]";
+}
+
+// One "key": value pair at a time, commas handled.
+struct JsonObject {
+    std::string text = "{";
+    void raw(const char* key, const std::string& value) {
+        text += (text.size() > 1 ? "," : "") + quoted(key) + ":" + value;
+    }
+    void str(const char* key, const std::string& value) { raw(key, quoted(value)); }
+    std::string done() const { return text + "}"; }
+};
+
+std::vector<std::string> split(const std::string& text, char by) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t end = text.find(by, start);
+        const std::string part = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!part.empty()) out.push_back(part);
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return out;
+}
+
+const char* noEnvironment(void*, const char*) { return nullptr; }
+
+} // namespace
+
+std::string renderKafkaSection(const std::vector<KafkaClusterConfig>& clusters,
+                               const std::vector<MqttToKafkaConfig>& toKafka,
+                               const std::vector<KafkaToMqttConfig>& fromKafka) {
+    std::string clusterText = "[";
+    for (size_t i = 0; i < clusters.size(); i++) {
+        const KafkaClusterConfig& c = clusters[i];
+        JsonObject o;
+        o.str("id", c.id);
+        o.raw("bootstrap-servers", list(split(c.bootstrapServers, ',')));
+        if (c.tls) {
+            JsonObject tls;
+            if (!c.caFile.empty()) tls.str("ca", c.caFile);
+            if (!c.certificateFile.empty()) tls.str("cert", c.certificateFile);
+            if (!c.keyFile.empty()) tls.str("key", c.keyFile);
+            tls.raw("verify-hostname", c.verifyHostname ? "true" : "false");
+            o.raw("tls", tls.done());
+        }
+        if (c.mechanism != "none" || !c.username.empty()) {
+            JsonObject auth;
+            auth.str("mechanism", c.mechanism);
+            if (!c.username.empty()) auth.str("username", c.username);
+            if (!c.passwordFile.empty()) auth.str("password-file", c.passwordFile);
+            else if (!c.password.empty()) auth.str("password", c.password);
+            o.raw("authentication", auth.done());
+        }
+        if (!c.properties.empty()) {
+            JsonObject properties;
+            for (const auto& p : c.properties) properties.str(p.first.c_str(), p.second);
+            o.raw("properties", properties.done());
+        }
+        clusterText += (i ? "," : "") + o.done();
+    }
+    clusterText += "]";
+
+    std::string toText = "[";
+    for (size_t i = 0; i < toKafka.size(); i++) {
+        const MqttToKafkaConfig& m = toKafka[i];
+        JsonObject o;
+        o.str("id", m.id);
+        if (!m.cluster.empty()) o.str("cluster", m.cluster);
+        o.raw("mqtt-topic-filters", list(m.filters));
+        o.str("kafka-topic", m.kafkaTopic);
+        o.str("kafka-acks", m.acks == 0 ? "zero" : m.acks == 1 ? "one" : "all");
+        o.raw("max-record-bytes", std::to_string(m.maxRecordBytes));
+        switch (m.key) {
+        case KafkaKeyMode::Topic: o.str("key", "topic"); break;
+        case KafkaKeyMode::ClientId: o.str("key", "clientid"); break;
+        case KafkaKeyMode::None: o.str("key", "none"); break;
+        case KafkaKeyMode::Template: o.str("key", m.keyTemplate); break;
+        }
+        if (m.allHeaders) {
+            o.str("headers", "all");
+        } else if (!m.headers.empty()) {
+            std::string headers = "[";
+            for (size_t h = 0; h < m.headers.size(); h++) {
+                const KafkaHeaderSpec& spec = m.headers[h];
+                std::string one;
+                if (spec.fixed) {
+                    JsonObject fixed;
+                    fixed.str(spec.name.c_str(), spec.value);
+                    one = fixed.done();
+                } else {
+                    one = quoted(spec.name);
+                }
+                headers += (h ? "," : "") + one;
+            }
+            o.raw("headers", headers + "]");
+        }
+        o.str("partition-strategy", m.uniform ? "uniform" : "key-based");
+        o.str("acknowledge", m.acknowledgeOnKafka ? "kafka" : "routed");
+        toText += (i ? "," : "") + o.done();
+    }
+    toText += "]";
+
+    std::string fromText = "[";
+    for (size_t i = 0; i < fromKafka.size(); i++) {
+        const KafkaToMqttConfig& m = fromKafka[i];
+        JsonObject o;
+        o.str("id", m.id);
+        if (!m.cluster.empty()) o.str("cluster", m.cluster);
+        if (!m.kafkaTopicPattern.empty()) o.str("kafka-topic-pattern", m.kafkaTopicPattern);
+        else o.raw("kafka-topics", list(m.kafkaTopics));
+        o.raw("mqtt-topic", list(m.mqttTopics));
+        o.raw("from-headers", m.fromHeaders ? "true" : "false");
+        o.raw("qos", std::to_string(m.qos));
+        o.raw("retain", m.retain ? "true" : "false");
+        o.str("consumer-group", m.group);
+        JsonObject properties;
+        if (!m.contentType.empty()) properties.str("content-type", m.contentType);
+        if (!m.responseTopic.empty()) properties.str("response-topic", m.responseTopic);
+        if (m.hasPayloadFormat) properties.raw("payload-format-indicator", std::to_string(m.payloadFormat));
+        if (m.hasMessageExpiry) properties.raw("message-expiry-interval", std::to_string(m.messageExpiry));
+        if (!m.userProperties.empty()) {
+            std::string user = "[";
+            for (size_t u = 0; u < m.userProperties.size(); u++) {
+                JsonObject pair;
+                pair.str(m.userProperties[u].first.c_str(), m.userProperties[u].second);
+                user += (u ? "," : "") + pair.done();
+            }
+            properties.raw("user-properties", user + "]");
+        }
+        if (properties.text.size() > 1) o.raw("properties", properties.done());
+        fromText += (i ? "," : "") + o.done();
+    }
+    fromText += "]";
+
+    JsonObject kafka;
+    kafka.raw("clusters", clusterText);
+    kafka.raw("mqtt-to-kafka", toText);
+    kafka.raw("kafka-to-mqtt", fromText);
+    JsonObject top;
+    top.raw("kafka", kafka.done());
+    return top.done() + "\n";
+}
+
+bool loadKafkaSection(const std::string& text, ServerConfig& out, std::string& error) {
+    ConfigSource source;
+    source.name = "kafka";
+    source.env = &noEnvironment;
+    std::vector<ConfigProblem> problems;
+    ServerConfig loaded;
+    const bool ok = loadServerConfig(text, source, loaded, problems);
+    error.clear();
+    for (const ConfigProblem& p : problems) {
+        if (p.warning) continue;
+        if (!error.empty()) error += "\n";
+        error += (p.path.empty() ? std::string() : p.path + ": ") + p.message;
+    }
+    if (!ok) return false;
+    out.clusters = loaded.clusters;
+    out.toKafka = loaded.toKafka;
+    out.fromKafka = loaded.fromKafka;
+    return true;
 }

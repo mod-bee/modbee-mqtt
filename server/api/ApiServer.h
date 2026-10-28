@@ -29,6 +29,7 @@ class AppConnections;
 class AppAdmin;
 class AuthGate;
 class ShardedBroker;
+class KafkaControl;
 
 struct ApiServerConfig {
     std::vector<std::string> addresses;   // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
@@ -55,6 +56,7 @@ public:
         AppAdmin* admin = nullptr;           // sessions and retained messages, on the shards
         AuthGate* logins = nullptr;          // the login database, where logins are kept here
         ShardedBroker* server = nullptr;     // its listeners, TLS and status
+        KafkaControl* kafka = nullptr;       // the kafka: section, changed live
         // Sparkplug Aware, read and changed while it runs (server/events/SparkplugAware.h).
         std::function<bool()> sparkplugAware;
         std::function<void(bool)> setSparkplugAware;

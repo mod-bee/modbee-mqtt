@@ -101,6 +101,7 @@ struct KafkaClusterConfig {
     bool verifyHostname = true;
     std::string mechanism = "none";    // none | plain | scram-sha256 | scram-sha512 | oauthbearer
     std::string username, password;
+    std::string passwordFile;          // where `password` was read from, when it was
     // Anything else, handed to librdkafka exactly as written ("linger.ms").
     std::vector<std::pair<std::string, std::string>> properties;
     size_t line = 0;
@@ -373,6 +374,22 @@ bool loadEffectiveConfig(const std::string& fileText, const std::string& fileNam
 
 // "broker.tls.port" -> "MODBEE_BROKER_TLS_PORT"
 std::string configEnvironmentName(const std::string& path);
+
+// --- The kafka: section on its own ---------------------------------------------
+//
+// What the Application API changes live (Kafka.PutCluster ...), and keeps in
+// the state directory as kafka.json. The section is WRITTEN BACK AS TEXT and
+// read by the same loader as modbee.yaml, so a change made over the API meets
+// exactly the rules the file does - one copy of them. The text is JSON, which
+// is YAML.
+std::string renderKafkaSection(const std::vector<KafkaClusterConfig>& clusters,
+                               const std::vector<MqttToKafkaConfig>& toKafka,
+                               const std::vector<KafkaToMqttConfig>& fromKafka);
+
+// Reads one back: clusters and mappings into `out`, nothing else, and no
+// environment variables (they set the file's values, not these). False with
+// every problem in `error`, one per line.
+bool loadKafkaSection(const std::string& text, ServerConfig& out, std::string& error);
 
 // The placeholders a mqtt-to-kafka `headers:` list may name, and that
 // `headers: all` writes. Null-terminated.

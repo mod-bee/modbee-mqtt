@@ -39,7 +39,8 @@ endif()
 
 # `modbee-mqtt serve` needs the server tier, which exists only where it builds.
 if(TARGET modbee-server)
-    target_link_libraries(modbee PRIVATE modbee-server modbee-config modbee-retained modbee-auth modbee-events modbee-sessions)
+    target_link_libraries(modbee PRIVATE modbee-server modbee-config modbee-retained modbee-auth modbee-events modbee-sessions
+                          modbee-kafka-control)
     target_compile_definitions(modbee PRIVATE MODBEE_HAVE_SERVER=1)
 endif()
 

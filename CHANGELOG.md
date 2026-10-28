@@ -13,6 +13,15 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Kafka through the Application API and the CLI, live** (`Kafka.PutCluster` ... `DeleteMapping`, `Kafka.Status`;
+  `modbee-mqtt kafka-clusters|kafka-mappings put|get|list|delete`, `modbee-mqtt kafka status`; REST
+  `/v1/kafka-clusters`, `/v1/kafka-mappings`, `/v1/kafka-status`): clusters and mappings with the fields of the file's
+  `kafka:` section, checked by the same loader, applied all or nothing while the server runs. Only what a change
+  touches restarts - a producer when its cluster or a topic's acks or partitioning change, a consumer when its
+  cluster, topics or group do - and a replaced producer is let go only once Kafka has answered every record it held,
+  so a PUBACK already waiting on Kafka is still sent. Kept in the state directory (`kafka.json`), which wins over the
+  file once the API has changed anything, as EMQX does; passwords never come back out. The pipe is now there in
+  every build with librdkafka, mappings or not.
 - **Sparkplug B arrays, structs and tables in the library** - every metric datatype, on a board too. The thirteen
   array types (`mq_spPackArray` from a program's own C array, `mq_spArrayCount` / `mq_spArrayAt` to read one),
   Templates - a PLC `STRUCT` or UDT: `MqttSparkplugTemplate`, `mq_sparkplugEncodeTemplate` / `DecodeTemplate`, and on

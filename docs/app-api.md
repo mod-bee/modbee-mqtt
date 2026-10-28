@@ -22,7 +22,7 @@ started with flags alone (`serve --api unix:<path> --api-token-file <file> --aut
 
 `Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), and what
 it added since (`connections.subscriptions`: subscription options on a connection; `admin.listeners`:
-`PutListeners`; `events.handshake`; `sparkplug.codec`; `sparkplug.host`; `sparkplug.edge`; `sparkplug.structures` - the edge node's templates, arrays and DataSets; `sparkplug.aware`), so an application asks rather than guesses.
+`PutListeners`; `events.handshake`; `sparkplug.codec`; `sparkplug.host`; `sparkplug.edge`; `sparkplug.structures` - the edge node's templates, arrays and DataSets; `sparkplug.aware`; `kafka`), so an application asks rather than guesses.
 
 **`System.Attach`** is an instance's presence. Open it with the messages to
 publish should the instance vanish - its Wills, as an MQTT client has one:
@@ -215,6 +215,19 @@ Sparkplug is kept once, here: your application needs no Sparkplug codec of its o
 A value is in the field its datatype names: `Int8`-`Int64` in `int_value`, `UInt8`-`UInt64` and `DateTime` (ms since
 1970) in `uint_value`, `String`/`Text`/`UUID` in `string_value`, `Bytes`/`File` in `bytes_value`, an array's elements
 in `array_value` (`ints`, `uints`, `floats`, `doubles`, `booleans`, `strings`).
+
+---
+
+## Kafka
+
+`Kafka.PutCluster` / `GetCluster` / `ListClusters` / `DeleteCluster`, `Kafka.PutMapping` / `GetMapping` /
+`ListMappings` / `DeleteMapping`: the clusters, and the mappings between this broker's topics and Kafka's, with the
+fields of modbee.yaml's `kafka:` section ([kafka.md](kafka.md)) and its rules - changed live and all or nothing, kept in
+the state directory (`kafka.json`), and a publisher's acknowledgement already waiting on Kafka kept through any change
+([kafka.md](kafka.md#changing-it-while-it-runs)). `Kafka.Status`: each mapping's counters, the acknowledgements waiting
+on Kafka now, and whether Kafka can be reached. A server built without librdkafka answers `FAILED_PRECONDITION`, and
+Hello lists `kafka` only where it has it. REST: `/v1/kafka-clusters/{id}`, `/v1/kafka-mappings/{id}`,
+`GET /v1/kafka-status`.
 
 ---
 

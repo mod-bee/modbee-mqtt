@@ -326,6 +326,15 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt messages publish` | `Messages.Publish` | `POST /v1/publish` |
 | `modbee-mqtt groups list` | `Messages.ListGroups` | `GET /v1/groups` |
 | `modbee-mqtt groups delete` | `Messages.DeleteGroup` | `DELETE /v1/groups/{group}?connection=` |
+| `modbee-mqtt kafka-clusters put` | `Kafka.PutCluster` | `PUT /v1/kafka-clusters/{id}` |
+| `modbee-mqtt kafka-clusters get` | `Kafka.GetCluster` | `GET /v1/kafka-clusters/{id}` |
+| `modbee-mqtt kafka-clusters list` | `Kafka.ListClusters` | `GET /v1/kafka-clusters` |
+| `modbee-mqtt kafka-clusters delete` | `Kafka.DeleteCluster` | `DELETE /v1/kafka-clusters/{id}` |
+| `modbee-mqtt kafka-mappings put` | `Kafka.PutMapping` | `PUT /v1/kafka-mappings/{id}` |
+| `modbee-mqtt kafka-mappings get` | `Kafka.GetMapping` | `GET /v1/kafka-mappings/{id}` |
+| `modbee-mqtt kafka-mappings list` | `Kafka.ListMappings` | `GET /v1/kafka-mappings` |
+| `modbee-mqtt kafka-mappings delete` | `Kafka.DeleteMapping` | `DELETE /v1/kafka-mappings/{id}` |
+| `modbee-mqtt kafka status` | `Kafka.Status` | `GET /v1/kafka-status` |
 | `modbee-mqtt connections put` | `Connections.Put` | `PUT /v1/connections/{id}` |
 | `modbee-mqtt connections get` | `Connections.Get` | `GET /v1/connections/{id}` |
 | `modbee-mqtt connections list` | `Connections.List` | `GET /v1/connections` |

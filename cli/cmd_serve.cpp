@@ -34,6 +34,7 @@
 #include "AppConnections.h"
 #include "AppAdmin.h"
 #endif
+#include "KafkaControl.h"
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
 #include "KafkaRetained.h"
@@ -406,16 +407,33 @@ int cmdServe(int argc, char** argv) {
     config.broker.maxRetained = b.maxRetained;
     config.broker.reserveUpFront = args.has("reserve-up-front");
 
-    // THE KAFKA PIPE, when the file asks for it, and THE RETAINED STORE, when
-    // retained messages are to outlive a restart. Both see every message.
+    // THE KAFKA PIPE, and THE RETAINED STORE, when retained messages are to
+    // outlive a restart. Both see every message.
+    //
+    // The pipe is there in every build that has Kafka, mappings or not - with
+    // none it makes no client and costs a loop over nothing - because the
+    // Application API adds them live (Kafka.PutMapping). Its clusters and
+    // mappings start from kafka.json in the state directory, when the API has
+    // changed them before, and otherwise from the file.
     ShardExtensionChain extensions;
     const bool wantsKafka = !file.toKafka.empty() || !file.fromKafka.empty();
-#if defined(MODBEE_HAVE_KAFKA)
-    std::unique_ptr<KafkaPipe> pipe;
-    if (wantsKafka) {
-        pipe.reset(new KafkaPipe(file));
-        extensions.add(pipe.get());
+    std::string retainedCluster;
+    if (file.retained.store == RetainedStore::Kafka) {
+        retainedCluster = file.retained.cluster;
+        if (retainedCluster.empty() && file.clusters.size() == 1) retainedCluster = file.clusters[0].id;
     }
+    KafkaControl kafka(file, file.api.stateDirectory, retainedCluster);
+    {
+        std::string why;
+        if (!kafka.load(why)) {
+            std::fprintf(stderr, "modbee-mqtt serve: %s\n", why.c_str());
+            return 2;
+        }
+    }
+#if defined(MODBEE_HAVE_KAFKA)
+    std::unique_ptr<KafkaPipe> pipe(new KafkaPipe(kafka.section()));
+    kafka.attach(pipe.get());
+    extensions.add(pipe.get());
 #else
     if (wantsKafka || file.retained.store == RetainedStore::Kafka) {
         std::fprintf(stderr, "modbee-mqtt serve: the file uses Kafka, but this build has no "
@@ -621,6 +639,7 @@ int cmdServe(int argc, char** argv) {
         s.admin = admin.get();
         s.logins = gate.get();
         s.server = &server;
+        s.kafka = &kafka;
         s.sparkplugAware = [&aware] { return aware.enabled(); };
         s.setSparkplugAware = [&aware](bool on) { aware.enable(on); };
         if (!read || !api.start(c, s, why)) {
@@ -728,10 +747,11 @@ int cmdServe(int argc, char** argv) {
 #endif
     }
 #if defined(MODBEE_HAVE_KAFKA)
-    if (pipe) {
+    {
+        const ServerConfig section = kafka.section();
         std::printf("modbee-mqtt serve: kafka pipe (librdkafka %s): %zu cluster(s), %zu mqtt-to-kafka, "
-                    "%zu kafka-to-mqtt\n", KafkaPipe::libraryVersion(), file.clusters.size(),
-                    file.toKafka.size(), file.fromKafka.size());
+                    "%zu kafka-to-mqtt\n", KafkaPipe::libraryVersion(), section.clusters.size(),
+                    section.toKafka.size(), section.fromKafka.size());
     }
 #endif
 

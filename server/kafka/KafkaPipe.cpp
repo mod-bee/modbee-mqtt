@@ -10,10 +10,13 @@
 
 #include <librdkafka/rdkafka.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <set>
 
 #include "WakeSignal.h"
 
@@ -53,7 +56,7 @@ const mq_time_t kServiceIntervalMs = 100;
 // back to the topic it was read from.
 struct KafkaOrigin {
     uint32_t magic = 0x6B61666Bu;   // "kafk"
-    size_t cluster = 0;
+    const std::string* cluster = nullptr;   // its id
     const char* topic = nullptr;
 };
 
@@ -139,20 +142,126 @@ void addHeader(rd_kafka_headers_t* headers, const char* name, const void* value,
 
 } // namespace
 
-// --- The mappings, shared read-only by every shard after begin() ------------
+// --- The plan: the clusters and mappings, replaced whole ---------------------
 
 struct KafkaPipe::ToKafka {
     MqttToKafkaConfig config;
-    size_t cluster = 0;            // index into _config.clusters
-    KafkaMappingCounters counters;
+    std::shared_ptr<KafkaMappingCounters> counters;
 };
 
 struct KafkaPipe::FromKafka {
     KafkaToMqttConfig config;
-    size_t cluster = 0;
+    std::shared_ptr<KafkaMappingCounters> counters;
     uint32_t owner = 0;            // the shard whose loop runs its consumer
-    KafkaMappingCounters counters;
 };
+
+struct KafkaPipe::Plan {
+    std::vector<KafkaClusterConfig> clusters;
+    std::vector<std::shared_ptr<ToKafka>> toKafka;
+    std::vector<std::shared_ptr<FromKafka>> fromKafka;
+    const KafkaClusterConfig* cluster(const std::string& id) const {
+        for (const KafkaClusterConfig& c : clusters) if (c.id == id) return &c;
+        return nullptr;
+    }
+};
+
+namespace {
+
+// Everything about a cluster a client is made from: two clusters with the
+// same signature need no new client.
+std::string clusterSignature(const KafkaClusterConfig& c) {
+    std::string s = c.id + '\n' + c.bootstrapServers + '\n' + (c.tls ? "tls" : "plain") + '\n' + c.caFile + '\n' +
+                    c.certificateFile + '\n' + c.keyFile + '\n' + (c.verifyHostname ? "verify" : "trust") + '\n' +
+                    c.mechanism + '\n' + c.username + '\n' + c.password + '\n' + c.passwordFile + '\n';
+    for (const auto& p : c.properties) s += p.first + '=' + p.second + '\n';
+    return s;
+}
+
+// The shard owning a consumer: by its id, so a change to other mappings does
+// not move it.
+uint32_t ownerOf(const std::string& id, size_t shards) {
+    return shards == 0 ? 0 : (uint32_t)(std::hash<std::string>()(id) % shards);
+}
+
+const char* acksText(int acks) { return acks == 0 ? "0" : acks == 1 ? "1" : "-1"; }
+
+rd_kafka_conf_t* producerConf(const KafkaClusterConfig& cluster, bool allAcks, const std::string& clientId,
+                              std::string& error) {
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    // Idempotence keeps a retried send from being written twice and keeps
+    // order within a partition through retries. Kafka allows it only with
+    // acks=all, so a cluster with any mapping on fewer acks goes without -
+    // and docs/kafka.md says what that costs.
+    const bool ok =
+        kafkaClusterSettings(conf, cluster, clientId, error) &&
+        kafkaSet(conf, "enable.idempotence", allAcks ? "true" : "false", error) &&
+        kafkaSet(conf, "linger.ms", "5", error) &&
+        kafkaSet(conf, "compression.type", "lz4", error) &&
+        // The Java client's partitioner, so a key lands on the same partition
+        // whether modbee or a Java producer wrote it.
+        kafkaSet(conf, "partitioner", "murmur2_random", error) &&
+        // How long a record may wait for Kafka before it is given up on - and
+        // with it, how long a publisher's PUBACK can be held. librdkafka's
+        // default is five minutes, far beyond the point where a device has
+        // given up waiting (this library's client: 60 s). Thirty seconds rides
+        // out a broker restart and still answers inside the client's
+        // patience. The file can change it.
+        kafkaSet(conf, "message.timeout.ms", "30000", error) &&
+        // What may wait for Kafka, in memory. librdkafka's default is a
+        // gigabyte, per producer - so a Kafka that stalled while devices
+        // published large payloads took a broker in a 256 MB container past
+        // its limit, and the kernel killed it. A full queue is answered, not
+        // waited out (offer()). The file can change it.
+        kafkaSet(conf, "queue.buffering.max.kbytes", "65536", error) &&
+        // Broker state for /readyz (onStatistics). The file can change it.
+        kafkaSet(conf, "statistics.interval.ms", "5000", error) &&
+        kafkaPassThrough(conf, cluster, error);
+    if (!ok) {
+        rd_kafka_conf_destroy(conf);
+        error = "kafka cluster " + cluster.id + ": " + error;
+        return nullptr;
+    }
+    return conf;
+}
+
+rd_kafka_conf_t* consumerConf(const KafkaClusterConfig& cluster, const KafkaToMqttConfig& mapping,
+                              std::string& error) {
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    // At-least-once: offsets are STORED only once the broker has taken the
+    // record, and committed (automatically) from the store.
+    const bool ok =
+        kafkaClusterSettings(conf, cluster, "modbee-" + mapping.id, error) &&
+        kafkaSet(conf, "group.id", mapping.group, error) &&
+        kafkaSet(conf, "enable.auto.commit", "true", error) &&
+        kafkaSet(conf, "enable.auto.offset.store", "false", error) &&
+        kafkaSet(conf, "auto.offset.reset", "latest", error) &&
+        kafkaPassThrough(conf, cluster, error);
+    if (!ok) {
+        rd_kafka_conf_destroy(conf);
+        error = "kafka mapping " + mapping.id + ": " + error;
+        return nullptr;
+    }
+    return conf;
+}
+
+// The topic-level settings a mapping asks for, from the producer's defaults:
+// the topic-level settings the file passed through (message.timeout.ms,
+// compression per topic) live there, and a fresh one would silently drop
+// every one of them.
+rd_kafka_topic_conf_t* topicConf(rd_kafka_t* producer, const MqttToKafkaConfig& mapping, std::string& error) {
+    rd_kafka_topic_conf_t* conf = rd_kafka_default_topic_conf_dup(producer);
+    char why[512];
+    if (rd_kafka_topic_conf_set(conf, "acks", acksText(mapping.acks), why, sizeof why) != RD_KAFKA_CONF_OK ||
+        rd_kafka_topic_conf_set(conf, "partitioner", mapping.uniform ? "random" : "murmur2_random", why,
+                                sizeof why) != RD_KAFKA_CONF_OK) {
+        rd_kafka_topic_conf_destroy(conf);
+        error = "kafka mapping " + mapping.id + ": " + why;
+        return nullptr;
+    }
+    return conf;
+}
+
+} // namespace
 
 // --- One shard's clients -----------------------------------------------------
 
@@ -165,18 +274,53 @@ struct KafkaPipe::Shard {
     bool backlog = false;                  // a consumer had more than its budget
     std::atomic<uint64_t> held{0};         // acknowledgements waiting on Kafka
 
-    // Producers, one per cluster that has mqtt-to-kafka mappings; and per
-    // mapping, its topic handle on that producer (null: another cluster).
-    std::vector<rd_kafka_t*> producers;
-    std::vector<rd_kafka_topic_t*> topics;
+    // One Kafka topic on one producer. Its delivery reports count against the
+    // mapping that writes to it, kept alive here while its records are out.
+    struct Topic {
+        std::string name;
+        int acks = -1;
+        bool uniform = false;
+        rd_kafka_topic_t* handle = nullptr;
+        std::shared_ptr<ToKafka> owner;
+    };
+    struct Producer {
+        std::string clusterId;
+        std::string signature;
+        rd_kafka_t* handle = nullptr;
+        std::vector<std::unique_ptr<Topic>> topics;
+        bool retiring = false;             // takes no more; destroyed once Kafka has answered it all
+        Topic* topic(const std::string& name) {
+            for (std::unique_ptr<Topic>& t : topics) if (t->name == name) return t.get();
+            return nullptr;
+        }
+    };
+    struct Consumer {
+        std::string signature;
+        std::shared_ptr<FromKafka> from;
+        rd_kafka_t* handle = nullptr;
+        rd_kafka_queue_t* closing = nullptr;   // being closed, without blocking the shard
+    };
 
-    // Consumers this shard runs: (mapping index, handle).
-    std::vector<std::pair<size_t, rd_kafka_t*>> consumers;
+    // The plan this shard runs, and what it made for it. route[i] is the
+    // topic plan->toKafka[i] produces to (null: its cluster has no client).
+    std::shared_ptr<const Plan> plan;
+    uint64_t generation = 0;
+    std::vector<std::unique_ptr<Producer>> producers;
+    std::vector<Topic*> route;
+    std::vector<Producer*> routeProducer;
+    std::vector<std::unique_ptr<Consumer>> consumers;
 
     static void onDelivery(rd_kafka_t*, const rd_kafka_message_t* message, void* opaque);
     static void onError(rd_kafka_t*, int error, const char* reason, void* opaque);
     static int onStatistics(rd_kafka_t*, char* json, size_t length, void* opaque);
-    void consume(size_t mapping, rd_kafka_t* consumer);
+    // Takes the pipe's current plan, if it is not the one running.
+    bool reconcile(std::string* error);
+    Producer* makeProducer(const KafkaClusterConfig& cluster, const std::string& signature, bool allAcks,
+                           std::string& error);
+    bool makeConsumer(Consumer& consumer, const KafkaClusterConfig& cluster, std::string& error);
+    void beginClose(Consumer& consumer);
+    void retire();
+    void consume(Consumer& consumer);
     void publishRecord(FromKafka& mapping, const rd_kafka_message_t* record);
 };
 
@@ -207,16 +351,16 @@ int KafkaPipe::Shard::onStatistics(rd_kafka_t*, char* json, size_t length, void*
 // Runs inside rd_kafka_poll(), on the shard's own thread.
 void KafkaPipe::Shard::onDelivery(rd_kafka_t*, const rd_kafka_message_t* message, void* opaque) {
     Shard& shard = *static_cast<Shard*>(opaque);
-    const size_t mapping = (size_t)(uintptr_t)rd_kafka_topic_opaque(message->rkt);
-    ToKafka& to = *shard.pipe->_toKafka[mapping];
+    const Topic& topic = *static_cast<const Topic*>(rd_kafka_topic_opaque(message->rkt));
+    KafkaMappingCounters& counters = *topic.owner->counters;
     const uint64_t deferral = (uint64_t)(uintptr_t)message->_private;
     if (message->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
         shard.pipe->_brokersDown.store(false, std::memory_order_relaxed);
-        to.counters.success.fetch_add(1, std::memory_order_relaxed);
+        counters.success.fetch_add(1, std::memory_order_relaxed);
         const int64_t latency = rd_kafka_message_latency(message);
-        if (latency > 0) to.counters.latencyMicros.fetch_add((uint64_t)latency, std::memory_order_relaxed);
+        if (latency > 0) counters.latencyMicros.fetch_add((uint64_t)latency, std::memory_order_relaxed);
     } else {
-        to.counters.failed.fetch_add(1, std::memory_order_relaxed);
+        counters.failed.fetch_add(1, std::memory_order_relaxed);
     }
     if (deferral == 0) return;
     shard.held.fetch_sub(1, std::memory_order_relaxed);
@@ -227,20 +371,6 @@ void KafkaPipe::Shard::onDelivery(rd_kafka_t*, const rd_kafka_message_t* message
         const uint8_t reason = message->err == RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE
                                    ? kImplementationError : kQuotaExceeded;
         shard.broker->concludeDeferred(deferral, 1, 1, reason);
-    }
-}
-
-// --- Construction ------------------------------------------------------------
-
-KafkaPipe::KafkaPipe(const ServerConfig& config) : _config(config) {}
-
-KafkaPipe::~KafkaPipe() {
-    for (std::unique_ptr<Shard>& shard : _shards) {
-        shard->broker = nullptr;
-        for (auto& consumer : shard->consumers) rd_kafka_destroy(consumer.second);
-        for (rd_kafka_topic_t* topic : shard->topics) if (topic) rd_kafka_topic_destroy(topic);
-        for (rd_kafka_t* producer : shard->producers) if (producer) rd_kafka_destroy(producer);
-        shard->wake.close();
     }
 }
 
@@ -257,25 +387,78 @@ std::string KafkaPipe::libraryFeatures() {
     return out;
 }
 
-bool KafkaPipe::begin(size_t shards, std::string& error) {
-    for (const MqttToKafkaConfig& m : _config.toKafka) {
-        std::unique_ptr<ToKafka> to(new ToKafka());
-        to->config = m;
-        for (size_t c = 0; c < _config.clusters.size(); c++) {
-            if (_config.clusters[c].id == m.cluster) to->cluster = c;
-        }
-        _toKafka.push_back(std::move(to));
-    }
-    for (size_t i = 0; i < _config.fromKafka.size(); i++) {
-        std::unique_ptr<FromKafka> from(new FromKafka());
-        from->config = _config.fromKafka[i];
-        for (size_t c = 0; c < _config.clusters.size(); c++) {
-            if (_config.clusters[c].id == from->config.cluster) from->cluster = c;
-        }
-        from->owner = (uint32_t)(i % shards);
-        _fromKafka.push_back(std::move(from));
-    }
+// --- Construction ------------------------------------------------------------
 
+KafkaPipe::KafkaPipe(const ServerConfig& config) {
+    _plan = makePlan(config);
+}
+
+KafkaPipe::~KafkaPipe() {
+    for (std::unique_ptr<Shard>& shard : _shards) {
+        shard->broker = nullptr;
+        for (auto& consumer : shard->consumers) {
+            if (consumer->closing) rd_kafka_queue_destroy(consumer->closing);
+            if (consumer->handle) rd_kafka_destroy(consumer->handle);
+        }
+        for (auto& producer : shard->producers) {
+            for (auto& topic : producer->topics) rd_kafka_topic_destroy(topic->handle);
+            rd_kafka_destroy(producer->handle);
+        }
+        shard->wake.close();
+    }
+}
+
+std::shared_ptr<const KafkaPipe::Plan> KafkaPipe::makePlan(const ServerConfig& section) {
+    // Under _planLock, or before anything else can see the pipe.
+    std::shared_ptr<Plan> plan(new Plan());
+    plan->clusters = section.clusters;
+    std::set<std::string> ids;
+    const auto countersFor = [&](const std::string& id) {
+        ids.insert(id);
+        std::shared_ptr<KafkaMappingCounters>& counters = _counters[id];
+        if (!counters) counters.reset(new KafkaMappingCounters());
+        return counters;
+    };
+    for (const MqttToKafkaConfig& m : section.toKafka) {
+        std::shared_ptr<ToKafka> to(new ToKafka());
+        to->config = m;
+        to->counters = countersFor(m.id);
+        plan->toKafka.push_back(to);
+    }
+    for (const KafkaToMqttConfig& m : section.fromKafka) {
+        std::shared_ptr<FromKafka> from(new FromKafka());
+        from->config = m;
+        from->counters = countersFor(m.id);
+        from->owner = ownerOf(m.id, _shardCount);
+        plan->fromKafka.push_back(from);
+    }
+    // A mapping deleted takes its counters with it; made again, it counts
+    // from zero.
+    for (auto at = _counters.begin(); at != _counters.end();) {
+        at = ids.count(at->first) ? std::next(at) : _counters.erase(at);
+    }
+    return plan;
+}
+
+std::shared_ptr<const KafkaPipe::Plan> KafkaPipe::currentPlan(uint64_t& generation) const {
+    std::lock_guard<std::mutex> hold(_planLock);
+    generation = _generation.load(std::memory_order_acquire);
+    return _plan;
+}
+
+bool KafkaPipe::begin(size_t shards, std::string& error) {
+    {
+        std::lock_guard<std::mutex> hold(_planLock);
+        _shardCount = shards;
+        // The consumers' shards, now that there is a number of them.
+        std::shared_ptr<Plan> plan(new Plan(*_plan));
+        for (std::shared_ptr<FromKafka>& from : plan->fromKafka) {
+            std::shared_ptr<FromKafka> placed(new FromKafka(*from));
+            placed->owner = ownerOf(placed->config.id, shards);
+            from = placed;
+        }
+        _plan = plan;
+    }
     for (size_t s = 0; s < shards; s++) {
         std::unique_ptr<Shard> shard(new Shard());
         shard->pipe = this;
@@ -284,173 +467,320 @@ bool KafkaPipe::begin(size_t shards, std::string& error) {
             error = "kafka: no wake-up descriptor for shard " + std::to_string(s);
             return false;
         }
+        // Its clients, here before its thread starts; later on its thread.
+        if (!shard->reconcile(&error)) return false;
+        _shards.push_back(std::move(shard));
+    }
+    return true;
+}
 
-        // PRODUCERS: one per cluster that something is produced to.
-        shard->producers.assign(_config.clusters.size(), nullptr);
-        shard->topics.assign(_toKafka.size(), nullptr);
-        for (size_t c = 0; c < _config.clusters.size(); c++) {
-            bool used = false, allAcks = true;
-            for (const std::unique_ptr<ToKafka>& to : _toKafka) {
-                if (to->cluster != c) continue;
-                used = true;
-                allAcks = allAcks && to->config.acks == -1;
-            }
-            if (!used) continue;
-            const KafkaClusterConfig& cluster = _config.clusters[c];
-            rd_kafka_conf_t* conf = rd_kafka_conf_new();
-            const std::string clientId = "modbee-s" + std::to_string(s) + "-" + cluster.id;
-            // Idempotence keeps a retried send from being written twice and
-            // keeps order within a partition through retries. Kafka allows it
-            // only with acks=all, so a cluster with any mapping on fewer acks
-            // goes without - and docs/kafka.md says what that costs.
-            const bool ok =
-                kafkaClusterSettings(conf, cluster, clientId, error) &&
-                kafkaSet(conf, "enable.idempotence", allAcks ? "true" : "false", error) &&
-                kafkaSet(conf, "linger.ms", "5", error) &&
-                kafkaSet(conf, "compression.type", "lz4", error) &&
-                // The Java client's partitioner, so a key lands on the same
-                // partition whether modbee or a Java producer wrote it.
-                kafkaSet(conf, "partitioner", "murmur2_random", error) &&
-                // How long a record may wait for Kafka before it is given up
-                // on - and with it, how long a publisher's PUBACK can be held.
-                // librdkafka's default is five minutes, far beyond the point
-                // where a device has given up waiting (this library's client:
-                // 60 s). Thirty seconds rides out a broker restart and still
-                // answers inside the client's patience. The file can change it.
-                kafkaSet(conf, "message.timeout.ms", "30000", error) &&
-                // What may wait for Kafka, in memory. librdkafka's default is
-                // a gigabyte, per producer - so a Kafka that stalled while
-                // devices published large payloads took a broker in a 256 MB
-                // container past its limit, and the kernel killed it. A full
-                // queue is answered, not waited out (offer()). The file can
-                // change it.
-                kafkaSet(conf, "queue.buffering.max.kbytes", "65536", error) &&
-                // Broker state for /readyz (onStatistics). The file can change it.
-                kafkaSet(conf, "statistics.interval.ms", "5000", error) &&
-                kafkaPassThrough(conf, cluster, error);
-            if (!ok) {
-                rd_kafka_conf_destroy(conf);
-                error = "kafka cluster " + cluster.id + ": " + error;
-                return false;
-            }
-            rd_kafka_conf_set_dr_msg_cb(conf, &Shard::onDelivery);
-            rd_kafka_conf_set_error_cb(conf, &Shard::onError);
-            rd_kafka_conf_set_stats_cb(conf, &Shard::onStatistics);
-            rd_kafka_conf_set_opaque(conf, shard.get());
+bool KafkaPipe::apply(const ServerConfig& section, std::string& error) {
+    // EVERY CLIENT IT NEEDS IS TRIED FIRST, here on the caller's thread and
+    // then let go: a setting librdkafka refuses, a TLS file that is not there,
+    // is a refused change and not a shard left without a producer.
+    for (const KafkaClusterConfig& cluster : section.clusters) {
+        bool produced = false, allAcks = true;
+        for (const MqttToKafkaConfig& m : section.toKafka) {
+            if (m.cluster != cluster.id) continue;
+            produced = true;
+            allAcks = allAcks && m.acks == -1;
+        }
+        if (produced) {
+            rd_kafka_conf_t* conf = producerConf(cluster, allAcks, "modbee-check-" + cluster.id, error);
+            if (conf == nullptr) return false;
             char reason[512];
-            rd_kafka_t* producer = rd_kafka_new(RD_KAFKA_PRODUCER, conf, reason, sizeof reason);
-            if (producer == nullptr) {
+            rd_kafka_t* probe = rd_kafka_new(RD_KAFKA_PRODUCER, conf, reason, sizeof reason);
+            if (probe == nullptr) {
                 rd_kafka_conf_destroy(conf);
                 error = "kafka cluster " + cluster.id + ": " + reason;
                 return false;
             }
-            rd_kafka_queue_t* queue = rd_kafka_queue_get_main(producer);
-            wakeOnEvents(queue, shard->wake);
-            rd_kafka_queue_destroy(queue);
-            shard->producers[c] = producer;
-
-            for (size_t m = 0; m < _toKafka.size(); m++) {
-                if (_toKafka[m]->cluster != c) continue;
-                const MqttToKafkaConfig& mc = _toKafka[m]->config;
-                // FROM THE PRODUCER'S DEFAULTS, not a fresh topic config: the
-                // topic-level settings the file passed through (message.timeout.ms,
-                // compression per topic) live there, and a fresh one would
-                // silently drop every one of them.
-                rd_kafka_topic_conf_t* tconf = rd_kafka_default_topic_conf_dup(producer);
-                char why[512];
-                const char* acks = mc.acks == 0 ? "0" : mc.acks == 1 ? "1" : "-1";
-                if (rd_kafka_topic_conf_set(tconf, "acks", acks, why, sizeof why) != RD_KAFKA_CONF_OK ||
-                    rd_kafka_topic_conf_set(tconf, "partitioner",
-                                            mc.uniform ? "random" : "murmur2_random", why,
-                                            sizeof why) != RD_KAFKA_CONF_OK) {
-                    rd_kafka_topic_conf_destroy(tconf);
-                    error = "kafka mapping " + mc.id + ": " + why;
+            for (const MqttToKafkaConfig& m : section.toKafka) {
+                if (m.cluster != cluster.id) continue;
+                rd_kafka_topic_conf_t* tconf = topicConf(probe, m, error);
+                if (tconf == nullptr) {
+                    rd_kafka_destroy(probe);
                     return false;
                 }
-                rd_kafka_topic_conf_set_opaque(tconf, (void*)(uintptr_t)m);
-                rd_kafka_topic_t* topic = rd_kafka_topic_new(producer, mc.kafkaTopic.c_str(), tconf);
-                if (topic == nullptr) {
-                    error = "kafka mapping " + mc.id + ": " + rd_kafka_err2str(rd_kafka_last_error());
-                    return false;
-                }
-                shard->topics[m] = topic;
+                rd_kafka_topic_conf_destroy(tconf);
             }
+            rd_kafka_destroy(probe);
         }
-
-        // CONSUMERS: each kafka-to-mqtt mapping on the shard that owns it.
-        for (size_t m = 0; m < _fromKafka.size(); m++) {
-            FromKafka& from = *_fromKafka[m];
-            if (from.owner != s) continue;
-            const KafkaClusterConfig& cluster = _config.clusters[from.cluster];
-            rd_kafka_conf_t* conf = rd_kafka_conf_new();
-            const std::string clientId = "modbee-" + from.config.id;
-            // At-least-once: offsets are STORED only once the broker has
-            // taken the record, and committed (automatically) from the store.
-            const bool ok =
-                kafkaClusterSettings(conf, cluster, clientId, error) &&
-                kafkaSet(conf, "group.id", from.config.group, error) &&
-                kafkaSet(conf, "enable.auto.commit", "true", error) &&
-                kafkaSet(conf, "enable.auto.offset.store", "false", error) &&
-                kafkaSet(conf, "auto.offset.reset", "latest", error) &&
-                kafkaPassThrough(conf, cluster, error);
-            if (!ok) {
-                rd_kafka_conf_destroy(conf);
-                error = "kafka mapping " + from.config.id + ": " + error;
-                return false;
-            }
-            char reason[512];
-            rd_kafka_t* consumer = rd_kafka_new(RD_KAFKA_CONSUMER, conf, reason, sizeof reason);
-            if (consumer == nullptr) {
-                rd_kafka_conf_destroy(conf);
-                error = "kafka mapping " + from.config.id + ": " + reason;
-                return false;
-            }
-            rd_kafka_poll_set_consumer(consumer);
-            rd_kafka_queue_t* queue = rd_kafka_queue_get_consumer(consumer);
-            wakeOnEvents(queue, shard->wake);
-            rd_kafka_queue_destroy(queue);
-
-            const bool pattern = !from.config.kafkaTopicPattern.empty();
-            rd_kafka_topic_partition_list_t* topics =
-                rd_kafka_topic_partition_list_new(pattern ? 1 : (int)from.config.kafkaTopics.size());
-            if (pattern) {
-                rd_kafka_topic_partition_list_add(topics, from.config.kafkaTopicPattern.c_str(),
-                                                  RD_KAFKA_PARTITION_UA);
-            } else {
-                for (const std::string& t : from.config.kafkaTopics) {
-                    rd_kafka_topic_partition_list_add(topics, t.c_str(), RD_KAFKA_PARTITION_UA);
-                }
-            }
-            const rd_kafka_resp_err_t subscribed = rd_kafka_subscribe(consumer, topics);
-            rd_kafka_topic_partition_list_destroy(topics);
-            if (subscribed != RD_KAFKA_RESP_ERR_NO_ERROR) {
-                rd_kafka_destroy(consumer);
-                error = "kafka mapping " + from.config.id + ": " + rd_kafka_err2str(subscribed);
-                return false;
-            }
-            shard->consumers.push_back(std::make_pair(m, consumer));
-        }
-        _shards.push_back(std::move(shard));
     }
+    for (const KafkaToMqttConfig& m : section.fromKafka) {
+        const KafkaClusterConfig* cluster = section.cluster(m.cluster);
+        if (cluster == nullptr) {
+            error = "kafka mapping " + m.id + ": no cluster \"" + m.cluster + "\"";
+            return false;
+        }
+        rd_kafka_conf_t* conf = consumerConf(*cluster, m, error);
+        if (conf == nullptr) return false;
+        rd_kafka_conf_destroy(conf);
+    }
+    {
+        std::lock_guard<std::mutex> hold(_planLock);
+        _plan = makePlan(section);
+        _generation.fetch_add(1, std::memory_order_release);
+    }
+    // Each shard takes it at once, not at its next message.
+    for (std::unique_ptr<Shard>& shard : _shards) shard->wake.signal();
     return true;
+}
+
+// --- A shard takes a plan, on its own thread ------------------------------------
+
+KafkaPipe::Shard::Producer* KafkaPipe::Shard::makeProducer(const KafkaClusterConfig& cluster,
+                                                           const std::string& signature, bool allAcks,
+                                                           std::string& error) {
+    const std::string clientId = "modbee-s" + std::to_string(index) + "-" + cluster.id;
+    rd_kafka_conf_t* conf = producerConf(cluster, allAcks, clientId, error);
+    if (conf == nullptr) return nullptr;
+    rd_kafka_conf_set_dr_msg_cb(conf, &Shard::onDelivery);
+    rd_kafka_conf_set_error_cb(conf, &Shard::onError);
+    rd_kafka_conf_set_stats_cb(conf, &Shard::onStatistics);
+    rd_kafka_conf_set_opaque(conf, this);
+    char reason[512];
+    rd_kafka_t* handle = rd_kafka_new(RD_KAFKA_PRODUCER, conf, reason, sizeof reason);
+    if (handle == nullptr) {
+        rd_kafka_conf_destroy(conf);
+        error = "kafka cluster " + cluster.id + ": " + reason;
+        return nullptr;
+    }
+    rd_kafka_queue_t* queue = rd_kafka_queue_get_main(handle);
+    wakeOnEvents(queue, wake);
+    rd_kafka_queue_destroy(queue);
+    std::unique_ptr<Producer> producer(new Producer());
+    producer->clusterId = cluster.id;
+    producer->signature = signature;
+    producer->handle = handle;
+    producers.push_back(std::move(producer));
+    return producers.back().get();
+}
+
+bool KafkaPipe::Shard::makeConsumer(Consumer& consumer, const KafkaClusterConfig& cluster, std::string& error) {
+    const KafkaToMqttConfig& mapping = consumer.from->config;
+    rd_kafka_conf_t* conf = consumerConf(cluster, mapping, error);
+    if (conf == nullptr) return false;
+    char reason[512];
+    rd_kafka_t* handle = rd_kafka_new(RD_KAFKA_CONSUMER, conf, reason, sizeof reason);
+    if (handle == nullptr) {
+        rd_kafka_conf_destroy(conf);
+        error = "kafka mapping " + mapping.id + ": " + reason;
+        return false;
+    }
+    rd_kafka_poll_set_consumer(handle);
+    rd_kafka_queue_t* queue = rd_kafka_queue_get_consumer(handle);
+    wakeOnEvents(queue, wake);
+    rd_kafka_queue_destroy(queue);
+
+    const bool pattern = !mapping.kafkaTopicPattern.empty();
+    rd_kafka_topic_partition_list_t* topics =
+        rd_kafka_topic_partition_list_new(pattern ? 1 : (int)mapping.kafkaTopics.size());
+    if (pattern) {
+        rd_kafka_topic_partition_list_add(topics, mapping.kafkaTopicPattern.c_str(), RD_KAFKA_PARTITION_UA);
+    } else {
+        for (const std::string& t : mapping.kafkaTopics) {
+            rd_kafka_topic_partition_list_add(topics, t.c_str(), RD_KAFKA_PARTITION_UA);
+        }
+    }
+    const rd_kafka_resp_err_t subscribed = rd_kafka_subscribe(handle, topics);
+    rd_kafka_topic_partition_list_destroy(topics);
+    if (subscribed != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        rd_kafka_destroy(handle);
+        error = "kafka mapping " + mapping.id + ": " + rd_kafka_err2str(subscribed);
+        return false;
+    }
+    consumer.handle = handle;
+    return true;
+}
+
+// Leaves its group and commits what it stored, without blocking the shard:
+// the close runs on its own queue, which retire() polls.
+void KafkaPipe::Shard::beginClose(Consumer& consumer) {
+    if (consumer.handle == nullptr || consumer.closing != nullptr) return;
+    consumer.closing = rd_kafka_queue_new(consumer.handle);
+    rd_kafka_error_t* failed = rd_kafka_consumer_close_queue(consumer.handle, consumer.closing);
+    if (failed != nullptr) rd_kafka_error_destroy(failed);
+}
+
+// What a new plan replaced, let go once it is done: a producer once Kafka
+// has answered every record it holds (each answer concludes a held PUBACK), a
+// consumer once its close has finished.
+void KafkaPipe::Shard::retire() {
+    for (auto at = producers.begin(); at != producers.end();) {
+        Producer& p = **at;
+        if (!p.retiring) { ++at; continue; }
+        for (int n = 0; n < 64 && rd_kafka_poll(p.handle, 0) > 0; n++) {
+        }
+        if (rd_kafka_outq_len(p.handle) > 0) { ++at; continue; }
+        for (auto& topic : p.topics) rd_kafka_topic_destroy(topic->handle);
+        rd_kafka_destroy(p.handle);
+        at = producers.erase(at);
+    }
+    for (auto at = consumers.begin(); at != consumers.end();) {
+        Consumer& c = **at;
+        if (c.closing == nullptr) { ++at; continue; }
+        // A close may hand back the group's revocation, which must be
+        // answered (no rebalance callback is set) or the close never ends.
+        while (rd_kafka_event_t* event = rd_kafka_queue_poll(c.closing, 0)) {
+            if (rd_kafka_event_type(event) == RD_KAFKA_EVENT_REBALANCE &&
+                rd_kafka_event_error(event) == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS) {
+                const char* protocol = rd_kafka_rebalance_protocol(c.handle);
+                if (protocol != nullptr && std::strcmp(protocol, "COOPERATIVE") == 0) {
+                    rd_kafka_error_t* failed =
+                        rd_kafka_incremental_unassign(c.handle, rd_kafka_event_topic_partition_list(event));
+                    if (failed) rd_kafka_error_destroy(failed);
+                } else {
+                    rd_kafka_assign(c.handle, nullptr);
+                }
+            }
+            rd_kafka_event_destroy(event);
+        }
+        if (!rd_kafka_consumer_closed(c.handle)) { ++at; continue; }
+        rd_kafka_queue_destroy(c.closing);
+        rd_kafka_destroy_flags(c.handle, RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE);
+        at = consumers.erase(at);
+    }
+}
+
+bool KafkaPipe::Shard::reconcile(std::string* error) {
+    uint64_t now = 0;
+    std::shared_ptr<const Plan> next = pipe->currentPlan(now);
+    if (now == generation) return true;
+    bool ok = true;
+    std::string why;
+    const auto failed = [&](const std::string& reason) {
+        ok = false;
+        if (error) *error = reason;
+        else std::fprintf(stderr, "kafka: %s\n", reason.c_str());
+    };
+
+    // PRODUCERS: one per cluster that something is produced to.
+    std::map<std::string, Producer*> live;
+    for (const KafkaClusterConfig& cluster : next->clusters) {
+        bool used = false, allAcks = true;
+        for (const std::shared_ptr<ToKafka>& to : next->toKafka) {
+            if (to->config.cluster != cluster.id) continue;
+            used = true;
+            allAcks = allAcks && to->config.acks == -1;
+        }
+        if (!used) continue;
+        const std::string signature = clusterSignature(cluster) + (allAcks ? "idempotent" : "plain");
+        Producer* keep = nullptr;
+        for (std::unique_ptr<Producer>& p : producers) {
+            if (!p->retiring && p->clusterId == cluster.id) keep = p.get();
+        }
+        // Kept, unless a topic it already writes to is asked for with other
+        // acks or partitioning: librdkafka keeps one topic object per name, so
+        // that takes a producer of its own.
+        bool reusable = keep != nullptr && keep->signature == signature;
+        for (const std::shared_ptr<ToKafka>& to : next->toKafka) {
+            if (!reusable || to->config.cluster != cluster.id) continue;
+            const Topic* t = keep->topic(to->config.kafkaTopic);
+            if (t != nullptr && (t->acks != to->config.acks || t->uniform != to->config.uniform)) reusable = false;
+        }
+        if (!reusable) {
+            if (keep != nullptr) keep->retiring = true;
+            keep = makeProducer(cluster, signature, allAcks, why);
+            if (keep == nullptr) failed(why);
+        }
+        if (keep != nullptr) live[cluster.id] = keep;
+    }
+    for (std::unique_ptr<Producer>& p : producers) {
+        if (!live.count(p->clusterId) || live[p->clusterId] != p.get()) p->retiring = true;
+    }
+
+    // ROUTES: each mapping's topic on its cluster's producer.
+    route.assign(next->toKafka.size(), nullptr);
+    routeProducer.assign(next->toKafka.size(), nullptr);
+    std::set<Topic*> owned;
+    for (size_t m = 0; m < next->toKafka.size(); m++) {
+        const std::shared_ptr<ToKafka>& to = next->toKafka[m];
+        auto p = live.find(to->config.cluster);
+        if (p == live.end()) continue;
+        Producer& producer = *p->second;
+        Topic* topic = producer.topic(to->config.kafkaTopic);
+        if (topic == nullptr) {
+            rd_kafka_topic_conf_t* tconf = topicConf(producer.handle, to->config, why);
+            if (tconf == nullptr) {
+                failed(why);
+                continue;
+            }
+            std::unique_ptr<Topic> made(new Topic());
+            made->name = to->config.kafkaTopic;
+            made->acks = to->config.acks;
+            made->uniform = to->config.uniform;
+            rd_kafka_topic_conf_set_opaque(tconf, made.get());
+            made->handle = rd_kafka_topic_new(producer.handle, made->name.c_str(), tconf);
+            if (made->handle == nullptr) {
+                failed("kafka mapping " + to->config.id + ": " + rd_kafka_err2str(rd_kafka_last_error()));
+                continue;
+            }
+            producer.topics.push_back(std::move(made));
+            topic = producer.topics.back().get();
+        }
+        // Its reports count against the first mapping writing to it.
+        if (owned.insert(topic).second) topic->owner = to;
+        route[m] = topic;
+        routeProducer[m] = &producer;
+    }
+
+    // CONSUMERS: each kafka-to-mqtt mapping on the shard that owns it - kept
+    // when only its MQTT side changed, made anew when its Kafka side did.
+    std::set<Consumer*> kept;
+    for (const std::shared_ptr<FromKafka>& from : next->fromKafka) {
+        if (from->owner != index) continue;
+        const KafkaClusterConfig* cluster = next->cluster(from->config.cluster);
+        if (cluster == nullptr) continue;
+        std::string signature = clusterSignature(*cluster) + from->config.group + '\n' +
+                                from->config.kafkaTopicPattern + '\n';
+        for (const std::string& t : from->config.kafkaTopics) signature += t + ',';
+        Consumer* match = nullptr;
+        for (std::unique_ptr<Consumer>& c : consumers) {
+            if (c->closing == nullptr && c->from->config.id == from->config.id) match = c.get();
+        }
+        if (match != nullptr && match->signature == signature) {
+            match->from = from;
+            kept.insert(match);
+            continue;
+        }
+        if (match != nullptr) beginClose(*match);
+        std::unique_ptr<Consumer> made(new Consumer());
+        made->signature = signature;
+        made->from = from;
+        if (!makeConsumer(*made, *cluster, why)) {
+            failed(why);
+            continue;
+        }
+        kept.insert(made.get());
+        consumers.push_back(std::move(made));
+    }
+    for (std::unique_ptr<Consumer>& c : consumers) {
+        if (!kept.count(c.get())) beginClose(*c);
+    }
+
+    plan = next;
+    generation = now;
+    return ok;
 }
 
 int KafkaPipe::waitHandle(uint32_t shard) {
     return shard < _shards.size() ? _shards[shard]->wake.handle() : -1;
 }
 
-// --- MQTT -> Kafka -----------------------------------------------------------
-
 uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBrokerRouted& message,
                           uint64_t deferral) {
     Shard& shard = *_shards[shardIndex];
     shard.broker = &broker;
+    // A plan changed since the last message: one atomic read to know.
+    if (shard.generation != _generation.load(std::memory_order_acquire)) shard.reconcile(nullptr);
     const KafkaOrigin* origin = static_cast<const KafkaOrigin*>(message.origin);
     if (origin != nullptr && origin->magic != KafkaOrigin().magic) origin = nullptr;
 
     uint32_t parties = 0;
-    for (size_t m = 0; m < _toKafka.size(); m++) {
-        ToKafka& to = *_toKafka[m];
+    const Plan& plan = *shard.plan;
+    for (size_t m = 0; m < plan.toKafka.size(); m++) {
+        ToKafka& to = *plan.toKafka[m];
         const MqttToKafkaConfig& mapping = to.config;
         bool matches = false;
         for (const std::string& filter : mapping.filters) {
@@ -458,12 +788,12 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
         }
         if (!matches) continue;
         // Never back where it came from: that is a loop, not a mapping.
-        if (origin != nullptr && origin->cluster == to.cluster &&
+        if (origin != nullptr && origin->cluster != nullptr && *origin->cluster == mapping.cluster &&
             mapping.kafkaTopic == origin->topic) {
             continue;
         }
-        rd_kafka_topic_t* topic = shard.topics[m];
-        if (topic == nullptr) continue;
+        if (shard.route[m] == nullptr) continue;
+        rd_kafka_topic_t* topic = shard.route[m]->handle;
 
         // The acknowledgement waits for Kafka only for a client's QoS 1/2
         // publish on a mapping that asks for it. Everything else is sent and
@@ -539,7 +869,7 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
         const size_t recordBytes = message.payload.length + (keyed ? key.size() : 0) + headerBytes;
         if (recordBytes > mapping.maxRecordBytes) {
             if (headers) rd_kafka_headers_destroy(headers);
-            to.counters.tooLarge.fetch_add(1, std::memory_order_relaxed);
+            to.counters->tooLarge.fetch_add(1, std::memory_order_relaxed);
             if (deferral != 0) {
                 broker.concludeDeferred(deferral, 1, 1, kImplementationError);
                 parties++;
@@ -565,18 +895,18 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
 
         // Never blocks: RD_KAFKA_MSG_F_BLOCK is not passed. A full queue is
         // the backpressure signal, and it is answered, not waited out.
-        rd_kafka_error_t* failure = rd_kafka_produceva(shard.producers[to.cluster], vu, n);
+        rd_kafka_error_t* failure = rd_kafka_produceva(shard.routeProducer[m]->handle, vu, n);
         if (failure != nullptr) {
             rd_kafka_error_destroy(failure);
             if (headers) rd_kafka_headers_destroy(headers);   // still ours when the produce failed
-            to.counters.failed.fetch_add(1, std::memory_order_relaxed);
+            to.counters->failed.fetch_add(1, std::memory_order_relaxed);
             if (deferral != 0) {
                 broker.concludeDeferred(deferral, 1, 1, kQuotaExceeded);
                 parties++;
             }
             continue;
         }
-        to.counters.send.fetch_add(1, std::memory_order_relaxed);
+        to.counters->send.fetch_add(1, std::memory_order_relaxed);
         if (wait) {
             shard.held.fetch_add(1, std::memory_order_relaxed);
             parties++;
@@ -661,7 +991,7 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
     for (const auto& user : users) properties.addUserProperty(spanOf(user.first), spanOf(user.second));
 
     KafkaOrigin origin;
-    origin.cluster = from.cluster;
+    origin.cluster = &from.config.cluster;
     origin.topic = kafkaTopic;
     for (const std::string& topic : topics) {
         MqttBrokerRouted message;
@@ -676,7 +1006,7 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
         // $modbee/events/... A record never speaks on one - whoever can write
         // to the Kafka topic must not be able to issue requests or forge events.
         if (!mq_topicNameIsValid(message.topic) || topic[0] == '$') {
-            from.counters.invalid.fetch_add(1, std::memory_order_relaxed);
+            from.counters->invalid.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         // Committed either way (at-least-once is about reaching the broker, and a
@@ -685,20 +1015,20 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
         // subscribes to reaches nobody and is not counted here - with several
         // shards, this one cannot know whether another has a subscriber.
         if (!broker->publishMessage(message)) {
-            from.counters.refused.fetch_add(1, std::memory_order_relaxed);
+            from.counters->refused.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        from.counters.published.fetch_add(1, std::memory_order_relaxed);
+        from.counters->published.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-void KafkaPipe::Shard::consume(size_t mappingIndex, rd_kafka_t* consumer) {
-    FromKafka& from = *pipe->_fromKafka[mappingIndex];
+void KafkaPipe::Shard::consume(Consumer& consumer) {
+    FromKafka& from = *consumer.from;
     for (int n = 0; n < kConsumeBudget; n++) {
-        rd_kafka_message_t* record = rd_kafka_consumer_poll(consumer, 0);
+        rd_kafka_message_t* record = rd_kafka_consumer_poll(consumer.handle, 0);
         if (record == nullptr) return;
         if (record->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
-            from.counters.polled.fetch_add(1, std::memory_order_relaxed);
+            from.counters->polled.fetch_add(1, std::memory_order_relaxed);
             publishRecord(from, record);
             // TAKEN: now, and only now, may this offset be committed. A crash
             // before here re-reads the record - at-least-once - rather than
@@ -722,13 +1052,17 @@ void KafkaPipe::service(uint32_t shardIndex, MqttBroker& broker) {
     if (!woken && !shard.backlog && mq_elapsed(shard.servedAt, now) < kServiceIntervalMs) return;
     shard.servedAt = now;
     shard.backlog = false;
-    for (rd_kafka_t* producer : shard.producers) {
-        if (producer == nullptr) continue;
+    if (shard.generation != _generation.load(std::memory_order_acquire)) shard.reconcile(nullptr);
+    for (std::unique_ptr<Shard::Producer>& producer : shard.producers) {
+        if (producer->retiring) continue;
         // Every queued delivery report, not only the first.
-        for (int n = 0; n < 64 && rd_kafka_poll(producer, 0) > 0; n++) {
+        for (int n = 0; n < 64 && rd_kafka_poll(producer->handle, 0) > 0; n++) {
         }
     }
-    for (auto& consumer : shard.consumers) shard.consume(consumer.first, consumer.second);
+    for (std::unique_ptr<Shard::Consumer>& consumer : shard.consumers) {
+        if (consumer->closing == nullptr) shard.consume(*consumer);
+    }
+    shard.retire();
 }
 
 bool KafkaPipe::hasPendingWork(uint32_t shardIndex) {
@@ -740,11 +1074,14 @@ void KafkaPipe::stop(uint32_t shardIndex, MqttBroker& broker) {
     shard.broker = &broker;
     // Consumers first: closing commits the offsets already stored, and no
     // more records arrive to publish into a broker that is about to end.
-    for (auto& consumer : shard.consumers) rd_kafka_consumer_close(consumer.second);
-    // Then what is in flight to Kafka, within a bound: each delivery report
-    // concludes its held PUBACK while the client is still connected.
-    for (rd_kafka_t* producer : shard.producers) {
-        if (producer != nullptr) rd_kafka_flush(producer, _flushMillis);
+    for (std::unique_ptr<Shard::Consumer>& consumer : shard.consumers) {
+        if (consumer->closing == nullptr) rd_kafka_consumer_close(consumer->handle);
+    }
+    // Then what is in flight to Kafka - from replaced producers too - within a
+    // bound: each delivery report concludes its held PUBACK while the client
+    // is still connected.
+    for (std::unique_ptr<Shard::Producer>& producer : shard.producers) {
+        rd_kafka_flush(producer->handle, _flushMillis);
     }
     shard.broker = nullptr;
 }
@@ -752,25 +1089,27 @@ void KafkaPipe::stop(uint32_t shardIndex, MqttBroker& broker) {
 KafkaPipeStatus KafkaPipe::status() const {
     KafkaPipeStatus out;
     out.kafkaReachable = !_brokersDown.load(std::memory_order_relaxed);
-    for (const std::unique_ptr<ToKafka>& to : _toKafka) {
+    uint64_t ignored = 0;
+    const std::shared_ptr<const Plan> plan = currentPlan(ignored);
+    for (const std::shared_ptr<ToKafka>& to : plan->toKafka) {
         KafkaPipeStatus::Mapping m;
         m.id = to->config.id;
         m.toKafka = true;
-        m.send = to->counters.send.load();
-        m.success = to->counters.success.load();
-        m.failed = to->counters.failed.load();
-        m.tooLarge = to->counters.tooLarge.load();
-        m.latencyMicros = to->counters.latencyMicros.load();
+        m.send = to->counters->send.load();
+        m.success = to->counters->success.load();
+        m.failed = to->counters->failed.load();
+        m.tooLarge = to->counters->tooLarge.load();
+        m.latencyMicros = to->counters->latencyMicros.load();
         out.mappings.push_back(m);
     }
-    for (const std::unique_ptr<FromKafka>& from : _fromKafka) {
+    for (const std::shared_ptr<FromKafka>& from : plan->fromKafka) {
         KafkaPipeStatus::Mapping m;
         m.id = from->config.id;
         m.toKafka = false;
-        m.polled = from->counters.polled.load();
-        m.published = from->counters.published.load();
-        m.invalid = from->counters.invalid.load();
-        m.refused = from->counters.refused.load();
+        m.polled = from->counters->polled.load();
+        m.published = from->counters->published.load();
+        m.invalid = from->counters->invalid.load();
+        m.refused = from->counters->refused.load();
         out.mappings.push_back(m);
     }
     for (const std::unique_ptr<Shard>& shard : _shards) out.heldAcknowledgements += shard->held.load();

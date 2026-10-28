@@ -12,6 +12,7 @@
 #include "AppAdmin.h"
 #include "AuthGate.h"
 #include "Json.h"
+#include "KafkaControl.h"
 #include "ShardedBroker.h"
 #if MQTT_TLS_SOCKETS
 #include "transport/MqttCertificate.h"
@@ -1526,9 +1527,9 @@ private:
 class SystemService final : public v1::System::CallbackService {
 public:
     SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections, bool admin,
-                  bool aware = false)
+                  bool aware = false, bool kafka = false)
         : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr),
-          _connections(connections), _admin(admin), _aware(aware) {}
+          _connections(connections), _admin(admin), _aware(aware), _kafka(kafka) {}
 
     grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown>* Attach(grpc::CallbackServerContext* context) override {
         return new AttachReactor(_hub, allowed(context, _config.token));
@@ -1557,6 +1558,7 @@ public:
         // Its edge node takes Template definitions, arrays and DataSets; ListNodes reports every value.
         if (_connections) reply->add_features("sparkplug.structures");
         if (_aware) reply->add_features("sparkplug.aware");
+        if (_kafka) reply->add_features("kafka");           // Kafka.*, live
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1569,6 +1571,7 @@ private:
     bool _connections;
     bool _admin;
     bool _aware;
+    bool _kafka;
 };
 
 
@@ -1623,6 +1626,363 @@ public:
 private:
     const ApiServerConfig& _config;
     AdminCore& _core;
+};
+
+// =============================================================================
+// Kafka: the clusters and mappings, live (server/kafka/KafkaControl.h)
+// =============================================================================
+
+namespace {
+
+std::string joined(const google::protobuf::RepeatedPtrField<std::string>& items, const char* by) {
+    std::string out;
+    for (const std::string& item : items) out += (out.empty() ? "" : by) + item;
+    return out;
+}
+
+// A choice the file spells as a word: checked here, because the config
+// struct holds the meaning and not the word. The file's own message.
+bool choice(const std::string& given, const char* field, std::initializer_list<const char*> allowed,
+            std::string& out, std::string& error) {
+    if (given.empty()) {
+        out = *allowed.begin();
+        return true;
+    }
+    std::string list;
+    for (const char* a : allowed) {
+        if (given == a) {
+            out = given;
+            return true;
+        }
+        list += (list.empty() ? "" : ", ") + std::string(a);
+    }
+    error = std::string(field) + ": expected one of " + list + ", not \"" + given + "\"";
+    return false;
+}
+
+KafkaClusterConfig clusterFrom(const v1::KafkaCluster& c) {
+    KafkaClusterConfig out;
+    out.id = c.id();
+    out.bootstrapServers = joined(c.bootstrap_servers(), ",");
+    out.tls = c.has_tls();
+    out.caFile = c.tls().ca();
+    out.certificateFile = c.tls().cert();
+    out.keyFile = c.tls().key();
+    out.verifyHostname = !c.tls().has_verify_hostname() || c.tls().verify_hostname();
+    out.mechanism = c.authentication().mechanism().empty() ? "none" : c.authentication().mechanism();
+    out.username = c.authentication().username();
+    out.password = c.authentication().password();
+    out.passwordFile = c.authentication().password_file();
+    for (const auto& p : c.properties()) out.properties.push_back(std::make_pair(p.first, p.second));
+    std::sort(out.properties.begin(), out.properties.end());
+    return out;
+}
+
+void clusterTo(const KafkaClusterConfig& c, v1::KafkaCluster& out) {
+    out.set_id(c.id);
+    size_t start = 0;
+    while (start <= c.bootstrapServers.size()) {
+        const size_t end = c.bootstrapServers.find(',', start);
+        const std::string one = c.bootstrapServers.substr(start, end == std::string::npos ? std::string::npos
+                                                                                          : end - start);
+        if (!one.empty()) out.add_bootstrap_servers(one);
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (c.tls) {
+        v1::KafkaClusterTls* tls = out.mutable_tls();
+        tls->set_ca(c.caFile);
+        tls->set_cert(c.certificateFile);
+        tls->set_key(c.keyFile);
+        tls->set_verify_hostname(c.verifyHostname);
+    }
+    if (c.mechanism != "none" || !c.username.empty()) {
+        v1::KafkaClusterAuthentication* auth = out.mutable_authentication();
+        auth->set_mechanism(c.mechanism);
+        auth->set_username(c.username);
+        auth->set_password_file(c.passwordFile);
+        auth->set_password_set(!c.password.empty() || !c.passwordFile.empty());   // never the password itself
+    }
+    for (const auto& p : c.properties) (*out.mutable_properties())[p.first] = p.second;
+}
+
+bool toKafkaFrom(const std::string& id, const v1::KafkaMqttToKafka& m, MqttToKafkaConfig& out, std::string& error) {
+    out.id = id;
+    out.cluster = m.cluster();
+    out.filters.assign(m.mqtt_topic_filters().begin(), m.mqtt_topic_filters().end());
+    out.kafkaTopic = m.kafka_topic();
+    std::string word;
+    if (!choice(m.kafka_acks(), "kafka_acks", {"all", "one", "zero"}, word, error)) return false;
+    out.acks = word == "zero" ? 0 : word == "one" ? 1 : -1;
+    if (m.has_max_record_bytes()) out.maxRecordBytes = (size_t)m.max_record_bytes();
+    const std::string& key = m.key();
+    if (key.empty() || key == "topic") out.key = KafkaKeyMode::Topic;
+    else if (key == "clientid") out.key = KafkaKeyMode::ClientId;
+    else if (key == "none") out.key = KafkaKeyMode::None;
+    else {
+        out.key = KafkaKeyMode::Template;   // the loader checks it is one
+        out.keyTemplate = key;
+    }
+    if (!choice(m.headers(), "headers", {"none", "all"}, word, error)) return false;
+    out.allHeaders = word == "all";
+    if (out.allHeaders && m.header_list_size() > 0) {
+        error = "headers: all, or a header_list - not both";
+        return false;
+    }
+    for (const v1::KafkaHeader& h : m.header_list()) {
+        KafkaHeaderSpec spec;
+        if (!h.placeholder().empty()) {
+            spec.name = h.placeholder();
+        } else {
+            spec.name = h.name();
+            spec.value = h.value();
+            spec.fixed = true;
+        }
+        out.headers.push_back(spec);
+    }
+    if (!choice(m.partition_strategy(), "partition_strategy", {"key-based", "uniform"}, word, error)) return false;
+    out.uniform = word == "uniform";
+    if (!choice(m.acknowledge(), "acknowledge", {"kafka", "routed"}, word, error)) return false;
+    out.acknowledgeOnKafka = word == "kafka";
+    return true;
+}
+
+void toKafkaTo(const MqttToKafkaConfig& m, v1::KafkaMapping& out) {
+    out.set_id(m.id);
+    v1::KafkaMqttToKafka* to = out.mutable_mqtt_to_kafka();
+    to->set_cluster(m.cluster);
+    for (const std::string& f : m.filters) to->add_mqtt_topic_filters(f);
+    to->set_kafka_topic(m.kafkaTopic);
+    to->set_kafka_acks(m.acks == 0 ? "zero" : m.acks == 1 ? "one" : "all");
+    to->set_max_record_bytes(m.maxRecordBytes);
+    switch (m.key) {
+    case KafkaKeyMode::Topic: to->set_key("topic"); break;
+    case KafkaKeyMode::ClientId: to->set_key("clientid"); break;
+    case KafkaKeyMode::None: to->set_key("none"); break;
+    case KafkaKeyMode::Template: to->set_key(m.keyTemplate); break;
+    }
+    to->set_headers(m.allHeaders ? "all" : "none");
+    for (const KafkaHeaderSpec& h : m.headers) {
+        v1::KafkaHeader* header = to->add_header_list();
+        if (h.fixed) {
+            header->set_name(h.name);
+            header->set_value(h.value);
+        } else {
+            header->set_placeholder(h.name);
+        }
+    }
+    to->set_partition_strategy(m.uniform ? "uniform" : "key-based");
+    to->set_acknowledge(m.acknowledgeOnKafka ? "kafka" : "routed");
+}
+
+bool fromKafkaFrom(const std::string& id, const v1::KafkaKafkaToMqtt& m, KafkaToMqttConfig& out, std::string& error) {
+    out.id = id;
+    out.cluster = m.cluster();
+    out.kafkaTopics.assign(m.kafka_topics().begin(), m.kafka_topics().end());
+    out.kafkaTopicPattern = m.kafka_topic_pattern();
+    out.mqttTopics.assign(m.mqtt_topic().begin(), m.mqtt_topic().end());
+    if (out.mqttTopics.empty()) out.mqttTopics.assign(1, "${KAFKA_TOPIC}");
+    out.fromHeaders = m.from_headers();
+    if (m.has_qos()) {
+        if (m.qos() > 2) {
+            error = "qos: 0, 1 or 2";
+            return false;
+        }
+        out.qos = (uint8_t)m.qos();
+    }
+    out.retain = m.retain();
+    out.group = m.consumer_group();
+    const v1::KafkaMqttProperties& p = m.properties();
+    out.contentType = p.content_type();
+    out.responseTopic = p.response_topic();
+    if (p.has_payload_format_indicator()) {
+        if (p.payload_format_indicator() > 1) {
+            error = "properties.payload_format_indicator: 0 or 1";
+            return false;
+        }
+        out.hasPayloadFormat = true;
+        out.payloadFormat = (uint8_t)p.payload_format_indicator();
+    }
+    if (p.has_message_expiry_interval()) {
+        out.hasMessageExpiry = true;
+        out.messageExpiry = p.message_expiry_interval();
+    }
+    for (const v1::KafkaUserProperty& u : p.user_properties()) {
+        out.userProperties.push_back(std::make_pair(u.name(), u.value()));
+    }
+    return true;
+}
+
+void fromKafkaTo(const KafkaToMqttConfig& m, v1::KafkaMapping& out) {
+    out.set_id(m.id);
+    v1::KafkaKafkaToMqtt* from = out.mutable_kafka_to_mqtt();
+    from->set_cluster(m.cluster);
+    for (const std::string& t : m.kafkaTopics) from->add_kafka_topics(t);
+    from->set_kafka_topic_pattern(m.kafkaTopicPattern);
+    for (const std::string& t : m.mqttTopics) from->add_mqtt_topic(t);
+    from->set_from_headers(m.fromHeaders);
+    from->set_qos(m.qos);
+    from->set_retain(m.retain);
+    from->set_consumer_group(m.group);
+    v1::KafkaMqttProperties* p = from->mutable_properties();
+    p->set_content_type(m.contentType);
+    p->set_response_topic(m.responseTopic);
+    if (m.hasPayloadFormat) p->set_payload_format_indicator(m.payloadFormat);
+    if (m.hasMessageExpiry) p->set_message_expiry_interval(m.messageExpiry);
+    for (const auto& u : m.userProperties) {
+        v1::KafkaUserProperty* property = p->add_user_properties();
+        property->set_name(u.first);
+        property->set_value(u.second);
+    }
+}
+
+grpc::Status statusOf(KafkaControl::Result result, const std::string& error) {
+    switch (result) {
+    case KafkaControl::Result::Ok: return grpc::Status::OK;
+    case KafkaControl::Result::NotFound: return grpc::Status(grpc::StatusCode::NOT_FOUND, error);
+    case KafkaControl::Result::Invalid: return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error);
+    case KafkaControl::Result::InUse:
+    case KafkaControl::Result::Unavailable:
+    case KafkaControl::Result::Failed: return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error);
+    }
+    return grpc::Status(grpc::StatusCode::INTERNAL, error);
+}
+
+} // namespace
+
+// Each call, for the gRPC service and the REST surface alike.
+namespace kafka_calls {
+
+grpc::Status putCluster(KafkaControl& kafka, const v1::KafkaCluster& request, v1::KafkaCluster& reply) {
+    std::string error;
+    KafkaClusterConfig stored;
+    const KafkaControl::Result result = kafka.putCluster(clusterFrom(request), &stored, error);
+    if (result == KafkaControl::Result::Ok) clusterTo(stored, reply);
+    return statusOf(result, error);
+}
+
+grpc::Status getCluster(KafkaControl& kafka, const std::string& id, v1::KafkaCluster& reply) {
+    const ServerConfig section = kafka.section();
+    const KafkaClusterConfig* cluster = section.cluster(id);
+    if (cluster == nullptr) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no Kafka cluster \"" + id + "\"");
+    clusterTo(*cluster, reply);
+    return grpc::Status::OK;
+}
+
+grpc::Status listClusters(KafkaControl& kafka, v1::KafkaClusterList& reply) {
+    for (const KafkaClusterConfig& c : kafka.section().clusters) clusterTo(c, *reply.add_clusters());
+    return grpc::Status::OK;
+}
+
+grpc::Status deleteCluster(KafkaControl& kafka, const std::string& id) {
+    std::string error;
+    return statusOf(kafka.deleteCluster(id, error), error);
+}
+
+grpc::Status putMapping(KafkaControl& kafka, const v1::KafkaMapping& request, v1::KafkaMapping& reply) {
+    std::string error;
+    KafkaControl::Result result = KafkaControl::Result::Invalid;
+    if (request.has_mqtt_to_kafka()) {
+        MqttToKafkaConfig mapping, stored;
+        if (!toKafkaFrom(request.id(), request.mqtt_to_kafka(), mapping, error)) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error);
+        }
+        result = kafka.putToKafka(mapping, &stored, error);
+        if (result == KafkaControl::Result::Ok) toKafkaTo(stored, reply);
+    } else if (request.has_kafka_to_mqtt()) {
+        KafkaToMqttConfig mapping, stored;
+        if (!fromKafkaFrom(request.id(), request.kafka_to_mqtt(), mapping, error)) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error);
+        }
+        result = kafka.putFromKafka(mapping, &stored, error);
+        if (result == KafkaControl::Result::Ok) fromKafkaTo(stored, reply);
+    } else {
+        error = "a mapping is mqtt_to_kafka or kafka_to_mqtt";
+    }
+    return statusOf(result, error);
+}
+
+grpc::Status getMapping(KafkaControl& kafka, const std::string& id, v1::KafkaMapping& reply) {
+    const ServerConfig section = kafka.section();
+    for (const MqttToKafkaConfig& m : section.toKafka) {
+        if (m.id != id) continue;
+        toKafkaTo(m, reply);
+        return grpc::Status::OK;
+    }
+    for (const KafkaToMqttConfig& m : section.fromKafka) {
+        if (m.id != id) continue;
+        fromKafkaTo(m, reply);
+        return grpc::Status::OK;
+    }
+    return grpc::Status(grpc::StatusCode::NOT_FOUND, "no Kafka mapping \"" + id + "\"");
+}
+
+grpc::Status listMappings(KafkaControl& kafka, v1::KafkaMappingList& reply) {
+    const ServerConfig section = kafka.section();
+    for (const MqttToKafkaConfig& m : section.toKafka) toKafkaTo(m, *reply.add_mappings());
+    for (const KafkaToMqttConfig& m : section.fromKafka) fromKafkaTo(m, *reply.add_mappings());
+    return grpc::Status::OK;
+}
+
+grpc::Status deleteMapping(KafkaControl& kafka, const std::string& id) {
+    std::string error;
+    return statusOf(kafka.deleteMapping(id, error), error);
+}
+
+grpc::Status status(KafkaControl& kafka, v1::KafkaStatus& reply) {
+    const KafkaPipeStatus status = kafka.status();
+    reply.set_reachable(status.kafkaReachable);
+    reply.set_held_acknowledgements(status.heldAcknowledgements);
+    for (const KafkaPipeStatus::Mapping& m : status.mappings) {
+        v1::KafkaMappingStatus* out = reply.add_mappings();
+        out->set_id(m.id);
+        out->set_to_kafka(m.toKafka);
+        out->set_send(m.send);
+        out->set_success(m.success);
+        out->set_failed(m.failed);
+        out->set_too_large(m.tooLarge);
+        out->set_latency_micros(m.latencyMicros);
+        out->set_polled(m.polled);
+        out->set_published(m.published);
+        out->set_invalid(m.invalid);
+        out->set_refused(m.refused);
+    }
+    return grpc::Status::OK;
+}
+
+const grpc::Status kNoKafka(grpc::StatusCode::FAILED_PRECONDITION, "this server has no Kafka (built without librdkafka)");
+
+} // namespace kafka_calls
+
+class KafkaService final : public v1::Kafka::CallbackService {
+public:
+    KafkaService(const ApiServerConfig& config, KafkaControl* kafka) : _config(config), _kafka(kafka) {}
+
+#define MODBEE_KAFKA_CALL(Name, Request, Reply, call)                                                     \
+    grpc::ServerUnaryReactor* Name(grpc::CallbackServerContext* context, const Request* request,          \
+                                   Reply* reply) override {                                               \
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();                                    \
+        (void)request;                                                                                    \
+        (void)reply;                                                                                      \
+        if (!allowed(context, _config.token)) reactor->Finish(refusedToken());                            \
+        else if (_kafka == nullptr || !_kafka->available()) reactor->Finish(kafka_calls::kNoKafka);       \
+        else reactor->Finish(call);                                                                       \
+        return reactor;                                                                                   \
+    }
+    MODBEE_KAFKA_CALL(PutCluster, v1::KafkaCluster, v1::KafkaCluster, kafka_calls::putCluster(*_kafka, *request, *reply))
+    MODBEE_KAFKA_CALL(GetCluster, v1::KafkaRef, v1::KafkaCluster, kafka_calls::getCluster(*_kafka, request->id(), *reply))
+    MODBEE_KAFKA_CALL(ListClusters, v1::Empty, v1::KafkaClusterList, kafka_calls::listClusters(*_kafka, *reply))
+    MODBEE_KAFKA_CALL(DeleteCluster, v1::KafkaRef, v1::Empty, kafka_calls::deleteCluster(*_kafka, request->id()))
+    MODBEE_KAFKA_CALL(PutMapping, v1::KafkaMapping, v1::KafkaMapping, kafka_calls::putMapping(*_kafka, *request, *reply))
+    MODBEE_KAFKA_CALL(GetMapping, v1::KafkaRef, v1::KafkaMapping, kafka_calls::getMapping(*_kafka, request->id(), *reply))
+    MODBEE_KAFKA_CALL(ListMappings, v1::Empty, v1::KafkaMappingList, kafka_calls::listMappings(*_kafka, *reply))
+    MODBEE_KAFKA_CALL(DeleteMapping, v1::KafkaRef, v1::Empty, kafka_calls::deleteMapping(*_kafka, request->id()))
+    MODBEE_KAFKA_CALL(Status, v1::Empty, v1::KafkaStatus, kafka_calls::status(*_kafka, *reply))
+#undef MODBEE_KAFKA_CALL
+
+private:
+    const ApiServerConfig& _config;
+    KafkaControl* _kafka;
 };
 
 class ConnectionsService final : public v1::Connections::CallbackService {
@@ -2426,6 +2786,7 @@ struct ApiServer::Impl {
     std::unique_ptr<MessagesService> messages;
     std::unique_ptr<ConnectionsService> connections;
     std::unique_ptr<SparkplugService> sparkplug;
+    std::unique_ptr<KafkaService> kafka;
     std::unique_ptr<grpc::Server> server;
     std::vector<std::string> listening;
     std::vector<std::string> sockets;      // Unix socket files, removed at stop
@@ -2445,11 +2806,13 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     self.core.reset(new AdminCore(self.services));
     self.admin.reset(new AdminService(self.config, *self.core));
     self.system.reset(new SystemService(self.config, authority != nullptr, messages, connections != nullptr,
-                                         services.admin != nullptr, (bool)services.sparkplugAware));
+                                         services.admin != nullptr, (bool)services.sparkplugAware,
+                                         services.kafka != nullptr && services.kafka->available()));
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
     self.sparkplug.reset(new SparkplugService(self.config, connections, messages, self.services));
+    self.kafka.reset(new KafkaService(self.config, services.kafka));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -2493,6 +2856,7 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     if (self.connections) builder.RegisterService(self.connections.get());
     builder.RegisterService(self.admin.get());
     builder.RegisterService(self.sparkplug.get());
+    builder.RegisterService(self.kafka.get());
     self.server = builder.BuildAndStart();
     if (!self.server) {
         error = "the Application API could not listen on every address (in use, or no permission?)";
@@ -2866,6 +3230,48 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
             }
         } else if (method == "DELETE") {
             answer(made<v1::DeleteConnectionReply>(), connections.remove(name) ? grpc::Status::OK : missing);
+        }
+    } else if (collection == "kafka-clusters" || collection == "kafka-mappings" || collection == "kafka-status") {
+        KafkaControl* kafka = self.services.kafka;
+        if (kafka == nullptr || !kafka->available()) {
+            answer(made<v1::Empty>(), kafka_calls::kNoKafka);
+        } else if (collection == "kafka-status" && method == "GET") {
+            auto out = made<v1::KafkaStatus>();
+            answer(out, kafka_calls::status(*kafka, *out));
+        } else if (collection == "kafka-clusters") {
+            if (method == "GET" && name.empty()) {
+                auto out = made<v1::KafkaClusterList>();
+                answer(out, kafka_calls::listClusters(*kafka, *out));
+            } else if (method == "GET") {
+                auto out = made<v1::KafkaCluster>();
+                answer(out, kafka_calls::getCluster(*kafka, name, *out));
+            } else if (method == "PUT") {
+                v1::KafkaCluster r;
+                if (read(r)) {
+                    r.set_id(name);
+                    auto out = made<v1::KafkaCluster>();
+                    answer(out, kafka_calls::putCluster(*kafka, r, *out));
+                }
+            } else if (method == "DELETE") {
+                answer(made<v1::Empty>(), kafka_calls::deleteCluster(*kafka, name));
+            }
+        } else if (collection == "kafka-mappings") {
+            if (method == "GET" && name.empty()) {
+                auto out = made<v1::KafkaMappingList>();
+                answer(out, kafka_calls::listMappings(*kafka, *out));
+            } else if (method == "GET") {
+                auto out = made<v1::KafkaMapping>();
+                answer(out, kafka_calls::getMapping(*kafka, name, *out));
+            } else if (method == "PUT") {
+                v1::KafkaMapping r;
+                if (read(r)) {
+                    r.set_id(name);
+                    auto out = made<v1::KafkaMapping>();
+                    answer(out, kafka_calls::putMapping(*kafka, r, *out));
+                }
+            } else if (method == "DELETE") {
+                answer(made<v1::Empty>(), kafka_calls::deleteMapping(*kafka, name));
+            }
         }
     } else if (collection == "groups" && self.services.messages) {
         AppHub& hub = *self.services.messages;

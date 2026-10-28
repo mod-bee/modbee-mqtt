@@ -1041,6 +1041,26 @@ void sparkplugStructures(Server& server) {
     }
 }
 
+void kafkaWithoutKafka(Server& server) {
+    section("Kafka.* on a server without Kafka: said, not pretended");
+    auto kafka = v1::Kafka::NewStub(server.channel());
+    auto system = v1::System::NewStub(server.channel());
+    grpc::ClientContext c;
+    authorize(c);
+    v1::Empty none;
+    v1::KafkaClusterList clusters;
+    const grpc::Status status = kafka->ListClusters(&c, none, &clusters);
+    ok(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION, "ListClusters: FAILED_PRECONDITION");
+    grpc::ClientContext h;
+    authorize(h);
+    v1::HelloRequest hello;
+    v1::HelloReply reply;
+    system->Hello(&h, hello, &reply);
+    bool listed = false;
+    for (const std::string& f : reply.features()) listed |= f == "kafka";
+    ok(!listed, "  and Hello does not list kafka");
+}
+
 void sparkplugAware(Server& server) {
     section("Sparkplug Aware: births kept on $sparkplug/certificates/..., cleared by deaths, turned on and off live");
     auto sparkplug = v1::Sparkplug::NewStub(server.channel());
@@ -1225,6 +1245,7 @@ int main() {
     if (server.started) sparkplugAware(server);
     if (server.started) sparkplugEdgeNode(server);
     if (server.started) sparkplugStructures(server);
+    if (server.started) kafkaWithoutKafka(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);
     return check::report("api_tests");

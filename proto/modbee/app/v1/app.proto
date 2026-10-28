@@ -786,6 +786,135 @@ enum SparkplugDataType {
 }
 
 // =============================================================================
+// KAFKA - the clusters, and the mappings between this broker and Kafka topics
+// =============================================================================
+//
+// The same fields as modbee.yaml's kafka: section (docs/kafka.md), named as it
+// names them (kafka-acks there, kafka_acks here), and checked by the same
+// rules: a loop between a mapping each way, a cluster no mapping can find, a
+// Kafka topic name Kafka would refuse.
+
+service Kafka {
+  // Each change is applied live and all or nothing: it starts a new producer or consumer only where it touches one,
+  // and a publisher's acknowledgement already waiting on Kafka is kept. Kept in the state directory (kafka.json), so
+  // a server started from flags keeps them; a file's kafka: is where they start - what was changed here wins over
+  // it, as EMQX keeps what its API changed over its configuration file. FAILED_PRECONDITION: no Kafka in this build.
+  rpc PutCluster(KafkaCluster) returns (KafkaCluster);   // create, or replace by id
+  rpc GetCluster(KafkaRef) returns (KafkaCluster);
+  rpc ListClusters(Empty) returns (KafkaClusterList);
+  rpc DeleteCluster(KafkaRef) returns (Empty);           // refused while a mapping or the retained store uses it
+  rpc PutMapping(KafkaMapping) returns (KafkaMapping);   // create, or replace by id
+  rpc GetMapping(KafkaRef) returns (KafkaMapping);
+  rpc ListMappings(Empty) returns (KafkaMappingList);
+  rpc DeleteMapping(KafkaRef) returns (Empty);
+  // Each mapping's counters (the names HiveMQ's Kafka extension and /metrics use), the acknowledgements waiting on
+  // Kafka now, and whether Kafka can be reached.
+  rpc Status(Empty) returns (KafkaStatus);
+}
+
+message KafkaRef {
+  string id = 1;
+}
+
+// kafka.clusters[]. A password is never given back: an answer has it empty and says `password_set`; a Put with it
+// empty keeps the one the cluster has.
+message KafkaCluster {
+  string id = 1;
+  repeated string bootstrap_servers = 2;   // host:port
+  KafkaClusterTls tls = 3;                 // set: TLS
+  KafkaClusterAuthentication authentication = 4;
+  map<string, string> properties = 5;      // librdkafka settings, exactly as written ("linger.ms")
+}
+message KafkaClusterTls {
+  string ca = 1;                           // files on the server
+  string cert = 2;
+  string key = 3;
+  optional bool verify_hostname = 4;       // absent: true
+}
+message KafkaClusterAuthentication {
+  string mechanism = 1;                    // none (default) | plain | scram-sha256 | scram-sha512 | oauthbearer
+  string username = 2;
+  string password = 3;
+  string password_file = 4;                // a file on the server holding it, instead
+  bool password_set = 5;                   // in an answer: it has one
+}
+message KafkaClusterList {
+  repeated KafkaCluster clusters = 1;
+}
+
+// One mapping: kafka.mqtt-to-kafka[] or kafka.kafka-to-mqtt[].
+message KafkaMapping {
+  string id = 1;
+  oneof direction {
+    KafkaMqttToKafka mqtt_to_kafka = 2;
+    KafkaKafkaToMqtt kafka_to_mqtt = 3;
+  }
+}
+message KafkaMqttToKafka {
+  string cluster = 1;                      // "": the only cluster there is
+  repeated string mqtt_topic_filters = 2;
+  string kafka_topic = 3;
+  string kafka_acks = 4;                   // zero | one | all (default)
+  optional uint64 max_record_bytes = 5;    // default 1048576
+  string key = 6;                          // topic (default) | clientid | none | a template, as the file has it
+  string headers = 7;                      // all | none (default) - or list them in header_list
+  repeated KafkaHeader header_list = 8;
+  string partition_strategy = 9;           // key-based (default) | uniform
+  string acknowledge = 10;                 // kafka (default): the PUBACK waits for Kafka | routed
+}
+// One header a record gets: a placeholder (mqtt-topic, mqtt-qos, ...), or a fixed name and value.
+message KafkaHeader {
+  string placeholder = 1;
+  string name = 2;
+  string value = 3;
+}
+message KafkaKafkaToMqtt {
+  string cluster = 1;
+  repeated string kafka_topics = 2;
+  string kafka_topic_pattern = 3;          // a regular expression, instead of kafka_topics
+  repeated string mqtt_topic = 4;          // templates; default the record's own Kafka topic
+  bool from_headers = 5;                   // topic, QoS, retain and properties from the mqtt-* headers
+  optional uint32 qos = 6;                 // default 1
+  bool retain = 7;
+  string consumer_group = 8;               // default modbee-<id>-group
+  KafkaMqttProperties properties = 9;      // MQTT 5 properties it publishes with
+}
+message KafkaMqttProperties {
+  string content_type = 1;
+  string response_topic = 2;
+  optional uint32 payload_format_indicator = 3;
+  optional uint32 message_expiry_interval = 4;
+  repeated KafkaUserProperty user_properties = 5;
+}
+message KafkaUserProperty {
+  string name = 1;
+  string value = 2;
+}
+message KafkaMappingList {
+  repeated KafkaMapping mappings = 1;
+}
+
+message KafkaStatus {
+  bool reachable = 1;                      // false from "every broker is down" until one is up again
+  uint64 held_acknowledgements = 2;        // PUBACKs and PUBRECs waiting on Kafka now
+  repeated KafkaMappingStatus mappings = 3;
+}
+// Running totals since the mapping was made (a change to it keeps them).
+message KafkaMappingStatus {
+  string id = 1;
+  bool to_kafka = 2;
+  uint64 send = 3;                         // mqtt-to-kafka: handed to the producer
+  uint64 success = 4;                      //   Kafka has it
+  uint64 failed = 5;
+  uint64 too_large = 6;                    //   over max_record_bytes, never sent
+  uint64 latency_micros = 7;               //   summed over success
+  uint64 polled = 8;                       // kafka-to-mqtt: records read
+  uint64 published = 9;
+  uint64 invalid = 10;                     //   could not be published (a topic that is not one, ...)
+  uint64 refused = 11;                     //   the broker could not take it
+}
+
+// =============================================================================
 // CONNECTIONS - MQTT client connections the broker keeps for the application
 // =============================================================================
 //

@@ -107,6 +107,12 @@ endif()
 # --- the Kafka pipe, where librdkafka is installed ---
 # Its CMake package (vcpkg, Windows) first; pkg-config (Linux packages) else.
 find_package(RdKafka CONFIG QUIET)
+# --- the kafka: section, changed live (no librdkafka: every build has it) ---
+add_library(modbee-kafka-control STATIC kafka/KafkaControl.cpp)
+target_link_libraries(modbee-kafka-control PUBLIC modbee-server modbee-config)
+target_include_directories(modbee-kafka-control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/kafka)
+target_compile_features(modbee-kafka-control PUBLIC cxx_std_17)
+
 if(RdKafka_FOUND)
     set(RDKAFKA_FOUND TRUE)
     set(RDKAFKA_VERSION ${RdKafka_VERSION})
@@ -120,7 +126,8 @@ else()
 endif()
 if(RDKAFKA_FOUND)
     add_library(modbee-kafka STATIC kafka/KafkaPipe.cpp kafka/KafkaCommon.cpp kafka/KafkaRetained.cpp)
-    target_link_libraries(modbee-kafka PUBLIC modbee-server modbee-config modbee-retained ${_modbee_rdkafka})
+    target_link_libraries(modbee-kafka PUBLIC modbee-server modbee-config modbee-retained modbee-kafka-control
+                          ${_modbee_rdkafka})
     target_include_directories(modbee-kafka PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/kafka)
     target_compile_definitions(modbee-kafka PUBLIC MODBEE_HAVE_KAFKA=1)
     target_compile_features(modbee-kafka PUBLIC cxx_std_17)
@@ -189,7 +196,8 @@ if(MQTT_BUILD_APP_API)
     find_package(ZLIB REQUIRED)    # compressed Sparkplug payloads; gRPC needs it already
     add_library(modbee-api STATIC api/ApiServer.cpp api/SparkplugCodec.cpp ${_modbee_app}.pb.cc
         ${_modbee_app}.grpc.pb.cc ${_modbee_wire}.pb.cc)
-    target_link_libraries(modbee-api PUBLIC modbee-app gRPC::grpc++ protobuf::libprotobuf ZLIB::ZLIB)
+    target_link_libraries(modbee-api PUBLIC modbee-app modbee-kafka-control gRPC::grpc++ protobuf::libprotobuf
+                          ZLIB::ZLIB)
     target_include_directories(modbee-api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/api ${_modbee_generated})
     target_compile_definitions(modbee-api PUBLIC MODBEE_HAVE_APP_API=1)
     target_compile_features(modbee-api PUBLIC cxx_std_17)

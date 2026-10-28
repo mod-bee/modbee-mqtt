@@ -18,50 +18,35 @@
 // librdkafka's background threads never touch broker state: they only write to
 // a WakeSignal in the shard's readiness set, and the shard runs every callback from
 // its own loop.
+//
+// LIVE (apply()): the clusters and mappings are a PLAN, replaced whole. Each
+// shard takes a new plan on its own thread, at its next message or service
+// pass, and changes only the clients it touches: a producer is kept unless its
+// cluster's settings, its idempotence, or a Kafka topic's acks or partitioner
+// changed; a consumer unless its cluster, topics or group did. A producer that
+// is replaced takes no more records and is destroyed once Kafka has answered
+// every one it holds - so a PUBACK already waiting on Kafka is still sent, by
+// the delivery report it was waiting for. A consumer is closed without
+// blocking the shard, committing what it stored.
 
+#include "KafkaControl.h"
 #include "ShardedBroker.h"
 #include "ServerConfig.h"
 
 #include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-
-// Counters, named as HiveMQ's Kafka extension names them so an operator who
-// knows one knows the other. Running totals; read at any time from any thread.
-struct KafkaMappingCounters {
-    std::atomic<uint64_t> send{0};        // mqtt-to-kafka: handed to the producer
-    std::atomic<uint64_t> success{0};     //   acknowledged by Kafka
-    std::atomic<uint64_t> failed{0};      //   refused by Kafka or the producer
-    std::atomic<uint64_t> tooLarge{0};    //   over max-record-bytes, never sent
-    std::atomic<uint64_t> latencyMicros{0};   // sum, for success; / success = mean
-    std::atomic<uint64_t> polled{0};      // kafka-to-mqtt: records read
-    std::atomic<uint64_t> published{0};   //   published into the broker
-    std::atomic<uint64_t> invalid{0};     //   could not be published (bad topic, ...)
-    std::atomic<uint64_t> refused{0};     //   the broker could not take it (a queue or the retained store full)
-};
-
-struct KafkaPipeStatus {
-    struct Mapping {
-        std::string id;
-        bool toKafka = true;
-        uint64_t send = 0, success = 0, failed = 0, tooLarge = 0, latencyMicros = 0;
-        uint64_t polled = 0, published = 0, invalid = 0, refused = 0;
-    };
-    std::vector<Mapping> mappings;
-    uint64_t heldAcknowledgements = 0;    // PUBACK/PUBRECs waiting on Kafka now
-    // False from librdkafka's "all brokers down" (or statistics showing no
-    // broker UP) until a statistics report shows one UP again, or Kafka
-    // acknowledges a record - what /readyz reports.
-    bool kafkaReachable = true;
-};
 
 // The pipe's counters, appended in the Prometheus text format, one series
 // per mapping (label mapping="<id>").
 void renderKafkaMetrics(const KafkaPipeStatus& status, std::string& out);
 
-class KafkaPipe : public ShardExtension {
+class KafkaPipe : public ShardExtension, public KafkaLive {
 public:
+    // `config`'s clusters and mappings are the first plan (they may be none).
     explicit KafkaPipe(const ServerConfig& config);
     ~KafkaPipe() override;
 
@@ -79,7 +64,12 @@ public:
     bool hasPendingWork(uint32_t shard) override;
     void stop(uint32_t shard, MqttBroker& broker) override;
 
-    KafkaPipeStatus status() const;
+    // A new plan, checked already (KafkaControl). Every client it needs is
+    // tried first, so a cluster a client cannot be made for (a TLS file that
+    // is not there, a librdkafka setting it refuses) is an error, and the old
+    // plan runs on.
+    bool apply(const ServerConfig& section, std::string& error) override;
+    KafkaPipeStatus status() const override;
 
     // librdkafka's version string, for a log line.
     static const char* libraryVersion();
@@ -90,12 +80,19 @@ public:
     struct Shard;
     struct ToKafka;
     struct FromKafka;
+    struct Plan;
 
 private:
-    ServerConfig _config;
+    std::shared_ptr<const Plan> makePlan(const ServerConfig& section);
+    std::shared_ptr<const Plan> currentPlan(uint64_t& generation) const;
+
     int _flushMillis = 5000;
-    std::vector<std::unique_ptr<ToKafka>> _toKafka;
-    std::vector<std::unique_ptr<FromKafka>> _fromKafka;
+    size_t _shardCount = 0;
+    mutable std::mutex _planLock;
+    std::shared_ptr<const Plan> _plan;                 // under _planLock
+    std::atomic<uint64_t> _generation{1};
+    // Each mapping's counters by id: a mapping changed keeps its own.
+    std::map<std::string, std::shared_ptr<KafkaMappingCounters>> _counters;   // under _planLock
     std::vector<std::unique_ptr<Shard>> _shards;
     std::atomic<bool> _brokersDown{false};
 };

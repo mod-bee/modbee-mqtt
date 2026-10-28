@@ -314,6 +314,45 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
 
 ---
 
+## Changing it while it runs
+
+Clusters and mappings can be added, changed and removed while the server
+runs - from the command line, the Application API (`Kafka.PutCluster` ...
+`Kafka.Status`, [app-api.md](app-api.md#kafka)) or its REST surface - with
+**the same fields as this file**, named as it names them, and checked by the
+same rules. Each change is all or nothing:
+
+```sh
+modbee-mqtt kafka-clusters put --id main --bootstrap-servers kafka-1:9092
+modbee-mqtt kafka-mappings put --id telemetry \
+    --mqtt-to-kafka.mqtt-topic-filters 'plant/#' --mqtt-to-kafka.kafka-topic telemetry
+modbee-mqtt kafka-mappings put --id commands \
+    --kafka-to-mqtt.kafka-topics commands --kafka-to-mqtt.mqtt-topic 'cmd/${KAFKA_KEY}'
+modbee-mqtt kafka status
+```
+
+- **Only what a change touches restarts.** A change to a mapping's MQTT side
+  (its filters, key, headers, how it acknowledges) restarts nothing. A
+  producer is replaced when its cluster's settings change, or a Kafka topic
+  it writes to is asked for with other acks or partitioning; a consumer when
+  its cluster, Kafka topics or group change. A producer that is replaced takes
+  no more records and lets go only once Kafka has answered every one it holds
+  - so **a PUBACK already waiting on Kafka is still sent**, when Kafka
+  acknowledges the record, as it would have been.
+- **Refused before anything changes:** a setting the file would refuse, a
+  mapping on a cluster that does not exist, a librdkafka setting librdkafka
+  refuses, a cluster a mapping or the retained store still uses.
+- **Kept in the state directory** (`kafka.json` beside `connections.json`),
+  so a server started from flags alone keeps its mappings. The file's
+  `kafka:` is where they start: once the API has changed them, `kafka.json`
+  wins - as EMQX keeps what its API changed over its configuration file - and
+  a file edited later does not quietly undo a change made live. Delete
+  `kafka.json` to start from the file again.
+- **A password is never given back**: an answer says `password_set`, and a
+  change with no password keeps the one the cluster has.
+- **Counters carry through a change** to a mapping, and start again from zero
+  when it is deleted and made anew.
+
 ## Every key, and the environment
 
 | Section | Keys |
@@ -321,7 +360,7 @@ whichever engine serves MQTT ([docker.md](docker.md#building-the-image-yourself)
 | `broker:` | `address`, `plain`, `port`, `tls: {port, cert, key, client-ca, client-certificates, cert-pem, key-pem, client-ca-pem}` ([below](#tls-for-mqtt)), `shards`, `max-connections`, `max-sessions`, `max-session-expiry`, `connect-timeout`, `max-keepalive`, `max-packet`, `queue-bytes`, `queue-bytes-total`, `queue`, `subscriptions`, `max-retained`, `pin-threads`, `status-every` |
 | `authentication:` | `database`: device logins in SQLite, managed live ([logins.md](logins.md)), with `username`/`password` (or `password-file`) as the admin. Without `database`: `username`/`password` and `users:` are a fixed set of logins. Any login makes logging in required. `certificate-login`: a verified client certificate logs in as the login its CN names ([logins.md](logins.md#logging-in-with-a-certificate)). `default-topics`: `all` (default) or `none` - what a database login with no rules may use ([logins.md](logins.md#what-a-device-may-do)) |
 | `authentication: authority:` | Logins decided by your application over the Application API: `timeout-ms` (2000), `stale-for` (86400 s), `cache-size`, `max-pending` ([app-api.md](app-api.md#logins-decided-by-your-application)) |
-| `api:` | The Application API: `grpc` (`unix:<path>`, `tcp://<host>:<port>`), `tls: {cert, key, client-ca}`, `token` or `token-file`, `plain` (TCP without TLS where only this machine or a private network reaches it, the token still required), `max-queued` (100000 per consumer group), `state-directory` (`/var/lib/modbee`, where managed connections are kept), `rest` (the Admin calls as JSON on the metrics listener; off loopback only with a token) ([app-api.md](app-api.md)) |
+| `api:` | The Application API: `grpc` (`unix:<path>`, `tcp://<host>:<port>`), `tls: {cert, key, client-ca}`, `token` or `token-file`, `plain` (TCP without TLS where only this machine or a private network reaches it, the token still required), `max-queued` (100000 per consumer group), `state-directory` (`/var/lib/modbee`, where managed connections, and Kafka changes made live, are kept), `rest` (the Admin calls as JSON on the metrics listener; off loopback only with a token) ([app-api.md](app-api.md)) |
 | `retained:` | `store` (`memory`, `file` or `kafka`), `file` (default `/var/lib/modbee/retained.db`), `topic` (default `modbee-retained`), `cluster` |
 | `sessions:` | `store` (`memory` or `file`), `directory` (default `/var/lib/modbee/sessions`), `sync` (`normal` or `full`) ([docker.md](docker.md#sessions)) |
 | `metrics:` | `enabled`, `address`, `port` (default 9464) |

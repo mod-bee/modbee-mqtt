@@ -58,6 +58,16 @@ static const ApiCommand kApiCommands[] = {
     {"groups", "list", "Messages.ListGroups", "GET /v1/groups"},
     {"groups", "delete", "Messages.DeleteGroup", "DELETE /v1/groups/{group}?connection="},
 
+    {"kafka-clusters", "put", "Kafka.PutCluster", "PUT /v1/kafka-clusters/{id}"},
+    {"kafka-clusters", "get", "Kafka.GetCluster", "GET /v1/kafka-clusters/{id}"},
+    {"kafka-clusters", "list", "Kafka.ListClusters", "GET /v1/kafka-clusters"},
+    {"kafka-clusters", "delete", "Kafka.DeleteCluster", "DELETE /v1/kafka-clusters/{id}"},
+    {"kafka-mappings", "put", "Kafka.PutMapping", "PUT /v1/kafka-mappings/{id}"},
+    {"kafka-mappings", "get", "Kafka.GetMapping", "GET /v1/kafka-mappings/{id}"},
+    {"kafka-mappings", "list", "Kafka.ListMappings", "GET /v1/kafka-mappings"},
+    {"kafka-mappings", "delete", "Kafka.DeleteMapping", "DELETE /v1/kafka-mappings/{id}"},
+    {"kafka", "status", "Kafka.Status", "GET /v1/kafka-status"},
+
     {"connections", "put", "Connections.Put", "PUT /v1/connections/{id}"},
     {"connections", "get", "Connections.Get", "GET /v1/connections/{id}"},
     {"connections", "list", "Connections.List", "GET /v1/connections"},
