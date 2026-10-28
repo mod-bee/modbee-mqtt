@@ -461,11 +461,11 @@ int cmdServe(int argc, char** argv) {
     // EVENTS BEFORE THE PIPE SEES THEM? Order does not matter: an event is a
     // message published from the shard's service pass, offered to every
     // extension - the Kafka pipe takes it when a mapping's filter matches.
-    std::unique_ptr<BrokerEvents> events;
-    if (file.events.enabled) {
-        events.reset(new BrokerEvents());
-        extensions.add(events.get());
-    }
+    // Always there, switched on and off live (Admin.PutEvents): off, it makes
+    // no event at all.
+    std::unique_ptr<BrokerEvents> events(new BrokerEvents());
+    events->enable(file.events.enabled);
+    extensions.add(events.get());
     // SPARKPLUG AWARE: always there, so the API can turn it on while it runs.
     SparkplugAware aware(file.sparkplug.aware);
     extensions.add(&aware);
@@ -640,6 +640,12 @@ int cmdServe(int argc, char** argv) {
         s.logins = gate.get();
         s.server = &server;
         s.kafka = &kafka;
+        AppHub* eventsHub = hub.get();
+        s.clientEvents = [&events] { return events->enabled(); };
+        s.setClientEvents = [&events, eventsHub](bool on) {
+            events->enable(on);
+            if (eventsHub) eventsHub->eventsEnabled(on);
+        };
         s.sparkplugAware = [&aware] { return aware.enabled(); };
         s.setSparkplugAware = [&aware](bool on) { aware.enable(on); };
         if (!read || !api.start(c, s, why)) {
@@ -684,7 +690,7 @@ int cmdServe(int argc, char** argv) {
         std::printf("modbee-mqtt serve: a verified client certificate logs in as the login its CN "
                     "names, without a password (certificate-login)\n");
     }
-    if (events) std::printf("modbee-mqtt serve: client events published on $modbee/events/...\n");
+    if (events->enabled()) std::printf("modbee-mqtt serve: client events published on $modbee/events/...\n");
 #if defined(MODBEE_HAVE_APP_API)
     for (const std::string& address : api.listening()) {
         std::printf("modbee-mqtt serve: Application API (gRPC) on %s\n", address.c_str());

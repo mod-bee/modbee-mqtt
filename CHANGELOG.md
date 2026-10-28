@@ -13,6 +13,12 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **`Admin.Backup`** (`modbee-mqtt logins backup`, `POST /v1/backups`): a copy of the login database made in its
+  backups folder, as `modbee-mqtt backup` does over MQTT, and named; with `contents`, its bytes too. Hello says
+  `admin.backup`.
+- **Client events turned on and off live** (`Admin.GetEvents` / `PutEvents`, `modbee-mqtt events get|set`,
+  `GET`/`PUT /v1/events`): published on `$modbee/events/...` and to Consume streams only while on. Not kept, as
+  `PutListeners` is not; `--events` and `events.enabled` still set it at start. Hello says `events.live`.
 - **Kafka through the Application API and the CLI, live** (`Kafka.PutCluster` ... `DeleteMapping`, `Kafka.Status`;
   `modbee-mqtt kafka-clusters|kafka-mappings put|get|list|delete`, `modbee-mqtt kafka status`; REST
   `/v1/kafka-clusters`, `/v1/kafka-mappings`, `/v1/kafka-status`): clusters and mappings with the fields of the file's

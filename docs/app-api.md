@@ -285,6 +285,8 @@ running server, without restarting it:
 | `GetListeners` `PutTls` | The listeners, and the TLS certificate they serve - replaced live: new handshakes use it, open connections keep theirs |
 | `PutListeners` | Changed live, all or nothing: the plain and TLS ports (`0` turns one off; turning TLS on brings its certificate in `tls`), `max_connections` and `max_packet`. A listener that moves keeps its connections - they have their sockets already; one turned off closes its own with DISCONNECT `0x98`. `max_connections` goes as far as `max_connections_ceiling`, the room kept for sessions at the start (`--max-sessions`); lowered, it closes nobody and refuses new connections (`0x89`) until enough have gone. A connection already up keeps the packet size its CONNACK told it. A taken port is `FAILED_PRECONDITION`, with nothing changed. The queue caps too: `queue` (messages a session holds), `queue_bytes` (its bytes) and `queue_bytes_total` (every session's together, the whole server's; `0`: no cap) - a queue already over a lowered cap keeps what it holds and refuses new messages, counted as dropped, until it drains below it. Like `PutTls` it is not kept: the next start uses what the server is started with |
 | `Stats` | The server's counters: connections, sessions, messages in and out, what is queued right now (`queued_messages`, `queued_bytes`), logins asked of your application and answered from its cache |
+| `Backup` | A copy of the login database, made now in its backups folder - what `modbee-mqtt backup` does over MQTT - and its file named; with `contents: true`, its bytes too, for an application on another machine. A restore is `modbee-mqtt restore`, with the server stopped: a running server cannot have its database replaced under it |
+| `GetEvents` `PutEvents` | [Client events](events.md) on or off, live. Not kept: a lasting change is `serve --events` or `SetSettings` `events.enabled` |
 | `GetSettings` `CheckSettings` `SetSettings` `ApplySettings` `ResetSettings` | The settings kept in the login database - what `modbee-mqtt config` does over MQTT ([settings.md](settings.md)): single settings by their path (`set`, `remove`), or a whole `modbee.yaml` (`document`), validated as the file is and applied at the next start, or at once with `restart`; the TLS material is applied live. A change that would not load is `INVALID_ARGUMENT`, naming the setting; `CheckSettings` answers with the problems instead. Without a login database, `FAILED_PRECONDITION` |
 
 ### REST
@@ -321,6 +323,8 @@ curl -X POST localhost:9464/v1/sessions/pump-1:kick
 | `GET /v1/retained?filter=&payloads=` · `DELETE /v1/retained?filter=` | `ListRetained` · `DeleteRetained` |
 | `GET /v1/listeners` · `PUT /v1/listeners` · `PUT /v1/listeners/tls` | `GetListeners` · `PutListeners` · `PutTls` |
 | `GET /v1/stats` · `GET /v1/health` | `Stats` · health |
+| `POST /v1/backups` · `GET` · `PUT /v1/events` | `Backup` · `GetEvents` · `PutEvents` |
+| `GET` · `PUT` · `DELETE /v1/kafka-clusters/{id}`, `/v1/kafka-mappings/{id}` · `GET /v1/kafka-status` | `Kafka.*` |
 | `GET /v1/settings` · `PATCH` · `PUT /v1/settings` · `POST /v1/settings:check` · `POST /v1/settings:reset` | `GetSettings` · `SetSettings` · `ApplySettings` · `CheckSettings` · `ResetSettings` |
 | `GET /v1/connections` · `GET` · `PUT` · `DELETE /v1/connections/{id}` · `POST /v1/connections/{id}:reconnect` | `Connections.*` (`Watch` is gRPC only) |
 | `GET /v1/groups` · `DELETE /v1/groups/{group}?connection=` | `Messages.ListGroups` · `DeleteGroup` |

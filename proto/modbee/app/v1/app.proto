@@ -1069,6 +1069,16 @@ service Admin {
 
   rpc Stats(Empty) returns (StatsReply);
 
+  // A copy of the login database, made now in its backups folder - what modbee-mqtt backup does over MQTT - the
+  // newest few kept. With `contents`, its bytes too, for an application on another machine. Without a login
+  // database: FAILED_PRECONDITION. (A restore is made with the server stopped: modbee-mqtt restore.)
+  rpc Backup(BackupRequest) returns (BackupReply);
+
+  // Client events (docs/events.md) on or off, live: published on the events topics and to Consume streams that
+  // ask for them. Like PutListeners, not kept - a lasting change is serve --events or SetSettings events.enabled.
+  rpc GetEvents(Empty) returns (EventsSetting);
+  rpc PutEvents(EventsSetting) returns (EventsSetting);
+
   // The settings kept in the login database (serve --data, or authentication: database): what `modbee-mqtt config`
   // reads and changes. Validated as the file is; applied at the next start - or at once, with `restart` - but for
   // the TLS material, which is applied live. Authentication is the file's and the flags' alone. Without a login
@@ -1081,6 +1091,19 @@ service Admin {
 }
 
 message Empty {}
+
+message BackupRequest {
+  bool contents = 1;               // the file's bytes in the reply too
+}
+message BackupReply {
+  string file = 1;                 // where it is, on the server's machine
+  uint64 size = 2;
+  bytes contents = 3;              // when asked
+}
+
+message EventsSetting {
+  bool enabled = 1;
+}
 
 message NameRef {
   string name = 1;

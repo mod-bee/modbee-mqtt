@@ -101,6 +101,7 @@ void BrokerEvents::prepare(uint32_t shard, MqttBroker& broker) {
 
 void BrokerEvents::onEvent(void* context, const MqttBrokerClientEvent& event) {
     Shard& shard = *static_cast<Shard*>(context);
+    if (!shard.owner->enabled()) return;
     // A connection refused before it had a session has no client to speak of - except one whose TLS handshake
     // failed, which never had a client id to give: its address is what there is.
     if (event.clientId.length == 0 && event.kind != MqttBrokerClientEventKind::HandshakeFailed) return;
@@ -122,6 +123,7 @@ void BrokerEvents::service(uint32_t shard, MqttBroker& broker) {
     // Published once, from shard 0, before any client's events - a reader starts over from here.
     if (shard == 0 && _announceStart) {
         _announceStart = false;
+        if (!enabled()) return;
         Pending started;
         started.topic = "$modbee/events/started";
         started.body = startedDocument(nowMillis());

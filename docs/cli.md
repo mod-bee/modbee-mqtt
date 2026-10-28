@@ -326,6 +326,9 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt messages publish` | `Messages.Publish` | `POST /v1/publish` |
 | `modbee-mqtt groups list` | `Messages.ListGroups` | `GET /v1/groups` |
 | `modbee-mqtt groups delete` | `Messages.DeleteGroup` | `DELETE /v1/groups/{group}?connection=` |
+| `modbee-mqtt logins backup` | `Admin.Backup` | `POST /v1/backups` |
+| `modbee-mqtt events get` | `Admin.GetEvents` | `GET /v1/events` |
+| `modbee-mqtt events set` | `Admin.PutEvents` | `PUT /v1/events` |
 | `modbee-mqtt kafka-clusters put` | `Kafka.PutCluster` | `PUT /v1/kafka-clusters/{id}` |
 | `modbee-mqtt kafka-clusters get` | `Kafka.GetCluster` | `GET /v1/kafka-clusters/{id}` |
 | `modbee-mqtt kafka-clusters list` | `Kafka.ListClusters` | `GET /v1/kafka-clusters` |

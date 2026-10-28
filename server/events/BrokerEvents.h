@@ -54,6 +54,11 @@ public:
 
     uint64_t published() const { return _published.load(); }
 
+    // On or off, live (Admin.PutEvents): off, a client's events are not
+    // made at all. On by default; serve sets it from events: enabled.
+    void enable(bool on) { _enabled.store(on, std::memory_order_relaxed); }
+    bool enabled() const { return _enabled.load(std::memory_order_relaxed); }
+
     // The document a server start becomes (exposed for tests).
     static std::string startedDocument(uint64_t timeMillis);
 
@@ -77,4 +82,5 @@ private:
     std::vector<std::unique_ptr<Shard>> _shards;
     bool _announceStart = false;            // read and cleared on shard 0's own thread
     std::atomic<uint64_t> _published{0};
+    std::atomic<bool> _enabled{true};
 };

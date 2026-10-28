@@ -152,7 +152,7 @@ struct AppGroupInfo {
 
 struct AppHubConfig {
     size_t maxQueued = 100000;                   // per group: past it, the group refuses
-    bool eventsEnabled = false;                  // events: enabled - $modbee/events/... exist
+    bool eventsEnabled = false;                  // events: enabled - $modbee/events/... exist (at start)
     std::string directory;                       // set: named groups are kept in <directory>/groups.db
     bool syncFull = false;                       // and every commit reaches the disk first
 };
@@ -170,6 +170,10 @@ class GroupStore;
 class AppHub : public ShardExtension {
 public:
     explicit AppHub(const AppHubConfig& config);
+
+    // Client events on or off, live (Admin.PutEvents): a Consume stream may
+    // ask for them only while they are on.
+    void eventsEnabled(bool on) { _eventsOn.store(on); }
     ~AppHub() override;
 
     // --- ShardExtension ---
@@ -220,6 +224,7 @@ public:
 
 private:
     AppHubConfig _config;
+    std::atomic<bool> _eventsOn{false};
     std::vector<std::unique_ptr<Shard>> _shards;
     std::unique_ptr<GroupStore> _store;          // with a directory
     uint64_t _nextStored = 1;                    // under _lock

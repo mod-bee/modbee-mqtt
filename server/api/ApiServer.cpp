@@ -952,6 +952,34 @@ public:
         listeners(reply, done);
     }
 
+    void backup(const v1::BackupRequest& request, v1::BackupReply* reply, Done done) {
+        json::Value answer;
+        grpc::Status status;
+        if (!ask("{\"command\":\"backup\"}", answer, status)) return done(status);
+        const std::string file = answer.str("file");
+        reply->set_file(file);
+        std::ifstream in(file, std::ios::binary);
+        if (!in) return done(grpc::Status(grpc::StatusCode::INTERNAL, "the backup was made but cannot be read: " + file));
+        std::stringstream bytes;
+        bytes << in.rdbuf();
+        reply->set_size(bytes.str().size());
+        if (request.contents()) reply->set_contents(bytes.str());
+        done(grpc::Status::OK);
+    }
+
+    void getEvents(v1::EventsSetting* reply, Done done) {
+        if (!_s.clientEvents) return done(grpc::Status(grpc::StatusCode::UNAVAILABLE, "this server has no client events"));
+        reply->set_enabled(_s.clientEvents());
+        done(grpc::Status::OK);
+    }
+
+    void putEvents(const v1::EventsSetting& request, v1::EventsSetting* reply, Done done) {
+        if (!_s.setClientEvents) return done(grpc::Status(grpc::StatusCode::UNAVAILABLE, "this server has no client events"));
+        _s.setClientEvents(request.enabled());
+        reply->set_enabled(_s.clientEvents());
+        done(grpc::Status::OK);
+    }
+
     void stats(v1::StatsReply* reply, Done done) {
         if (_s.server == nullptr) return done(unavailable());
         const ShardedBrokerStatus status = _s.server->status();
@@ -1559,6 +1587,8 @@ public:
         if (_connections) reply->add_features("sparkplug.structures");
         if (_aware) reply->add_features("sparkplug.aware");
         if (_kafka) reply->add_features("kafka");           // Kafka.*, live
+        if (_admin) reply->add_features("admin.backup");
+        if (_admin) reply->add_features("events.live");    // Admin.PutEvents
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1619,6 +1649,9 @@ public:
     MODBEE_ADMIN_CALL(ResetSettings, v1::SettingsChange, v1::SettingsResult,
                       _core.changeSettings("config.reset", *request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(Stats, v1::Empty, v1::StatsReply, _core.stats(reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(Backup, v1::BackupRequest, v1::BackupReply, _core.backup(*request, reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(GetEvents, v1::Empty, v1::EventsSetting, _core.getEvents(reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(PutEvents, v1::EventsSetting, v1::EventsSetting, _core.putEvents(*request, reply, MODBEE_FINISH))
 
 #undef MODBEE_FINISH
 #undef MODBEE_ADMIN_CALL
@@ -3230,6 +3263,23 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
             }
         } else if (method == "DELETE") {
             answer(made<v1::DeleteConnectionReply>(), connections.remove(name) ? grpc::Status::OK : missing);
+        }
+    } else if (collection == "backups" && method == "POST" && name.empty()) {
+        auto r = made<v1::BackupRequest>();
+        if (body.empty() || read(*r)) {
+            auto out = made<v1::BackupReply>();
+            run(r, out, [=](Done done) { core->backup(*r, out.get(), done); });
+        }
+    } else if (collection == "events" && name.empty() && (method == "GET" || method == "PUT")) {
+        if (method == "GET") {
+            auto out = made<v1::EventsSetting>();
+            run(nullptr, out, [=](Done done) { core->getEvents(out.get(), done); });
+        } else {
+            auto r = made<v1::EventsSetting>();
+            if (read(*r)) {
+                auto out = made<v1::EventsSetting>();
+                run(r, out, [=](Done done) { core->putEvents(*r, out.get(), done); });
+            }
         }
     } else if (collection == "kafka-clusters" || collection == "kafka-mappings" || collection == "kafka-status") {
         KafkaControl* kafka = self.services.kafka;

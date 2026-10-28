@@ -57,6 +57,9 @@ public:
         AuthGate* logins = nullptr;          // the login database, where logins are kept here
         ShardedBroker* server = nullptr;     // its listeners, TLS and status
         KafkaControl* kafka = nullptr;       // the kafka: section, changed live
+        // Client events, on or off while it runs (server/events/BrokerEvents.h).
+        std::function<bool()> clientEvents;
+        std::function<void(bool)> setClientEvents;
         // Sparkplug Aware, read and changed while it runs (server/events/SparkplugAware.h).
         std::function<bool()> sparkplugAware;
         std::function<void(bool)> setSparkplugAware;

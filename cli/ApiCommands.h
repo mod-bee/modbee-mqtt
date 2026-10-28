@@ -58,6 +58,10 @@ static const ApiCommand kApiCommands[] = {
     {"groups", "list", "Messages.ListGroups", "GET /v1/groups"},
     {"groups", "delete", "Messages.DeleteGroup", "DELETE /v1/groups/{group}?connection="},
 
+    {"logins", "backup", "Admin.Backup", "POST /v1/backups"},
+    {"events", "get", "Admin.GetEvents", "GET /v1/events"},
+    {"events", "set", "Admin.PutEvents", "PUT /v1/events"},
+
     {"kafka-clusters", "put", "Kafka.PutCluster", "PUT /v1/kafka-clusters/{id}"},
     {"kafka-clusters", "get", "Kafka.GetCluster", "GET /v1/kafka-clusters/{id}"},
     {"kafka-clusters", "list", "Kafka.ListClusters", "GET /v1/kafka-clusters"},

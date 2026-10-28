@@ -28,6 +28,12 @@ when it is on:
 modbee-mqtt serve: client events published on $modbee/events/...
 ```
 
+**Turned on and off while it runs** with `modbee-mqtt events set --enabled`
+(and `events set` alone, off), or the Application API's `Admin.PutEvents`.
+That is not kept - the next start goes by the file and `--events` - so a
+lasting change is the file, the flag, or the stored setting
+(`modbee-mqtt config set events.enabled=true`). Off, no event is made at all.
+
 ---
 
 ## The messages

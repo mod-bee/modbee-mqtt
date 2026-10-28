@@ -131,7 +131,7 @@ struct AppHub::Shard {
     }
 };
 
-AppHub::AppHub(const AppHubConfig& config) : _config(config) {}
+AppHub::AppHub(const AppHubConfig& config) : _config(config), _eventsOn(config.eventsEnabled) {}
 
 AppHub::~AppHub() {
     {
@@ -417,7 +417,7 @@ AppHub::Member* AppHub::open(const AppConsumeOptions& options, AppConsumer* cons
             return nullptr;
         }
     }
-    if (options.events && !_config.eventsEnabled) {
+    if (options.events && !_eventsOn.load()) {
         error = "client events are off on this server (events: enabled)";
         return nullptr;
     }
