@@ -146,7 +146,12 @@ std::chrono::milliseconds jittered(uint32_t base) {
     return std::chrono::milliseconds(least + random() % (base - least + 1));
 }
 
-const uint32_t kPacketBytes = 65536;       // a connection's buffers: the largest packet either way
+// A connection's buffers: the largest packet either way. Megabytes, because a
+// Sparkplug birth of thousands of metrics is (one of 1500 is 123 kB): at 64 kB
+// the server's host never received such a birth and asked for it again for
+// ever. Held only while a large packet needs it (kPacketStartBytes).
+const uint32_t kPacketBytes = 16777216;
+const uint32_t kPacketStartBytes = 65536;
 const uint32_t kLinkPacketBytes = 1114112;  // a Kafka link's: Kafka's 1 MiB record, and the packet around it
 const uint32_t kBackoffMaxMs = 60000;      // the library's reconnectMaximumMs
 const uint32_t kStableMs = 30000;          // MQ_RECONNECT_STABLE_MS
@@ -960,6 +965,7 @@ void AppConnections::open(Connection& c) {
     behaviour.queueCapacity = 256;       // room for store and forward's window as well
     behaviour.receiveBufferSize = buffer;
     behaviour.transmitBufferSize = buffer;
+    behaviour.initialBufferSize = c.spec.kafka ? 0 : kPacketStartBytes;
     c.client.begin(*c.transport, connection, behaviour);
     c.client.onMessage(&Connection::received, &c);
     c.client.onSessionEstablished(&Connection::established, &c);

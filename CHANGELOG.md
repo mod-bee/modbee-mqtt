@@ -178,6 +178,10 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **A connection took packets of at most 64 KiB, so the server's Sparkplug host never received a large birth.** A
+  1500-metric NBIRTH (123 kB) was dropped by the other broker for this connection, and the host asked for it again for
+  ever. Connections now take up to 16 MiB (`maximum_packet_size` lowers it), with buffers that start at 64 KiB and
+  grow only while a large packet needs them.
 - **Sparkplug node: a birth larger than the server takes no longer counts as a birth.** At MQTT 5.0 the server states
   its Maximum Packet Size; a larger NBIRTH was queued, dropped by the client, and the node counted itself born and sent
   data no host could name while every host asked for the birth again. It is refused now: the node stays unborn,
