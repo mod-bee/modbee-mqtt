@@ -55,8 +55,8 @@
 
 // A board's text fields (MQTT_LEAN, MqttFixed.h). Ids are already at most
 // MQ_SP_MAX_ID everywhere. A metric name longer than its field is refused at
-// declare(); units and text values are cut to theirs - a text value comes from
-// a PLC STRING, 126 characters unless declared longer.
+// declare(); units are cut to theirs. A metric's VALUE is not held in one of
+// these: text, an array or a template is as long as it is (MqttSparkplugBytes).
 #if MQTT_LEAN
     #ifndef MQ_SP_POINT_NAME
     #define MQ_SP_POINT_NAME 96
@@ -66,9 +66,6 @@
     #endif
     #ifndef MQ_SP_POINT_DESCRIPTION
     #define MQ_SP_POINT_DESCRIPTION 64
-    #endif
-    #ifndef MQ_SP_POINT_TEXT
-    #define MQ_SP_POINT_TEXT 126
     #endif
     #ifndef MQ_SP_WILL_BYTES
     #define MQ_SP_WILL_BYTES 64       // the NDEATH: one bdSeq metric
@@ -151,25 +148,24 @@ typedef void (*MqttSparkplugCommandContextFn)(void* context,
 // pointer.
 //
 // ONE BLOCK, in PSRAM where the board has some (mq_allocLarge): the values,
-// and beside them, for a TEXT metric only, the text each one owns - a decoded
-// STRING or BYTES value is a span into the receive buffer, which the next
-// packet overwrites, so a value kept past the message it came in cannot be
-// one. A number's slots carry no text. They each carried 127 characters, four
-// to every writable metric whatever its type, and as four small allocations
-// they went to a board's internal RAM first.
+// and beside them, for a SPAN metric only (text, bytes, an array, a dataset,
+// a template), the bytes each one owns - a decoded one is a span into the
+// receive buffer, which the next packet overwrites, so a value kept past the
+// message it came in cannot be one. A number's slots carry none.
 struct MqttSparkplugWriteQueue {
     MqttSparkplugValue* values = nullptr;          // `depth` of them
-    MQ_STRING(MQ_SP_POINT_TEXT)* texts = nullptr;  // a text metric's; else null
+    MqttSparkplugBytes* texts = nullptr;           // a span metric's; else null
     uint8_t depth = 0;
     uint8_t head = 0;
     uint8_t count = 0;
 };
 
-// --- What a text metric owns ---
+// --- What a span metric owns ---
 //
-// A STRING, TEXT, UUID, BYTES or FILE metric, and only one of those: made when
-// it is declared, in PSRAM where the board has some. A number used to carry
-// these two 127-character buffers too, empty, for ever.
+// A STRING, TEXT, UUID, BYTES, FILE, array, DataSet or Template metric, and
+// only one of those: made when it is declared, in PSRAM where the board has
+// some. Each copy is as long as the value it holds - it was a 127-character
+// field on a board, which cut a longer value.
 struct MqttSparkplugPointText {
     // The value: a span, as MqttSparkplugValue's - into the application's
     // buffer (a PLC STRING), or into `command`.
@@ -180,11 +176,11 @@ struct MqttSparkplugPointText {
     // the application's buffer, and a span kept as "what was last published"
     // moved with that buffer: the comparison was the buffer with itself, and
     // a change that kept the length was never reported.
-    MQ_STRING(MQ_SP_POINT_TEXT) published;
+    MqttSparkplugBytes published;
 
     // Owns the text of the value last written (or taken), so the value never
     // points into a receive buffer that has since been reused.
-    MQ_STRING(MQ_SP_POINT_TEXT) command;
+    MqttSparkplugBytes command;
 };
 
 // --- One declared metric ---
@@ -423,6 +419,24 @@ public:
     // has a Sparkplug datatype, so a STRUCT member's declared IEC type is
     // enough and nothing is inferred from a first sample.
     uint64_t declareTyped(const char* name, MqttValueType type);
+
+    // --- Templates: a PLC's STRUCT or UDT as one metric ---
+    //
+    // A DEFINITION is the type, declared once and published in every NBIRTH
+    // ([tck-id-topics-nbirth-templates], and only there,
+    // [tck-id-payloads-template-definition-nbirth-only]); `definition` is the
+    // encoded Payload.Template (mq_sparkplugEncodeTemplate) with
+    // is_definition true and no template_ref. Copied. A metric declared with
+    // datatype Template is then an INSTANCE: each value set on it must be an
+    // instance (is_definition false) whose template_ref names a definition
+    // declared here, or it is refused (TemplateReference) - so the far end
+    // never meets an instance of a type the birth did not describe
+    // [tck-id-payloads-template-definition-nbirth]. Returns the alias (or 1
+    // with aliases off), 0 when refused: not a definition, a name a
+    // definition or node metric already has, out of memory.
+    uint64_t declareTemplate(const char* name, const uint8_t* definition,
+                             size_t length);
+    size_t templateCount() const { return _templateCount; }
 
     size_t pointCount() const { return _pointCount; }
     const MqttSparkplugPoint* pointAt(size_t index) const;
@@ -771,7 +785,8 @@ private:
     static constexpr uint16_t kListed = 1u << 6;
     // A deadband is set: only then is the cold record read for it.
     static constexpr uint16_t kDeadband = 1u << 7;
-    // A text metric: its value is in its MqttSparkplugPointText.
+    // A span metric (text, bytes, array, dataset, template): its value is in
+    // its MqttSparkplugPointText.
     static constexpr uint16_t kText = 1u << 8;
 
     // THE METRICS THAT MAY HAVE TO GO, one list a slot - the node's own, and
@@ -993,6 +1008,19 @@ private:
     uint64_t _nextAlias = 1;
 
     MqttGrowList<Device> _devices;
+
+    // The template definitions, published in the NBIRTH after the node's
+    // metrics. Few, and read only at a birth or when an instance is set.
+    struct TemplateDefinition {
+        MQ_STRING(MQ_SP_POINT_NAME) name;
+        MqttSparkplugBytes bytes;
+        uint64_t alias = 0;
+    };
+    MqttGrowList<TemplateDefinition> _templates;
+    size_t _templateCount = 0;
+    int findTemplate(const uint8_t* name, size_t length) const;
+    // Not a Template, or an instance of a definition declared here.
+    bool knownInstance(const MqttSparkplugValue& value) const;
     bool _outOfMemory = false;
     size_t _deviceCount = 0;
 

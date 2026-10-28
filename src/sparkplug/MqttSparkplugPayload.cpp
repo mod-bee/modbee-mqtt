@@ -225,17 +225,12 @@ bool isSignedType(MqttSparkplugDataType type) {
 
 // --- Property sizing and writing ---
 
-size_t propertyValueBodySize(const MqttSparkplugProperty& property,
-                             MqttSparkplugError& error) {
+// The value fields alone. PropertyValue and Template.Parameter number them
+// the same, 3 to 8, so one sizer and one writer serve both; a nested
+// PropertySet or PropertySetList (fields 9 and 10) only a PropertyValue has.
+size_t propertyScalarSize(const MqttSparkplugProperty& property,
+                          MqttSparkplugError& error) {
     size_t total = 0;
-    total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_TYPE) +
-             mq_pbVarintSize((uint64_t)property.type);
-
-    if (property.isNull) {
-        total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_IS_NULL) + 1;
-        return total;
-    }
-
     switch (property.type) {
         case MqttSparkplugDataType::Int8:
         case MqttSparkplugDataType::Int16:
@@ -273,6 +268,16 @@ size_t propertyValueBodySize(const MqttSparkplugProperty& property,
                      mq_pbVarintSize(property.as.text.length) +
                      property.as.text.length;
             break;
+        case MqttSparkplugDataType::PropertySet:
+            total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_PROPERTYSET) +
+                     mq_pbVarintSize(property.as.text.length) +
+                     property.as.text.length;
+            break;
+        case MqttSparkplugDataType::PropertySetList:
+            total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_PROPERTYSETS) +
+                     mq_pbVarintSize(property.as.text.length) +
+                     property.as.text.length;
+            break;
         default:
             error = MqttSparkplugError::DataTypeNotSupported;
             return 0;
@@ -280,17 +285,23 @@ size_t propertyValueBodySize(const MqttSparkplugProperty& property,
     return total;
 }
 
-void writePropertyValue(PbWriter& writer,
-                        const MqttSparkplugProperty& property) {
-    writer.tag(MQ_SP_F_PROPERTYVALUE_TYPE, MQ_PB_VARINT);
-    writer.varint((uint64_t)property.type);
+size_t propertyValueBodySize(const MqttSparkplugProperty& property,
+                             MqttSparkplugError& error) {
+    size_t total = 0;
+    total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_TYPE) +
+             mq_pbVarintSize((uint64_t)property.type);
 
     if (property.isNull) {
-        writer.tag(MQ_SP_F_PROPERTYVALUE_IS_NULL, MQ_PB_VARINT);
-        writer.varint(1);
-        return;
+        total += mq_pbTagSize(MQ_SP_F_PROPERTYVALUE_IS_NULL) + 1;
+        return total;
     }
+    const size_t scalar = propertyScalarSize(property, error);
+    if (error != MqttSparkplugError::None) return 0;
+    return total + scalar;
+}
 
+void writePropertyScalar(PbWriter& writer,
+                         const MqttSparkplugProperty& property) {
     switch (property.type) {
         case MqttSparkplugDataType::Int8:
         case MqttSparkplugDataType::Int16:
@@ -330,18 +341,39 @@ void writePropertyValue(PbWriter& writer,
             writer.tag(MQ_SP_F_PROPERTYVALUE_STRING, MQ_PB_LENGTH);
             writer.bytes(property.as.text.data, property.as.text.length);
             break;
+        case MqttSparkplugDataType::PropertySet:
+            writer.tag(MQ_SP_F_PROPERTYVALUE_PROPERTYSET, MQ_PB_LENGTH);
+            writer.bytes(property.as.text.data, property.as.text.length);
+            break;
+        case MqttSparkplugDataType::PropertySetList:
+            writer.tag(MQ_SP_F_PROPERTYVALUE_PROPERTYSETS, MQ_PB_LENGTH);
+            writer.bytes(property.as.text.data, property.as.text.length);
+            break;
         default:
             break;
     }
 }
 
+void writePropertyValue(PbWriter& writer,
+                        const MqttSparkplugProperty& property) {
+    writer.tag(MQ_SP_F_PROPERTYVALUE_TYPE, MQ_PB_VARINT);
+    writer.varint((uint64_t)property.type);
+
+    if (property.isNull) {
+        writer.tag(MQ_SP_F_PROPERTYVALUE_IS_NULL, MQ_PB_VARINT);
+        writer.varint(1);
+        return;
+    }
+    writePropertyScalar(writer, property);
+}
+
 // The PropertySet wrapping a metric's properties. Two parallel repeated
 // fields, keys then values, index-matched.
-size_t propertySetBodySize(const MqttSparkplugMetric& metric,
-                           MqttSparkplugError& error) {
+size_t propertySetBodySize(const MqttSparkplugProperty* properties,
+                           size_t count, MqttSparkplugError& error) {
     size_t total = 0;
-    for (size_t index = 0; index < metric.propertyCount; index++) {
-        const MqttSparkplugProperty& property = metric.properties[index];
+    for (size_t index = 0; index < count; index++) {
+        const MqttSparkplugProperty& property = properties[index];
         const size_t keyLength = property.key ? strlen(property.key) : 0;
         total += mq_pbTagSize(MQ_SP_F_PROPERTYSET_KEYS) +
                  mq_pbVarintSize(keyLength) + keyLength;
@@ -354,12 +386,18 @@ size_t propertySetBodySize(const MqttSparkplugMetric& metric,
     return total;
 }
 
-void writePropertySet(PbWriter& writer, const MqttSparkplugMetric& metric) {
-    for (size_t index = 0; index < metric.propertyCount; index++) {
-        const MqttSparkplugProperty& property = metric.properties[index];
+// Every key, then every value: field order, as every generated encoder writes
+// a message's repeated fields - so the bytes compare equal with theirs. (They
+// were interleaved, key and value; just as valid, and caught only when a
+// PropertySet was compared byte for byte against Eclipse Tahu's.)
+void writePropertySet(PbWriter& writer, const MqttSparkplugProperty* properties,
+                      size_t count) {
+    for (size_t index = 0; index < count; index++) {
         writer.tag(MQ_SP_F_PROPERTYSET_KEYS, MQ_PB_LENGTH);
-        writer.text(property.key);
-
+        writer.text(properties[index].key);
+    }
+    for (size_t index = 0; index < count; index++) {
+        const MqttSparkplugProperty& property = properties[index];
         MqttSparkplugError ignored = MqttSparkplugError::None;
         const size_t valueBody = propertyValueBodySize(property, ignored);
         writer.tag(MQ_SP_F_PROPERTYSET_VALUES, MQ_PB_LENGTH);
@@ -465,23 +503,24 @@ size_t metricBodySize(const MqttSparkplugMetric& metric,
             case MqttSparkplugDataType::Boolean:
                 total += mq_pbTagSize(field) + 1;
                 break;
-            case MqttSparkplugDataType::String:
-            case MqttSparkplugDataType::Text:
-            case MqttSparkplugDataType::UUID:
-            case MqttSparkplugDataType::Bytes:
-            case MqttSparkplugDataType::File:
+            default:
+                // Text, bytes, an array, a dataset, a template: a span, as
+                // its own bytes - a DataSet's or Template's are the encoded
+                // nested message, written as it is.
+                if (!metric.value.isSpan()) {
+                    error = MqttSparkplugError::DataTypeNotSupported;
+                    return 0;
+                }
                 total += mq_pbTagSize(field) +
                          mq_pbVarintSize(metric.value.as.bytes.length) +
                          metric.value.as.bytes.length;
                 break;
-            default:
-                error = MqttSparkplugError::DataTypeNotSupported;
-                return 0;
         }
     }
 
     if (metric.propertyCount > 0) {
-        const size_t setBody = propertySetBodySize(metric, error);
+        const size_t setBody =
+            propertySetBodySize(metric.properties, metric.propertyCount, error);
         if (error != MqttSparkplugError::None) return 0;
         total += mq_pbTagSize(MQ_SP_F_METRIC_PROPERTIES) +
                  mq_pbVarintSize(setBody) + setBody;
@@ -526,10 +565,11 @@ void writeMetric(PbWriter& writer, const MqttSparkplugMetric& metric,
 
     if (metric.propertyCount > 0) {
         MqttSparkplugError ignored = MqttSparkplugError::None;
-        const size_t setBody = propertySetBodySize(metric, ignored);
+        const size_t setBody =
+            propertySetBodySize(metric.properties, metric.propertyCount, ignored);
         writer.tag(MQ_SP_F_METRIC_PROPERTIES, MQ_PB_LENGTH);
         writer.varint(setBody);
-        writePropertySet(writer, metric);
+        writePropertySet(writer, metric.properties, metric.propertyCount);
     }
 
     if (metric.value.isNull) return;
@@ -568,16 +608,11 @@ void writeMetric(PbWriter& writer, const MqttSparkplugMetric& metric,
             writer.tag(field, MQ_PB_VARINT);
             writer.varint(metric.value.as.boolean ? 1 : 0);
             break;
-        case MqttSparkplugDataType::String:
-        case MqttSparkplugDataType::Text:
-        case MqttSparkplugDataType::UUID:
-        case MqttSparkplugDataType::Bytes:
-        case MqttSparkplugDataType::File:
+        default:
+            if (!metric.value.isSpan()) break;
             writer.tag(field, MQ_PB_LENGTH);
             writer.bytes(metric.value.as.bytes.data,
                          metric.value.as.bytes.length);
-            break;
-        default:
             break;
     }
 }
@@ -711,9 +746,14 @@ bool readTag(PbReader& reader, uint32_t& field, uint32_t& wireType) {
     return true;
 }
 
+// A Template.Parameter too, when `parameterNames` is given: its fields 1 and 2
+// are the name (interned there) and the type, where a PropertyValue's are the
+// type and is_null; the value fields, 3 to 8, are the same. A parameter with
+// no value is null.
 bool decodePropertyValue(const uint8_t* body, size_t bodyLength,
                          MqttSparkplugProperty& out,
-                         MqttSparkplugError& error) {
+                         MqttSparkplugError& error,
+                         MqttSparkplugPayload* parameterNames = nullptr) {
     // THE FIELD THAT ARRIVED IS HELD RAW, AND INTERPRETED BY THE DECLARED TYPE
     // ONCE BOTH ARE KNOWN - exactly as decodeMetric() does, and for the same
     // reason. This used to write whichever union member the wire field named,
@@ -734,12 +774,35 @@ bool decodePropertyValue(const uint8_t* body, size_t bodyLength,
     const uint8_t* rawText = nullptr;
     size_t rawTextLength = 0;
     bool sawText = false;
+    const uint8_t* rawSet = nullptr;
+    size_t rawSetLength = 0;
+    bool sawSet = false;
 
     PbReader reader(body, bodyLength);
     while (reader.ok() && !reader.atEnd()) {
         uint32_t field = 0;
         uint32_t wireType = 0;
         if (!readTag(reader, field, wireType)) break;
+
+        if (parameterNames != nullptr && field == MQ_SP_F_PARAMETER_NAME) {
+            const uint8_t* name = nullptr;
+            size_t nameLength = 0;
+            if (wireType != MQ_PB_LENGTH) {
+                reader.fail(MqttSparkplugError::WireTypeMismatch);
+            } else if (reader.lengthDelimited(name, nameLength)) {
+                out.key = parameterNames->intern(name, nameLength);
+                if (out.key == nullptr) reader.fail(MqttSparkplugError::TooManyMetrics);
+            }
+            continue;
+        }
+        if (parameterNames != nullptr && field == MQ_SP_F_PARAMETER_TYPE) {
+            if (wireType != MQ_PB_VARINT) {
+                reader.fail(MqttSparkplugError::WireTypeMismatch);
+            } else {
+                out.type = (MqttSparkplugDataType)(uint32_t)reader.varint();
+            }
+            continue;
+        }
 
         switch (field) {
             case MQ_SP_F_PROPERTYVALUE_TYPE:
@@ -802,6 +865,17 @@ bool decodePropertyValue(const uint8_t* body, size_t bodyLength,
                 sawText = true;
                 break;
             }
+            case MQ_SP_F_PROPERTYVALUE_PROPERTYSET:
+            case MQ_SP_F_PROPERTYVALUE_PROPERTYSETS:
+                // The nested set (or list of sets) as its bytes, as a
+                // template's: mq_sparkplugDecodePropertySet reads it.
+                if (wireType != MQ_PB_LENGTH) {
+                    reader.fail(MqttSparkplugError::WireTypeMismatch);
+                    break;
+                }
+                if (!reader.lengthDelimited(rawSet, rawSetLength)) break;
+                sawSet = true;
+                break;
             default:
                 reader.skip(wireType);
                 break;
@@ -811,6 +885,11 @@ bool decodePropertyValue(const uint8_t* body, size_t bodyLength,
     if (!reader.ok()) {
         error = reader.error;
         return false;
+    }
+
+    if (parameterNames != nullptr && !sawVarint && !sawBoolean && !sawFixed32 &&
+        !sawFixed64 && !sawText) {
+        out.isNull = true;
     }
 
     // A field that does not belong to the declared type is ignored, and the
@@ -855,10 +934,78 @@ bool decodePropertyValue(const uint8_t* body, size_t bodyLength,
                     out.as.text.length = 0;
                 }
                 break;
+            case MqttSparkplugDataType::PropertySet:
+            case MqttSparkplugDataType::PropertySetList:
+                out.as.text.data = sawSet ? rawSet : nullptr;
+                out.as.text.length = sawSet ? (uint32_t)rawSetLength : 0;
+                break;
             default:
                 break;
         }
     }
+    return true;
+}
+
+// A PropertySet: two parallel repeated fields, keys then values, matched by
+// index. They are read in one pass and paired as they arrive, which assumes an
+// encoder emits them interleaved or keys-then-values consistently - both of
+// which index-match correctly because each is counted separately. Keys are
+// interned into `owner`.
+bool decodePropertySet(const uint8_t* setBody, size_t setLength,
+                       MqttSparkplugProperty* properties, size_t capacity,
+                       size_t& count, MqttSparkplugPayload& owner,
+                       MqttSparkplugError& error) {
+    count = 0;
+    PbReader setReader(setBody, setLength);
+    size_t keyCount = 0;
+    size_t valueCount = 0;
+    while (setReader.ok() && !setReader.atEnd()) {
+        uint32_t setField = 0;
+        uint32_t setWire = 0;
+        if (!readTag(setReader, setField, setWire)) break;
+        if (setField == MQ_SP_F_PROPERTYSET_KEYS &&
+            setWire == MQ_PB_LENGTH) {
+            const uint8_t* key = nullptr;
+            size_t keyLength = 0;
+            if (!setReader.lengthDelimited(key, keyLength)) break;
+            if (keyCount >= capacity) {
+                setReader.fail(MqttSparkplugError::TooManyMetrics);
+                break;
+            }
+            properties[keyCount].key = owner.intern(key, keyLength);
+            if (properties[keyCount].key == nullptr) {
+                setReader.fail(MqttSparkplugError::TooManyMetrics);
+                break;
+            }
+            keyCount++;
+        } else if (setField == MQ_SP_F_PROPERTYSET_VALUES &&
+                   setWire == MQ_PB_LENGTH) {
+            const uint8_t* valueBody = nullptr;
+            size_t valueLength = 0;
+            if (!setReader.lengthDelimited(valueBody, valueLength)) break;
+            if (valueCount >= capacity) {
+                setReader.fail(MqttSparkplugError::TooManyMetrics);
+                break;
+            }
+            MqttSparkplugError valueError = MqttSparkplugError::None;
+            if (!decodePropertyValue(valueBody, valueLength,
+                                     properties[valueCount], valueError)) {
+                setReader.fail(valueError);
+                break;
+            }
+            valueCount++;
+        } else {
+            setReader.skip(setWire);
+        }
+    }
+    if (!setReader.ok()) {
+        error = setReader.error;
+        return false;
+    }
+    // A PropertySet with a different number of keys and values is
+    // malformed. Taking the smaller would silently mis-pair every
+    // property after the mismatch.
+    count = keyCount < valueCount ? keyCount : valueCount;
     return true;
 }
 
@@ -906,7 +1053,14 @@ bool mq_sparkplugApplyDatatype(MqttSparkplugMetric& metric, MqttSparkplugDataTyp
         case MqttSparkplugDataType::File:
             fits = arrived == MqttSparkplugDataType::Bytes;
             break;
+        case MqttSparkplugDataType::DataSet:
+        case MqttSparkplugDataType::Template:
+            // Their own fields, so the provisional type is already theirs.
+            fits = arrived == declared;
+            break;
         default:
+            fits = mq_sparkplugIsArrayType(declared) &&
+                   arrived == MqttSparkplugDataType::Bytes;
             break;
     }
     if (!fits) {
@@ -942,8 +1096,13 @@ uint32_t mq_sparkplugValueField(MqttSparkplugDataType type) {
         case MqttSparkplugDataType::Bytes:
         case MqttSparkplugDataType::File:
             return MQ_SP_F_METRIC_BYTES;
+        case MqttSparkplugDataType::DataSet:
+            return MQ_SP_F_METRIC_DATASET;
+        case MqttSparkplugDataType::Template:
+            return MQ_SP_F_METRIC_TEMPLATE;
         default:
-            return 0;
+            // Section 6.4.17: every array travels in bytes_value.
+            return mq_sparkplugIsArrayType(type) ? MQ_SP_F_METRIC_BYTES : 0;
     }
 }
 
@@ -1332,6 +1491,11 @@ bool decodeMetric(const uint8_t* body, size_t bodyLength,
     bool sawBytes = false;
     bool sawBoolean = false;
     bool sawDatatype = false;
+    // A DataSet's or Template's nested message, kept as its bytes.
+    const uint8_t* rawNested = nullptr;
+    size_t rawNestedLength = 0;
+    bool sawDataSet = false;
+    bool sawTemplate = false;
 
     while (reader.ok() && !reader.atEnd()) {
         uint32_t field = 0;
@@ -1407,63 +1571,12 @@ bool decodeMetric(const uint8_t* body, size_t bodyLength,
                 size_t setLength = 0;
                 if (!reader.lengthDelimited(setBody, setLength)) break;
 
-                // PropertySet is two parallel repeated fields, keys then
-                // values, matched by index. They are read in one pass and
-                // paired as they arrive, which assumes an encoder emits them
-                // interleaved or keys-then-values consistently - both of which
-                // index-match correctly because each is counted separately.
-                PbReader setReader(setBody, setLength);
-                size_t keyCount = 0;
-                size_t valueCount = 0;
-                while (setReader.ok() && !setReader.atEnd()) {
-                    uint32_t setField = 0;
-                    uint32_t setWire = 0;
-                    if (!readTag(setReader, setField, setWire)) break;
-                    if (setField == MQ_SP_F_PROPERTYSET_KEYS &&
-                        setWire == MQ_PB_LENGTH) {
-                        const uint8_t* key = nullptr;
-                        size_t keyLength = 0;
-                        if (!setReader.lengthDelimited(key, keyLength)) break;
-                        if (keyCount >= MQ_SP_MAX_PROPERTIES) {
-                            setReader.fail(MqttSparkplugError::TooManyMetrics);
-                            break;
-                        }
-                        out.properties[keyCount].key =
-                            owner.intern(key, keyLength);
-                        if (out.properties[keyCount].key == nullptr) {
-                            setReader.fail(MqttSparkplugError::TooManyMetrics);
-                            break;
-                        }
-                        keyCount++;
-                    } else if (setField == MQ_SP_F_PROPERTYSET_VALUES &&
-                               setWire == MQ_PB_LENGTH) {
-                        const uint8_t* valueBody = nullptr;
-                        size_t valueLength = 0;
-                        if (!setReader.lengthDelimited(valueBody, valueLength)) break;
-                        if (valueCount >= MQ_SP_MAX_PROPERTIES) {
-                            setReader.fail(MqttSparkplugError::TooManyMetrics);
-                            break;
-                        }
-                        MqttSparkplugError valueError = MqttSparkplugError::None;
-                        if (!decodePropertyValue(valueBody, valueLength,
-                                                 out.properties[valueCount],
-                                                 valueError)) {
-                            setReader.fail(valueError);
-                            break;
-                        }
-                        valueCount++;
-                    } else {
-                        setReader.skip(setWire);
-                    }
+                MqttSparkplugError setError = MqttSparkplugError::None;
+                if (!decodePropertySet(setBody, setLength, out.properties,
+                                       MQ_SP_MAX_PROPERTIES, out.propertyCount,
+                                       owner, setError)) {
+                    reader.fail(setError);
                 }
-                if (!setReader.ok()) {
-                    reader.fail(setReader.error);
-                    break;
-                }
-                // A PropertySet with a different number of keys and values is
-                // malformed. Taking the smaller would silently mis-pair every
-                // property after the mismatch.
-                out.propertyCount = keyCount < valueCount ? keyCount : valueCount;
                 break;
             }
             case MQ_SP_F_METRIC_INT:
@@ -1514,14 +1627,18 @@ bool decodeMetric(const uint8_t* body, size_t bodyLength,
                 break;
             }
             case MQ_SP_F_METRIC_DATASET:
-            case MQ_SP_F_METRIC_TEMPLATE:
-                // Present in the schema, not carried by this build. Skipped,
-                // and the metric marked below - valueUnsupported, and NULL,
-                // never a zero. A value that silently read as zero is the
-                // fault that survives commissioning; a metric marked as having
-                // no value this library can show is not that fault.
-                reader.skip(wireType);
+            case MQ_SP_F_METRIC_TEMPLATE: {
+                // The nested message, as its bytes: read it with
+                // MqttSparkplugDataSetReader or mq_sparkplugDecodeTemplate.
+                if (wireType != MQ_PB_LENGTH) {
+                    reader.fail(MqttSparkplugError::WireTypeMismatch);
+                    break;
+                }
+                if (!reader.lengthDelimited(rawNested, rawNestedLength)) break;
+                sawDataSet = field == MQ_SP_F_METRIC_DATASET;
+                sawTemplate = field == MQ_SP_F_METRIC_TEMPLATE;
                 break;
+            }
             default:
                 reader.skip(wireType);
                 break;
@@ -1542,6 +1659,8 @@ bool decodeMetric(const uint8_t* body, size_t bodyLength,
                        : sawFixed32 ? MqttSparkplugDataType::Float
                        : sawFixed64 ? MqttSparkplugDataType::Double
                        : sawBytes ? MqttSparkplugDataType::Bytes
+                       : sawDataSet ? MqttSparkplugDataType::DataSet
+                       : sawTemplate ? MqttSparkplugDataType::Template
                        : MqttSparkplugDataType::Unknown;
         if (out.value.type == MqttSparkplugDataType::Unknown) out.value.isNull = true;
     }
@@ -1586,9 +1705,25 @@ bool decodeMetric(const uint8_t* body, size_t bodyLength,
                 out.value.as.bytes.data = rawBytes;
                 out.value.as.bytes.length = (uint32_t)rawBytesLength;
                 break;
+            case MqttSparkplugDataType::DataSet:
+                if (!sawDataSet) break;
+                out.value.as.bytes.data = rawNested;
+                out.value.as.bytes.length = (uint32_t)rawNestedLength;
+                break;
+            case MqttSparkplugDataType::Template:
+                if (!sawTemplate) break;
+                out.value.as.bytes.data = rawNested;
+                out.value.as.bytes.length = (uint32_t)rawNestedLength;
+                break;
             default:
-                // A datatype outside what this build carries. The metric parsed
-                // cleanly and cannot be represented: kept, without a value.
+                if (mq_sparkplugIsArrayType(out.value.type)) {
+                    if (!sawBytes) break;
+                    out.value.as.bytes.data = rawBytes;
+                    out.value.as.bytes.length = (uint32_t)rawBytesLength;
+                    break;
+                }
+                // Unknown, or a property's type (PropertySet): no metric can
+                // carry it. The metric parsed cleanly: kept, without a value.
                 out.valueUnsupported = true;
                 out.value.isNull = true;
                 out.value.as.unsignedValue = 0;
@@ -1833,4 +1968,795 @@ size_t mq_sparkplugWriteState(char* out, size_t capacity, bool online,
     out[cursor++] = '}';
     out[cursor] = '\0';
     return cursor;
+}
+
+// =============================================================================
+// TEMPLATES, DATASETS, AND PROPERTY SETS AS VALUES
+// =============================================================================
+
+namespace {
+
+// The specification's "basic types": what a DataSet column and a Template
+// parameter may be.
+bool isBasicType(MqttSparkplugDataType type) {
+    switch (type) {
+        case MqttSparkplugDataType::Int8:
+        case MqttSparkplugDataType::Int16:
+        case MqttSparkplugDataType::Int32:
+        case MqttSparkplugDataType::Int64:
+        case MqttSparkplugDataType::UInt8:
+        case MqttSparkplugDataType::UInt16:
+        case MqttSparkplugDataType::UInt32:
+        case MqttSparkplugDataType::UInt64:
+        case MqttSparkplugDataType::Float:
+        case MqttSparkplugDataType::Double:
+        case MqttSparkplugDataType::Boolean:
+        case MqttSparkplugDataType::String:
+        case MqttSparkplugDataType::DateTime:
+        case MqttSparkplugDataType::Text:
+            return true;
+        default:
+            return false;
+    }
+}
+
+size_t textFieldSize(uint32_t field, const char* text) {
+    const size_t length = text ? strlen(text) : 0;
+    return mq_pbTagSize(field) + mq_pbVarintSize(length) + length;
+}
+
+// --- Template ---
+
+size_t parameterBodySize(const MqttSparkplugProperty& parameter,
+                         MqttSparkplugError& error) {
+    // [tck-id-payloads-template-parameter-name-required]
+    if (parameter.key == nullptr) {
+        error = MqttSparkplugError::InvalidName;
+        return 0;
+    }
+    // [tck-id-payloads-template-parameter-type-value]
+    if (!isBasicType(parameter.type)) {
+        error = MqttSparkplugError::DataTypeNotSupported;
+        return 0;
+    }
+    size_t total = textFieldSize(MQ_SP_F_PARAMETER_NAME, parameter.key) +
+                   mq_pbTagSize(MQ_SP_F_PARAMETER_TYPE) +
+                   mq_pbVarintSize((uint64_t)parameter.type);
+    if (!parameter.isNull) {
+        const size_t scalar = propertyScalarSize(parameter, error);
+        if (error != MqttSparkplugError::None) return 0;
+        total += scalar;
+    }
+    return total;
+}
+
+size_t templateBodySize(const MqttSparkplugTemplate& value,
+                        MqttSparkplugError& error) {
+    if (value.isDefinition == (value.templateRef != nullptr)) {
+        error = MqttSparkplugError::TemplateReference;
+        return 0;
+    }
+    size_t total = 0;
+    if (value.version != nullptr) {
+        total += textFieldSize(MQ_SP_F_TEMPLATE_VERSION, value.version);
+    }
+    for (size_t index = 0; index < value.members.metricCount; index++) {
+        const MqttSparkplugMetric& member = value.members.metrics[index];
+        if (member.name == nullptr) {
+            error = MqttSparkplugError::InvalidName;
+            return 0;
+        }
+        const size_t body = metricBodySize(member, MqttSparkplugType::NBirth, error);
+        if (error != MqttSparkplugError::None) return 0;
+        total += mq_pbTagSize(MQ_SP_F_TEMPLATE_METRICS) + mq_pbVarintSize(body) + body;
+    }
+    for (size_t index = 0; index < value.parameterCount; index++) {
+        const size_t body = parameterBodySize(value.parameters[index], error);
+        if (error != MqttSparkplugError::None) return 0;
+        total += mq_pbTagSize(MQ_SP_F_TEMPLATE_PARAMETERS) + mq_pbVarintSize(body) + body;
+    }
+    if (value.templateRef != nullptr) {
+        total += textFieldSize(MQ_SP_F_TEMPLATE_REF, value.templateRef);
+    }
+    // Always, true or false: [tck-id-payloads-template-is-definition].
+    total += mq_pbTagSize(MQ_SP_F_TEMPLATE_IS_DEFINITION) + 1;
+    return total;
+}
+
+// --- DataSet ---
+
+// A cell's DataSetValue body: its one value field, or nothing for a null.
+size_t cellBodySize(const MqttSparkplugValue& cell) {
+    if (cell.isNull) return 0;
+    switch (cell.type) {
+        case MqttSparkplugDataType::Int8:
+        case MqttSparkplugDataType::Int16:
+        case MqttSparkplugDataType::Int32:
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_INT) +
+                   mq_pbVarintSize(encodeSigned(cell.type, cell.as.signedValue));
+        case MqttSparkplugDataType::UInt8:
+        case MqttSparkplugDataType::UInt16:
+        case MqttSparkplugDataType::UInt32:
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_INT) +
+                   mq_pbVarintSize(cell.as.unsignedValue);
+        case MqttSparkplugDataType::Int64:
+        case MqttSparkplugDataType::UInt64:
+        case MqttSparkplugDataType::DateTime:
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_LONG) +
+                   mq_pbVarintSize(cell.as.unsignedValue);
+        case MqttSparkplugDataType::Float:
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_FLOAT) + 4;
+        case MqttSparkplugDataType::Double:
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_DOUBLE) + 8;
+        case MqttSparkplugDataType::Boolean:
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_BOOLEAN) + 1;
+        default:   // String, Text
+            return mq_pbTagSize(MQ_SP_F_DATASETVALUE_STRING) +
+                   mq_pbVarintSize(cell.as.bytes.length) + cell.as.bytes.length;
+    }
+}
+
+void writeCell(PbWriter& writer, const MqttSparkplugValue& cell) {
+    if (cell.isNull) return;
+    switch (cell.type) {
+        case MqttSparkplugDataType::Int8:
+        case MqttSparkplugDataType::Int16:
+        case MqttSparkplugDataType::Int32:
+            writer.tag(MQ_SP_F_DATASETVALUE_INT, MQ_PB_VARINT);
+            writer.varint(encodeSigned(cell.type, cell.as.signedValue));
+            break;
+        case MqttSparkplugDataType::UInt8:
+        case MqttSparkplugDataType::UInt16:
+        case MqttSparkplugDataType::UInt32:
+            writer.tag(MQ_SP_F_DATASETVALUE_INT, MQ_PB_VARINT);
+            writer.varint(cell.as.unsignedValue);
+            break;
+        case MqttSparkplugDataType::Int64:
+        case MqttSparkplugDataType::UInt64:
+        case MqttSparkplugDataType::DateTime:
+            writer.tag(MQ_SP_F_DATASETVALUE_LONG, MQ_PB_VARINT);
+            writer.varint(cell.as.unsignedValue);
+            break;
+        case MqttSparkplugDataType::Float:
+            writer.tag(MQ_SP_F_DATASETVALUE_FLOAT, MQ_PB_FIXED32);
+            writer.fixed32(bitsOfFloat(cell.as.float32));
+            break;
+        case MqttSparkplugDataType::Double:
+            writer.tag(MQ_SP_F_DATASETVALUE_DOUBLE, MQ_PB_FIXED64);
+            writer.fixed64(bitsOfDouble(cell.as.float64));
+            break;
+        case MqttSparkplugDataType::Boolean:
+            writer.tag(MQ_SP_F_DATASETVALUE_BOOLEAN, MQ_PB_VARINT);
+            writer.varint(cell.as.boolean ? 1 : 0);
+            break;
+        default:
+            writer.tag(MQ_SP_F_DATASETVALUE_STRING, MQ_PB_LENGTH);
+            writer.bytes(cell.as.bytes.data, cell.as.bytes.length);
+            break;
+    }
+}
+
+size_t rowBodySize(const MqttSparkplugValue* row, size_t columnCount) {
+    size_t total = 0;
+    for (size_t column = 0; column < columnCount; column++) {
+        const size_t cell = cellBodySize(row[column]);
+        total += mq_pbTagSize(MQ_SP_F_DATASET_ROW_ELEMENTS) + mq_pbVarintSize(cell) + cell;
+    }
+    return total;
+}
+
+size_t dataSetBodySize(const MqttSparkplugDataSetColumn* columns,
+                       size_t columnCount, const MqttSparkplugValue* cells,
+                       size_t rowCount, MqttSparkplugError& error) {
+    if ((columnCount > 0 && columns == nullptr) ||
+        (rowCount > 0 && columnCount > 0 && cells == nullptr)) {
+        error = MqttSparkplugError::InvalidName;
+        return 0;
+    }
+    size_t total = mq_pbTagSize(MQ_SP_F_DATASET_NUM_COLUMNS) +
+                   mq_pbVarintSize((uint64_t)columnCount);
+    for (size_t column = 0; column < columnCount; column++) {
+        if (columns[column].name == nullptr) {
+            error = MqttSparkplugError::InvalidName;
+            return 0;
+        }
+        if (!isBasicType(columns[column].type)) {
+            error = MqttSparkplugError::DataTypeNotSupported;
+            return 0;
+        }
+        total += textFieldSize(MQ_SP_F_DATASET_COLUMNS, columns[column].name) +
+                 mq_pbTagSize(MQ_SP_F_DATASET_TYPES) +
+                 mq_pbVarintSize((uint64_t)columns[column].type);
+    }
+    for (size_t row = 0; row < rowCount; row++) {
+        const MqttSparkplugValue* cellsOf = cells + row * columnCount;
+        for (size_t column = 0; column < columnCount; column++) {
+            const MqttSparkplugValue& cell = cellsOf[column];
+            // String and Text share a field, so either fills either column.
+            const bool textual = (cell.type == MqttSparkplugDataType::String ||
+                                  cell.type == MqttSparkplugDataType::Text) &&
+                                 (columns[column].type == MqttSparkplugDataType::String ||
+                                  columns[column].type == MqttSparkplugDataType::Text);
+            if (!cell.isNull && cell.type != columns[column].type && !textual) {
+                error = MqttSparkplugError::ValueTypeMismatch;
+                return 0;
+            }
+        }
+        const size_t body = rowBodySize(cellsOf, columnCount);
+        total += mq_pbTagSize(MQ_SP_F_DATASET_ROWS) + mq_pbVarintSize(body) + body;
+    }
+    return total;
+}
+
+// One DataSetValue as a value of the column's type. False when its field is
+// not the one that type travels in.
+bool readCell(const uint8_t* body, size_t length, MqttSparkplugDataType type,
+              MqttSparkplugValue& out) {
+    out = MqttSparkplugValue();
+    out.type = type;
+    out.isNull = true;
+    PbReader reader(body, length);
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) return false;
+        bool fits = false;
+        switch (type) {
+            case MqttSparkplugDataType::Int8:
+            case MqttSparkplugDataType::Int16:
+            case MqttSparkplugDataType::Int32:
+            case MqttSparkplugDataType::UInt8:
+            case MqttSparkplugDataType::UInt16:
+            case MqttSparkplugDataType::UInt32:
+                fits = field == MQ_SP_F_DATASETVALUE_INT && wireType == MQ_PB_VARINT;
+                if (fits) {
+                    const uint64_t raw = reader.varint();
+                    if (isSignedType(type)) out.as.signedValue = decodeSigned(type, raw);
+                    else out.as.unsignedValue = raw & 0xFFFFFFFFu;
+                }
+                break;
+            case MqttSparkplugDataType::Int64:
+            case MqttSparkplugDataType::UInt64:
+            case MqttSparkplugDataType::DateTime:
+                fits = field == MQ_SP_F_DATASETVALUE_LONG && wireType == MQ_PB_VARINT;
+                if (fits) out.as.unsignedValue = reader.varint();
+                break;
+            case MqttSparkplugDataType::Float:
+                fits = field == MQ_SP_F_DATASETVALUE_FLOAT && wireType == MQ_PB_FIXED32;
+                if (fits) out.as.float32 = floatOfBits(reader.fixed32());
+                break;
+            case MqttSparkplugDataType::Double:
+                fits = field == MQ_SP_F_DATASETVALUE_DOUBLE && wireType == MQ_PB_FIXED64;
+                if (fits) out.as.float64 = doubleOfBits(reader.fixed64());
+                break;
+            case MqttSparkplugDataType::Boolean:
+                fits = field == MQ_SP_F_DATASETVALUE_BOOLEAN && wireType == MQ_PB_VARINT;
+                if (fits) out.as.boolean = reader.varint() != 0;
+                break;
+            default: {   // String, Text
+                fits = field == MQ_SP_F_DATASETVALUE_STRING && wireType == MQ_PB_LENGTH;
+                const uint8_t* text = nullptr;
+                size_t textLength = 0;
+                if (fits && reader.lengthDelimited(text, textLength)) {
+                    out.as.bytes.data = text;
+                    out.as.bytes.length = (uint32_t)textLength;
+                }
+                break;
+            }
+        }
+        if (!fits) return false;
+        out.isNull = false;
+    }
+    return reader.ok();
+}
+
+}  // namespace
+
+// --- Templates ---
+
+void MqttSparkplugTemplate::clear() {
+    version = nullptr;
+    templateRef = nullptr;
+    isDefinition = false;
+    for (size_t index = 0; index < parameterCount; index++) {
+        parameters[index] = MqttSparkplugProperty();
+    }
+    parameterCount = 0;
+    members.clear();
+}
+
+size_t mq_sparkplugTemplateSize(const MqttSparkplugTemplate& value,
+                                MqttSparkplugError& error) {
+    error = MqttSparkplugError::None;
+    return templateBodySize(value, error);
+}
+
+size_t mq_sparkplugEncodeTemplate(uint8_t* out, size_t capacity,
+                                  const MqttSparkplugTemplate& value,
+                                  MqttSparkplugError& error) {
+    const size_t needed = mq_sparkplugTemplateSize(value, error);
+    if (error != MqttSparkplugError::None) return 0;
+    if ((out == nullptr && needed > 0) || capacity < needed) {
+        error = MqttSparkplugError::Overflow;
+        return 0;
+    }
+    PbWriter writer(out, capacity);
+    if (value.version != nullptr) {
+        writer.tag(MQ_SP_F_TEMPLATE_VERSION, MQ_PB_LENGTH);
+        writer.text(value.version);
+    }
+    for (size_t index = 0; index < value.members.metricCount; index++) {
+        const MqttSparkplugMetric& member = value.members.metrics[index];
+        MqttSparkplugError ignored = MqttSparkplugError::None;
+        writer.tag(MQ_SP_F_TEMPLATE_METRICS, MQ_PB_LENGTH);
+        writer.varint(metricBodySize(member, MqttSparkplugType::NBirth, ignored));
+        writeMetric(writer, member, MqttSparkplugType::NBirth);
+    }
+    for (size_t index = 0; index < value.parameterCount; index++) {
+        const MqttSparkplugProperty& parameter = value.parameters[index];
+        MqttSparkplugError ignored = MqttSparkplugError::None;
+        writer.tag(MQ_SP_F_TEMPLATE_PARAMETERS, MQ_PB_LENGTH);
+        writer.varint(parameterBodySize(parameter, ignored));
+        writer.tag(MQ_SP_F_PARAMETER_NAME, MQ_PB_LENGTH);
+        writer.text(parameter.key);
+        writer.tag(MQ_SP_F_PARAMETER_TYPE, MQ_PB_VARINT);
+        writer.varint((uint64_t)parameter.type);
+        if (!parameter.isNull) writePropertyScalar(writer, parameter);
+    }
+    if (value.templateRef != nullptr) {
+        writer.tag(MQ_SP_F_TEMPLATE_REF, MQ_PB_LENGTH);
+        writer.text(value.templateRef);
+    }
+    writer.tag(MQ_SP_F_TEMPLATE_IS_DEFINITION, MQ_PB_VARINT);
+    writer.varint(value.isDefinition ? 1 : 0);
+    if (!writer.ok() || writer.written() != needed) {
+        error = MqttSparkplugError::Overflow;
+        return 0;
+    }
+    return needed;
+}
+
+MqttSparkplugError mq_sparkplugDecodeTemplate(const uint8_t* in, size_t length,
+                                              MqttSparkplugTemplate& out) {
+    out.clear();
+    if (length == 0) return MqttSparkplugError::None;
+    if (in == nullptr) return MqttSparkplugError::Truncated;
+    PbReader reader(in, length);
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) break;
+        const uint8_t* body = nullptr;
+        size_t bodyLength = 0;
+        switch (field) {
+            case MQ_SP_F_TEMPLATE_VERSION:
+            case MQ_SP_F_TEMPLATE_REF: {
+                if (wireType != MQ_PB_LENGTH) {
+                    reader.fail(MqttSparkplugError::WireTypeMismatch);
+                    break;
+                }
+                if (!reader.lengthDelimited(body, bodyLength)) break;
+                const char* text = out.members.intern(body, bodyLength);
+                if (text == nullptr) reader.fail(MqttSparkplugError::TooManyMetrics);
+                if (field == MQ_SP_F_TEMPLATE_VERSION) out.version = text;
+                else out.templateRef = text;
+                break;
+            }
+            case MQ_SP_F_TEMPLATE_METRICS: {
+                if (wireType != MQ_PB_LENGTH) {
+                    reader.fail(MqttSparkplugError::WireTypeMismatch);
+                    break;
+                }
+                if (!reader.lengthDelimited(body, bodyLength)) break;
+                if (out.members.metricCount >= out.members.capacity()) {
+                    reader.fail(MqttSparkplugError::TooManyMetrics);
+                    break;
+                }
+                MqttSparkplugMetric member;
+                MqttSparkplugError error = MqttSparkplugError::None;
+                if (!decodeMetric(body, bodyLength, member, out.members, error)) {
+                    reader.fail(error);
+                    break;
+                }
+                out.members.metrics[out.members.metricCount++] = member;
+                break;
+            }
+            case MQ_SP_F_TEMPLATE_PARAMETERS: {
+                if (wireType != MQ_PB_LENGTH) {
+                    reader.fail(MqttSparkplugError::WireTypeMismatch);
+                    break;
+                }
+                if (!reader.lengthDelimited(body, bodyLength)) break;
+                if (out.parameterCount >= MQ_SP_MAX_PARAMETERS) {
+                    reader.fail(MqttSparkplugError::TooManyMetrics);
+                    break;
+                }
+                MqttSparkplugProperty parameter;
+                MqttSparkplugError error = MqttSparkplugError::None;
+                if (!decodePropertyValue(body, bodyLength, parameter, error,
+                                         &out.members)) {
+                    reader.fail(error);
+                    break;
+                }
+                out.parameters[out.parameterCount++] = parameter;
+                break;
+            }
+            case MQ_SP_F_TEMPLATE_IS_DEFINITION:
+                if (wireType != MQ_PB_VARINT) {
+                    reader.fail(MqttSparkplugError::WireTypeMismatch);
+                    break;
+                }
+                out.isDefinition = reader.varint() != 0;
+                break;
+            default:
+                reader.skip(wireType);
+                break;
+        }
+    }
+    return reader.error;
+}
+
+bool mq_sparkplugTemplateHeader(const uint8_t* in, size_t length,
+                                bool& isDefinition, const uint8_t*& ref,
+                                size_t& refLength) {
+    isDefinition = false;
+    ref = nullptr;
+    refLength = 0;
+    PbReader reader(in, length);
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) break;
+        if (field == MQ_SP_F_TEMPLATE_REF && wireType == MQ_PB_LENGTH) {
+            reader.lengthDelimited(ref, refLength);
+        } else if (field == MQ_SP_F_TEMPLATE_IS_DEFINITION && wireType == MQ_PB_VARINT) {
+            isDefinition = reader.varint() != 0;
+        } else {
+            reader.skip(wireType);
+        }
+    }
+    return reader.ok();
+}
+
+// --- DataSets ---
+
+bool mq_sparkplugDataSetTypeAllowed(MqttSparkplugDataType type) {
+    return isBasicType(type);
+}
+
+size_t mq_sparkplugDataSetSize(const MqttSparkplugDataSetColumn* columns,
+                               size_t columnCount,
+                               const MqttSparkplugValue* cells, size_t rowCount,
+                               MqttSparkplugError& error) {
+    error = MqttSparkplugError::None;
+    return dataSetBodySize(columns, columnCount, cells, rowCount, error);
+}
+
+size_t mq_sparkplugEncodeDataSet(uint8_t* out, size_t capacity,
+                                 const MqttSparkplugDataSetColumn* columns,
+                                 size_t columnCount,
+                                 const MqttSparkplugValue* cells,
+                                 size_t rowCount, MqttSparkplugError& error) {
+    const size_t needed =
+        mq_sparkplugDataSetSize(columns, columnCount, cells, rowCount, error);
+    if (error != MqttSparkplugError::None) return 0;
+    if (out == nullptr || capacity < needed) {
+        error = MqttSparkplugError::Overflow;
+        return 0;
+    }
+    PbWriter writer(out, capacity);
+    // [tck-id-payloads-dataset-column-size]
+    writer.tag(MQ_SP_F_DATASET_NUM_COLUMNS, MQ_PB_VARINT);
+    writer.varint((uint64_t)columnCount);
+    for (size_t column = 0; column < columnCount; column++) {
+        writer.tag(MQ_SP_F_DATASET_COLUMNS, MQ_PB_LENGTH);
+        writer.text(columns[column].name);
+    }
+    // Unpacked, one field each, as the proto2 schema's generated encoders
+    // write them; the reader takes either.
+    for (size_t column = 0; column < columnCount; column++) {
+        writer.tag(MQ_SP_F_DATASET_TYPES, MQ_PB_VARINT);
+        writer.varint((uint64_t)columns[column].type);
+    }
+    for (size_t row = 0; row < rowCount; row++) {
+        const MqttSparkplugValue* cellsOf = cells + row * columnCount;
+        writer.tag(MQ_SP_F_DATASET_ROWS, MQ_PB_LENGTH);
+        writer.varint(rowBodySize(cellsOf, columnCount));
+        for (size_t column = 0; column < columnCount; column++) {
+            writer.tag(MQ_SP_F_DATASET_ROW_ELEMENTS, MQ_PB_LENGTH);
+            writer.varint(cellBodySize(cellsOf[column]));
+            writeCell(writer, cellsOf[column]);
+        }
+    }
+    if (!writer.ok() || writer.written() != needed) {
+        error = MqttSparkplugError::Overflow;
+        return 0;
+    }
+    return needed;
+}
+
+MqttSparkplugError MqttSparkplugDataSetReader::open(const uint8_t* data,
+                                                    size_t length) {
+    _data = data;
+    _length = length;
+    _columns = 0;
+    _rows = 0;
+    if (length > 0 && data == nullptr) return MqttSparkplugError::Truncated;
+
+    // First the shape: names, types, the declared count, how many rows.
+    size_t names = 0;
+    size_t types = 0;
+    uint64_t declared = 0;
+    bool sawDeclared = false;
+    size_t rows = 0;
+    PbReader reader(data, length);
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) break;
+        const uint8_t* body = nullptr;
+        size_t bodyLength = 0;
+        if (field == MQ_SP_F_DATASET_NUM_COLUMNS && wireType == MQ_PB_VARINT) {
+            declared = reader.varint();
+            sawDeclared = true;
+        } else if (field == MQ_SP_F_DATASET_COLUMNS && wireType == MQ_PB_LENGTH) {
+            if (reader.lengthDelimited(body, bodyLength)) names++;
+        } else if (field == MQ_SP_F_DATASET_TYPES && wireType == MQ_PB_VARINT) {
+            const uint64_t type = reader.varint();
+            if (!isBasicType((MqttSparkplugDataType)(uint32_t)type)) {
+                return MqttSparkplugError::DataTypeNotSupported;
+            }
+            types++;
+        } else if (field == MQ_SP_F_DATASET_TYPES && wireType == MQ_PB_LENGTH) {
+            // Packed, as a proto3 encoder writes a repeated scalar.
+            if (!reader.lengthDelimited(body, bodyLength)) break;
+            PbReader packed(body, bodyLength);
+            while (packed.ok() && !packed.atEnd()) {
+                const uint64_t type = packed.varint();
+                if (!packed.ok()) break;
+                if (!isBasicType((MqttSparkplugDataType)(uint32_t)type)) {
+                    return MqttSparkplugError::DataTypeNotSupported;
+                }
+                types++;
+            }
+            if (!packed.ok()) return packed.error;
+        } else if (field == MQ_SP_F_DATASET_ROWS && wireType == MQ_PB_LENGTH) {
+            if (reader.lengthDelimited(body, bodyLength)) rows++;
+        } else if (field == MQ_SP_F_DATASET_NUM_COLUMNS ||
+                   field == MQ_SP_F_DATASET_COLUMNS ||
+                   field == MQ_SP_F_DATASET_ROWS) {
+            return MqttSparkplugError::WireTypeMismatch;
+        } else {
+            reader.skip(wireType);
+        }
+    }
+    if (!reader.ok()) return reader.error;
+    // [tck-id-payloads-dataset-column-num-headers], -types-num, -column-size
+    if (names != types || (sawDeclared && declared != (uint64_t)names)) {
+        return MqttSparkplugError::ValueTypeMismatch;
+    }
+    _columns = names;
+    _rows = rows;
+
+    // Then every row, in one walk: a cell for each column, each in its
+    // column's field. A column's type is looked up per cell - a table is
+    // read once, and a board's is small.
+    PbReader walk(_data, _length);
+    while (walk.ok() && !walk.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(walk, field, wireType)) break;
+        if (field != MQ_SP_F_DATASET_ROWS || wireType != MQ_PB_LENGTH) {
+            walk.skip(wireType);
+            continue;
+        }
+        const uint8_t* rowBody = nullptr;
+        size_t rowLength = 0;
+        if (!walk.lengthDelimited(rowBody, rowLength)) break;
+        PbReader rowReader(rowBody, rowLength);
+        size_t cells = 0;
+        bool fits = true;
+        while (fits && rowReader.ok() && !rowReader.atEnd()) {
+            if (!readTag(rowReader, field, wireType)) break;
+            if (field != MQ_SP_F_DATASET_ROW_ELEMENTS || wireType != MQ_PB_LENGTH) {
+                rowReader.skip(wireType);
+                continue;
+            }
+            const uint8_t* body = nullptr;
+            size_t bodyLength = 0;
+            if (!rowReader.lengthDelimited(body, bodyLength)) break;
+            const uint8_t* name = nullptr;
+            size_t nameLength = 0;
+            MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
+            MqttSparkplugValue cell;
+            fits = cells < _columns && column(cells, name, nameLength, type) &&
+                   readCell(body, bodyLength, type, cell);
+            cells++;
+        }
+        MqttSparkplugError failed = rowReader.error;
+        if (failed == MqttSparkplugError::None && (!fits || cells != _columns)) {
+            failed = MqttSparkplugError::ValueTypeMismatch;
+        }
+        if (failed != MqttSparkplugError::None) {
+            _columns = _rows = 0;
+            return failed;
+        }
+    }
+    if (!walk.ok()) {
+        _columns = _rows = 0;
+        return walk.error;
+    }
+    return MqttSparkplugError::None;
+}
+
+bool MqttSparkplugDataSetReader::column(size_t index, const uint8_t*& name,
+                                        size_t& nameLength,
+                                        MqttSparkplugDataType& type) const {
+    if (index >= _columns) return false;
+    name = nullptr;
+    nameLength = 0;
+    type = MqttSparkplugDataType::Unknown;
+    size_t names = 0;
+    size_t types = 0;
+    PbReader reader(_data, _length);
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) break;
+        const uint8_t* body = nullptr;
+        size_t bodyLength = 0;
+        if (field == MQ_SP_F_DATASET_COLUMNS && wireType == MQ_PB_LENGTH) {
+            reader.lengthDelimited(body, bodyLength);
+            if (names++ == index) {
+                name = body;
+                nameLength = bodyLength;
+            }
+        } else if (field == MQ_SP_F_DATASET_TYPES && wireType == MQ_PB_VARINT) {
+            const uint64_t raw = reader.varint();
+            if (types++ == index) type = (MqttSparkplugDataType)(uint32_t)raw;
+        } else if (field == MQ_SP_F_DATASET_TYPES && wireType == MQ_PB_LENGTH) {
+            reader.lengthDelimited(body, bodyLength);
+            PbReader packed(body, bodyLength);
+            while (packed.ok() && !packed.atEnd()) {
+                const uint64_t raw = packed.varint();
+                if (types++ == index) type = (MqttSparkplugDataType)(uint32_t)raw;
+            }
+        } else {
+            reader.skip(wireType);
+        }
+    }
+    return reader.ok() && type != MqttSparkplugDataType::Unknown;
+}
+
+bool MqttSparkplugDataSetReader::cell(size_t row, size_t column,
+                                      MqttSparkplugValue& out) const {
+    const uint8_t* name = nullptr;
+    size_t nameLength = 0;
+    MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
+    if (row >= _rows || !this->column(column, name, nameLength, type)) return false;
+    PbReader reader(_data, _length);
+    size_t rows = 0;
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) break;
+        if (field != MQ_SP_F_DATASET_ROWS || wireType != MQ_PB_LENGTH) {
+            reader.skip(wireType);
+            continue;
+        }
+        const uint8_t* rowBody = nullptr;
+        size_t rowLength = 0;
+        if (!reader.lengthDelimited(rowBody, rowLength)) break;
+        if (rows++ != row) continue;
+        PbReader cells(rowBody, rowLength);
+        size_t seen = 0;
+        while (cells.ok() && !cells.atEnd()) {
+            if (!readTag(cells, field, wireType)) break;
+            if (field != MQ_SP_F_DATASET_ROW_ELEMENTS || wireType != MQ_PB_LENGTH) {
+                cells.skip(wireType);
+                continue;
+            }
+            const uint8_t* body = nullptr;
+            size_t bodyLength = 0;
+            if (!cells.lengthDelimited(body, bodyLength)) break;
+            if (seen++ == column) return readCell(body, bodyLength, type, out);
+        }
+        return false;
+    }
+    return false;
+}
+
+// --- PropertySets as values ---
+
+MqttSparkplugProperty mq_spPropertySet(const char* key, const uint8_t* encoded,
+                                       uint32_t length) {
+    MqttSparkplugProperty out;
+    out.key = key;
+    out.type = MqttSparkplugDataType::PropertySet;
+    out.as.text.data = encoded;
+    out.as.text.length = encoded ? length : 0;
+    return out;
+}
+
+MqttSparkplugProperty mq_spPropertySetList(const char* key,
+                                           const uint8_t* encoded,
+                                           uint32_t length) {
+    MqttSparkplugProperty out = mq_spPropertySet(key, encoded, length);
+    out.type = MqttSparkplugDataType::PropertySetList;
+    return out;
+}
+
+size_t mq_sparkplugEncodePropertySet(uint8_t* out, size_t capacity,
+                                     const MqttSparkplugProperty* properties,
+                                     size_t count, MqttSparkplugError& error) {
+    error = MqttSparkplugError::None;
+    if (count > 0 && properties == nullptr) {
+        error = MqttSparkplugError::InvalidName;
+        return 0;
+    }
+    const size_t needed = propertySetBodySize(properties, count, error);
+    if (error != MqttSparkplugError::None) return 0;
+    if (out == nullptr || capacity < needed) return needed;
+    PbWriter writer(out, capacity);
+    writePropertySet(writer, properties, count);
+    if (!writer.ok() || writer.written() != needed) {
+        error = MqttSparkplugError::Overflow;
+        return 0;
+    }
+    return needed;
+}
+
+MqttSparkplugError mq_sparkplugDecodePropertySet(
+    const uint8_t* in, size_t length, MqttSparkplugProperty* properties,
+    size_t capacity, size_t& count, MqttSparkplugPayload& names) {
+    MqttSparkplugError error = MqttSparkplugError::None;
+    count = 0;
+    if (length > 0 && in == nullptr) return MqttSparkplugError::Truncated;
+    decodePropertySet(in, length, properties, capacity, count, names, error);
+    return error;
+}
+
+size_t mq_sparkplugEncodePropertySetList(uint8_t* out, size_t capacity,
+                                         const uint8_t* const* sets,
+                                         const size_t* lengths, size_t count) {
+    if (count > 0 && (sets == nullptr || lengths == nullptr)) return 0;
+    size_t needed = 0;
+    for (size_t index = 0; index < count; index++) {
+        needed += mq_pbTagSize(MQ_SP_F_PROPERTYSETLIST_SETS) +
+                  mq_pbVarintSize(lengths[index]) + lengths[index];
+    }
+    if (out == nullptr || capacity < needed) return needed;
+    PbWriter writer(out, capacity);
+    for (size_t index = 0; index < count; index++) {
+        writer.tag(MQ_SP_F_PROPERTYSETLIST_SETS, MQ_PB_LENGTH);
+        writer.bytes(sets[index], lengths[index]);
+    }
+    return writer.ok() ? needed : 0;
+}
+
+bool mq_sparkplugPropertySetListAt(const uint8_t* in, size_t length,
+                                   size_t index, const uint8_t*& set,
+                                   size_t& setLength) {
+    set = nullptr;
+    setLength = 0;
+    PbReader reader(in, length);
+    size_t seen = 0;
+    while (reader.ok() && !reader.atEnd()) {
+        uint32_t field = 0;
+        uint32_t wireType = 0;
+        if (!readTag(reader, field, wireType)) break;
+        if (field != MQ_SP_F_PROPERTYSETLIST_SETS || wireType != MQ_PB_LENGTH) {
+            reader.skip(wireType);
+            continue;
+        }
+        const uint8_t* body = nullptr;
+        size_t bodyLength = 0;
+        if (!reader.lengthDelimited(body, bodyLength)) return false;
+        if (seen++ == index) {
+            set = body;
+            setLength = bodyLength;
+            return true;
+        }
+    }
+    return false;
 }

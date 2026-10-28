@@ -100,6 +100,12 @@ struct MqttSparkplugTrackedMetric {
     MqttSparkplugValue value;
     bool hasValue = false;
     uint64_t at = 0;
+
+    // A span value's bytes - text, bytes, an array, a dataset, a template -
+    // and `value` points here. It pointed into the host's decode buffer, which
+    // the next message reuses, so read() of a String could return another
+    // message's bytes.
+    MqttSparkplugBytes owned;
 };
 
 struct MqttSparkplugTrackedNode {

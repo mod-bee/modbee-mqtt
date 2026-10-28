@@ -311,6 +311,11 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
     // a different type would change the meaning of a metric the NBIRTH has
     // already described.
     if (findPointIndex(name, device) >= 0) return 0;
+    // Nor a node metric with a template definition's name: both are metrics
+    // in the NBIRTH.
+    if (device < 0 && findTemplate((const uint8_t*)name, strlen(name)) >= 0) {
+        return 0;
+    }
 
     // UTF-8, and the specification discourages a list of punctuation in metric
     // names but forbids none of it - so this validates encoding only, and does
@@ -324,11 +329,12 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
     // birth that cannot be built.
     if (!growPoints(_pointCount + 1)) return 0;
 
-    // The text a text metric owns, and nothing for a number.
+    // What a span metric (text, bytes, array, dataset, template) owns, and
+    // nothing for a number.
     MqttSparkplugValue probe;
     probe.type = type;
     MqttSparkplugPointText* text = nullptr;
-    if (probe.isText() || probe.isBytes()) {
+    if (probe.isSpan()) {
         void* raw = mq_allocLarge(sizeof(MqttSparkplugPointText));
         if (raw == nullptr) {
             _outOfMemory = true;
@@ -366,6 +372,68 @@ uint64_t MqttSparkplugNode::declareInternal(const char* name,
     // the next message, as it did when every call looked at every metric.
     markChanged(_pointCount - 1);
     return point.alias;
+}
+
+bool MqttSparkplugNode::knownInstance(const MqttSparkplugValue& value) const {
+    if (value.type != MqttSparkplugDataType::Template || value.isNull) return true;
+    bool isDefinition = false;
+    const uint8_t* ref = nullptr;
+    size_t refLength = 0;
+    return mq_sparkplugTemplateHeader(value.as.bytes.data, value.as.bytes.length,
+                                      isDefinition, ref, refLength) &&
+           !isDefinition && ref != nullptr && findTemplate(ref, refLength) >= 0;
+}
+
+int MqttSparkplugNode::findTemplate(const uint8_t* name, size_t length) const {
+    for (size_t index = 0; index < _templateCount; index++) {
+        const TemplateDefinition& definition = _templates[index];
+        if (definition.name.size() == length &&
+            memcmp(definition.name.c_str(), name, length) == 0) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+uint64_t MqttSparkplugNode::declareTemplate(const char* name,
+                                           const uint8_t* definition,
+                                           size_t length) {
+    if (name == nullptr || *name == '\0' || definition == nullptr) return 0;
+#if MQTT_LEAN
+    if (strlen(name) > MQ_SP_POINT_NAME) return 0;
+#endif
+    if (mq_validateUtf8((const uint8_t*)name, strlen(name)) != MqttError::None) {
+        return 0;
+    }
+    // A definition, and only that: is_definition true, no template_ref.
+    bool isDefinition = false;
+    const uint8_t* ref = nullptr;
+    size_t refLength = 0;
+    if (!mq_sparkplugTemplateHeader(definition, length, isDefinition, ref,
+                                    refLength) ||
+        !isDefinition || ref != nullptr) {
+        _lastPayloadError = MqttSparkplugError::TemplateReference;
+        return 0;
+    }
+    // Its name is a metric name in the NBIRTH: unique among them.
+    if (findTemplate((const uint8_t*)name, strlen(name)) >= 0 ||
+        findPointIndex(name, -1) >= 0) {
+        return 0;
+    }
+    if (!_templates.reserve(_templateCount + 1)) {
+        _outOfMemory = true;
+        return 0;
+    }
+    TemplateDefinition& added = _templates[_templateCount];
+    if (!added.bytes.assign(definition, length)) {
+        _outOfMemory = true;
+        return 0;
+    }
+    added.name = name;
+    // [tck-id-payloads-alias-uniqueness]: from the node's one counter.
+    added.alias = _aliasesEnabled ? _nextAlias++ : 0;
+    _templateCount++;
+    return added.alias != 0 ? added.alias : 1;
 }
 
 uint64_t MqttSparkplugNode::declare(const char* name,
@@ -626,15 +694,8 @@ void MqttSparkplugNode::storeCommand(size_t index,
     // A host's text lives in the receive buffer, or in a queue slot that is
     // reused: copied into the metric's own storage, and the span pointed there.
     MqttSparkplugPointText& text = *_points[index].text;
-    if (value.as.bytes.data != nullptr && value.as.bytes.length > 0) {
-        text.command.assign((const char*)value.as.bytes.data,
-                            (size_t)value.as.bytes.length);
-    } else {
-        text.command.clear();
-    }
-    MqttSparkplugValue owned = value;
-    owned.as.bytes.data = (const uint8_t*)text.command.data();
-    owned.as.bytes.length = (uint32_t)text.command.size();
+    const MqttSparkplugValue owned = text.command.keep(value);
+    if (owned.isNull) _outOfMemory = true;
     storeValue(index, owned);
 }
 
@@ -644,13 +705,8 @@ void MqttSparkplugNode::markPublished(size_t index) {
     if (state.flags & kText) {
         // Owned: the application's buffer moves on, the copy does not.
         MqttSparkplugPointText& text = *_points[index].text;
-        if (!isNull) {
-            if (text.data != nullptr && text.length > 0) {
-                text.published.assign((const char*)text.data,
-                                      (size_t)text.length);
-            } else {
-                text.published.clear();
-            }
+        if (!isNull && !text.published.assign(text.data, text.length)) {
+            _outOfMemory = true;
         }
     } else {
         state.published = state.value;
@@ -674,6 +730,13 @@ bool MqttSparkplugNode::putValue(size_t index, const MqttSparkplugValue& value,
     // NBIRTH said was something else.
     if (value.type != (MqttSparkplugDataType)state.type) {
         _lastPayloadError = MqttSparkplugError::ValueTypeMismatch;
+        return false;
+    }
+    // An instance of a type this node's birth describes, and nothing else
+    // ([tck-id-payloads-template-instance-ref],
+    // [tck-id-payloads-template-definition-nbirth]).
+    if (!knownInstance(value)) {
+        _lastPayloadError = MqttSparkplugError::TemplateReference;
         return false;
     }
     // WHETHER IT CHANGED. Text handed over in the same buffer as last time - a
@@ -846,7 +909,7 @@ bool MqttSparkplugNode::makeQueue(size_t index) {
     if (point.queue != nullptr) return true;
     const size_t depth = _writeDepth;
     if (depth == 0) return false;
-    typedef MQ_STRING(MQ_SP_POINT_TEXT) QueuedText;
+    typedef MqttSparkplugBytes QueuedText;
     const size_t head = (sizeof(MqttSparkplugWriteQueue) + 15) & ~(size_t)15;
     const size_t values = (depth * sizeof(MqttSparkplugValue) + 15) & ~(size_t)15;
     const bool text = point.text != nullptr;
@@ -871,7 +934,7 @@ bool MqttSparkplugNode::makeQueue(size_t index) {
 
 void MqttSparkplugNode::freeQueue(MqttSparkplugWriteQueue* queue) {
     if (queue == nullptr) return;
-    typedef MQ_STRING(MQ_SP_POINT_TEXT) QueuedText;
+    typedef MqttSparkplugBytes QueuedText;
     if (queue->texts != nullptr) {
         for (size_t slot = 0; slot < queue->depth; slot++) {
             queue->texts[slot].~QueuedText();
@@ -926,17 +989,10 @@ void MqttSparkplugNode::acceptWrite(size_t index,
     const size_t slot = (queue.head + queue.count) % depth;
     MqttSparkplugValue& kept = queue.values[slot];
     kept = value;
-    if (queue.texts != nullptr && (value.isText() || value.isBytes()) &&
-        !value.isNull) {
-        // Its text owned by the slot, and the span pointed there.
-        if (value.as.bytes.data != nullptr && value.as.bytes.length > 0) {
-            queue.texts[slot].assign((const char*)value.as.bytes.data,
-                                     (size_t)value.as.bytes.length);
-        } else {
-            queue.texts[slot].clear();
-        }
-        kept.as.bytes.data = (const uint8_t*)queue.texts[slot].data();
-        kept.as.bytes.length = (uint32_t)queue.texts[slot].size();
+    if (queue.texts != nullptr) {
+        // Its bytes owned by the slot, and the span pointed there.
+        kept = queue.texts[slot].keep(value);
+        if (kept.isNull && !value.isNull) _outOfMemory = true;
     }
     queue.count++;
     state.flags |= kCommandPending;
@@ -1835,6 +1891,13 @@ bool MqttSparkplugNode::sizeBuffers() {
                 writableNames += point.name.size() + 1;
             }
         }
+        if (slot == 0) {
+            // The template definitions go in the NBIRTH too.
+            metrics += _templateCount;
+            for (size_t index = 0; index < _templateCount; index++) {
+                nameBytes += _templates[index].name.size() + 1;
+            }
+        }
         if (metrics > mostMetrics) mostMetrics = metrics;
         if (nameBytes > mostNames) mostNames = nameBytes;
     }
@@ -1953,6 +2016,28 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
         if (!payload.addMetric(rebirthMetric)) {
             _lastPayloadError = MqttSparkplugError::TooManyMetrics;
             return false;
+        }
+
+        // [tck-id-topics-nbirth-templates] Every template definition, in the
+        // NBIRTH and only there. Named, and aliased like every birth metric.
+        for (size_t index = 0; index < _templateCount; index++) {
+            const TemplateDefinition& definition = _templates[index];
+            MqttSparkplugMetric metric;
+            metric.name = payload.intern(definition.name.c_str());
+            if (metric.name == nullptr) {
+                _lastPayloadError = MqttSparkplugError::TooManyMetrics;
+                return false;
+            }
+            if (definition.alias != 0) {
+                metric.alias = definition.alias;
+                metric.hasAlias = true;
+            }
+            metric.value = mq_spTemplate(definition.bytes.data(),
+                                         (uint32_t)definition.bytes.size());
+            if (!payload.addMetric(metric)) {
+                _lastPayloadError = MqttSparkplugError::TooManyMetrics;
+                return false;
+            }
         }
     }
 
@@ -2806,7 +2891,8 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
              !mq_sparkplugApplyDatatype(metric, _points[point].type) &&
              !metric.valueUnsupported) ||
             (metric.value.type != _points[point].type &&
-             !metric.value.isNull)) {
+             !metric.value.isNull) ||
+            !knownInstance(metric.value)) {
             _commandsRefused++;
             refuseCommand(deviceId, _points[point].name.c_str(),
                           _points[point].alias, metric.value,

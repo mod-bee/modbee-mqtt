@@ -134,11 +134,12 @@ struct AppSparkplugMetricInfo {
     uint64_t alias = 0;
     bool hasAlias = false;
     uint32_t datatype = 0;
-    enum Kind : uint8_t { None, Signed, Unsigned, Real, Boolean } kind = None;
+    enum Kind : uint8_t { None, Signed, Unsigned, Real, Boolean, Span } kind = None;
     int64_t i = 0;
     uint64_t u = 0;
     double d = 0;
     bool b = false;
+    std::string bytes;                     // Span: text, bytes, an array's packed bytes, a DataSet or Template
     uint64_t at = 0;                       // the value's timestamp (ms since 1970)
 };
 
@@ -172,12 +173,20 @@ struct AppSparkplugMetricDeclaration {
     double deadband = 0, deadbandPercent = 0;
 };
 
+// A Template definition, published in the NBIRTH: `encoded` is its
+// Payload.Template (is_definition true, no template_ref).
+struct AppSparkplugTemplateDefinition {
+    std::string name;
+    std::string encoded;
+};
+
 struct AppSparkplugEdgeNodeSpec {
     std::string id, connection, group, node;
     std::string primaryHostId;             // "": born whenever connected
     std::vector<std::string> devices;
     std::vector<AppSparkplugMetricDeclaration> metrics;
     uint64_t historyMax = 100000;          // values kept while not born; full, the oldest go (counted)
+    std::vector<AppSparkplugTemplateDefinition> templates;
 };
 
 struct AppSparkplugEdgeNodeInfo {
@@ -191,7 +200,8 @@ struct AppSparkplugEdgeNodeInfo {
 };
 
 // A value the application sets: `value` at the metric's datatype, `text` the
-// bytes of a String/Text/UUID/Bytes one (value points into it).
+// bytes of a span one - String, Text, UUID, Bytes, File, an array's packed
+// bytes, a DataSet's or Template's encoded message (value points into it).
 struct AppSparkplugSet {
     std::string name;
     MqttSparkplugValue value;
@@ -263,8 +273,10 @@ public:
     bool removeEdgeNode(const std::string& id);          // its NDEATH first
     // Born: set, and the changes published (NDATA or DDATA, deadbands applied).
     // Not born: kept, and sent as history once it is. `unknown`: names it never declared.
+    // `refused`: "name: why" for a value its metric cannot take.
     bool setValues(const std::string& id, const std::string& device, std::vector<AppSparkplugSet>& values,
-                   uint32_t& sent, uint32_t& kept, std::vector<std::string>& unknown, std::string& error);
+                   uint32_t& sent, uint32_t& kept, std::vector<std::string>& unknown,
+                   std::vector<std::string>& refused, std::string& error);
     bool deviceState(const std::string& id, const std::string& device, bool online, std::string& error);
     bool rebirthEdgeNode(const std::string& id, std::string& error);
 

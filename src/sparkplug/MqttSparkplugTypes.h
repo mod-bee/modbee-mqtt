@@ -144,16 +144,16 @@ enum class MqttSparkplugDataType : uint32_t {
     // Structured. DataSet, Template, PropertySet and PropertySetList are the
     // nested, mutually recursive messages in the schema.
     //
-    // THREE OF THESE FOUR ARE NOT SUPPORTED, DELIBERATELY, AND ARE REFUSED BY
-    // NAME RATHER THAN DEFAULTED. They are most of the codec's difficulty and
-    // none of them is needed to publish a plant. PropertySet IS supported,
-    // with scalar values, because it is where engineering units and quality
-    // codes live and a number with no unit is not much use to an integrator.
+    // A DataSet or Template metric's value is ITS ENCODED MESSAGE - the bytes
+    // of the nested Payload.DataSet or Payload.Template, held as a span like
+    // a string's - and MqttSparkplugPayload.h builds and reads them. The codec
+    // carries the bytes through untouched, so a board that never uses one
+    // pays for none of it. PropertySet and PropertySetList are property
+    // types, never a metric's: a metric's value `oneof` has no field for them.
     //
-    // A Template is refused at declaration time, not at encode time:
-    // [tck-id-topics-nbirth-templates] requires every Template definition to be
-    // published in the NBIRTH, so half-supporting them produces a node that is
-    // wrong in a way the far end cannot detect.
+    // (Three of these were refused by name until 2026-10: "most of the
+    // codec's difficulty and none of them needed to publish a plant". A PLC
+    // has arrays and structs, and a gateway publishing one needs them.)
     DataSet = 16,
     Bytes = 17,
     File = 18,
@@ -161,7 +161,11 @@ enum class MqttSparkplugDataType : uint32_t {
     PropertySet = 20,
     PropertySetList = 21,
 
-    // Arrays. Not supported; see above.
+    // Arrays. Section 6.4.17: each travels in bytes_value, packed
+    // little-endian - an Int16Array of n values is 2n bytes; a BooleanArray is
+    // a uint32 count and then the bits, most significant first; a StringArray
+    // is the strings, each ended by a NUL; a DateTimeArray is uint64 ms. The
+    // value is those packed bytes (mq_spPackArray, mq_spArrayAt).
     Int8Array = 22,
     Int16Array = 23,
     Int32Array = 24,
@@ -181,10 +185,26 @@ enum class MqttSparkplugDataType : uint32_t {
 // that says the same word as the .proto is one lookup shorter.
 const char* mq_sparkplugDataTypeName(MqttSparkplugDataType type);
 
-// Whether this build can carry a value of that datatype. Everything the codec
+// Whether a METRIC can carry a value of that datatype. Everything the codec
 // refuses, it refuses through this - one predicate rather than a condition
-// repeated in the encoder and the decoder and drifting between them.
+// repeated in the encoder and the decoder and drifting between them. True for
+// every metric datatype; false for Unknown, and for PropertySet and
+// PropertySetList, which only a property can be.
 bool mq_sparkplugDataTypeSupported(MqttSparkplugDataType type);
+
+// Int8Array .. DateTimeArray.
+inline bool mq_sparkplugIsArrayType(MqttSparkplugDataType type) {
+    return type >= MqttSparkplugDataType::Int8Array &&
+           type <= MqttSparkplugDataType::DateTimeArray;
+}
+
+// An array's element: Int16 for Int16Array, DateTime for DateTimeArray.
+// Unknown for anything that is not an array.
+MqttSparkplugDataType mq_sparkplugArrayElement(MqttSparkplugDataType type);
+
+// The bytes each element takes, packed: 1, 2, 4 or 8. 0 for BooleanArray and
+// StringArray, which are not a fixed width, and for anything not an array.
+size_t mq_sparkplugArrayElementBytes(MqttSparkplugDataType type);
 
 // --- Quality ---
 //
@@ -319,9 +339,10 @@ enum class MqttSparkplugError : uint8_t {
     // always ours, and always caught before a byte is written.
     Overflow,
 
-    // A datatype this build does not carry: DataSet, Template, PropertySetList
-    // or any array type. Named rather than defaulted, because a metric silently
-    // decoded as zero is the fault that survives commissioning.
+    // A datatype a metric cannot carry: Unknown, or PropertySet and
+    // PropertySetList (a property's types, never a metric's). Named rather
+    // than defaulted, because a metric silently decoded as zero is the fault
+    // that survives commissioning.
     DataTypeNotSupported,
 
     // More metrics or properties in one payload than MQ_SP_MAX_METRICS or
@@ -336,6 +357,12 @@ enum class MqttSparkplugError : uint8_t {
     // A value whose type does not match the metric's declared datatype - an
     // Int32 metric handed a string. Caught at the API, before encoding.
     ValueTypeMismatch,
+
+    // A Template definition carrying a template_ref, an instance without one,
+    // or an instance whose template_ref names no definition this node
+    // published. [tck-id-payloads-template-definition-ref],
+    // [tck-id-payloads-template-instance-ref].
+    TemplateReference,
 };
 
 const char* mq_sparkplugErrorName(MqttSparkplugError error);

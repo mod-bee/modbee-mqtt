@@ -93,6 +93,36 @@
 #define MQ_SP_F_PROPERTYVALUE_DOUBLE  6
 #define MQ_SP_F_PROPERTYVALUE_BOOLEAN 7
 #define MQ_SP_F_PROPERTYVALUE_STRING  8
+#define MQ_SP_F_PROPERTYVALUE_PROPERTYSET  9
+#define MQ_SP_F_PROPERTYVALUE_PROPERTYSETS 10
+
+// message Payload.PropertySetList
+#define MQ_SP_F_PROPERTYSETLIST_SETS 1
+
+// message Payload.Template
+#define MQ_SP_F_TEMPLATE_VERSION       1
+#define MQ_SP_F_TEMPLATE_METRICS       2
+#define MQ_SP_F_TEMPLATE_PARAMETERS    3
+#define MQ_SP_F_TEMPLATE_REF           4
+#define MQ_SP_F_TEMPLATE_IS_DEFINITION 5
+
+// message Payload.Template.Parameter. Its value fields are PropertyValue's
+// numbers, 3 to 8; only 1 and 2 differ (name, then type).
+#define MQ_SP_F_PARAMETER_NAME 1
+#define MQ_SP_F_PARAMETER_TYPE 2
+
+// message Payload.DataSet, its Row and its DataSetValue
+#define MQ_SP_F_DATASET_NUM_COLUMNS 1
+#define MQ_SP_F_DATASET_COLUMNS     2
+#define MQ_SP_F_DATASET_TYPES       3
+#define MQ_SP_F_DATASET_ROWS        4
+#define MQ_SP_F_DATASET_ROW_ELEMENTS 1
+#define MQ_SP_F_DATASETVALUE_INT     1
+#define MQ_SP_F_DATASETVALUE_LONG    2
+#define MQ_SP_F_DATASETVALUE_FLOAT   3
+#define MQ_SP_F_DATASETVALUE_DOUBLE  4
+#define MQ_SP_F_DATASETVALUE_BOOLEAN 5
+#define MQ_SP_F_DATASETVALUE_STRING  6
 
 // --- Wire types ---
 #define MQ_PB_VARINT 0
@@ -110,7 +140,9 @@
 //   Double                                     ->  double_value (13, double)
 //   Boolean                                    ->  boolean_value(14, bool)
 //   String, Text, UUID                         ->  string_value (15, string)
-//   Bytes, File                                ->  bytes_value  (16, bytes)
+//   Bytes, File, every array                   ->  bytes_value  (16, bytes)
+//   DataSet                                    ->  dataset_value (17)
+//   Template                                   ->  template_value (18)
 //
 // So a SIGNED Int8 of -1 travels as the uint32 0xFFFFFFFF, and an Int16 of -1
 // travels as 0xFFFFFFFF too - not 0xFFFF. The width is in the DATATYPE, not in
@@ -118,19 +150,22 @@
 // like this goes wrong. Every one of those cases has a test with the bytes
 // written out.
 //
-// Returns 0 for a datatype with no value field - which is every unsupported
-// one, and Unknown.
+// Returns 0 for a datatype with no value field: Unknown, PropertySet and
+// PropertySetList.
 uint32_t mq_sparkplugValueField(MqttSparkplugDataType type);
 
 // --- One property ---
 
 struct MqttSparkplugProperty {
     // Not copied, same contract as MqttSparkplugValue: the caller owns it.
+    // A Template's parameter is one of these too, with its name here.
     const char* key = nullptr;
 
     // [tck-id-payloads-metric-propertyvalue-type-type] This MUST be an
     // unsigned 32-bit integer. The same datatype enum as a metric, because
-    // PropertyValue's own `oneof` mirrors Metric's.
+    // PropertyValue's own `oneof` mirrors Metric's. A PropertySet or
+    // PropertySetList value is its encoded message in `as.text`, as a
+    // template's is (mq_sparkplugEncodePropertySet, ...DecodePropertySet).
     MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
     bool isNull = false;
 
@@ -148,6 +183,14 @@ struct MqttSparkplugProperty {
 
     MqttSparkplugProperty() { as.unsignedValue = 0; }
 };
+
+// A nested PropertySet or PropertySetList as a property's value: `encoded` is
+// what mq_sparkplugEncodePropertySet (or ...PropertySetList) wrote. Not copied.
+MqttSparkplugProperty mq_spPropertySet(const char* key, const uint8_t* encoded,
+                                       uint32_t length);
+MqttSparkplugProperty mq_spPropertySetList(const char* key,
+                                           const uint8_t* encoded,
+                                           uint32_t length);
 
 // The two properties worth a constructor, because they are the two every
 // integrator asks for.
@@ -182,12 +225,11 @@ struct MqttSparkplugMetric {
     // produces a payload a conformant host rejects.
     const char* name = nullptr;
 
-    // A DATATYPE THIS LIBRARY DOES NOT CARRY - DataSet, Template,
-    // PropertySetList or an array. The metric is still here, with its name,
+    // A DATATYPE NO METRIC CAN CARRY - Unknown, or a property's type
+    // (PropertySet, PropertySetList). The metric is still here, with its name,
     // alias and datatype, so a host application knows it exists and what it
     // is; its value is not, and value.isNull is set. A message carrying one is
-    // read for everything else in it rather than refused whole, which used to
-    // make a node with one such metric invisible.
+    // read for everything else in it rather than refused whole.
     bool valueUnsupported = false;
 
     // THE METRIC CARRIED NO DATATYPE - which [tck-id-payloads-metric-datatype-
@@ -406,6 +448,162 @@ size_t mq_sparkplugEncode(uint8_t* out, size_t capacity,
 // message invalidates every name and string in the payload before it.
 MqttSparkplugError mq_sparkplugDecode(const uint8_t* in, size_t length,
                                       MqttSparkplugPayload& out);
+
+// --- Templates: a PLC's STRUCT or UDT ---
+//
+// A Template metric's value is the encoded Payload.Template. A DEFINITION is
+// the type - its members with their datatypes and default values, and its
+// parameters - published only in the NBIRTH, with is_definition true and no
+// template_ref ([tck-id-payloads-template-definition-is-definition],
+// [tck-id-payloads-template-definition-ref],
+// [tck-id-payloads-template-definition-nbirth-only]); is_definition is written
+// on both kinds ([tck-id-payloads-template-is-definition]). An INSTANCE is a value
+// of that type: is_definition false, template_ref the definition's name
+// ([tck-id-payloads-template-instance-ref]); in a birth with every member
+// ([tck-id-payloads-template-instance-members-birth]), in data with those
+// that changed.
+//
+// Members are metrics, and travel by NAME - the encoder writes each member's
+// name whatever message the template goes in. A member can itself be a
+// Template (a struct in a struct), an array or a dataset.
+#ifndef MQ_SP_MAX_PARAMETERS
+#define MQ_SP_MAX_PARAMETERS 8
+#endif
+
+struct MqttSparkplugTemplate {
+    // Optional, the schema's words: "the version of the Template to prevent
+    // mismatches".
+    const char* version = nullptr;
+
+    // An instance's definition, by name; null on a definition.
+    const char* templateRef = nullptr;
+    bool isDefinition = false;
+
+    // A parameter is a name, a type and a scalar value - a property in all
+    // but its field numbers, so it is one, its name in `key`.
+    MqttSparkplugProperty parameters[MQ_SP_MAX_PARAMETERS];
+    size_t parameterCount = 0;
+
+    // The member metrics, and the arena a decode interns their names (and
+    // the version, ref and parameter names) into. Sized like any payload.
+    MqttSparkplugPayload members;
+
+    MqttSparkplugTemplate() = default;
+    MqttSparkplugTemplate(size_t memberCapacity, size_t nameBytes)
+        : members(memberCapacity, nameBytes) {}
+    // Not copied: its strings point into its own arena.
+    MqttSparkplugTemplate(const MqttSparkplugTemplate&) = delete;
+    MqttSparkplugTemplate& operator=(const MqttSparkplugTemplate&) = delete;
+
+    bool addParameter(const MqttSparkplugProperty& parameter) {
+        if (parameterCount >= MQ_SP_MAX_PARAMETERS) return false;
+        parameters[parameterCount++] = parameter;
+        return true;
+    }
+    bool addMember(const MqttSparkplugMetric& member) {
+        return members.addMetric(member);
+    }
+    void clear();
+};
+
+// Exact encoded length, or 0 with an error set: a definition with a
+// template_ref or an instance without one (TemplateReference), a member with
+// no name (InvalidName), a value its datatype cannot hold.
+size_t mq_sparkplugTemplateSize(const MqttSparkplugTemplate& value,
+                                MqttSparkplugError& error);
+size_t mq_sparkplugEncodeTemplate(uint8_t* out, size_t capacity,
+                                  const MqttSparkplugTemplate& value,
+                                  MqttSparkplugError& error);
+
+// Into a caller-owned template; members' values are spans into `in`, as a
+// payload's are.
+MqttSparkplugError mq_sparkplugDecodeTemplate(const uint8_t* in, size_t length,
+                                              MqttSparkplugTemplate& out);
+
+// Only whether it is a definition and the name it references, without
+// decoding its members - what a node checks an instance against its
+// definitions with. `ref` is a span into `in`, null when there is none.
+bool mq_sparkplugTemplateHeader(const uint8_t* in, size_t length,
+                                bool& isDefinition, const uint8_t*& ref,
+                                size_t& refLength);
+
+// --- DataSets: a table ---
+//
+// Columns with names and types, then rows of cells. A column's type is one of
+// the scalars [tck-id-payloads-dataset-types-value] allows - the integers,
+// Float, Double, Boolean, String, DateTime, Text - and each row has a cell
+// for every column ([tck-id-payloads-dataset-parameter-type-req] and its
+// siblings). A null cell travels as an empty value: the schema has no is_null
+// for one.
+struct MqttSparkplugDataSetColumn {
+    const char* name = nullptr;
+    MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
+};
+
+// Whether a DataSet column can be this type.
+bool mq_sparkplugDataSetTypeAllowed(MqttSparkplugDataType type);
+
+// `cells` is row-major, rowCount * columnCount of them, each of its column's
+// type or null. Exact length, or 0 with ValueTypeMismatch for a cell of the
+// wrong type, DataTypeNotSupported for a column type a DataSet cannot have.
+size_t mq_sparkplugDataSetSize(const MqttSparkplugDataSetColumn* columns,
+                               size_t columnCount,
+                               const MqttSparkplugValue* cells, size_t rowCount,
+                               MqttSparkplugError& error);
+size_t mq_sparkplugEncodeDataSet(uint8_t* out, size_t capacity,
+                                 const MqttSparkplugDataSetColumn* columns,
+                                 size_t columnCount,
+                                 const MqttSparkplugValue* cells,
+                                 size_t rowCount, MqttSparkplugError& error);
+
+// Reads an encoded DataSet where it lies: nothing is copied, a column name
+// and a String cell are spans into it. open() checks the whole of it once -
+// as many names and types as columns, a cell for every column in every row,
+// each in its column's field - so column() and cell() cannot meet a
+// malformed one. Each walks to what it is asked for: a table is read once.
+class MqttSparkplugDataSetReader {
+public:
+    MqttSparkplugError open(const uint8_t* data, size_t length);
+    MqttSparkplugError open(const MqttSparkplugValue& dataSet) {
+        return open(dataSet.as.bytes.data, dataSet.as.bytes.length);
+    }
+
+    size_t columnCount() const { return _columns; }
+    size_t rowCount() const { return _rows; }
+
+    bool column(size_t index, const uint8_t*& name, size_t& nameLength,
+                MqttSparkplugDataType& type) const;
+    // A cell as a value of its column's type; isNull for an empty one.
+    bool cell(size_t row, size_t column, MqttSparkplugValue& out) const;
+
+private:
+    const uint8_t* _data = nullptr;
+    size_t _length = 0;
+    size_t _columns = 0;
+    size_t _rows = 0;
+};
+
+// --- PropertySets as values ---
+//
+// A property whose value is a PropertySet, or a PropertySetList - a list of
+// them. Encoded here, carried as bytes, read back here; keys are interned
+// into `names` (any payload's arena).
+size_t mq_sparkplugEncodePropertySet(uint8_t* out, size_t capacity,
+                                     const MqttSparkplugProperty* properties,
+                                     size_t count, MqttSparkplugError& error);
+MqttSparkplugError mq_sparkplugDecodePropertySet(
+    const uint8_t* in, size_t length, MqttSparkplugProperty* properties,
+    size_t capacity, size_t& count, MqttSparkplugPayload& names);
+
+// A list from sets already encoded; the length, written only if it fits.
+size_t mq_sparkplugEncodePropertySetList(uint8_t* out, size_t capacity,
+                                         const uint8_t* const* sets,
+                                         const size_t* lengths, size_t count);
+// The list's sets, one at a time, as spans into `in`. False past the end or
+// for a malformed list.
+bool mq_sparkplugPropertySetListAt(const uint8_t* in, size_t length,
+                                   size_t index, const uint8_t*& set,
+                                   size_t& setLength);
 
 // --- The STATE payload, which is JSON and not protobuf ---
 //

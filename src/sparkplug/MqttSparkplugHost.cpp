@@ -578,8 +578,14 @@ void MqttSparkplugHost::recordValues(MqttSparkplugTrackedNode& tracked,
             continue;
         }
 
-        tracked.metrics[slot].value = metric.value;
-        tracked.metrics[slot].hasValue = true;
+        // Owned: `metric` points into _inbound's buffer, reused next message.
+        MqttSparkplugTrackedMetric& entry = tracked.metrics[slot];
+        entry.value = entry.owned.keep(metric.value);
+        entry.hasValue = !entry.value.isNull;
+        if (!entry.hasValue) {
+            _outOfMemory = true;
+            continue;
+        }
         // The metric's own timestamp if it carried one, otherwise the
         // payload's - which is the usual case, since one payload timestamp
         // covering the batch is most of the bandwidth saving.

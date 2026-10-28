@@ -332,6 +332,10 @@ struct AppConnections::EdgeNode {
     AppSparkplugEdgeNodeSpec spec;
     std::unique_ptr<MqttSparkplugNode> library;
     uint64_t history = 0, historyLost = 0;
+    // The bytes of each span metric's current value, by its index: the
+    // library's node keeps a span into them until the next value (a rebirth
+    // reads it), so they outlive the call that set them.
+    std::vector<std::string> values;
     std::string key() const { return "sparkplug-node:" + spec.id; }
     const char* device(const std::string& d) const { return d.empty() ? nullptr : d.c_str(); }
 };
@@ -349,7 +353,7 @@ AppMessage keptValue(const std::string& device, const AppSparkplugSet& set) {
     m.payload.assign((const char*)&type, sizeof type);
     m.payload.push_back(set.value.isNull ? 1 : 0);
     m.payload.append((const char*)&set.value.as.unsignedValue, sizeof set.value.as.unsignedValue);
-    if (set.value.isText() || set.value.isBytes()) m.payload += set.text;
+    if (set.value.isSpan()) m.payload += set.text;
     return m;
 }
 
@@ -363,12 +367,42 @@ bool valueOfKept(const AppMessage& m, AppSparkplugSet& set) {
     set.value.type = (MqttSparkplugDataType)type;
     set.value.isNull = m.payload[sizeof type] != 0;
     std::memcpy(&set.value.as.unsignedValue, m.payload.data() + sizeof type + 1, sizeof(uint64_t));
-    if (set.value.isText() || set.value.isBytes()) {
+    if (set.value.isSpan()) {
         set.text = m.payload.substr(head);
         set.value.as.bytes.data = (const uint8_t*)set.text.data();
         set.value.as.bytes.length = (uint32_t)set.text.size();
     }
     return true;
+}
+
+// The name a Template instance's template_ref gives; "" when it has none.
+std::string templateRefOf(const MqttSparkplugValue& value) {
+    bool isDefinition = false;
+    const uint8_t* ref = nullptr;
+    size_t length = 0;
+    if (!mq_sparkplugTemplateHeader(value.as.bytes.data, value.as.bytes.length, isDefinition, ref, length) ||
+        isDefinition || ref == nullptr) {
+        return std::string();
+    }
+    return std::string((const char*)ref, length);
+}
+
+std::string hexOf(const std::string& bytes) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (unsigned char c : bytes) {
+        out.push_back(digits[c >> 4]);
+        out.push_back(digits[c & 15]);
+    }
+    return out;
+}
+
+std::string bytesOfHex(const std::string& hex) {
+    auto nibble = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    std::string out;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) out.push_back((char)(nibble(hex[i]) << 4 | nibble(hex[i + 1])));
+    return out;
 }
 
 } // namespace
@@ -714,6 +748,10 @@ void AppConnections::startEdgeNode(Connection& c) {
         if (!e->spec.primaryHostId.empty()) node.primaryHost(e->spec.primaryHostId.c_str());
         node.epochNow((uint64_t)utcNowMs());
         for (const std::string& d : e->spec.devices) node.addDevice(d.c_str());
+        // The definitions first: an instance set later is checked against them.
+        for (const AppSparkplugTemplateDefinition& t : e->spec.templates) {
+            node.declareTemplate(t.name.c_str(), (const uint8_t*)t.encoded.data(), t.encoded.size());
+        }
         for (const AppSparkplugMetricDeclaration& m : e->spec.metrics) {
             const MqttSparkplugDataType type = (MqttSparkplugDataType)m.datatype;
             const char* device = e->device(m.device);
@@ -731,6 +769,7 @@ void AppConnections::startEdgeNode(Connection& c) {
             if (m.deadband != 0 || m.deadbandPercent != 0) node.deadbandAt((size_t)at, m.deadband, m.deadbandPercent);
         }
         for (const std::string& d : e->spec.devices) node.deviceOnline(d.c_str());
+        e->values.resize(node.pointCount());
         e->history = _outbox.totals(e->key()).messages;
         node.connect();                            // its NDEATH is this connection's Will from now on
         c.edge = std::move(e);
@@ -1447,7 +1486,6 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
                 metric.hasAlias = aliases;
                 metric.datatype = (uint32_t)tracked.type;
                 metric.at = tracked.at;
-                // Numbers and bools only: the library keeps text by reference to a buffer it reuses.
                 const MqttSparkplugValue& v = tracked.value;
                 if (tracked.hasValue && !v.isNull) {
                     switch (v.type) {
@@ -1471,6 +1509,11 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
                         metric.b = v.as.boolean;
                         break;
                     default:
+                        if (!v.isSpan()) break;
+                        metric.kind = AppSparkplugMetricInfo::Span;
+                        if (v.as.bytes.length > 0) {
+                            metric.bytes.assign((const char*)v.as.bytes.data, v.as.bytes.length);
+                        }
                         break;
                     }
                 }
@@ -1560,10 +1603,30 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
         error = "group and node are Sparkplug ids (no '/', '+' or '#')";
         return false;
     }
+    std::set<std::string> templates;
+    for (const AppSparkplugTemplateDefinition& t : spec.templates) {
+        bool isDefinition = false;
+        const uint8_t* ref = nullptr;
+        size_t refLength = 0;
+        if (t.name.empty() || !templates.insert(t.name).second) {
+            error = "template \"" + t.name + "\": each definition needs a name of its own";
+            return false;
+        }
+        if (!mq_sparkplugTemplateHeader((const uint8_t*)t.encoded.data(), t.encoded.size(), isDefinition, ref,
+                                        refLength) ||
+            !isDefinition || ref != nullptr) {
+            error = "template \"" + t.name + "\": a definition has no template_ref";
+            return false;
+        }
+    }
     for (const AppSparkplugMetricDeclaration& m : spec.metrics) {
         if (!mq_sparkplugDataTypeSupported((MqttSparkplugDataType)m.datatype)) {
-            error = "metric \"" + m.name + "\": an edge node here carries numbers, bool, text, bytes and DateTime, not " +
-                    mq_sparkplugDataTypeName((MqttSparkplugDataType)m.datatype);
+            error = "metric \"" + m.name + "\": a metric cannot be " +
+                    std::string(mq_sparkplugDataTypeName((MqttSparkplugDataType)m.datatype));
+            return false;
+        }
+        if (m.device.empty() && templates.count(m.name)) {
+            error = "metric \"" + m.name + "\": a template definition has that name (both are NBIRTH metrics)";
             return false;
         }
         if (!m.device.empty() && std::find(spec.devices.begin(), spec.devices.end(), m.device) == spec.devices.end()) {
@@ -1660,7 +1723,8 @@ bool AppConnections::removeEdgeNode(const std::string& id) {
 }
 
 bool AppConnections::setValues(const std::string& id, const std::string& device, std::vector<AppSparkplugSet>& values,
-                               uint32_t& sent, uint32_t& kept, std::vector<std::string>& unknown, std::string& error) {
+                               uint32_t& sent, uint32_t& kept, std::vector<std::string>& unknown,
+                               std::vector<std::string>& refused, std::string& error) {
     sent = kept = 0;
     bool found = false;
     call([&] {
@@ -1687,9 +1751,41 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
             }
             const MqttSparkplugPoint* point = node.pointAt((size_t)index);
             set.value.type = point->type;
+            if (set.value.isSpan() && !set.value.isNull) {
+                set.value.as.bytes.data = (const uint8_t*)set.text.data();
+                set.value.as.bytes.length = (uint32_t)set.text.size();
+            }
+            // An instance of a definition this node publishes, and no other
+            // ([tck-id-payloads-template-instance-ref]) - checked here, so
+            // one is never kept as history it could not send.
+            if (set.value.type == MqttSparkplugDataType::Template && !set.value.isNull) {
+                const std::string ref = templateRefOf(set.value);
+                const bool known = std::any_of(e->spec.templates.begin(), e->spec.templates.end(),
+                                               [&](const AppSparkplugTemplateDefinition& t) { return t.name == ref; });
+                if (!known) {
+                    refused.push_back(set.name + ": its template_ref \"" + ref +
+                                      "\" is not one of this edge node's templates");
+                    continue;
+                }
+            }
             if (set.timestamp == 0) set.timestamp = (uint64_t)utcNowMs();
-            if (born && node.setAt((size_t)index, set.value)) {
-                sent++;
+            if (born) {
+                // The same value again is not news: nothing to send, and not
+                // history either (it used to be kept, and sent as history).
+                if (!set.value.differsFrom(node.valueAt((size_t)index))) {
+                    sent++;
+                    continue;
+                }
+                if (set.value.isSpan() && !set.value.isNull) {
+                    std::string owned = set.text;           // a buffer of its own: see EdgeNode::values
+                    e->values[(size_t)index].swap(owned);
+                    set.value.as.bytes.data = (const uint8_t*)e->values[(size_t)index].data();
+                }
+                if (node.setAt((size_t)index, set.value)) {
+                    sent++;
+                } else {
+                    refused.push_back(set.name + ": " + mq_sparkplugErrorName(node.lastPayloadError()));
+                }
                 continue;
             }
             // Not born (or behind what it kept): kept, and sent as history.
@@ -1773,6 +1869,13 @@ void AppConnections::saveHosts() {
             metrics += (i ? "," : "") + d.str();
         }
         o.raw("metrics", metrics + "]");
+        std::string defs = "[";
+        for (size_t i = 0; i < n.templates.size(); i++) {
+            json::Object d;
+            d.add("name", n.templates[i].name).add("encoded", hexOf(n.templates[i].encoded));
+            defs += (i ? "," : "") + d.str();
+        }
+        o.raw("templates", defs + "]");
         text += (first ? "\n" : ",\n") + o.str();
         first = false;
     }
@@ -1811,6 +1914,12 @@ bool AppConnections::loadHosts(std::string& error) {
                 m.deadband = std::atof(d.str("deadband").c_str());
                 m.deadbandPercent = std::atof(d.str("deadbandPercent").c_str());
                 n.metrics.push_back(m);
+            }
+            for (const json::Value& d : v["templates"].items) {
+                AppSparkplugTemplateDefinition t;
+                t.name = d.str("name");
+                t.encoded = bytesOfHex(d.str("encoded"));
+                n.templates.push_back(t);
             }
             if (!n.id.empty()) _edgeNodes[n.id] = n;
         }

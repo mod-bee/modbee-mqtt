@@ -635,3 +635,70 @@ bool encode(const v1::SparkplugPayload& payload, bool compress, std::string& out
 }
 
 } // namespace sparkplug_codec
+
+namespace sparkplug_codec {
+
+bool encodeTemplate(const v1::SparkplugTemplate& value, std::string& out, std::string& error) {
+    wire::Payload::Template w;
+    if (!templateFor(value, w, error)) return false;
+    out = w.SerializeAsString();
+    return true;
+}
+
+bool decodeTemplate(const std::string& bytes, v1::SparkplugTemplate& out, std::string& error) {
+    wire::Payload::Template w;
+    if (!w.ParseFromString(bytes)) {
+        error = "not a Template";
+        return false;
+    }
+    templateOf(w, out, error);
+    return error.empty();
+}
+
+bool encodeValue(uint32_t t, const v1::SparkplugValue& value, std::string& out, std::string& error) {
+    if (isArray(t)) {
+        if (value.kind_case() != v1::SparkplugValue::kArrayValue) {
+            error = "an array metric takes array_value";
+            return false;
+        }
+        out = pack(t, value.array_value());
+        return true;
+    }
+    if (t == v1::DATATYPE_DATASET) {
+        if (value.kind_case() != v1::SparkplugValue::kDatasetValue) {
+            error = "a DataSet metric takes dataset_value";
+            return false;
+        }
+        wire::Payload::DataSet w;
+        if (!dataSetFor(value.dataset_value(), w, error)) return false;
+        out = w.SerializeAsString();
+        return true;
+    }
+    if (t == v1::DATATYPE_TEMPLATE) {
+        if (value.kind_case() != v1::SparkplugValue::kTemplateValue) {
+            error = "a Template metric takes template_value";
+            return false;
+        }
+        return encodeTemplate(value.template_value(), out, error);
+    }
+    error = "not an array, DataSet or Template";
+    return false;
+}
+
+bool decodeValue(uint32_t t, const std::string& bytes, v1::SparkplugValue& out, std::string& error) {
+    if (isArray(t)) return unpack(t, bytes, *out.mutable_array_value(), error);
+    if (t == v1::DATATYPE_DATASET) {
+        wire::Payload::DataSet w;
+        if (!w.ParseFromString(bytes)) {
+            error = "not a DataSet";
+            return false;
+        }
+        dataSetOf(w, *out.mutable_dataset_value());
+        return true;
+    }
+    if (t == v1::DATATYPE_TEMPLATE) return decodeTemplate(bytes, *out.mutable_template_value(), error);
+    error = "not an array, DataSet or Template";
+    return false;
+}
+
+} // namespace sparkplug_codec

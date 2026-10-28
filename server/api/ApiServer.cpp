@@ -1554,6 +1554,8 @@ public:
         reply->add_features("sparkplug.codec");
         if (_connections) reply->add_features("sparkplug.host");
         if (_connections) reply->add_features("sparkplug.edge");
+        // Its edge node takes Template definitions, arrays and DataSets; ListNodes reports every value.
+        if (_connections) reply->add_features("sparkplug.structures");
         if (_aware) reply->add_features("sparkplug.aware");
         reactor->Finish(grpc::Status::OK);
         return reactor;
@@ -1819,6 +1821,12 @@ void edgeInfoTo(const AppSparkplugEdgeNodeInfo& info, v1::SparkplugEdgeNodeInfo&
         d->set_deadband(m.deadband);
         d->set_deadband_percent(m.deadbandPercent);
     }
+    for (const AppSparkplugTemplateDefinition& t : info.spec.templates) {
+        v1::SparkplugTemplateDefinition* d = s->add_templates();
+        d->set_name(t.name);
+        std::string ignored;
+        sparkplug_codec::decodeTemplate(t.encoded, *d->mutable_definition(), ignored);
+    }
     wire.set_born(info.born);
     wire.set_bd_seq(info.bdSeq);
     wire.set_primary_host_online(info.primaryHostOnline);
@@ -1908,6 +1916,18 @@ public:
             m.deadbandPercent = d.deadband_percent();
             spec.metrics.push_back(m);
         }
+        for (const v1::SparkplugTemplateDefinition& d : request->templates()) {
+            AppSparkplugTemplateDefinition t;
+            t.name = d.name();
+            v1::SparkplugTemplate definition = d.definition();
+            definition.set_is_definition(true);
+            std::string why;
+            if (!sparkplug_codec::encodeTemplate(definition, t.encoded, why)) {
+                reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "template \"" + t.name + "\": " + why));
+                return reactor;
+            }
+            spec.templates.push_back(t);
+        }
         AppSparkplugEdgeNodeInfo info;
         std::string error;
         if (!_connections->putEdgeNode(spec, &info, error)) {
@@ -1956,13 +1976,32 @@ public:
                                         v1::SparkplugValuesReply* reply) override {
         grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
         if (!ready(context, reactor)) return reactor;
+        // The declarations first: a value is read as its metric's datatype wants it.
+        AppSparkplugEdgeNodeInfo info;
+        const bool declared = _connections->getEdgeNode(request->edge_node(), info);
         std::vector<AppSparkplugSet> sets;
+        std::vector<std::string> refused;
         for (const v1::SparkplugMetric& m : request->metrics()) {
+            uint32_t datatype = v1::DATATYPE_UNKNOWN;
+            for (const AppSparkplugMetricDeclaration& d : info.spec.metrics) {
+                if (declared && d.name == m.name() && d.device == request->device()) datatype = d.datatype;
+            }
             AppSparkplugSet set;
             set.name = m.name();
             set.timestamp = m.has_timestamp() ? m.timestamp() : 0;
             MqttSparkplugValue& v = set.value;
+            v.type = (MqttSparkplugDataType)datatype;
             v.isNull = m.is_null();
+            if ((v.isArray() || v.isStructured()) && !v.isNull) {
+                // An array's packed bytes, a DataSet's or Template's message: what the library's node carries.
+                std::string why;
+                if (!sparkplug_codec::encodeValue(datatype, m.value(), set.text, why)) {
+                    refused.push_back(m.name() + ": " + why);
+                    continue;
+                }
+                sets.push_back(std::move(set));
+                continue;
+            }
             switch (m.value().kind_case()) {
             case v1::SparkplugValue::kIntValue: v.as.signedValue = m.value().int_value(); break;
             case v1::SparkplugValue::kUintValue: v.as.unsignedValue = m.value().uint_value(); break;
@@ -1973,20 +2012,12 @@ public:
             case v1::SparkplugValue::kBytesValue: set.text = m.value().bytes_value(); break;
             default: v.isNull = true; break;
             }
+            // A value given in another field than its datatype's is read as that datatype wants it.
+            if (datatype != v1::DATATYPE_UNKNOWN) coerce(m.value(), (MqttSparkplugDataType)datatype, set);
             sets.push_back(std::move(set));
         }
-        // A value given in another field than its datatype's is read as that datatype wants it.
-        AppSparkplugEdgeNodeInfo info;
-        if (_connections->getEdgeNode(request->edge_node(), info)) {
-            for (size_t i = 0; i < sets.size(); i++) {
-                for (const AppSparkplugMetricDeclaration& d : info.spec.metrics) {
-                    if (d.name != sets[i].name || d.device != request->device()) continue;
-                    coerce(request->metrics((int)i).value(), (MqttSparkplugDataType)d.datatype, sets[i]);
-                }
-            }
-        }
         for (AppSparkplugSet& set : sets) {
-            if (!set.text.empty() || set.value.isText() || set.value.isBytes()) {
+            if (set.value.isSpan() || !set.text.empty()) {
                 set.value.as.bytes.data = (const uint8_t*)set.text.data();
                 set.value.as.bytes.length = (uint32_t)set.text.size();
             }
@@ -1994,13 +2025,15 @@ public:
         uint32_t sent = 0, kept = 0;
         std::vector<std::string> unknown;
         std::string error;
-        if (!_connections->setValues(request->edge_node(), request->device(), sets, sent, kept, unknown, error)) {
+        if (!_connections->setValues(request->edge_node(), request->device(), sets, sent, kept, unknown, refused,
+                                     error)) {
             reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, error));
             return reactor;
         }
         reply->set_sent(sent);
         reply->set_kept(kept);
         for (const std::string& u : unknown) reply->add_unknown(u);
+        for (const std::string& r : refused) reply->add_refused(r);
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -2161,6 +2194,25 @@ public:
                     else metric->mutable_value()->set_double_value(m.d);
                     break;
                 case AppSparkplugMetricInfo::Boolean: metric->mutable_value()->set_boolean_value(m.b); break;
+                case AppSparkplugMetricInfo::Span: {
+                    v1::SparkplugValue* value = metric->mutable_value();
+                    std::string why;
+                    switch (m.datatype) {
+                    case v1::DATATYPE_STRING: case v1::DATATYPE_TEXT: case v1::DATATYPE_UUID:
+                        value->set_string_value(m.bytes);
+                        break;
+                    case v1::DATATYPE_BYTES: case v1::DATATYPE_FILE:
+                        value->set_bytes_value(m.bytes);
+                        break;
+                    default:   // an array, a DataSet or a Template; as it came if it does not read
+                        if (!sparkplug_codec::decodeValue(m.datatype, m.bytes, *value, why)) {
+                            value->Clear();
+                            value->set_bytes_value(m.bytes);
+                        }
+                        break;
+                    }
+                    break;
+                }
                 default: break;
                 }
             }

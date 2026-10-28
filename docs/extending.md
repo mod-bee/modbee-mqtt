@@ -261,17 +261,26 @@ written yet.
 Nothing in it knows what Sparkplug is either. Anyone about to restate
 everything has already made a queued update redundant.
 
-### What is out, and why that is a real answer
+### The structured types: carried as their own bytes
 
-`DataSet`, `Template`, `PropertySetList` and the fourteen array datatypes.
-Thirty-seven of the specification's statements, and the three structured types
-are its nested, mutually recursive messages — most of the codec's difficulty for
-none of a plant's needs. `PropertySet` with scalar values **is** in, because
-that is where engineering units and quality codes live.
+`DataSet`, `Template` and the thirteen array datatypes are carried - a PLC has
+arrays and structs, and a gateway publishing one needs them. (They were left
+out at first, as "most of the codec's difficulty for none of a plant's needs";
+that was a choice, not something a board imposed, and it was reversed.)
 
-An unsupported datatype is refused **by name** when decoded and at declaration
-time when written, never defaulted. A metric silently decoded as zero is the
-fault that survives commissioning.
+The way they are carried keeps the board's cost where it was: a value of one is
+a span of its wire bytes - an array's packed `bytes_value`, a DataSet's or
+Template's encoded nested message - exactly as a string is a span of its
+characters. The codec writes and reads those bytes untouched; building and
+reading one is separate code (`mq_spPackArray`, `MqttSparkplugTemplate`,
+`MqttSparkplugDataSetReader`) that the linker drops from a program that never
+calls it. Measured on the Sparkplug example for an ESP32: 1.4 kB of flash and
+16 bytes of RAM, and every text metric now uses only the heap its value needs.
+
+Only a datatype no metric can carry - `Unknown`, or a property's `PropertySet`
+- is refused, by name when decoded and at declaration time when written, never
+defaulted. A metric silently decoded as zero is the fault that survives
+commissioning.
 
 ### How it is known to be right
 

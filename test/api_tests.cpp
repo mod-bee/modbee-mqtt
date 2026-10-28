@@ -804,6 +804,243 @@ void sparkplugEdgeNode(Server& server) {
     ok(fleet.until([&] { return births("spBv1.0/plant2/NDEATH/gw-9") >= 1; }), "  its NDEATH first");
 }
 
+void sparkplugStructures(Server& server) {
+    section("an edge node in the server publishes a PLC struct (Template), an array, a DataSet and text; a host here reads them");
+    auto connections = v1::Connections::NewStub(server.channel());
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    auto decode = [&](const check::Got& g) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDecodeRequest request;
+        request.set_topic(g.topic);
+        request.set_payload(g.payload);
+        v1::SparkplugMessage out;
+        sparkplug->Decode(&c, request, &out);
+        return out;
+    };
+    Fleet fleet(server.broker.port());
+    Client& watcher = fleet.make("structures-watcher");
+    watcher.subscribe("spBv1.0/plant3/#", MQ_QOS_1);
+    ok(fleet.connected(watcher) && fleet.until([&] { return watcher.subscribed >= 1; }), "a watcher on the group");
+    for (const char* id : {"edge3", "host3"}) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::ConnectionSpec spec;
+        spec.set_id(id);
+        spec.set_this_server(true);
+        spec.set_client_id(std::string(id) + "-client");
+        v1::ConnectionInfo info;
+        connections->Put(&c, spec, &info);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostSpec host;
+        host.set_id("h3");
+        host.set_connection("host3");
+        host.set_host_id("reader3");
+        host.set_group("plant3");
+        v1::SparkplugHostInfo info;
+        ok(sparkplug->PutHost(&c, host, &info).ok(), "a host in the server, following the group");
+    }
+    // Online once its session has its Will - and its subscriptions, made just before its STATE.
+    ok(fleet.until([&] {
+           grpc::ClientContext c;
+           authorize(c);
+           v1::SparkplugHostRef ref;
+           ref.set_id("h3");
+           v1::SparkplugHostInfo info;
+           return sparkplug->GetHost(&c, ref, &info).ok() && info.online();
+       }),
+       "  and online");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeSpec spec;
+        spec.set_id("gw3");
+        spec.set_connection("edge3");
+        spec.set_group("plant3");
+        spec.set_node("gw-30");
+        v1::SparkplugTemplateDefinition* pump = spec.add_templates();
+        pump->set_name("Pump");
+        v1::SparkplugMetric* running = pump->mutable_definition()->add_metrics();
+        running->set_name("running");
+        running->set_datatype(v1::DATATYPE_BOOLEAN);
+        running->mutable_value()->set_boolean_value(false);
+        v1::SparkplugMetric* hours = pump->mutable_definition()->add_metrics();
+        hours->set_name("hours");
+        hours->set_datatype(v1::DATATYPE_DOUBLE);
+        hours->mutable_value()->set_double_value(0);
+        const std::pair<const char*, v1::SparkplugDataType> metrics[] = {
+            {"pump1", v1::DATATYPE_TEMPLATE}, {"curve", v1::DATATYPE_FLOAT_ARRAY},
+            {"table", v1::DATATYPE_DATASET}, {"note", v1::DATATYPE_STRING}};
+        for (const auto& one : metrics) {
+            v1::SparkplugMetricDeclaration* d = spec.add_metrics();
+            d->set_name(one.first);
+            d->set_datatype(one.second);
+        }
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, spec, &info).ok(), "PutEdgeNode with a template definition and those metrics");
+        ok(info.spec().templates_size() == 1 && info.spec().templates(0).name() == "Pump" &&
+               info.spec().templates(0).definition().is_definition() &&
+               info.spec().templates(0).definition().metrics_size() == 2,
+           "  its spec gives the definition back");
+    }
+    auto births = [&](const char* topic) {
+        size_t n = 0;
+        for (const check::Got& g : watcher.got) n += g.topic == topic ? 1 : 0;
+        return n;
+    };
+    ok(fleet.until([&] { return births("spBv1.0/plant3/NBIRTH/gw-30") >= 1; }), "  it is born");
+    {
+        bool definition = false;
+        for (const check::Got& g : watcher.got) {
+            if (g.topic != "spBv1.0/plant3/NBIRTH/gw-30") continue;
+            const v1::SparkplugMessage read = decode(g);
+            for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+                definition |= m.name() == "Pump" && m.datatype() == v1::DATATYPE_TEMPLATE &&
+                              m.value().template_value().is_definition();
+            }
+        }
+        ok(definition, "  the NBIRTH carries the Pump definition");
+    }
+    auto set = [&](const std::vector<v1::SparkplugMetric>& metrics) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugValuesRequest request;
+        request.set_edge_node("gw3");
+        for (const v1::SparkplugMetric& m : metrics) *request.add_metrics() = m;
+        v1::SparkplugValuesReply reply;
+        sparkplug->SetValues(&c, request, &reply);
+        return reply;
+    };
+    std::vector<v1::SparkplugMetric> values(4);
+    values[0].set_name("pump1");
+    v1::SparkplugTemplate* instance = values[0].mutable_value()->mutable_template_value();
+    instance->set_template_ref("Pump");
+    v1::SparkplugMetric* member = instance->add_metrics();
+    member->set_name("running");
+    member->set_datatype(v1::DATATYPE_BOOLEAN);
+    member->mutable_value()->set_boolean_value(true);
+    member = instance->add_metrics();
+    member->set_name("hours");
+    member->set_datatype(v1::DATATYPE_DOUBLE);
+    member->mutable_value()->set_double_value(3.5);
+    values[1].set_name("curve");
+    for (float f : {1.0f, 2.0f, 3.0f}) values[1].mutable_value()->mutable_array_value()->add_floats(f);
+    values[2].set_name("table");
+    v1::SparkplugDataSet* table = values[2].mutable_value()->mutable_dataset_value();
+    table->add_columns("tag");
+    table->add_types(v1::DATATYPE_STRING);
+    table->add_columns("count");
+    table->add_types(v1::DATATYPE_INT32);
+    v1::SparkplugRow* row = table->add_rows();
+    row->add_values()->set_string_value("a");
+    row->add_values()->set_int_value(-4);
+    values[3].set_name("note");
+    values[3].mutable_value()->set_string_value("hello from the server");
+    {
+        const v1::SparkplugValuesReply reply = set(values);
+        equal<uint32_t>("SetValues: all four sent", reply.sent(), 4);
+        ok(reply.refused_size() == 0 && reply.unknown_size() == 0, "  none refused");
+    }
+    ok(fleet.until([&] {
+           bool pump = false, curve = false, rows = false;
+           for (const check::Got& g : watcher.got) {
+               if (g.topic != "spBv1.0/plant3/NDATA/gw-30") continue;
+               const v1::SparkplugMessage read = decode(g);
+            for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+                   const v1::SparkplugTemplate& t = m.value().template_value();
+                   pump |= t.template_ref() == "Pump" && t.metrics_size() == 2 && t.metrics(1).value().double_value() == 3.5;
+                   curve |= m.value().array_value().floats_size() == 3 && m.value().array_value().floats(2) == 3.0f;
+                   rows |= m.value().dataset_value().rows_size() == 1 &&
+                           m.value().dataset_value().rows(0).values(1).int_value() == -4;
+               }
+           }
+           return pump && curve && rows;
+       }),
+       "  NDATA carries the instance of Pump, the FloatArray and the DataSet");
+    {
+        std::vector<v1::SparkplugMetric> stranger(1, values[0]);
+        stranger[0].mutable_value()->mutable_template_value()->set_template_ref("Valve");
+        const v1::SparkplugValuesReply reply = set(stranger);
+        ok(reply.sent() == 0 && reply.refused_size() == 1 && reply.refused(0).find("Valve") != std::string::npos,
+           "an instance of a type the node does not declare is refused, saying why");
+        std::vector<v1::SparkplugMetric> wrong(1);
+        wrong[0].set_name("curve");
+        wrong[0].mutable_value()->set_double_value(1);
+        ok(set(wrong).refused_size() == 1, "and an array metric given a number");
+    }
+    {
+        const v1::SparkplugValuesReply again = set(std::vector<v1::SparkplugMetric>(1, values[3]));
+        ok(again.sent() == 1 && again.kept() == 0, "the same text again: nothing to send, and not kept as history");
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id("gw3");
+        v1::SparkplugEdgeNodeInfo info;
+        sparkplug->GetEdgeNode(&c, ref, &info);
+        equal<uint64_t>("  nothing waiting as history", info.history(), 0);
+    }
+    {
+        // A rebirth reads every value again - the text from the server's own copy, not the request long gone.
+        const size_t before = births("spBv1.0/plant3/NBIRTH/gw-30");
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id("gw3");
+        v1::Empty none;
+        sparkplug->RebirthEdgeNode(&c, ref, &none);
+        ok(fleet.until([&] { return births("spBv1.0/plant3/NBIRTH/gw-30") > before; }), "RebirthEdgeNode");
+        std::string note;
+        for (const check::Got& g : watcher.got) {
+            if (g.topic != "spBv1.0/plant3/NBIRTH/gw-30") continue;
+            const v1::SparkplugMessage read = decode(g);
+            for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+                if (m.name() == "note") note = m.value().string_value();
+            }
+        }
+        ok(note == "hello from the server", "  the new NBIRTH carries the text set earlier");
+    }
+    {
+        bool text = false, array = false, instance = false;
+        fleet.until([&] {
+            grpc::ClientContext c;
+            authorize(c);
+            v1::SparkplugNodesRequest request;
+            request.set_host("h3");
+            v1::SparkplugNodesReply reply;
+            sparkplug->ListNodes(&c, request, &reply);
+            for (const v1::SparkplugNode& n : reply.nodes()) {
+                for (const v1::SparkplugNodeMetric& m : n.metrics()) {
+                    text |= m.name() == "note" && m.value().string_value() == "hello from the server";
+                    array |= m.name() == "curve" && m.value().array_value().floats_size() == 3;
+                    instance |= m.name() == "pump1" && m.value().template_value().template_ref() == "Pump";
+                }
+            }
+            return text && array && instance;
+        });
+        ok(text, "ListNodes: the host reports the text");
+        ok(array && instance, "  and the array and the template instance, decoded");
+    }
+    for (const char* id : {"gw3"}) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id(id);
+        v1::Empty none;
+        sparkplug->DeleteEdgeNode(&c, ref, &none);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostRef ref;
+        ref.set_id("h3");
+        v1::Empty none;
+        sparkplug->DeleteHost(&c, ref, &none);
+    }
+}
+
 void sparkplugAware(Server& server) {
     section("Sparkplug Aware: births kept on $sparkplug/certificates/..., cleared by deaths, turned on and off live");
     auto sparkplug = v1::Sparkplug::NewStub(server.channel());
@@ -987,6 +1224,7 @@ int main() {
     if (server.started) sparkplugHost(server);
     if (server.started) sparkplugAware(server);
     if (server.started) sparkplugEdgeNode(server);
+    if (server.started) sparkplugStructures(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);
     return check::report("api_tests");

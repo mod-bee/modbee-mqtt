@@ -98,8 +98,6 @@ const char* mq_sparkplugDataTypeName(MqttSparkplugDataType type) {
 
 bool mq_sparkplugDataTypeSupported(MqttSparkplugDataType type) {
     switch (type) {
-        // The scalars, all of them, plus the two byte-array forms. This is
-        // everything a plant needs and roughly a third of the codec.
         case MqttSparkplugDataType::Int8:
         case MqttSparkplugDataType::Int16:
         case MqttSparkplugDataType::Int32:
@@ -117,14 +115,58 @@ bool mq_sparkplugDataTypeSupported(MqttSparkplugDataType type) {
         case MqttSparkplugDataType::UUID:
         case MqttSparkplugDataType::Bytes:
         case MqttSparkplugDataType::File:
+        case MqttSparkplugDataType::DataSet:
+        case MqttSparkplugDataType::Template:
             return true;
 
         // Unknown is a legal enum value and not a legal metric datatype. It
         // exists so a decoder can say "the far end did not tell me", which is
         // different from "the far end told me something I cannot carry".
+        // PropertySet and PropertySetList are a property's types: a metric's
+        // value `oneof` has no field for either.
         case MqttSparkplugDataType::Unknown:
-        default:
+        case MqttSparkplugDataType::PropertySet:
+        case MqttSparkplugDataType::PropertySetList:
             return false;
+
+        default:
+            return mq_sparkplugIsArrayType(type);
+    }
+}
+
+MqttSparkplugDataType mq_sparkplugArrayElement(MqttSparkplugDataType type) {
+    switch (type) {
+        case MqttSparkplugDataType::Int8Array:     return MqttSparkplugDataType::Int8;
+        case MqttSparkplugDataType::Int16Array:    return MqttSparkplugDataType::Int16;
+        case MqttSparkplugDataType::Int32Array:    return MqttSparkplugDataType::Int32;
+        case MqttSparkplugDataType::Int64Array:    return MqttSparkplugDataType::Int64;
+        case MqttSparkplugDataType::UInt8Array:    return MqttSparkplugDataType::UInt8;
+        case MqttSparkplugDataType::UInt16Array:   return MqttSparkplugDataType::UInt16;
+        case MqttSparkplugDataType::UInt32Array:   return MqttSparkplugDataType::UInt32;
+        case MqttSparkplugDataType::UInt64Array:   return MqttSparkplugDataType::UInt64;
+        case MqttSparkplugDataType::FloatArray:    return MqttSparkplugDataType::Float;
+        case MqttSparkplugDataType::DoubleArray:   return MqttSparkplugDataType::Double;
+        case MqttSparkplugDataType::BooleanArray:  return MqttSparkplugDataType::Boolean;
+        case MqttSparkplugDataType::StringArray:   return MqttSparkplugDataType::String;
+        case MqttSparkplugDataType::DateTimeArray: return MqttSparkplugDataType::DateTime;
+        default:                                   return MqttSparkplugDataType::Unknown;
+    }
+}
+
+size_t mq_sparkplugArrayElementBytes(MqttSparkplugDataType type) {
+    switch (type) {
+        case MqttSparkplugDataType::Int8Array:
+        case MqttSparkplugDataType::UInt8Array:    return 1;
+        case MqttSparkplugDataType::Int16Array:
+        case MqttSparkplugDataType::UInt16Array:   return 2;
+        case MqttSparkplugDataType::Int32Array:
+        case MqttSparkplugDataType::UInt32Array:
+        case MqttSparkplugDataType::FloatArray:    return 4;
+        case MqttSparkplugDataType::Int64Array:
+        case MqttSparkplugDataType::UInt64Array:
+        case MqttSparkplugDataType::DoubleArray:
+        case MqttSparkplugDataType::DateTimeArray: return 8;
+        default:                                   return 0;
     }
 }
 
@@ -140,6 +182,7 @@ const char* mq_sparkplugErrorName(MqttSparkplugError error) {
         case MqttSparkplugError::TooManyMetrics:       return "too many metrics";
         case MqttSparkplugError::InvalidName:          return "invalid name";
         case MqttSparkplugError::ValueTypeMismatch:    return "value type mismatch";
+        case MqttSparkplugError::TemplateReference:    return "template reference";
     }
     return "?";
 }

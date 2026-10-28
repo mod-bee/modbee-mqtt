@@ -371,6 +371,74 @@ broker.
 declarations, aliases, devices and write queues stay. With 5.0 the
 `disconnect()` before it makes the broker publish the NDEATH.
 
+### Arrays, structs and tables
+
+A PLC's `ARRAY OF REAL` is a `FloatArray` metric, a `STRUCT` or UDT is a
+`Template`, and a table is a `DataSet`. Each value travels as its own wire
+bytes, so a program that uses none of them pays for none of it.
+
+**An array** is packed from your own C array, little-endian whatever the
+board, as the specification packs it:
+
+```cpp
+float curve[3] = {1.0f, 2.0f, 3.0f};
+uint8_t packed[12];
+node.declare("curve", MqttSparkplugDataType::FloatArray);
+mq_spPackArray(MqttSparkplugDataType::FloatArray, curve, 3, packed, sizeof packed);
+node.set("curve", mq_spArray(MqttSparkplugDataType::FloatArray, packed, 12));
+```
+
+The element types follow C: `int16_t` for an `Int16Array`, `bool` for a
+`BooleanArray`, `const char*` for a `StringArray`, `uint64_t` milliseconds for
+a `DateTimeArray`. With a null buffer `mq_spPackArray()` returns the size it
+needs. Reading one back: `mq_spArrayCount(value, count)` and
+`mq_spArrayAt(value, index, element)`, which also say when the bytes are not a
+well-formed array.
+
+**A struct** is a Template. Declare its *definition* once - the members with
+their datatypes and starting values - and every metric of that type is an
+*instance*. The definition goes in every NBIRTH; an instance must name it.
+
+```cpp
+// The type: a Pump has running and hours.
+MqttSparkplugTemplate pump;
+pump.isDefinition = true;
+MqttSparkplugMetric running;  running.name = "running";  running.value = mq_spBool(false);
+MqttSparkplugMetric hours;    hours.name = "hours";      hours.value = mq_spDouble(0);
+pump.addMember(running);
+pump.addMember(hours);
+MqttSparkplugError error;
+uint8_t definition[128];
+size_t length = mq_sparkplugEncodeTemplate(definition, sizeof definition, pump, error);
+node.declareTemplate("Pump", definition, length);
+
+// A metric of that type, and a value for it.
+node.declare("pump1", MqttSparkplugDataType::Template);
+MqttSparkplugTemplate value;
+value.templateRef = "Pump";            // an instance of Pump
+hours.value = mq_spDouble(12.5);
+value.addMember(hours);                // in data, only what changed
+uint8_t bytes[128];
+length = mq_sparkplugEncodeTemplate(bytes, sizeof bytes, value, error);
+node.set("pump1", mq_spTemplate(bytes, (uint32_t)length));
+```
+
+A value whose `templateRef` names no definition this node declared is refused
+(`lastPayloadError()` says `TemplateReference`), and so is a host's write of
+one. A member can itself be a Template - a struct in a struct - an array or a
+DataSet. Parameters go in `addParameter()`, as name, type and value.
+`mq_sparkplugDecodeTemplate()` reads one back.
+
+**A table** is a DataSet: named, typed columns (the integers, `Float`,
+`Double`, `Boolean`, `String`, `DateTime`, `Text`) and rows with a cell for
+each - `mq_sparkplugEncodeDataSet()` to write one from your cells,
+`MqttSparkplugDataSetReader` to read one where it lies.
+
+The node keeps its own copy of what it last published, as long as the value
+is, so a value rewritten in place - a PLC writing into the same array - is
+still seen to change. (On a board, a text value used to be cut to 126
+characters; it is not any more.)
+
 ### Records with their own time, and store-and-forward
 
 ```cpp
@@ -465,20 +533,20 @@ pass the network object as for the node.
 
 ## What is supported
 
-**Datatypes:** `Int8` to `Int64`, `UInt8` to `UInt64`, `Float`, `Double`,
-`Boolean`, `String`, `Text`, `UUID`, `DateTime`, `Bytes`, `File`, and metric
-properties with scalar values (engineering units and quality live there).
+**Datatypes: all of Sparkplug B 3.0's.** `Int8` to `Int64`, `UInt8` to
+`UInt64`, `Float`, `Double`, `Boolean`, `String`, `Text`, `UUID`, `DateTime`,
+`Bytes`, `File`, the thirteen array types, `DataSet` and `Template` (see
+[Arrays, structs and tables](#arrays-structs-and-tables)); metric properties,
+and a property whose value is a `PropertySet` or a `PropertySetList`
+(`mq_spPropertySet()`, `mq_sparkplugDecodePropertySet()`).
 
-**Not supported yet:** `DataSet`, `Template`, `PropertySetList` and the
-array types. They are part of Sparkplug 3.0; this library does not carry
-their values yet.
-
-- **A node cannot declare one** - `declare()` refuses it.
-- **A host still sees a node that sends one** (an Ignition UDT is a
-  Template). The rest of the message is read as usual, and the metric itself
-  is kept with its name, alias and datatype, `valueUnsupported` set and its
-  value NULL - never a zero. The host's dictionary lists it; `read()` finds no
-  value for it.
+- **A host keeps what it reads.** `read()` of a String, an array or a
+  Template gives the host's own copy of the last value - not bytes in its
+  receive buffer, which the next message reuses. An Ignition UDT arrives as a
+  Template, its bytes readable with `mq_sparkplugDecodeTemplate()`.
+- Only a datatype no metric can carry (`Unknown`, or a property's
+  `PropertySet`) is kept without a value: `valueUnsupported` set and NULL,
+  never a zero.
 
 **Data without datatypes.** The specification says data and command
 messages SHOULD NOT carry a metric's datatype, because the birth declared it.
@@ -543,9 +611,15 @@ messages land in one Kafka partition and stay in order:
 Three independent checks, because tests written from the same reading of the
 specification as the code would share its mistakes:
 
-- **The Eclipse Sparkplug TCK**, the specification project's own test suite.
+- **The Eclipse Sparkplug TCK**, the specification project's own test suite -
+  its node under test declares a Template definition with a parameter, an
+  instance and an array, so the template statements are graded too.
 - **Other implementations' codecs:** Eclipse Tahu (Python) and the npm
   `sparkplug-payload` decode what this library encodes, and the reverse.
+  Arrays, Templates, DataSets and nested PropertySets match Tahu byte for
+  byte. `sparkplug-payload` 1.0.3 has no array datatypes and refuses a
+  negative `Int32` in a DataSet cell - one more reason to decode through the
+  server's API rather than in an application.
 - **A live node and host**, on a real broker, judged by an independent Python
   host application.
 

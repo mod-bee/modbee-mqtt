@@ -13,6 +13,21 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Sparkplug B arrays, structs and tables in the library** - every metric datatype, on a board too. The thirteen
+  array types (`mq_spPackArray` from a program's own C array, `mq_spArrayCount` / `mq_spArrayAt` to read one),
+  Templates - a PLC `STRUCT` or UDT: `MqttSparkplugTemplate`, `mq_sparkplugEncodeTemplate` / `DecodeTemplate`, and on
+  the edge node `declareTemplate()`, its definition published in every NBIRTH and each value of a Template metric
+  checked to be an instance of a declared one (`TemplateReference` otherwise) - DataSets (`mq_sparkplugEncodeDataSet`,
+  `MqttSparkplugDataSetReader`), and a property whose value is a PropertySet or a PropertySetList. A value is carried
+  as its own wire bytes, so a program that uses none of them links none of it: the ESP32 Sparkplug example grew by
+  1.4 kB of flash and 16 bytes of RAM. They were refused by name until now - a choice made in the library's first
+  commit, not a limit of the boards. Checked byte for byte against Eclipse Tahu both ways, and by the Sparkplug TCK
+  (its template statements included). A PropertySet is now written keys first, then values, as generated encoders
+  write it - the same message, now byte-identical with theirs.
+- **The server's edge node takes them too**: `SparkplugEdgeNodeSpec.templates` (definitions, kept with the node),
+  arrays, DataSets and Template instances in `SetValues`, and `SparkplugValuesReply.refused` ("name: why") for a value
+  its metric cannot take. `ListNodes` reports the last value of every metric - text, bytes, arrays, DataSets and
+  Templates as well as numbers and bools. Hello says `sparkplug.structures`.
 - **`sub --sparkplug`**: Sparkplug B messages printed decoded, as JSON lines - the same codec the Application API
   uses.
 - **A Sparkplug B Edge Node in the server** (`Sparkplug.PutEdgeNode` ... `DeleteEdgeNode`, `SetValues`,
@@ -36,7 +51,8 @@ minor version may change the API or the configuration, and says how here.
   messages decoded (`Delivery.sparkplug`) - every datatype, arrays, datasets, templates, property sets and their
   lists, metadata, compressed payloads (DEFLATE, GZIP) - `PublishRequest.sparkplug` publishes a typed payload, and
   `Sparkplug.Decode` / `Encode` convert one on their own (`modbee-mqtt sparkplug decode|encode`). The server's codec
-  is its own (proto/modbee/sparkplug/v1/wire.proto); the library's, for boards, is unchanged.
+  is its own (proto/modbee/sparkplug/v1/wire.proto), typed through; the library's, for boards, carries the same
+  datatypes as their wire bytes (above).
 - **Store and forward on a managed connection** (`ConnectionSpec.store_and_forward`): every publish on it is kept on
   disk until the other broker acknowledges it - a connection that is down, a restart or a crash loses none, and
   they are sent in order, at QoS 1 or more. `PUBLISH_STORED` while it is down; bounded in messages and bytes, full
@@ -98,6 +114,14 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **A Sparkplug host could read another message's text**: `MqttSparkplugHost` kept a String, Text or Bytes value as a
+  pointer into its receive buffer, which the next message reuses, so `read()` could return the wrong bytes. It keeps
+  its own copy now (`MqttSparkplugTrackedMetric::owned`).
+- **A board's Sparkplug text was cut to 126 characters**: a node's copies of a metric's last-published and written
+  values were fixed 127-character fields; they are as long as the value now, and only a text metric has them.
+- **The server's edge node**: a String it was given kept pointing into the request after the call returned, so a
+  rebirth could read freed memory - it keeps its own copy now; and `SetValues` with an unchanged value while born
+  kept it as history and later sent it again, `is_historical`.
 - A named group kept on disk lost a handshake-failed event's `detail` across a restart.
 - **Client events say where a client came from**: `connected` and `connect-refused` carry `address`, and so does
   `ClientEvent.address` over the Application API, which the contract promised for CONNECTED and was always empty.

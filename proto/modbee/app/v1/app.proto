@@ -442,8 +442,8 @@ service Sparkplug {
   rpc GetHost(SparkplugHostRef) returns (SparkplugHostInfo);
   rpc ListHosts(Empty) returns (SparkplugHostList);
   rpc DeleteHost(SparkplugHostRef) returns (Empty);           // its STATE made offline first
-  // What the host knows of its nodes now: sessions, devices, every declared metric, and the last value of each
-  // number and bool.
+  // What the host knows of its nodes now: sessions, devices, every declared metric, and the last value of each:
+  // numbers, bools, text, bytes, arrays, DataSets and Templates.
   rpc ListNodes(SparkplugNodesRequest) returns (SparkplugNodesReply);
   // Node Control/Rebirth (or, with `device`, Device Control/Rebirth), now - asked by a person, so not limited.
   rpc Rebirth(SparkplugRebirthRequest) returns (SparkplugCommandReply);
@@ -460,8 +460,9 @@ service Sparkplug {
   // what it declares (aliases its own), NDATA and DDATA as values are set - deadbands applied - a rebirth when a host
   // asks, and a primary host's STATE waited for. While it is not born, values set are kept on disk and sent, oldest
   // first, with is_historical once it is: Sparkplug's store and forward. A host's writes reach the application on the
-  // connection, as NCMD and DCMD (ConsumeOpen.sparkplug: names filled in). Kept in the state directory. Its datatypes are
-  // the library's: numbers, Boolean, String, Text, UUID, Bytes, File, DateTime.
+  // connection, as NCMD and DCMD (ConsumeOpen.sparkplug: names filled in). Kept in the state directory. Every metric
+  // datatype: numbers, Boolean, String, Text, UUID, Bytes, File, DateTime, the arrays, DataSet, and Template - a PLC
+  // struct or UDT, its definition in `templates` (published in the NBIRTH) and each Template metric an instance of one.
   rpc PutEdgeNode(SparkplugEdgeNodeSpec) returns (SparkplugEdgeNodeInfo);
   rpc GetEdgeNode(SparkplugEdgeNodeRef) returns (SparkplugEdgeNodeInfo);
   rpc ListEdgeNodes(Empty) returns (SparkplugEdgeNodeList);
@@ -480,6 +481,16 @@ message SparkplugEdgeNodeSpec {
   repeated string devices = 6;
   repeated SparkplugMetricDeclaration metrics = 7;
   optional uint64 history_max = 8; // values kept while not born (default 100000; 0: none); full, the oldest go
+  repeated SparkplugTemplateDefinition templates = 9;
+}
+// A Template definition the edge node publishes in its NBIRTH: the type of a PLC struct or UDT - its members (name,
+// datatype, default value; a member may itself be a Template instance, an array or a DataSet) and its parameters.
+// `definition.is_definition` is taken as true and `template_ref` must be empty. A metric declared with datatype
+// DATATYPE_TEMPLATE is an instance: SetValues gives it a template_value whose template_ref is one of these names - in
+// a birth with every member, in data with those that changed.
+message SparkplugTemplateDefinition {
+  string name = 1;                 // a metric name in the NBIRTH: not one of the node's own metrics
+  SparkplugTemplate definition = 2;
 }
 message SparkplugMetricDeclaration {
   string name = 1;
@@ -514,9 +525,10 @@ message SparkplugValuesRequest {
   repeated SparkplugMetric metrics = 3; // name, value, and a timestamp if not now
 }
 message SparkplugValuesReply {
-  uint32 sent = 1;                 // set and published (deadbands may hold some back)
+  uint32 sent = 1;                 // set and published (deadbands, or no change, may hold some back)
   uint32 kept = 2;                 // not born: kept, sent as history once it is
   repeated string unknown = 3;     // names it never declared
+  repeated string refused = 4;     // "name: why" - a value its metric cannot take (a template_ref it does not declare)
 }
 message SparkplugDeviceStateRequest {
   string edge_node = 1;
@@ -580,7 +592,7 @@ message SparkplugNodeMetric {
   string device = 2;               // "" for the node's own
   optional uint64 alias = 3;
   SparkplugDataType datatype = 4;
-  SparkplugValue value = 5;        // the last, for a number or a bool; unset otherwise
+  SparkplugValue value = 5;        // the last; unset when there is none (or it was null)
   uint64 timestamp = 6;
 }
 

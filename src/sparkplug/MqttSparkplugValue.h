@@ -33,8 +33,10 @@
 //
 // All twelve of the typed layer's kinds have a Sparkplug datatype, so a
 // SPARKPLUG_STRUCT block can bind any STRUCT the MQTT_STRUCT_PUBLISH block
-// could. Sparkplug adds four the typed layer has no entry for - DateTime, Text,
-// UUID and Bytes/File - and those are reachable from here directly.
+// could. Sparkplug adds what the typed layer has no entry for - DateTime,
+// Text, UUID, Bytes/File, the arrays, DataSet and Template - and those are
+// reachable from here directly: an ARRAY OF REAL is a FloatArray
+// (mq_spPackArray), a STRUCT a Template (MqttSparkplugTemplate).
 //
 // THE STORAGE IS A UNION AND THE REASON IS THE BOARD. A metric is 24 bytes here
 // against about 40 for a struct of every field, and a payload holds up to
@@ -114,6 +116,22 @@ struct MqttSparkplugValue {
                type == MqttSparkplugDataType::File;
     }
 
+    // Int8Array .. DateTimeArray: the packed bytes, in `as.bytes`.
+    bool isArray() const { return mq_sparkplugIsArrayType(type); }
+
+    // DataSet and Template: the nested message's encoded bytes, in `as.bytes`.
+    bool isStructured() const {
+        return type == MqttSparkplugDataType::DataSet ||
+               type == MqttSparkplugDataType::Template;
+    }
+
+    // Held as a span in `as.bytes` - text, bytes, an array, a dataset or a
+    // template - rather than as a number. What a holder of a value past its
+    // message must copy (MqttSparkplugBytes), and what compares by content.
+    bool isSpan() const {
+        return isText() || isBytes() || isArray() || isStructured();
+    }
+
     // One number, whatever the declared type, for the change detection a
     // report-by-exception layer needs. A BOOL is 1.0 or 0.0; text and bytes are
     // 0.0 and are compared by content instead.
@@ -166,6 +184,16 @@ MqttSparkplugValue mq_spUuid(const char* text);
 MqttSparkplugValue mq_spBytes(const uint8_t* data, uint32_t length);
 MqttSparkplugValue mq_spFile(const uint8_t* data, uint32_t length);
 
+// An array, from bytes already packed as section 6.4.17 packs them (see
+// mq_spPackArray). Not copied.
+MqttSparkplugValue mq_spArray(MqttSparkplugDataType arrayType,
+                              const uint8_t* packed, uint32_t length);
+
+// A Template or DataSet, from its encoded message (mq_sparkplugEncodeTemplate,
+// mq_sparkplugEncodeDataSet in MqttSparkplugPayload.h). Not copied.
+MqttSparkplugValue mq_spTemplate(const uint8_t* encoded, uint32_t length);
+MqttSparkplugValue mq_spDataSet(const uint8_t* encoded, uint32_t length);
+
 // Milliseconds since the Unix epoch, UTC. Section 6.4.17: "Date time value as
 // uint64 value representing milliseconds since epoch (Jan 1, 1970)".
 MqttSparkplugValue mq_spDateTime(uint64_t millisecondsSinceEpoch);
@@ -174,6 +202,69 @@ MqttSparkplugValue mq_spDateTime(uint64_t millisecondsSinceEpoch);
 // Application needs to know what the metric IS in order to show it greyed out
 // rather than absent.
 MqttSparkplugValue mq_spNull(MqttSparkplugDataType type);
+
+// --- Arrays ---
+//
+// Packed as section 6.4.17 packs them, little-endian byte by byte whatever the
+// board, so the same bytes go out from an ESP32 and an x86 host.
+//
+// FROM A PROGRAM'S OWN ARRAY. `elements` is `count` values laid out as C lays
+// out the element type - int8_t .. uint64_t, float, double; `bool` for a
+// BooleanArray; `const char*` (NUL-ended) for a StringArray; uint64_t
+// milliseconds for a DateTimeArray - which is how a PLC holds ARRAY OF INT or
+// ARRAY OF REAL. Returns the packed length; writes only when it fits in
+// `capacity`, so a null `out` asks the size. A StringArray with a null string
+// packs it as empty.
+size_t mq_spPackArray(MqttSparkplugDataType arrayType, const void* elements,
+                      size_t count, uint8_t* out, size_t capacity);
+
+// How many elements a packed array holds. False when the bytes are not a
+// well-formed array of that type: a length that is not a multiple of the
+// width, a BooleanArray with fewer bits than its count, a StringArray whose
+// last string has no NUL.
+bool mq_spArrayCount(const MqttSparkplugValue& array, size_t& count);
+
+// One element, as a scalar value of the element's type: Int16 for an
+// Int16Array. A StringArray's element is a span into the array. False past
+// the end or for a malformed array.
+bool mq_spArrayAt(const MqttSparkplugValue& array, size_t index,
+                  MqttSparkplugValue& element);
+
+// --- A value's bytes, owned ---
+//
+// A span value - text, bytes, an array, a dataset, a template - points into
+// someone's buffer, and a receive buffer is reused for the next message. What
+// keeps a value past its message (a node's last-published copy and its
+// commands, a host's current picture) copies it here. Grows to the largest it
+// has held and never shrinks, in PSRAM where the board has some; it was a
+// 127-character text field on a board, which cut every longer value.
+class MqttSparkplugBytes {
+public:
+    MqttSparkplugBytes() noexcept = default;
+    ~MqttSparkplugBytes() noexcept;
+    MqttSparkplugBytes(const MqttSparkplugBytes&) = delete;
+    MqttSparkplugBytes& operator=(const MqttSparkplugBytes&) = delete;
+    // Moved, so a table of them can grow: the bytes stay where they are.
+    MqttSparkplugBytes(MqttSparkplugBytes&& other) noexcept;
+    MqttSparkplugBytes& operator=(MqttSparkplugBytes&& other) noexcept;
+
+    // A copy of `length` bytes, which may be inside this one. False, and
+    // empty, when the memory is not there.
+    bool assign(const uint8_t* data, size_t length) noexcept;
+    void clear() noexcept { _size = 0; }
+
+    const uint8_t* data() const noexcept { return _data; }
+    size_t size() const noexcept { return _size; }
+
+    // `value` with its span pointed here, after assign()ing its bytes. A null
+    // value, or a number, is returned as it is.
+    MqttSparkplugValue keep(const MqttSparkplugValue& value) noexcept;
+
+private:
+    uint8_t* _data = nullptr;
+    uint32_t _size = 0;
+    uint32_t _capacity = 0;
+};
 
 // --- Converting to and from the typed layer ---
 //
