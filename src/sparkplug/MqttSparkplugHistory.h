@@ -97,6 +97,30 @@ public:
     // placed and keeps its mark.
     void placeOnClock(uint64_t utcNow, uint32_t uptimeNow);
 
+    // --- Keeping it across a restart: the application's to do ---
+    //
+    // The ring is RAM and stays RAM - a library that wrote to flash on its own
+    // would wear it out on a schedule nobody chose, and on OpenPLC the
+    // project's retained variables are already the store. What the library
+    // owes is a way out and a way back in, which is these.
+    //
+    // save() copies what is held, oldest first, into `out` (up to `capacity`)
+    // and returns how many; persist those and lost(). After a restart, begin()
+    // again and restore() them - oldest first, as add() would take them, the
+    // oldest dropped and counted if there are more than the depth - with the
+    // lost count carried over. An event still stamped with uptime
+    // (MQ_SP_EVENT_UPTIME) is on the previous boot's counter, which no clock
+    // can place: restore() drops it and counts it in lost() rather than file
+    // it at a time that never happened. (placeOnClock() before saving keeps
+    // such events, once the clock is set.) Returns how many it kept.
+    //
+    // mq_spEventWrite()/mq_spEventRead() below give an event a fixed byte
+    // layout to store, so a saved ring survives a firmware whose struct is
+    // laid out differently.
+    size_t save(MqttSparkplugEvent* out, size_t capacity) const;
+    size_t restore(const MqttSparkplugEvent* events, size_t count,
+                   uint32_t lost = 0);
+
 private:
     MqttSparkplugEvent* _events = nullptr;
     size_t _depth = 0;
@@ -105,3 +129,11 @@ private:
     uint32_t _lost = 0;
     bool _begun = false;
 };
+
+// An event as MQ_SP_EVENT_BYTES bytes, little-endian, in a layout that does
+// not change with the compiler: timestamp (8), value (4, IEEE 754 bits), seq
+// (4), source (2), code (2), flags (1), and a version byte - 1 - and two zero
+// bytes. Read answers false for bytes that are not version 1.
+#define MQ_SP_EVENT_BYTES 24
+void mq_spEventWrite(uint8_t* out, const MqttSparkplugEvent& event);
+bool mq_spEventRead(const uint8_t* in, MqttSparkplugEvent& event);

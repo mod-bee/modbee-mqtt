@@ -51,6 +51,7 @@ MqttSparkplugNode::~MqttSparkplugNode() {
     mq_freeLarge(_stateBlock);
     mq_freeLarge(_pointIndex);
     mq_freeLarge(_scratch);
+    mq_freeLarge(_replay);
 }
 
 #if MQTT_TLS_SOCKETS
@@ -96,8 +97,22 @@ uint64_t MqttSparkplugNode::utcNow() const {
     // system hands it the time is more trustworthy than a container whose
     // clock nobody has looked at.
     if (_epochSet) {
-        return _epochAtBoot +
-               (uint64_t)mq_elapsed(_epochSetAt, mq_millis());
+        // THE ANCHOR MOVES FORWARD AS IT IS READ. mq_millis() is 32 bits and
+        // wraps after 49.7 days, and the time since epochNow() was measured
+        // with it: so on day 50 every timestamp this node sent jumped back by
+        // 49.7 days - every NDATA older than the birth before it, and a host
+        // filing the data by its own timestamp put a month and a half of it
+        // in the past. Re-anchored once the elapsed time passes 2^30 ms
+        // (12.4 days), it never comes near the wrap, so long as the node is
+        // asked the time once in the 37 days after that - poll() asks.
+        const mq_time_t now = mq_millis();
+        const mq_time_t elapsed = mq_elapsed(_epochSetAt, now);
+        if (elapsed >= 0x40000000u) {
+            _epochAtBoot += elapsed;
+            _epochSetAt = now;
+            return _epochAtBoot;
+        }
+        return _epochAtBoot + (uint64_t)elapsed;
     }
 
     // The platform's own wall clock, which answers zero where there is none.
@@ -165,7 +180,21 @@ void MqttSparkplugNode::only(MqttVersion version) {
 // SERVERS
 // =============================================================================
 
+// NOT WHILE A CONNECT IS READING IT. On a board the transport keeps a pointer
+// to the active server's name (MqttStreamTransport), and where the channel's
+// connect runs on its own task (MqttConnectTask, ESP32) it reads that name
+// while poll() goes on. Rewriting the list then - server() rewrites the first
+// entry, which is usually the active one - changed the bytes under a
+// resolver mid-read. Refused while the transport is opening; the entries are
+// fixed storage inside the node, so outside an attempt the pointer stays good
+// and the new name is simply what the next attempt dials.
+bool MqttSparkplugNode::connectInFlight() const {
+    // The client's attempt, or the channel's dial on its task, which can outlast it.
+    return (_begun && _client.state() == MqttState::Connecting) || _net.connecting();
+}
+
 bool MqttSparkplugNode::server(const char* host, uint16_t port) {
+    if (connectInFlight()) return false;
     _serverCount = 0;
     _serverIndex = 0;
     return addServer(host, port);
@@ -173,6 +202,7 @@ bool MqttSparkplugNode::server(const char* host, uint16_t port) {
 
 bool MqttSparkplugNode::addServer(const char* host, uint16_t port) {
     if (host == nullptr || host[0] == '\0') return false;
+    if (connectInFlight()) return false;
     if (_serverCount >= MQ_SP_MAX_SERVERS) return false;
 #if MQTT_LEAN
     if (strlen(host) > _servers[_serverCount].host.capacity()) return false;
@@ -272,8 +302,23 @@ void MqttSparkplugNode::indexPoint(size_t index) {
 
 int MqttSparkplugNode::findPointByAlias(uint64_t alias) const {
     if (alias == 0) return -1;
-    for (size_t index = 0; index < _pointCount; index++) {
-        if (_points[index].alias == alias) return (int)index;
+    // BY HALVES, NOT IN A LINE. Aliases come from one counter, in the order
+    // the points were declared (templates take numbers from it too, so they
+    // are increasing but not contiguous), so the points are sorted by alias
+    // already. A host's command naming ten thousand aliases on a node of ten
+    // thousand points was a hundred million comparisons inside one poll; it
+    // is now fourteen a metric.
+    size_t low = 0;
+    size_t high = _pointCount;
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2;
+        const uint64_t at = _points[middle].alias;
+        if (at == alias) return (int)middle;
+        if (at < alias) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
     }
     return -1;
 }
@@ -1318,7 +1363,15 @@ void MqttSparkplugNode::applyConnectionConfig() {
         // told to move to the next server reconnected to the same one: the
         // index advanced and the socket did not. A transport the caller
         // brought is still left alone - see the constructor.
-        _net.target(active.host.c_str(), _connection.port);
+        //
+        // NOT WHILE A CONNECT IS READING THE OLD ONE (see server()): the
+        // retarget waits for poll() to find the transport no longer opening.
+        if (connectInFlight()) {
+            _retargetOwed = true;
+        } else {
+            _retargetOwed = false;
+            _net.target(active.host.c_str(), _connection.port);
+        }
     }
 
     // The client identifier. Sparkplug does not specify one, but the Edge Node
@@ -1503,12 +1556,18 @@ bool MqttSparkplugNode::rebind(MqttTransport& transport) {
     _net.borrow(transport);
     _disconnectAfterDeath = false;
     _reconnectAfterOffline = false;
+    // A transport swapped underneath a born node is usually a link that
+    // stopped working: what the window holds is owed to the next session.
+    if (_born && _replay != nullptr && _replayCount > 0) _replayCarried = true;
     endBirth();
     return true;
 }
 
 void MqttSparkplugNode::disconnect() {
     if (!_begun) return;
+    // A goodbye this node means: what it published went ahead of it on a
+    // connection that was working, and nothing is owed to the next session.
+    replayForget();
     _active = false;
     _restartOwed = false;
     _cycleOwed = false;
@@ -1612,6 +1671,7 @@ void MqttSparkplugNode::deathTrampoline(void* context, MqttResult result,
 }
 
 void MqttSparkplugNode::cycleSession() {
+    replayForget();
     if (!_shared) {
         _reconnectAfterOffline = true;
         disconnect();
@@ -1639,6 +1699,12 @@ void MqttSparkplugNode::poll() {
         return;
     }
     if (!_shared) _client.poll();   // a shared client's owner polls it
+    // A retarget that waited for a connect attempt to finish reading the old
+    // name (applyConnectionConfig()).
+    if (_retargetOwed && !connectInFlight() && _serverCount > 0) {
+        _retargetOwed = false;
+        _net.target(_servers[_serverIndex].host.c_str(), _connection.port);
+    }
     // A 3.1.1 DISCONNECT WAITS FOR THE NDEATH, AND NOT FOR EVER.
     //
     // The disconnect is deferred until the death certificate is acknowledged,
@@ -1731,6 +1797,22 @@ void MqttSparkplugNode::poll() {
         deviceBirthRefused(refused);
     }
 
+    // A REBIRTH HELD BY rebirthHoldoff() goes when the time is up - once,
+    // for however many requests it is answering.
+    if (_rebirthDeferred && _client.isConnected() && !_disconnectAfterDeath &&
+        mq_elapsed(_lastBirthAt, mq_millis()) >= _rebirthHoldoff) {
+        _rebirthDeferred = false;
+        if (!rebirth()) _rebirthPending = false;
+    }
+
+    // The replay window: what an unclean end left goes after the births
+    // above and before the data below; and the probe that proves delivery.
+    replayService();
+
+    // The clock is read at least once a poll, so its anchor moves on before
+    // the 32-bit millisecond counter can wrap under it (utcNow()).
+    (void)utcNow();
+
     // ONE NDATA, AND ONE DDATA A DEVICE, for everything the program marked
     // since the last poll (publishAtPoll()) - after the births above, never
     // before them.
@@ -1801,7 +1883,17 @@ void MqttSparkplugNode::stateChanged(MqttState state, MqttResult reason) {
         state == MqttState::Connecting) {
         _birthOwed = false;
         _subscriptionsOwed = false;
+        _rebirthDeferred = false;
+        // A probe on a connection that has gone proves nothing.
+        _replayProbeInFlight = false;
+        _replayOwed = false;
         if (!_born) return;
+        // NOT OURS: the link went. What the window still holds may be in a
+        // socket that led nowhere, so it goes again after the next birth.
+        // (Every end this node means - disconnect(), an offline STATE, a new
+        // host session - goes through endBirth() first, so _born is already
+        // false and this is not reached.)
+        if (_replay != nullptr && _replayCount > 0) _replayCarried = true;
         // A device is not offline - the LINK is. See endBirth().
         endBirth();
 
@@ -2191,6 +2283,16 @@ bool MqttSparkplugNode::publishBirth() {
 
     _born = true;
     _birthCount++;
+    _lastBirthAt = mq_millis();
+    _rebirthDeferred = false;   // this birth answers any request it held
+    // A session that ended uncleanly left values that may never have
+    // arrived: they follow this birth sequence (replayService()).
+    if (_replayCarried && _replayCount > 0) {
+        _replayOwed = true;
+        _replayOwedCount = _replayCount;
+        _replayOwedAt = mq_millis();
+    }
+    _replayCarried = false;
     // The birth is away, so data may flow again. Cleared here rather than in
     // rebirth() because the DBIRTHs below are part of the same sequence and
     // must not have data interleaved either.
@@ -2301,6 +2403,12 @@ bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
     // registry and go out with the birth, and then normally afterwards.
     if (_rebirthPending) return true;
 
+    // HISTORY FIRST. While the replay window is sending what the last session
+    // may have lost, live data waits behind it - not sent, not spent, still
+    // on its change list - so a host never sees a live value and then an
+    // older historical one for the same metric arrive after it.
+    if (_replayOwed) return false;
+
     // Nothing to say is not a failure, and publishing an empty NDATA would
     // still cost a sequence number and a message.
     //
@@ -2357,6 +2465,9 @@ bool MqttSparkplugNode::publishData(int16_t device, bool onlyChanged) {
         return false;
     }
 
+    // Kept until the broker is proven to have it (replayWindow()).
+    replayRecord(_outbound, device);
+
     // WHAT WENT, AND ONLY WHAT WENT, becomes the new reference (see
     // settleChanges()). Everything went: the list is empty.
     if (onlyChanged) {
@@ -2392,6 +2503,7 @@ bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
                                        size_t count, bool historical) {
     if (!_born || !_client.isConnected()) return false;
     if (_rebirthPending) return false;
+    if (_replayOwed) return false;   // history first: see publishData()
     if (records == nullptr || count == 0) return true;
 
     if (records[0].index >= _pointCount) return false;
@@ -2449,6 +2561,7 @@ bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
         _seq = sequenceBefore;
         return false;
     }
+    replayRecord(_outbound, device);
 
     if (!historical) {
         // Live: what went is now the metric's value and its reference, so
@@ -2467,6 +2580,271 @@ void MqttSparkplugNode::publishOwed() {
     _publishOwed = false;
     _pollPublishSent = publishChanged();
     _pollPublishes++;
+}
+
+void MqttSparkplugNode::withdrawData() {
+    if (mq_sparkplugBuildTopic(_topic, sizeof _topic, MqttSparkplugType::NData,
+                               _group.c_str(), _node.c_str(), nullptr) != 0) {
+        _client.withdraw(_topic);
+    }
+    for (size_t index = 0; index < _deviceCount; index++) {
+        if (mq_sparkplugBuildTopic(_topic, sizeof _topic,
+                                   MqttSparkplugType::DData, _group.c_str(),
+                                   _node.c_str(),
+                                   _devices[index].id.c_str()) != 0) {
+            _client.withdraw(_topic);
+        }
+    }
+}
+
+// =============================================================================
+// THE REPLAY WINDOW
+// =============================================================================
+//
+// See replayWindow() in the header for what it is for. The ring holds what
+// was published, oldest first; each entry carries the number of the probe it
+// waits for. A probe is an UNSUBSCRIBE of a filter this node never subscribed
+// to - spBv1.0/{group}/NDATA/{node}/+, which no message can match, since an
+// NDATA topic has no fifth level - so the broker's answer changes nothing,
+// resends nothing (a SUBSCRIBE would bring back anything retained), and
+// arrives after everything written before it on the same connection.
+
+bool MqttSparkplugNode::replayWindow(size_t entries, uint32_t maxAgeMs) {
+    mq_freeLarge(_replay);
+    _replay = nullptr;
+    _replayDepth = 0;
+    _replayFirst = 0;
+    _replayCount = 0;
+    _replayOwedCount = 0;
+    _replayCarried = false;
+    _replayOwed = false;
+    _replayProbeInFlight = false;
+    _replayMaxAge = maxAgeMs;
+    if (entries == 0) return true;
+    if (entries > ((size_t)-1) / sizeof(ReplayEntry)) return false;
+    void* raw = mq_allocLarge(entries * sizeof(ReplayEntry));
+    if (raw == nullptr) {
+        _outOfMemory = true;
+        return false;
+    }
+    _replay = static_cast<ReplayEntry*>(raw);
+    for (size_t index = 0; index < entries; index++) {
+        new (&_replay[index]) ReplayEntry();
+    }
+    _replayDepth = entries;
+    return true;
+}
+
+void MqttSparkplugNode::replayForget() {
+    _replayFirst = 0;
+    _replayCount = 0;
+    _replayOwedCount = 0;
+    _replayCarried = false;
+    _replayOwed = false;
+}
+
+void MqttSparkplugNode::replayKeep(size_t point, const MqttSparkplugValue& value,
+                                   uint64_t timestamp) {
+    if (value.isSpan()) {
+        // Not kept: its bytes are in a buffer that moves on, and copying them
+        // would put an allocation on every publish.
+        _replayLost++;
+        return;
+    }
+    if (_replayCount == _replayDepth) {
+        // FULL: the oldest goes - it is the likeliest to have arrived.
+        _replayFirst = (_replayFirst + 1) % _replayDepth;
+        _replayCount--;
+        _replayLost++;
+    }
+    ReplayEntry& entry = _replay[(_replayFirst + _replayCount) % _replayDepth];
+    entry.point = (uint32_t)point;
+    entry.timestamp = timestamp;
+    entry.isNull = value.isNull ? 1 : 0;
+    entry.bits = value.isNull ? 0 : mq_spBitsOf(value);
+    entry.epoch = _replayEpoch;
+    _replayCount++;
+}
+
+void MqttSparkplugNode::replayRecord(const MqttSparkplugPayload& payload,
+                                     int16_t device) {
+    if (_replay == nullptr) return;
+    for (size_t index = 0; index < payload.metricCount; index++) {
+        const MqttSparkplugMetric& metric = payload.metrics[index];
+        int point = metric.hasAlias ? findPointByAlias(metric.alias) : -1;
+        if (point < 0 && metric.name != nullptr) {
+            point = findPointIndex(metric.name, device);
+        }
+        if (point < 0) continue;   // bdSeq and the like: not a point
+        replayKeep((size_t)point, metric.value,
+                   metric.hasTimestamp ? metric.timestamp : payload.timestamp);
+    }
+}
+
+void MqttSparkplugNode::replayProbed(void* context, MqttResult result,
+                                     uint16_t packetId) {
+    (void)packetId;
+    MqttSparkplugNode* node = static_cast<MqttSparkplugNode*>(context);
+    if (!node->_replayProbeInFlight) return;   // a session that has gone
+    node->_replayProbeInFlight = false;
+    // ANY ANSWER FROM THE BROKER IS PROOF, a refusal included: it came back
+    // on this connection after everything written before the probe. Only the
+    // link failing is not.
+    const bool answered = result == MqttResult::Ok ||
+                          result == MqttResult::Refused ||
+                          result == MqttResult::NotAuthorized ||
+                          result == MqttResult::NoMatchingSubscribers ||
+                          result == MqttResult::TopicNameInvalid ||
+                          result == MqttResult::NotSupportedByPeer;
+    if (!answered) return;
+    // Everything recorded before the probe went - those entries carry an
+    // older probe number than the one now current. Held entries still owed to
+    // a replay are never let go here: they have not been sent again yet.
+    if (node->_replayOwed) return;
+    while (node->_replayCount > 0 &&
+           node->_replay[node->_replayFirst].epoch != node->_replayEpoch) {
+        node->_replayFirst = (node->_replayFirst + 1) % node->_replayDepth;
+        node->_replayCount--;
+    }
+}
+
+void MqttSparkplugNode::replayService() {
+    if (_replay == nullptr) return;
+    if (!_born || !_client.isConnected()) return;
+
+    if (_replayOwed) {
+        if (replayFlush()) {
+            _replayOwed = false;
+        } else if (mq_elapsed(_replayOwedAt, mq_millis()) > 10000) {
+            // TEN SECONDS AND NOT GONE - a queue that stays full, a device
+            // that never births again. Live data has waited long enough: what
+            // is left is counted and let go.
+            _replayLost += (uint32_t)_replayOwedCount;
+            replayForget();
+        }
+        return;
+    }
+
+    if (_replayCount == 0 || _replayProbeInFlight) return;
+    mq_time_t every = _replayProbeEvery;
+    if (every == 0) {
+        const uint16_t keepAlive = _client.activeKeepAlive();
+        every = keepAlive != 0 ? (mq_time_t)keepAlive * 500u : 15000u;
+    }
+    if (mq_elapsed(_replayProbedAt, mq_millis()) < every) return;
+
+    char filter[MQ_SP_MAX_TOPIC + 2];
+    const size_t length = mq_sparkplugBuildTopic(
+        filter, sizeof filter - 2, MqttSparkplugType::NData, _group.c_str(),
+        _node.c_str(), nullptr);
+    if (length == 0) return;
+    filter[length] = '/';
+    filter[length + 1] = '+';
+    filter[length + 2] = '\0';
+    _replayProbedAt = mq_millis();
+    // New entries wait for the NEXT probe; the ones held now, for this one.
+    _replayEpoch++;
+    _replayProbeInFlight =
+        mq_accepted(_client.unsubscribe(filter, &replayProbed, this));
+    if (!_replayProbeInFlight) _replayEpoch--;
+}
+
+// What an unclean end left, sent as history: in order, a message a device at
+// most, every metric is_historical with the time it was first sent. False
+// while something is still to go; called again from the next poll.
+//
+// The owed entries are at the front of the ring. Each one sent moves to the
+// back with the current probe's number, so it is held - and sent again after
+// another unclean end - until a probe proves this session delivered it.
+bool MqttSparkplugNode::replayFlush() {
+    static const size_t kBatch = 32;
+    const uint64_t now = utcNow();
+    while (_replayOwedCount > 0) {
+        const ReplayEntry& front = _replay[_replayFirst];
+        const bool known = front.point < _pointCount;
+        const int16_t device = known ? _points[front.point].device : -1;
+        if (!known || (device >= 0 && !_devices[(size_t)device].online)) {
+            if (known && _devices[(size_t)device].wantsBirth) {
+                // Not born yet: wait for its DBIRTH (poll() retries those),
+                // within replayService()'s bound.
+                return false;
+            }
+            // A device gone for good (deviceOffline()) has no birth for its
+            // history to follow: let go, and counted.
+            _replayLost++;
+            _replayFirst = (_replayFirst + 1) % _replayDepth;
+            _replayCount--;
+            _replayOwedCount--;
+            continue;
+        }
+
+        // A batch: consecutive owed entries of one device.
+        if (_outbound.capacity() < kBatch && !_outbound.reserve(kBatch, 1)) {
+            return false;
+        }
+        _outbound.clear();
+        _outbound.timestamp = now;
+        _outbound.hasTimestamp = true;
+        size_t taken = 0;
+        while (taken < _replayOwedCount && taken < kBatch) {
+            const ReplayEntry& entry = _replay[(_replayFirst + taken) % _replayDepth];
+            if (entry.point >= _pointCount || _points[entry.point].device != device) {
+                break;
+            }
+            taken++;
+            if (_replayMaxAge != 0 && now > entry.timestamp &&
+                now - entry.timestamp > _replayMaxAge) {
+                continue;   // too old to be worth sending: dropped below
+            }
+            const MqttSparkplugPoint& point = _points[entry.point];
+            MqttSparkplugMetric metric;
+            metric.name = point.name.c_str();
+            if (point.alias != 0) {
+                metric.alias = point.alias;
+                metric.hasAlias = true;
+            }
+            metric.value.type = point.type;
+            metric.value.isNull = entry.isNull != 0;
+            if (!metric.value.isNull) mq_spSetBits(metric.value, entry.bits);
+            metric.timestamp = entry.timestamp;
+            metric.hasTimestamp = true;
+            metric.isHistorical = true;
+            _outbound.addMetric(metric);
+        }
+        if (_outbound.metricCount > 0) {
+            const MqttSparkplugType type =
+                device < 0 ? MqttSparkplugType::NData : MqttSparkplugType::DData;
+            const uint8_t sequenceBefore = _seq;
+            nextSequence();
+            _outbound.seq = _seq;
+            _outbound.hasSeq = true;
+            const char* deviceId =
+                device < 0 ? nullptr : _devices[(size_t)device].id.c_str();
+            if (!sendPayload(type, deviceId, _outbound, MQ_QOS_0, false, false)) {
+                // Not sent, not spent; tried again on the next poll.
+                _seq = sequenceBefore;
+                _outbound.clear();
+                return false;
+            }
+            _replayedCount += (uint32_t)_outbound.metricCount;
+        }
+        _outbound.clear();
+        for (size_t index = 0; index < taken; index++) {
+            ReplayEntry entry = _replay[_replayFirst];
+            _replayFirst = (_replayFirst + 1) % _replayDepth;
+            _replayCount--;
+            _replayOwedCount--;
+            if (_replayMaxAge != 0 && now > entry.timestamp &&
+                now - entry.timestamp > _replayMaxAge) {
+                _replayLost++;
+                continue;
+            }
+            entry.epoch = _replayEpoch;
+            _replay[(_replayFirst + _replayCount) % _replayDepth] = entry;
+            _replayCount++;
+        }
+    }
+    return true;
 }
 
 bool MqttSparkplugNode::rebirth() {
@@ -2498,18 +2876,7 @@ bool MqttSparkplugNode::rebirth() {
     // Anything already written is beyond reach and stays owed, which is why
     // this reduces the window rather than closing it absolutely - the one part
     // of "immediately" that no implementation can deliver.
-    if (mq_sparkplugBuildTopic(_topic, sizeof _topic, MqttSparkplugType::NData,
-                               _group.c_str(), _node.c_str(), nullptr) != 0) {
-        _client.withdraw(_topic);
-    }
-    for (size_t index = 0; index < _deviceCount; index++) {
-        if (mq_sparkplugBuildTopic(_topic, sizeof _topic,
-                                   MqttSparkplugType::DData, _group.c_str(),
-                                   _node.c_str(),
-                                   _devices[index].id.c_str()) != 0) {
-            _client.withdraw(_topic);
-        }
-    }
+    withdrawData();
 
     // Every online device owes a DBIRTH again, because a Host Application
     // treats the NBIRTH as the start of a new picture.
@@ -2739,6 +3106,7 @@ const char* mq_sparkplugCommandOutcomeName(MqttSparkplugCommandOutcome outcome) 
         case MqttSparkplugCommandOutcome::ReadOnly:      return "read only";
         case MqttSparkplugCommandOutcome::WrongType:     return "wrong type";
         case MqttSparkplugCommandOutcome::NotARequest:   return "not a request";
+        case MqttSparkplugCommandOutcome::TooLarge:      return "too large";
     }
     return "?";
 }
@@ -2851,7 +3219,28 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
                                        MqttSparkplugDataType::Boolean
                                    ? metric.value.as.boolean
                                    : metric.value.asNumber() != 0.0;
-            if (asked) {
+            if (asked && (_rebirthDeferred ||
+                          (_rebirthHoldoff != 0 && _birthCount > 0 &&
+                           mq_elapsed(_lastBirthAt, mq_millis()) < _rebirthHoldoff))) {
+                // HELD: data stops now (-action-1, and publishData() honours
+                // the flag), and the birth that answers goes when the holdoff
+                // is up - poll() sends it. Every request until then is
+                // answered by that one birth.
+                _rebirthPending = true;
+                _rebirthDeferred = true;
+                _rebirthsHeld++;
+                // Including what is queued, as rebirth() does: see there.
+                withdrawData();
+                _commandsApplied++;
+
+                MqttSparkplugCommand command;
+                command.device = deviceId;
+                command.name = rebirthName;
+                command.alias = metric.alias;
+                command.isRebirth = true;
+                command.value = metric.value;
+                deliverCommand(command);
+            } else if (asked) {
                 // -action-1 first: stop sending data. Set BEFORE rebirth() so
                 // nothing can slip in between, including from a handler this
                 // call is about to run.
@@ -2920,6 +3309,16 @@ void MqttSparkplugNode::handleCommand(const MqttSparkplugTopicParts& parts,
             refuseCommand(deviceId, _points[point].name.c_str(),
                           _points[point].alias, metric.value,
                           MqttSparkplugCommandOutcome::WrongType);
+            continue;
+        }
+
+        // NO LARGER THAN commandLimit(): checked before a byte is copied.
+        if (metric.value.isSpan() && !metric.value.isNull &&
+            metric.value.as.bytes.length > _commandLimit) {
+            _commandsRefused++;
+            refuseCommand(deviceId, _points[point].name.c_str(),
+                          _points[point].alias, metric.value,
+                          MqttSparkplugCommandOutcome::TooLarge);
             continue;
         }
 

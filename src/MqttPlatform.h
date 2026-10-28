@@ -119,6 +119,21 @@ inline bool mq_isFuture(mq_time_t now, mq_time_t deadline) {
     return remaining != 0 && remaining < 0x80000000u;
 }
 
+// THE LONGEST AGE A REMEMBERED TIMESTAMP IS ALLOWED TO REACH: 2^30 ms, about
+// twelve days. mq_elapsed() is exact up to 49.7 days and then starts again
+// from zero - so a value last heard from fifty days ago reads as heard a
+// moment ago, and a dead sensor looks fresh for a minute every seven weeks.
+// Anything that keeps a "last heard" time for a reader to ask about holds it
+// no older than this, from its poll: see mq_ageCeiling() below.
+static const mq_time_t MQ_AGE_CEILING_MS = 0x40000000u;
+
+// Keep `stamp` no further behind `now` than MQ_AGE_CEILING_MS. Once there it
+// stays there, so its age reads as "at least twelve days" for ever instead of
+// wrapping round to young again.
+inline void mq_ageCeiling(mq_time_t& stamp, mq_time_t now) {
+    if (mq_elapsed(stamp, now) > MQ_AGE_CEILING_MS) stamp = (mq_time_t)(now - MQ_AGE_CEILING_MS);
+}
+
 // --- Clock source ---
 
 // The clock is replaceable, for two reasons.

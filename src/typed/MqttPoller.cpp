@@ -173,9 +173,18 @@ void MqttPoller::accept(const MqttMessage& message) {
 }
 
 void MqttPoller::poll() {
-    // Nothing to do. Quality is computed when it is asked for, from the clock,
-    // so a caller that polls once a minute gets the same answer as one that
-    // polls every scan - and there is no timer to drift.
+    // Quality is computed when it is asked for, from the clock, so a caller
+    // that polls once a minute gets the same answer as one that polls every
+    // scan - and there is no timer to drift.
+    //
+    // The one thing done here: an age is held at MQ_AGE_CEILING_MS (twelve
+    // days) once it gets there, because mq_elapsed() wraps at 49.7 days and a
+    // value silent that long would otherwise read Good again. So poll() needs
+    // calling at least once in twelve days - which any scan loop does.
+    const mq_time_t now = mq_millis();
+    for (size_t i = 0; i < MQTT_MAX_TRACKED; i++) {
+        if (_tracked[i].everReceived) mq_ageCeiling(_tracked[i].lastReceivedAt, now);
+    }
 }
 
 MqttQuality MqttPoller::qualityOf(const MqttTracked& entry, mq_time_t now) const {

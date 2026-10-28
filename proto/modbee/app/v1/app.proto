@@ -966,6 +966,11 @@ message ConnectionSpec {
   // connection, and its topics are not this server's. One of `servers`, `this_server` or `kafka`. Its TLS and login
   // are the cluster's (Kafka.PutCluster); FAILED_PRECONDITION in a build without Kafka.
   KafkaLink kafka = 20;
+  // A slow link's timings (0: the defaults). How long a connect - DNS, TCP, TLS and the CONNACK - may take (30);
+  // how long an acknowledgement is waited for before the message counts as lost (twice keepalive_seconds, at least
+  // 120): on a slow link a message waits behind others, and giving up early sends it again on a link only busy.
+  uint32 connect_timeout_seconds = 21;
+  uint32 ack_timeout_seconds = 22;
 }
 
 message KafkaLink {

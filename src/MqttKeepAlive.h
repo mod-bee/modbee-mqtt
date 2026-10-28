@@ -22,7 +22,19 @@
 // invisible to everything else. A missing PINGRESP is what proves it.
 //
 // The interval is in SECONDS on the wire and may be overridden by the peer
-// (V5:3.2.2.3.14). Zero turns the whole mechanism off at both versions.
+// (V5:3.2.2.3.14) - see MqttClient::handleConnAck for what is done with an
+// override, which is not simply to take it. Zero turns the whole mechanism off.
+//
+// LIVENESS IS BYTES, NOT PACKETS. A whole packet is the only thing that proves
+// the far end's event loop is alive, but on a slow link a packet can take
+// longer to cross than the keepalive interval: a 200 kB firmware chunk over a
+// 9600 baud modem link is three minutes of bytes. Counting only complete
+// packets, the silence rule below ended that connection two intervals in -
+// and the reconnect resent the same chunk, which ended the next one the same
+// way, for ever. So bytes ARRIVING count as hearing from the peer, and bytes
+// LEAVING count too once the transport had refused some (noteProgress): a
+// transmit buffer that was full and then drains is the far end's TCP
+// acknowledging what it was sent, which is a living peer and not a dead link.
 
 #include "MqttPlatform.h"
 #include "MqttTypes.h"
@@ -35,7 +47,8 @@ public:
         _intervalMs = (mq_time_t)seconds * 1000u;
         _lastSentAt = now;
         _lastReceivedAt = now;
-        _pingSentAt = 0;
+        _lastProgressAt = now;
+        _pingSentAt = now;
         _awaitingResponse = false;
     }
 
@@ -57,6 +70,19 @@ public:
         _awaitingResponse = false;
         _lastReceivedAt = now;
     }
+
+    // BYTES from the peer that are not yet a whole packet - the middle of a
+    // large PUBLISH on a slow link. The peer is plainly alive, so nothing is
+    // overdue and no ping is needed; but this is not the PINGRESP, which may
+    // be queued behind the very packet these bytes belong to, so a ping
+    // already sent is still awaited.
+    void noteBytesReceived(mq_time_t now) { _lastReceivedAt = now; }
+
+    // OUR bytes moving again after the transport had refused them: the far
+    // end acknowledged data, so the path to it is alive. Counts against the
+    // silence rule and a ping's deadline - not against our own obligation to
+    // send, which a packet still half-written has not met.
+    void noteProgress(mq_time_t now) { _lastProgressAt = now; }
 
     // Whether a PINGREQ is due now.
     //
@@ -94,11 +120,22 @@ public:
     // PINGREQ can be refused, nothing is ever awaited, and nothing ever times
     // out. Two whole intervals with nothing received ends the connection
     // whether or not a ping got out.
+    //
+    // PROGRESS PUTS BOTH OFF. Bytes arriving, or our own backlog draining, is
+    // the link doing its job slowly rather than not at all - and a PINGRESP
+    // cannot overtake a packet already on its way in, nor a PINGREQ one on its
+    // way out. So "nothing received" is measured from the last sign of life in
+    // EITHER direction, and a ping's deadline does not fall due while the link
+    // is still moving. A link that has stopped moving altogether is still
+    // ended after two intervals, as before.
     bool responseOverdue(mq_time_t now) const {
         if (!enabled()) return false;
-        if (mq_elapsed(_lastReceivedAt, now) >= 2 * _intervalMs) return true;
+        const mq_time_t heard = mq_elapsed(_lastReceivedAt, now);
+        const mq_time_t moved = mq_elapsed(_lastProgressAt, now);
+        const mq_time_t quiet = heard < moved ? heard : moved;
+        if (quiet >= 2 * _intervalMs) return true;
         if (!_awaitingResponse) return false;
-        return mq_elapsed(_pingSentAt, now) >= _intervalMs;
+        return mq_elapsed(_pingSentAt, now) >= _intervalMs && quiet >= _intervalMs;
     }
 
     bool awaitingResponse() const { return _awaitingResponse; }
@@ -108,6 +145,7 @@ private:
     mq_time_t _intervalMs = 0;
     mq_time_t _lastSentAt = 0;
     mq_time_t _lastReceivedAt = 0;
+    mq_time_t _lastProgressAt = 0;
     mq_time_t _pingSentAt = 0;
     bool _awaitingResponse = false;
 };

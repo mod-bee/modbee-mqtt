@@ -93,8 +93,16 @@ void MqttSparkplugHost::only(MqttVersion version) {
     _connection.fallbackVersion = MqttVersion::V311;
 }
 
+bool MqttSparkplugHost::connectInFlight() const {
+    // The client's attempt, or the channel's dial on its task, which can outlast it.
+    return (_begun && _client.state() == MqttState::Connecting) || _net.connecting();
+}
+
+// NOT WHILE A CONNECT IS READING IT: as MqttSparkplugNode::server().
 bool MqttSparkplugHost::server(const char* host, uint16_t port) {
     if (host == nullptr || host[0] == '\0') return false;
+    if (strlen(host) >= sizeof _dialHost) return false;
+    if (connectInFlight()) return false;
     _host = host;
     _port = port;
     return true;
@@ -115,9 +123,28 @@ bool MqttSparkplugHost::watch(const char* group) {
 void MqttSparkplugHost::applyConnectionConfig() {
     _connection.host = _host;
     _connection.port = _port != 0 ? _port : _net.defaultPort();
-    _net.target(_host.c_str(), _connection.port);
+    // THE TRANSPORT IS GIVEN A NAME IN STORAGE THAT DOES NOT MOVE. On a board
+    // a stream transport keeps the pointer, and the client's own reconnects
+    // dial it again without asking: _host is a std::string, and server()
+    // assigning a longer name reallocated it, so the next reconnect read
+    // freed memory. _dialHost is fixed and rewritten only here, and not while
+    // a connect attempt (MqttConnectTask) may be reading it.
+    if (connectInFlight()) {
+        _retargetOwed = true;
+    } else {
+        retarget();
+    }
 
     if (_connection.clientId.empty()) _connection.clientId = _hostId;
+}
+
+void MqttSparkplugHost::retarget() {
+    _retargetOwed = false;
+    const size_t length = _host.size() < sizeof _dialHost - 1 ? _host.size()
+                                                               : sizeof _dialHost - 1;
+    memcpy(_dialHost, _host.c_str(), length);
+    _dialHost[length] = '\0';
+    _net.target(_dialHost, _connection.port);
 }
 
 // EVERY CONNECT, the host's own client's or a shared one's, whoever starts it.
@@ -265,6 +292,7 @@ void MqttSparkplugHost::deathTrampoline(void* context, MqttResult result,
 void MqttSparkplugHost::poll() {
     if (!_begun) return;
     if (!_shared) _client.poll();   // a shared client's owner polls it
+    if (_retargetOwed && !connectInFlight()) retarget();
     serviceReorder();
 
     // A shared client restarts from here, never from inside its own poll.
@@ -382,7 +410,7 @@ bool MqttSparkplugHost::publishDeath(bool awaited) {
 }
 
 // =============================================================================
-// TRACKING NODES
+// READING THE PICTURE
 // =============================================================================
 
 const char* MqttSparkplugHost::lastErrorText() const {
@@ -410,11 +438,144 @@ bool MqttSparkplugHost::readDevice(const char* group, const char* node,
     return true;
 }
 
-int MqttSparkplugHost::trackNode(const char* group, const char* node) {
-    for (size_t index = 0; index < _nodeCount; index++) {
-        if (_nodes[index].group == group && _nodes[index].node == node) {
-            return (int)index;
+// =============================================================================
+// THE INDEXES
+// =============================================================================
+
+namespace {
+
+// FNV-1a. A host's keys are short text and a 64-bit alias; nothing here is a
+// secret, and a peer that chose names to collide would only make its own
+// node's lookups walk a little further - the probe is bounded by the half
+// load either way.
+uint32_t fnv(uint32_t hash, const char* text) {
+    if (text == nullptr) return hash;
+    for (; *text != '\0'; text++) {
+        hash ^= (uint8_t)*text;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+uint32_t nodeHash(const char* group, const char* node) {
+    uint32_t hash = fnv(2166136261u, group);
+    hash ^= 0xFFu;   // never part of a valid id: "a"+"bc" and "ab"+"c" differ
+    hash *= 16777619u;
+    return fnv(hash, node);
+}
+
+uint32_t nameHash(const char* name, const char* device) {
+    uint32_t hash = fnv(2166136261u, device != nullptr ? device : "");
+    hash ^= 0xFFu;
+    hash *= 16777619u;
+    return fnv(hash, name);
+}
+
+uint32_t aliasHash(uint64_t alias) {
+    // A 64-bit mix (splitmix64's finaliser): aliases are usually 1, 2, 3...
+    // and a plain truncation would put them in consecutive slots, which is
+    // fine, but a node using 0x100000000, 0x200000000... would put every one
+    // in slot zero.
+    alias ^= alias >> 33;
+    alias *= 0xff51afd7ed558ccdull;
+    alias ^= alias >> 33;
+    return (uint32_t)alias;
+}
+
+// The position of a tracked metric by alias, or by name and device: by the
+// index on a host, in a line on a board (or where the index could not be
+// built). The same answer either way.
+long trackedAlias(const MqttSparkplugTrackedNode& tracked, uint64_t alias) {
+#if MQ_SP_HOST_INDEX
+    if (tracked.byAlias.usable()) {
+        return tracked.byAlias.find(aliasHash(alias), [&](size_t position) {
+            return position < tracked.metricCount &&
+                   tracked.metrics[position].alias == alias;
+        });
+    }
+#endif
+    for (size_t index = 0; index < tracked.metricCount; index++) {
+        if (tracked.metrics[index].alias == alias) return (long)index;
+    }
+    return -1;
+}
+
+long trackedName(const MqttSparkplugTrackedNode& tracked, const char* name,
+                 const char* device) {
+    if (name == nullptr) return -1;
+    // A node-level "flow" and a device's "flow" are different metrics, so
+    // the device has to match too - including the empty case.
+    const char* wanted = device != nullptr ? device : "";
+#if MQ_SP_HOST_INDEX
+    if (tracked.byName.usable()) {
+        return tracked.byName.find(nameHash(name, wanted), [&](size_t position) {
+            return position < tracked.metricCount &&
+                   tracked.metrics[position].name == name &&
+                   tracked.metrics[position].device == wanted;
+        });
+    }
+#endif
+    for (size_t index = 0; index < tracked.metricCount; index++) {
+        if (tracked.metrics[index].name != name) continue;
+        if (tracked.metrics[index].device != wanted) continue;
+        return (long)index;
+    }
+    return -1;
+}
+
+}  // namespace
+
+MqttSparkplugHashIndex::~MqttSparkplugHashIndex() noexcept { release(); }
+
+void MqttSparkplugHashIndex::release() noexcept {
+    mq_freeLarge(_table);
+    _table = nullptr;
+    _slots = 0;
+    _used = 0;
+}
+
+bool MqttSparkplugHashIndex::allocate(size_t count) {
+    size_t slots = 16;
+    while (slots < count * 2) {
+        if (slots > ((size_t)-1) / (2 * sizeof(uint32_t))) {
+            release();
+            return false;
         }
+        slots *= 2;
+    }
+    uint32_t* table = (uint32_t*)mq_allocLarge(slots * sizeof(uint32_t));
+    release();
+    if (table == nullptr) return false;
+    memset(table, 0, slots * sizeof(uint32_t));
+    _table = table;
+    _slots = slots;
+    return true;
+}
+
+bool MqttSparkplugHashIndex::insert(uint32_t hash, size_t position) {
+    if (_slots == 0 || (_used + 1) * 2 > _slots) return false;
+    if (position >= 0xFFFFFFFFu) return false;
+    const size_t mask = _slots - 1;
+    size_t slot = hash & mask;
+    while (_table[slot] != 0) slot = (slot + 1) & mask;
+    _table[slot] = (uint32_t)(position + 1);
+    _used++;
+    return true;
+}
+
+// =============================================================================
+// TRACKING NODES
+// =============================================================================
+
+int MqttSparkplugHost::trackNode(const char* group, const char* node) {
+    const MqttSparkplugTrackedNode* known = findNode(group, node);
+    if (known != nullptr) return (int)(known - &_nodes[0]);
+
+    // A LIMIT FIRST, then memory: a client publishing births under ever new
+    // node ids is refused at the limit, counted, and costs nothing more.
+    if (_nodeCount >= _nodeLimit || _nodeCount >= 0x7FFFFFFFu) {
+        _nodesRefused++;
+        return -1;
     }
     if (!_nodes.reserve(_nodeCount + 1)) {
         _outOfMemory = true;
@@ -423,6 +584,18 @@ int MqttSparkplugHost::trackNode(const char* group, const char* node) {
     _nodes[_nodeCount].group = group;
     _nodes[_nodeCount].node = node;
     _nodeCount++;
+#if MQ_SP_HOST_INDEX
+    if (!_nodeIndex.insert(nodeHash(group, node), _nodeCount - 1)) {
+        // Past half full: rebuilt for the larger table. Without the memory the
+        // index goes and findNode() searches in a line - slower, never wrong.
+        if (!_nodeIndex.rebuild(_nodeCount, [&](size_t position) {
+                return nodeHash(_nodes[position].group.c_str(),
+                                _nodes[position].node.c_str());
+            })) {
+            _outOfMemory = true;
+        }
+    }
+#endif
     return (int)(_nodeCount - 1);
 }
 
@@ -434,6 +607,15 @@ const MqttSparkplugTrackedNode* MqttSparkplugHost::nodeAt(size_t index) const {
 const MqttSparkplugTrackedNode*
 MqttSparkplugHost::findNode(const char* group, const char* node) const {
     if (group == nullptr || node == nullptr) return nullptr;
+#if MQ_SP_HOST_INDEX
+    if (_nodeIndex.usable()) {
+        const long at = _nodeIndex.find(nodeHash(group, node), [&](size_t position) {
+            return position < _nodeCount && _nodes[position].group == group &&
+                   _nodes[position].node == node;
+        });
+        return at >= 0 ? &_nodes[(size_t)at] : nullptr;
+    }
+#endif
     for (size_t index = 0; index < _nodeCount; index++) {
         if (_nodes[index].group == group && _nodes[index].node == node) {
             return &_nodes[index];
@@ -442,29 +624,144 @@ MqttSparkplugHost::findNode(const char* group, const char* node) const {
     return nullptr;
 }
 
+void MqttSparkplugHost::askRebirth(MqttSparkplugTrackedNode& tracked,
+                                   const char* group, const char* node) {
+    // A Non-Primary Host may not ask at all - the non-normative note on
+    // [tck-id-operational-behavior-host-reordering-rebirth].
+    if (!_primary) return;
+    const mq_time_t now = mq_millis();
+    if (_rebirthHoldoff != 0 && tracked.rebirthAsked &&
+        mq_elapsed(tracked.rebirthAskedAt, now) < _rebirthHoldoff) {
+        tracked.rebirthsHeld++;
+        return;
+    }
+    if (requestRebirth(group, node)) {
+        tracked.rebirthsRequested++;
+        tracked.rebirthAsked = true;
+        tracked.rebirthAskedAt = now;
+    }
+}
+
 void MqttSparkplugHost::serviceReorder() {
-    if (_reorderTimeout == 0) return;
+    if (_reorderCount == 0) return;
 
     const mq_time_t now = mq_millis();
-    for (size_t index = 0; index < _nodeCount; index++) {
-        MqttSparkplugTrackedNode& tracked = _nodes[index];
-        if (!tracked.reordering) continue;
+    for (size_t at = 0; at < _reorderCount;) {
+        const size_t position = _reorderList[at];
+        MqttSparkplugTrackedNode& tracked = _nodes[position];
+        bool unlist = !tracked.reordering;
 
         // mq_isFuture handles the wrap of a 32-bit millisecond clock, which is
         // why it is used rather than a plain subtraction - the same reason
         // every other deadline in this library goes through it.
-        if (mq_isFuture(now, tracked.reorderStartedAt + _reorderTimeout)) {
+        if (!unlist && !mq_isFuture(now, tracked.reorderStartedAt + _reorderTimeout)) {
+            // [tck-id-operational-behavior-host-reordering-rebirth] If ... the
+            // Reorder Timeout elapses and the missing message(s) have not been
+            // received, the Sparkplug Host Application MUST send an NCMD to
+            // the Edge Node with a Node Control/Rebirth request.
+            //
+            // What did arrive is believed; the stream starts again from the
+            // next message, so the gap is reported once rather than on every
+            // message after it.
+            tracked.reordering = false;
+            tracked.hasSeq = false;
+            askRebirth(tracked, tracked.group.c_str(), tracked.node.c_str());
+            unlist = true;
+        }
+        if (unlist) {
+            tracked.reorderListed = false;
+            _reorderList[at] = _reorderList[_reorderCount - 1];
+            _reorderCount--;
             continue;
         }
+        at++;
+    }
+}
 
-        // [tck-id-operational-behavior-host-reordering-rebirth] If ... the
-        // Reorder Timeout elapses and the missing message(s) have not been
-        // received, the Sparkplug Host Application MUST send an NCMD to the
-        // Edge Node with a Node Control/Rebirth request.
-        tracked.reordering = false;
-        if (_primary) {
-            requestRebirth(tracked.group.c_str(), tracked.node.c_str());
-            tracked.rebirthsRequested++;
+// --- Sequence numbers ---
+//
+// [tck-id-payloads-sequence-num-incrementing] one greater, wrapping at 255.
+// A message that is not the next one is either AHEAD (one or more were lost,
+// or are late) or BEHIND (already seen: a duplicate). The window says which.
+namespace {
+
+// Arrived: remembered, and the number 128 behind it forgotten - so "seen" is
+// always the last 128 numbers, wherever the sequence has got to.
+void markSeen(uint32_t* seen, uint8_t seq) {
+    seen[seq >> 5] |= 1u << (seq & 31);
+    const uint8_t old = (uint8_t)(seq + 128);
+    seen[old >> 5] &= ~(1u << (old & 31));
+}
+
+bool wasSeen(const uint32_t* seen, uint8_t seq) { return (seen[seq >> 5] & (1u << (seq & 31))) != 0; }
+
+} // namespace
+
+void MqttSparkplugHost::trackSequence(MqttSparkplugTrackedNode& tracked,
+                                      uint8_t seq, const char* group,
+                                      const char* node) {
+    tracked.lastSeq = seq;
+    if (!tracked.hasSeq) {
+        tracked.hasSeq = true;
+        tracked.expectedSeq = (uint8_t)(seq + 1);
+        for (uint32_t& word : tracked.seqAhead) word = 0;
+        for (uint32_t& word : tracked.seqSeen) word = 0;
+        markSeen(tracked.seqSeen, seq);
+        return;
+    }
+    const uint8_t distance = (uint8_t)(seq - tracked.expectedSeq);
+    if (distance == 0) {
+        // In order: and whatever had arrived early behind it now follows.
+        markSeen(tracked.seqSeen, seq);
+        tracked.expectedSeq++;
+        while (tracked.seqAhead[tracked.expectedSeq >> 5] &
+               (1u << (tracked.expectedSeq & 31))) {
+            tracked.seqAhead[tracked.expectedSeq >> 5] &=
+                ~(1u << (tracked.expectedSeq & 31));
+            tracked.expectedSeq++;
+        }
+        bool pending = false;
+        for (uint32_t word : tracked.seqAhead) pending = pending || word != 0;
+        // [-reordering-success] If the missing message(s) ... arrive before
+        // the reordering timer elapses, the timer MUST be terminated and
+        // normal operation MUST continue.
+        if (!pending) tracked.reordering = false;
+        return;
+    }
+    if (wasSeen(tracked.seqSeen, seq)) {
+        // Arrived already, among the last 128: a duplicate, or one the
+        // server delivered twice. Not a gap.
+        tracked.duplicates++;
+        return;
+    }
+
+    // Not the next, and not seen: a gap - messages lost, or a stream that
+    // cannot be trusted (a number far from where the node was).
+    (void)distance;
+    tracked.seqAhead[seq >> 5] |= 1u << (seq & 31);
+    markSeen(tracked.seqSeen, seq);
+    if (tracked.reordering) return;   // the same gap, still open
+    tracked.gaps++;
+    if (_reorderTimeout == 0) {
+        tracked.hasSeq = false;
+        askRebirth(tracked, group, node);
+        return;
+    }
+    // [tck-id-operational-behavior-host-reordering-start] ... the Host
+    // Application MUST start a timer denoting the start of the Reorder
+    // Timeout window.
+    tracked.reordering = true;
+    tracked.reorderStartedAt = mq_millis();
+    if (!tracked.reorderListed) {
+        if (_reorderList.reserve(_reorderCount + 1)) {
+            _reorderList[_reorderCount++] = (uint32_t)(&tracked - &_nodes[0]);
+            tracked.reorderListed = true;
+        } else {
+            // No room to time it: ask now rather than never.
+            _outOfMemory = true;
+            tracked.reordering = false;
+            tracked.hasSeq = false;
+            askRebirth(tracked, group, node);
         }
     }
 }
@@ -474,37 +771,78 @@ void MqttSparkplugHost::serviceReorder() {
 // =============================================================================
 
 const char* MqttSparkplugTrackedNode::metricName(uint64_t alias) const {
-    for (size_t index = 0; index < metricCount; index++) {
-        if (metrics[index].alias == alias) return metrics[index].name.c_str();
-    }
-    return nullptr;
+    const long at = trackedAlias(*this, alias);
+    return at >= 0 ? metrics[(size_t)at].name.c_str() : nullptr;
 }
 
 const MqttSparkplugTrackedMetric* MqttSparkplugTrackedNode::find(
     const char* name, const char* device) const {
-    if (name == nullptr) return nullptr;
-    const char* wanted = device != nullptr ? device : "";
-    for (size_t index = 0; index < metricCount; index++) {
-        if (metrics[index].name != name) continue;
-        // A node-level "flow" and a device's "flow" are different metrics, so
-        // the device has to match too - including the empty case.
-        if (metrics[index].device != wanted) continue;
-        return &metrics[index];
-    }
-    return nullptr;
+    const long at = trackedName(*this, name, device);
+    return at >= 0 ? &metrics[(size_t)at] : nullptr;
 }
 
 MqttSparkplugDataType MqttSparkplugTrackedNode::metricType(
     uint64_t alias) const {
-    for (size_t index = 0; index < metricCount; index++) {
-        if (metrics[index].alias == alias) return metrics[index].type;
+    const long at = trackedAlias(*this, alias);
+    return at >= 0 ? metrics[(size_t)at].type : MqttSparkplugDataType::Unknown;
+}
+
+void MqttSparkplugHost::indexMetrics(MqttSparkplugTrackedNode& tracked) {
+#if MQ_SP_HOST_INDEX
+    const bool aliases = tracked.byAlias.rebuild(tracked.metricCount, [&](size_t at) {
+        return aliasHash(tracked.metrics[at].alias);
+    });
+    const bool names = tracked.byName.rebuild(tracked.metricCount, [&](size_t at) {
+        return nameHash(tracked.metrics[at].name.c_str(),
+                        tracked.metrics[at].device.c_str());
+    });
+    if (!aliases || !names) _outOfMemory = true;
+#else
+    (void)tracked;
+#endif
+}
+
+// A node that births smaller than it was gives the difference back: once its
+// table is four times what it holds (and worth the trouble), the entries move
+// to one of the right size. Once a birth, never on a data message - and the
+// same rule as the decode payload's: a table that only grows is a table a
+// peer can grow.
+void MqttSparkplugHost::compactMetrics(MqttSparkplugTrackedNode& tracked) {
+    const size_t capacity = tracked.metrics.capacity();
+    if (capacity <= 64 || tracked.metricCount >= capacity / 4) return;
+    MqttGrowList<MqttSparkplugTrackedMetric> sized;
+    if (!sized.reserveExactly(tracked.metricCount < 4 ? 4 : tracked.metricCount)) {
+        return;   // keeps the larger table: correct, only not given back
     }
-    return MqttSparkplugDataType::Unknown;
+    for (size_t index = 0; index < tracked.metricCount; index++) {
+        sized[index] = static_cast<MqttSparkplugTrackedMetric&&>(tracked.metrics[index]);
+    }
+    tracked.metrics = static_cast<MqttGrowList<MqttSparkplugTrackedMetric>&&>(sized);
+}
+
+void MqttSparkplugHost::forgetDevice(MqttSparkplugTrackedNode& tracked,
+                                     const char* deviceId) {
+    // The device's entries go, the rest close up in order, and the index is
+    // built again. Once a birth, never on a data message.
+    const char* wanted = deviceId != nullptr ? deviceId : "";
+    size_t kept = 0;
+    for (size_t index = 0; index < tracked.metricCount; index++) {
+        if (tracked.metrics[index].device == wanted) continue;
+        if (kept != index) {
+            tracked.metrics[kept] =
+                static_cast<MqttSparkplugTrackedMetric&&>(tracked.metrics[index]);
+        }
+        kept++;
+    }
+    if (kept == tracked.metricCount) return;
+    tracked.metricCount = kept;
+    indexMetrics(tracked);
 }
 
 void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
                                        const MqttSparkplugPayload& payload,
                                        const char* deviceId) {
+    const char* device = deviceId != nullptr ? deviceId : "";
     for (size_t index = 0; index < payload.metricCount; index++) {
         const MqttSparkplugMetric& metric = payload.metrics[index];
         if (!metric.hasAlias || metric.name == nullptr) continue;
@@ -514,31 +852,55 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
         // happen on a conformant node, but a host is reading someone else's
         // traffic and two entries for one alias would make which name wins
         // depend on search order.
-        size_t slot = tracked.metricCount;
-        for (size_t seen = 0; seen < tracked.metricCount; seen++) {
-            if (tracked.metrics[seen].alias == metric.alias) {
-                slot = seen;
-                break;
-            }
-        }
+        long slot = trackedAlias(tracked, metric.alias);
+        bool added = false;
 
-        // OUT OF MEMORY is said (outOfMemory()), not fatal. The table is a
-        // convenience for reading data; refusing the birth over it would lose
-        // the node entirely, and an unresolved alias already has an honest
-        // answer - metricName() returns nullptr and the caller sees a number
-        // it cannot name.
-        if (slot == tracked.metricCount) {
+        // A LIMIT, OUT OF MEMORY: said (metricsRefused(), outOfMemory()), not
+        // fatal. The table is a convenience for reading data; refusing the
+        // birth over it would lose the node entirely, and an unresolved alias
+        // already has an honest answer - metricName() returns nullptr and the
+        // caller sees a number it cannot name.
+        if (slot < 0) {
+            if (tracked.metricCount >= _metricLimit ||
+                tracked.metricCount >= 0x7FFFFFFFu) {
+                tracked.metricsRefused++;
+                _metricsRefused++;
+                continue;
+            }
             if (!tracked.metrics.reserve(tracked.metricCount + 1)) {
                 _outOfMemory = true;
-                return;
+                tracked.metricsRefused++;
+                _metricsRefused++;
+                continue;
             }
-            tracked.metricCount++;
+            slot = (long)tracked.metricCount++;
+            added = true;
+            MqttSparkplugTrackedMetric& fresh = tracked.metrics[(size_t)slot];
+            fresh.hasValue = false;
+            fresh.at = 0;
+            fresh.value = MqttSparkplugValue();
         }
 
-        tracked.metrics[slot].name = metric.name;
-        tracked.metrics[slot].alias = metric.alias;
-        tracked.metrics[slot].type = metric.value.type;
-        tracked.metrics[slot].device = deviceId != nullptr ? deviceId : "";
+        MqttSparkplugTrackedMetric& entry = tracked.metrics[(size_t)slot];
+        const bool renamed = entry.name != metric.name || entry.device != device;
+        entry.name = metric.name;
+        entry.alias = metric.alias;
+        entry.type = metric.value.type;
+        entry.device = device;
+#if MQ_SP_HOST_INDEX
+        // A new entry goes into both indexes; a redeclared alias under a new
+        // name into the name index (the old name's slot no longer matches).
+        // Either may find the index full, and it is then built again.
+        bool ok = true;
+        if (added) ok = tracked.byAlias.insert(aliasHash(metric.alias), (size_t)slot);
+        if (ok && (added || renamed)) {
+            ok = tracked.byName.insert(nameHash(metric.name, device), (size_t)slot);
+        }
+        if (!ok) indexMetrics(tracked);
+#else
+        (void)renamed;
+        (void)added;
+#endif
     }
 }
 
@@ -547,40 +909,34 @@ void MqttSparkplugHost::recordValues(MqttSparkplugTrackedNode& tracked,
                                     const char* deviceId) {
     // Called AFTER the names have been filled in, so a data message carrying
     // nothing but an alias still lands in the right entry.
-    const char* wanted = deviceId != nullptr ? deviceId : "";
     for (size_t index = 0; index < payload.metricCount; index++) {
         const MqttSparkplugMetric& metric = payload.metrics[index];
 
         // Matched by alias first, because that is what a conformant node
         // sends and it cannot be ambiguous. The name is the fallback for a
         // node that sends names, which the specification permits.
-        int slot = -1;
-        for (size_t seen = 0; seen < tracked.metricCount; seen++) {
-            if (metric.hasAlias) {
-                if (tracked.metrics[seen].alias == metric.alias) {
-                    slot = (int)seen;
-                    break;
-                }
-                continue;
-            }
-            if (metric.name == nullptr) continue;
-            if (tracked.metrics[seen].name != metric.name) continue;
-            if (tracked.metrics[seen].device != wanted) continue;
-            slot = (int)seen;
-            break;
-        }
+        const long slot = metric.hasAlias
+                              ? trackedAlias(tracked, metric.alias)
+                              : trackedName(tracked, metric.name, deviceId);
         if (slot < 0) continue;   // never declared; nothing to update
+
+        // A historical value is history, not the current picture: the
+        // specification's flag says "this message should not be considered a
+        // real time/current value", and a replayed hour must not overwrite a
+        // live reading with an older one.
+        if (metric.isHistorical) continue;
+
+        MqttSparkplugTrackedMetric& entry = tracked.metrics[(size_t)slot];
 
         // A NULL metric is a positive statement that the value is not known,
         // so the entry stops offering a stale reading rather than keeping the
         // last good one.
         if (metric.value.isNull) {
-            tracked.metrics[slot].hasValue = false;
+            entry.hasValue = false;
             continue;
         }
 
         // Owned: `metric` points into _inbound's buffer, reused next message.
-        MqttSparkplugTrackedMetric& entry = tracked.metrics[slot];
         entry.value = entry.owned.keep(metric.value);
         entry.hasValue = !entry.value.isNull;
         if (!entry.hasValue) {
@@ -590,9 +946,8 @@ void MqttSparkplugHost::recordValues(MqttSparkplugTrackedNode& tracked,
         // The metric's own timestamp if it carried one, otherwise the
         // payload's - which is the usual case, since one payload timestamp
         // covering the batch is most of the bandwidth saving.
-        tracked.metrics[slot].at =
-            metric.hasTimestamp ? metric.timestamp
-                                : (payload.hasTimestamp ? payload.timestamp : 0);
+        entry.at = metric.hasTimestamp ? metric.timestamp
+                                       : (payload.hasTimestamp ? payload.timestamp : 0);
     }
 }
 
@@ -610,26 +965,80 @@ void MqttSparkplugHost::resolveAliases(
         // - the tracked node is a member of this host. Nothing is copied into
         // the payload, which is the same contract MqttSparkplugMetric::name
         // already has: the caller does not own it.
-        if (metric.name == nullptr && metric.hasAlias) {
-            const char* name = tracked.metricName(metric.alias);
-            if (name != nullptr) metric.name = name;
+        long at = -1;
+        if (metric.hasAlias) {
+            at = trackedAlias(tracked, metric.alias);
+            if (metric.name == nullptr && at >= 0) {
+                metric.name = tracked.metrics[(size_t)at].name.c_str();
+            }
         }
 
         // [tck-id-payloads-metric-datatype-not-req] Data SHOULD NOT carry a
         // datatype, so the birth's is applied - by alias, or by name.
         if (metric.datatypeAbsent) {
-            MqttSparkplugDataType declared = MqttSparkplugDataType::Unknown;
-            if (metric.hasAlias) {
-                declared = tracked.metricType(metric.alias);
-            } else if (metric.name != nullptr) {
-                const MqttSparkplugTrackedMetric* entry = tracked.find(metric.name, deviceId);
-                if (entry != nullptr) declared = entry->type;
-            }
-            if (declared != MqttSparkplugDataType::Unknown) {
-                mq_sparkplugApplyDatatype(metric, declared);
+            if (!metric.hasAlias) at = trackedName(tracked, metric.name, deviceId);
+            if (at >= 0) {
+                const MqttSparkplugDataType declared = tracked.metrics[(size_t)at].type;
+                if (declared != MqttSparkplugDataType::Unknown) {
+                    mq_sparkplugApplyDatatype(metric, declared);
+                }
             }
         }
     }
+}
+
+bool MqttSparkplugHost::decodeInbound(const uint8_t* data, size_t length) {
+    // MEASURED, THEN DECODED ONCE, into a payload sized for this message.
+    //
+    // It decoded into whatever it had, and on TooManyMetrics doubled and tried
+    // again - doubling the name arena too, when the real cause was a metric
+    // with more properties than any payload holds, until the arena passed
+    // the message's size. And it never gave anything back: one large birth
+    // left about 208 bytes held for every byte that birth was, for the life
+    // of the host.
+    size_t metrics = 0;
+    size_t names = 0;
+    MqttSparkplugError error = mq_sparkplugMeasure(data, length, metrics, names);
+    if (error == MqttSparkplugError::None) {
+        // Past what this host would track of any node is refused here, before
+        // anything is allocated for it - a megabyte of empty metrics is half
+        // a million of them.
+        const size_t most =
+            (_metricLimit > MQ_SP_MAX_METRICS ? _metricLimit : MQ_SP_MAX_METRICS) + 64;
+        const bool small = metrics <= MQ_SP_MAX_METRICS && names <= MQ_SP_NAME_BYTES;
+        const bool grown = _inbound.capacity() > MQ_SP_MAX_METRICS ||
+                           _inbound.nameCapacity() > MQ_SP_NAME_BYTES;
+        if (grown && small) {
+            // Given back once the large messages have stopped, not after the
+            // first small one: a node whose births are large and whose data is
+            // small would otherwise reallocate on every birth.
+            if (++_smallInARow >= kShrinkAfter) {
+                _smallInARow = 0;
+                _inbound.resize(MQ_SP_MAX_METRICS, MQ_SP_NAME_BYTES);
+            }
+        } else if (!small) {
+            _smallInARow = 0;
+        }
+        if (metrics > most) {
+            error = MqttSparkplugError::TooManyMetrics;
+        } else if ((metrics > _inbound.capacity() ||
+                    names > _inbound.nameCapacity()) &&
+                   !_inbound.reserve(metrics, names)) {
+            _outOfMemory = true;
+            error = MqttSparkplugError::TooManyMetrics;
+        }
+    }
+    if (error == MqttSparkplugError::None) {
+        error = mq_sparkplugDecode(data, length, _inbound);
+    } else {
+        _inbound.clear();
+    }
+    if (error != MqttSparkplugError::None) {
+        _lastPayloadError = error;
+        _decodeFailures++;
+        return false;
+    }
+    return true;
 }
 
 void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
@@ -664,45 +1073,29 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
     // would be acting on its own traffic.
     if (mq_sparkplugIsCommand(parts.type)) return;
 
-    MqttSparkplugError error =
-        mq_sparkplugDecode(message.payload.data, message.payload.length,
-                           _inbound);
-    // The decode payload starts at the default size and grows to the
-    // largest message seen: one with more metrics, or longer names, than it
-    // holds is decoded again in a larger one, as far as memory goes. Never
-    // past what the message itself could carry.
-    while (error == MqttSparkplugError::TooManyMetrics) {
-        const size_t bytes = message.payload.length;
-        size_t metrics = _inbound.capacity();
-        size_t names = _inbound.nameCapacity();
-        if (_inbound.metricCount >= metrics && metrics < bytes) {
-            metrics = metrics ? metrics * 2 : MQ_SP_MAX_METRICS;
-        } else if (names <= bytes) {
-            names = names ? names * 2 : MQ_SP_NAME_BYTES;
-        } else {
-            break;   // too many properties on one metric: not a size we grow
-        }
-        if (!_inbound.reserve(metrics, names)) {
-            _outOfMemory = true;
-            break;
-        }
-        error = mq_sparkplugDecode(message.payload.data, message.payload.length,
-                                   _inbound);
-    }
-    if (error != MqttSparkplugError::None) {
-        _lastPayloadError = error;
-        _decodeFailures++;
-
+    if (!decodeInbound(message.payload.data, message.payload.length)) {
         // [tck-id-operational-behavior-host-reordering-rebirth]'s sibling
         // guidance: a Host Application MAY send Node Control/Rebirth NCMD
         // messages if malformed payloads arrive. Being primary is the
-        // condition, per that statement's own non-normative note.
-        if (_primary) {
-            requestRebirth(parts.group, parts.node);
+        // condition, per that statement's own non-normative note - and the
+        // node must be one this host already tracks: a malformed message is
+        // not a reason to start tracking a node id, and a peer spraying
+        // rubbish under new ids would otherwise fill the table with them.
+        //
+        // NOT for a payload past this host's own limits. That is ours, not
+        // the node's, and a rebirth would only send the same birth again -
+        // a request answered by the message that caused it, for ever.
+        if (_lastPayloadError != MqttSparkplugError::TooManyMetrics) {
+            const MqttSparkplugTrackedNode* known = findNode(parts.group, parts.node);
+            if (known != nullptr) {
+                askRebirth(_nodes[(size_t)(known - &_nodes[0])], parts.group,
+                           parts.node);
+            }
         }
         return;
     }
 
+    const char* const deviceId = parts.hasDevice ? parts.device : nullptr;
     const int index = trackNode(parts.group, parts.node);
     if (index >= 0) {
         MqttSparkplugTrackedNode& tracked = _nodes[(size_t)index];
@@ -718,17 +1111,21 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
         //
         // An NBIRTH REPLACES the table - it is a new picture of the node, and
         // keeping entries from the old one would let a metric that has been
-        // removed go on resolving. A DBIRTH EXTENDS it, because a device
-        // birthing says nothing about the node's own metrics.
+        // removed go on resolving. A DBIRTH REPLACES ITS DEVICE'S PART of it,
+        // for the same reason one level down; the node's own metrics and the
+        // other devices' are untouched.
         if (parts.type == MqttSparkplugType::NBirth) {
             tracked.metricCount = 0;
+            indexMetrics(tracked);
+        } else if (parts.type == MqttSparkplugType::DBirth) {
+            forgetDevice(tracked, deviceId);
         }
         if (parts.type == MqttSparkplugType::NBirth ||
             parts.type == MqttSparkplugType::DBirth) {
-            rememberMetrics(tracked, _inbound,
-                            parts.hasDevice ? parts.device : nullptr);
+            rememberMetrics(tracked, _inbound, deviceId);
+            compactMetrics(tracked);
         } else {
-            resolveAliases(tracked, _inbound, parts.hasDevice ? parts.device : nullptr);
+            resolveAliases(tracked, _inbound, deviceId);
         }
 
         // Births carry values too - [tck-id-payloads-nbirth-metric-reqs]
@@ -738,15 +1135,18 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
         // long the slowest one takes to change.
         if (parts.type != MqttSparkplugType::NDeath &&
             parts.type != MqttSparkplugType::DDeath) {
-            recordValues(tracked, _inbound,
-                         parts.hasDevice ? parts.device : nullptr);
+            recordValues(tracked, _inbound, deviceId);
         }
 
         if (parts.type == MqttSparkplugType::NBirth) {
             tracked.online = true;
-            tracked.hasSeq = true;
-            tracked.lastSeq = (uint8_t)_inbound.seq;
+            tracked.hasSeq = false;
             tracked.reordering = false;
+            tracked.rebirthAsked = false;   // answered
+            if (_inbound.hasSeq) {
+                trackSequence(tracked, (uint8_t)_inbound.seq, parts.group,
+                              parts.node);
+            }
 
             // [tck-id-topics-nbirth-bdseq-included] the bdSeq metric, which is
             // the only thing that will correlate the eventual NDEATH.
@@ -774,34 +1174,17 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
                 tracked.hasSeq = false;
                 tracked.reordering = false;
             }
+        } else if (parts.type != MqttSparkplugType::DDeath && !tracked.online) {
+            // DATA, OR A DEVICE BIRTH, FROM A NODE WITH NO BIRTH ON RECORD: a
+            // host that started after the node did, or a device born before
+            // its node's birth was seen. Nothing it sends by alias can be
+            // named, and nothing will change that until the node births again
+            // - so a primary host asks, as Ignition's does, held like every
+            // other request.
+            askRebirth(tracked, parts.group, parts.node);
         } else if (_inbound.hasSeq) {
-            // [tck-id-payloads-sequence-num-incrementing] one greater, wrapping
-            // at 255. Anything else is a gap.
-            const uint8_t expected = (uint8_t)(tracked.lastSeq + 1);
-            const uint8_t arrived = (uint8_t)_inbound.seq;
-
-            if (tracked.hasSeq && arrived != expected) {
-                tracked.gaps++;
-                if (_reorderTimeout > 0) {
-                    // [tck-id-operational-behavior-host-reordering-start] ...
-                    // the Host Application MUST start a timer denoting the
-                    // start of the Reorder Timeout window.
-                    if (!tracked.reordering) {
-                        tracked.reordering = true;
-                        tracked.reorderStartedAt = mq_millis();
-                    }
-                } else if (_primary) {
-                    requestRebirth(parts.group, parts.node);
-                    tracked.rebirthsRequested++;
-                }
-            } else if (tracked.reordering) {
-                // [-reordering-success] If the missing message(s) ... arrive
-                // before the reordering timer elapses, the timer MUST be
-                // terminated and normal operation MUST continue.
-                tracked.reordering = false;
-            }
-            tracked.lastSeq = arrived;
-            tracked.hasSeq = true;
+            trackSequence(tracked, (uint8_t)_inbound.seq, parts.group,
+                          parts.node);
         }
     }
 
@@ -811,7 +1194,7 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
     inbound.type = parts.type;
     inbound.group = parts.group;
     inbound.node = parts.node;
-    inbound.device = parts.hasDevice ? parts.device : nullptr;
+    inbound.device = deviceId;
     inbound.payload = &_inbound;
     if (_handler) _handler(inbound);
     if (_contextHandler) _contextHandler(_context, inbound);

@@ -361,6 +361,8 @@ AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     s.receiveMaximum = (uint16_t)std::min<uint32_t>(wire.receive_maximum(), 65535);
     s.topicAliasMaximum = (uint16_t)std::min<uint32_t>(wire.topic_alias_maximum(), 65535);
     s.maximumPacketSize = wire.maximum_packet_size();
+    s.connectTimeoutSeconds = wire.connect_timeout_seconds();
+    s.ackTimeoutSeconds = wire.ack_timeout_seconds();
     if (wire.store_and_forward().enabled()) {
         const v1::StoreAndForward& k = wire.store_and_forward();
         s.storeAndForward = true;
@@ -419,6 +421,8 @@ void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
     s->set_receive_maximum(info.spec.receiveMaximum);
     s->set_topic_alias_maximum(info.spec.topicAliasMaximum);
     s->set_maximum_packet_size(info.spec.maximumPacketSize);
+    s->set_connect_timeout_seconds(info.spec.connectTimeoutSeconds);
+    s->set_ack_timeout_seconds(info.spec.ackTimeoutSeconds);
     if (info.spec.storeAndForward) {
         v1::StoreAndForward* k = s->mutable_store_and_forward();
         k->set_enabled(true);

@@ -30,11 +30,22 @@
 // a class that repointed a transport it did not make would quietly undo
 // whatever its caller had configured on it.
 //
+// ON AN ESP32 A CHANNEL CONNECTS ON A TASK OF ITS OWN (MQTT_CONNECT_TASK). The
+// Sparkplug node keeps its client reconnecting by itself - a node that stopped
+// trying would be a dead node - so every reconnect ran inside poll(), and with
+// a TinyGsmClient that was loop() standing still for the modem's whole connect
+// time on every attempt. An adopted channel is therefore put behind an
+// MqttConnectTask, exactly as MqttDevice's is: get() hands out the task, the
+// task hands the medium back once it has connected, and nothing else changes.
+// connectInBackground(false) puts the channel back in front, for a sketch
+// that must talk to its modem itself at any moment (see MqttDevice's).
+//
 // Platform-aware by necessity, like MqttDevice - see scripts/check-layering.py.
 
 #include "MqttFeatures.h"   // MQTT_TLS_SOCKETS: an undefined macro is 0 in #if
 #include "MqttTransport.h"
 #include "MqttTypes.h"
+#include "transport/MqttConnectTask.h"
 #include "transport/MqttStreamTransport.h"
 #include "transport/MqttTcpTransport.h"
 #include "transport/MqttTlsTransport.h"
@@ -51,9 +62,7 @@ public:
 #endif
     }
 
-    ~MqttOwnedTransport() {
-        if (_destroy && _transport) _destroy(_transport);
-    }
+    ~MqttOwnedTransport() { release(); }
 
     MqttOwnedTransport(const MqttOwnedTransport&) = delete;
     MqttOwnedTransport& operator=(const MqttOwnedTransport&) = delete;
@@ -69,10 +78,29 @@ public:
                       "network channel transport wants an alignment this storage "
                       "does not give it");
         release();
-        _transport = new (_storage) Stream(channel);
+        Stream* stream = new (_storage) Stream(channel);
+        _channel = stream;
+        _transport = stream;
+#if MQTT_CONNECT_TASK
+        _task.wrap(*stream);
+        _task.stackBytes(MQTT_CONNECT_CHANNEL_STACK);
+        _transport = &_task;
+#endif
         _retarget = &retargetStream<ChannelType>;
         _destroy = &destroyStream<ChannelType>;
         _owned = true;
+    }
+
+    // Whether an adopted channel's connect runs on its own task (ESP32) - on
+    // by default. Off puts the channel in front, connecting inside the poll as
+    // before. Takes effect at the next connect; ignored while one is running.
+    void connectInBackground(bool enabled) {
+#if MQTT_CONNECT_TASK
+        if (_channel == nullptr || _task.busy()) return;
+        _transport = enabled ? static_cast<MqttTransport*>(&_task) : _channel;
+#else
+        (void)enabled;
+#endif
     }
 #else
     // Declared on a host too, so a class above can offer a channel
@@ -94,6 +122,18 @@ public:
         _owned = false;
     }
 
+    // Whether a connect is still opening the channel on its own task - which
+    // may outlast the client's attempt (a connect timeout ends the attempt,
+    // not the modem's dial). Nothing the task reads - the host name - may
+    // change meanwhile.
+    bool connecting() const {
+#if MQTT_CONNECT_TASK
+        return _channel != nullptr && _task.busy();
+#else
+        return false;
+#endif
+    }
+
     // Null only on a board that was given no channel.
     MqttTransport* get() const { return _transport; }
     bool owned() const { return _owned; }
@@ -103,7 +143,7 @@ public:
     void target(const char* host, uint16_t port) {
         if (!_owned) return;
         if (_retarget) {
-            _retarget(_transport, host, port);
+            _retarget(_channel, host, port);
             return;
         }
 #if defined(MQTT_PLATFORM_HOST)
@@ -158,10 +198,16 @@ public:
 
 private:
     void release() {
-        if (_destroy && _transport) _destroy(_transport);
+        // A connect still running on its task is using the channel's
+        // transport: it is waited for before that is destroyed.
+#if MQTT_CONNECT_TASK
+        if (_channel != nullptr) _task.settle();
+#endif
+        if (_destroy && _channel) _destroy(_channel);
         _destroy = nullptr;
         _retarget = nullptr;
         _transport = nullptr;
+        _channel = nullptr;
         _owned = false;
 #if MQTT_TLS_SOCKETS
         _useTls = false;
@@ -182,6 +228,13 @@ private:
 
     MqttTransport* _transport = nullptr;
     bool _owned = false;
+
+    // An adopted channel's own transport, which _retarget and _destroy act on
+    // - behind the connect task where there is one, so not always _transport.
+    MqttTransport* _channel = nullptr;
+#if MQTT_CONNECT_TASK
+    MqttConnectTask _task;
+#endif
 
     void (*_retarget)(void* transport, const char* host, uint16_t port) = nullptr;
     void (*_destroy)(void* transport) = nullptr;

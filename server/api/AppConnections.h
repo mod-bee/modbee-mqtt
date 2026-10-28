@@ -105,6 +105,13 @@ struct AppConnectionSpec {
     uint32_t willDelaySeconds = 0;
     uint16_t receiveMaximum = 0, topicAliasMaximum = 0;
     uint32_t maximumPacketSize = 0;
+    // A slow link's timings (0: the defaults): how long a connect - DNS, TCP,
+    // TLS and the CONNACK - may take (30 s), and how long an acknowledgement
+    // is waited for before the message counts as lost (twice the keep-alive,
+    // at least 120 s - a message waits behind others on a slow link, and
+    // giving up early sends it again on a link that was only busy).
+    uint32_t connectTimeoutSeconds = 0;
+    uint32_t ackTimeoutSeconds = 0;
     // STORE AND FORWARD (ConnectionOutbox): every publish on it kept on disk
     // until the other broker has acknowledged it, whether it is up or not.
     bool storeAndForward = false;

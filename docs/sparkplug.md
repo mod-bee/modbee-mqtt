@@ -269,7 +269,8 @@ with the reason, through `onCommandRefused()`:
 ```cpp
 void onRefused(const MqttSparkplugCommand& command) {
     // command.outcome: UnknownDevice, UnknownMetric, ReadOnly, WrongType,
-    // Undecodable or NotARequest - mq_sparkplugCommandOutcomeName() names it
+    // TooLarge, Undecodable or NotARequest - mq_sparkplugCommandOutcomeName()
+    // names it
     log(command.name, mq_sparkplugCommandOutcomeName(command.outcome));
 }
 
@@ -278,6 +279,23 @@ node.onCommandRefused(&onRefused);
 
 Between the two handlers every metric of every NCMD and DCMD is reported
 exactly once; `command.applied()` says which side it came from.
+
+**A write is no larger than `commandLimit()`** - 4 kB on a board, 1 MB on a
+host (`MQ_SP_COMMAND_LIMIT`) - for a text, bytes, array, DataSet or Template
+metric. A longer one is refused as `TooLarge` before anything is copied: a
+command's value is copied into the metric (and into each write-queue slot), so
+without a limit anybody who can publish on NCMD could make a board allocate
+whatever they sent. `node.commandLimit(bytes)` moves the line.
+
+**Rebirth requests are held to one birth every `rebirthHoldoff()`** - 2
+seconds by default (`MQ_SP_REBIRTH_HOLDOFF`). A request after a quiet spell
+is answered at once. One that comes within the holdoff of the last birth stops
+data at once, as the specification requires, and is answered by a single
+birth when the holdoff is up - however many requests came in between
+(`rebirthsHeld()` counts them). A host, a second host, or anybody who can
+publish on NCMD can no longer make the node send its largest messages back to
+back. `rebirthHoldoff(0)` answers every request with its own birth;
+`rebirth()`, called by the application, is never held.
 
 ### Devices
 
@@ -370,7 +388,52 @@ broker.
 | `lastErrorText()` | Why the link is down |
 | `sequence()`, `birthDeathSequence()` | The current `seq` and `bdSeq` |
 | `commandsApplied()`, `commandsRefused()` | Writes taken, and writes refused |
+| `birthCount()` | NBIRTHs and DBIRTHs published |
+| `rebirthsHeld()` | Rebirth requests answered by a birth already on its way |
+| `replayHeld()`, `replayed()`, `replayLost()` | The replay window: values held, sent again, and not kept |
 | `client()` | The `MqttClient` underneath, for anything else |
+
+### A link that dies without saying so: the replay window
+
+A cellular link can die with neither end told. Until the keepalive notices -
+up to one and a half keepalive intervals - the node is born, and every NDATA it
+writes goes into a socket that leads nowhere. Data is QoS 0, so nothing says it
+was lost, and the NBIRTH after the reconnect carries only current values. Over
+seven simulated hours of cellular faults (`test_sparkplug_soak`) that was 6,772
+values of 240,704, gone without a trace.
+
+```cpp
+node.replayWindow(64);          // before connect(): 64 values, 1.5 kB
+node.replayWindow(64, 600000);  // ... and nothing older than ten minutes
+```
+
+With a window the node keeps the last values it published until it has
+**proof** the broker has them. Every so often while values are held (half the
+keepalive by default, `replayProbe(ms)` to change it) it sends one UNSUBSCRIBE
+for a filter it never subscribed to; the broker's UNSUBACK comes back on the
+same connection after everything written before it, so every value published
+before the probe has arrived, and is let go. If the session then ends without
+the node meaning it to - the link lost, not `disconnect()` or a host's
+offline STATE - whatever is still held is published again after the next
+birth: NBIRTH, each device's DBIRTH, then the held values, oldest first, each
+marked `is_historical` with the time it was first sent, and only then the
+live data that waited behind them. A host files them in its history and does
+not let them overwrite the live picture (this library's host does exactly
+that). Some may have arrived the first time: a historian then sees the same
+value at the same timestamp twice, which is a duplicate, not a lie.
+
+It is the in-flight half of what Cirrus Link's MQTT Transmission calls store
+and forward. The outage half - values recorded while the node cannot publish
+at all - is `MqttSparkplugHistory` with `publishRecords()`, below.
+
+**Off by default**, on a host and a board, because it changes what goes on the
+wire after a reconnect. 24 bytes a value, allocated once with
+`mq_allocLarge()` (PSRAM first). Numbers, booleans and dates only: a text or
+other span value is not kept, and `replayLost()` counts it, as it counts a
+value pushed out of a full window, one too old to send, and one for a device
+that was taken offline. Each probe is about 40 bytes up and 5 down, at most
+once per probe interval and only while values are held.
+
 
 ### Changing settings while running
 
@@ -477,6 +540,35 @@ allocates `depth` events of 24 bytes with `mq_allocLarge()` (PSRAM first),
 events recorded before the clock was set onto UTC. The OpenPLC block
 `SPARKPLUG_HISTORY` is built on the two.
 
+**Keeping it across a restart** is the application's, and the ring gives it
+a way out and a way back in:
+
+```cpp
+// Before power goes (or on every change, where the store is cheap):
+MqttSparkplugEvent held[64];
+const size_t count = history.save(held, 64);           // oldest first
+for (size_t i = 0; i < count; i++) {
+    mq_spEventWrite(record[i], held[i]);               // 24 bytes, fixed layout
+}
+store(record, count, history.lost());
+
+// After the restart:
+history.begin(64);
+for (size_t i = 0; i < count; i++) mq_spEventRead(record[i], held[i]);
+history.restore(held, count, lostBefore);
+```
+
+`mq_spEventWrite()` gives an event a fixed, versioned little-endian layout
+(`MQ_SP_EVENT_BYTES`, 24), so a ring saved by one firmware reads back in
+another whose struct is laid out differently; `mq_spEventRead()` refuses
+bytes of any other layout. `restore()` takes the events as `add()` would and
+carries the lost count over. An event still stamped with uptime
+(`MQ_SP_EVENT_UPTIME`) is on the previous boot's counter, which no clock can
+place, so `restore()` drops it and counts it lost rather than file it at a
+time that never happened - call `placeOnClock()` before saving, once the clock
+is set, to keep such events. On OpenPLC the record array is a `VAR RETAIN`
+array of bytes; elsewhere, whatever the board keeps across a restart.
+
 ---
 
 ## A host application
@@ -518,9 +610,21 @@ What the host does for you:
   arrives with names, and `read()` and `readDevice()` return the latest value
   of any metric by name. `findNode()` gives the whole picture for one node:
   online or not, its metrics, their types and the time of each value.
-- **Checks sequence numbers.** With `actAsPrimary()`, a gap that does not fill
-  within `reorderTimeout()` (5 seconds by default) makes it ask the node for a
-  rebirth.
+- **Checks sequence numbers.** A message that arrives late closes the gap it
+  opened, and a duplicate is recognised as one rather than counted as a gap of
+  255. With `actAsPrimary()`, a gap that does not fill within
+  `reorderTimeout()` (5 seconds by default) makes it ask the node for a
+  rebirth - and so does a payload it cannot decode from a node it tracks, and
+  data from a node whose birth it never saw (a host started after the node, as
+  Ignition does).
+- **Asks once, not on every message.** Those requests are held to one per node
+  every `rebirthHoldoff()` (5 seconds by default; `rebirthsHeld` counts the
+  rest), so a lossy link gets a rebirth, not a storm of them - each answer is
+  the node's largest message, on the link that is already losing messages.
+  `requestRebirth()`, the application's own call, is never held.
+- **Keeps history out of the live picture.** A metric marked `is_historical`
+  reaches `onMessage()` but does not change what `read()` returns: an hour of
+  replayed history must not overwrite the reading from a minute ago.
 
 To write to a node:
 
@@ -560,6 +664,12 @@ and a property whose value is a `PropertySet` or a `PropertySetList`
   `PropertySet`) is kept without a value: `valueUnsupported` set and NULL,
   never a zero.
 
+**Compressed payloads are passed through, not decompressed.** A payload
+whose `uuid` is `SPBV1.0_COMPRESSED` decodes as what it is on the wire - the
+uuid, an `algorithm` metric and the compressed bytes in `body` - and reaches
+`onMessage()` like that. Nothing in the library inflates it, so a node that
+compresses is read by an application that does it itself.
+
 **Data without datatypes.** The specification says data and command
 messages SHOULD NOT carry a metric's datatype, because the birth declared it.
 This library's node includes it anyway (which is allowed), and both ends
@@ -572,18 +682,38 @@ send buffer are sized to its own birth certificate when it first connects -
 so nothing is allocated in the steady state, and a node with five metrics pays
 for five. On an ESP32 with PSRAM all of it is in PSRAM.
 
-**No fixed number of metrics or devices**, on a host or a board: a node
-declares as many metrics, under as many devices, as memory holds, and a
+**No fixed number of metrics or devices** on a node, on a host or a board: a
+node declares as many metrics, under as many devices, as memory holds, and a
 declaration memory cannot take is refused and `node.outOfMemory()` says so.
-`node.metricLimit(n)` sets a limit of your own. A host likewise tracks as many
-nodes, and metrics per node, as memory holds, and its decode payload grows to
-the largest birth it meets (`host.outOfMemory()` when it could not).
+`node.metricLimit(n)` sets a limit of your own.
+
+**A host's tables have limits, because a peer chooses what they hold.**
+`host.nodeLimit(n)` (default `MQ_SP_HOST_NODE_LIMIT`: a million on a host, 32
+on a board) and `host.metricLimit(n)` (`MQ_SP_HOST_METRIC_LIMIT`: 65,536 a
+node on a host, 1,024 on a board). A birth past either is still delivered to
+`onMessage()`; what it would have added is refused and counted
+(`nodesRefused()`, `metricsRefused()`, and per node `metricsRefused`), and a
+birth of more metrics than the host would track of any node is not decoded at
+all. A DBIRTH replaces its device's part of the dictionary, so a device that
+rebirths with new aliases does not grow it. On a host every lookup is through
+a hash index - a node by group and id, a metric by alias and by name - so each
+message costs one lookup per metric however large the plant; on a board the
+limits keep a straight search short. The decode payload is sized to each
+message before it is decoded (`mq_sparkplugMeasure()`), and given back once
+sixteen small messages in a row have followed a large one; a node's table
+shrinks when it births smaller. A metric with more than `MQ_SP_MAX_PROPERTIES`
+properties keeps the first ones and counts the rest in the payload's
+`propertiesDropped`, rather than failing the whole birth.
 
 | Macro | Default | What it bounds |
 | --- | --- | --- |
 | `MQ_SP_MAX_METRICS` | 34 on a board, 256 on a host | The size of a payload nobody sized, and where a host's decode payload starts before it grows |
 | `MQ_SP_MAX_SERVERS` | 4 | Brokers a node can fail over through |
-| `MQ_SP_MAX_PROPERTIES` | 4 | Properties per metric |
+| `MQ_SP_MAX_PROPERTIES` | 4 | Properties kept per metric; the rest are counted |
+| `MQ_SP_HOST_NODE_LIMIT` | 32 on a board, 1,048,576 on a host | `host.nodeLimit()` to start with |
+| `MQ_SP_HOST_METRIC_LIMIT` | 1,024 on a board, 65,536 on a host | `host.metricLimit()` to start with |
+| `MQ_SP_COMMAND_LIMIT` | 4 kB on a board, 1 MB on a host | `node.commandLimit()` to start with |
+| `MQ_SP_REBIRTH_HOLDOFF` | 2000 ms | `node.rebirthHoldoff()` to start with |
 
 To change one, set it for the **whole build**, not with a `#define` in the
 sketch: the library's own files are compiled separately and would not see it.
@@ -634,6 +764,16 @@ specification as the code would share its mistakes:
   server's API rather than in an application.
 - **A live node and host**, on a real broker, judged by an independent Python
   host application.
+- **A hostile peer and a bad link**, in-process: `test_sparkplug_hardening`
+  (every limit, linear time on large births and tables, the rebirth holdoffs,
+  the replay window, timestamps past 49.7 days of uptime),
+  `test_sparkplug_soak` (a node and its primary host through seven simulated
+  hours of cellular faults - half-open links, cuts, FINs, latency, small MTUs,
+  short writes - across the 32-bit millisecond wrap, checking bdSeq, seq, birth
+  order, history order and that every value published arrives), and
+  `test_sparkplug_fuzz` (the decoder, nested templates, datasets, property
+  sets and compressed payloads, then the same bytes delivered to a live host
+  and node), all under AddressSanitizer.
 
 Every requirement in the code names the statement of the specification it
 implements, by its `tck-id`. [extending.md](extending.md#sparkplug-b) has the

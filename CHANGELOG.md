@@ -13,6 +13,25 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Cellular-grade connections, in the library.** Every address of a host name is raced (RFC 8305: families
+  interleaved, 250 ms head start), so a broken IPv6 route or a dead A record costs 250 ms, not the connect timeout.
+  **The last good DNS answer** for each name is used when a fresh lookup fails or takes over 1.8 s (RFC 8767) - for
+  at most 24 hours (`setStaleAddressLimit()`), a fresh answer always wins and replaces it at once, and a remembered
+  address that is refused is forgotten - so a carrier DNS outage does not stop a reconnect, and a server that moves
+  is followed. Host sockets get `SO_KEEPALIVE` and `TCP_USER_TIMEOUT` (120 s, `setDeadLinkTimeout()`).
+  `MqttClientConfig::firstConnectSpreadMs` spreads a fleet's first connect after a power cut (default off).
+  `MqttDevice::connecting()` / `connectInBackground()`, `MqttConnectTask::settle()`, `MqttTransport::connectWithin()`.
+- **Sparkplug B, production-sized.** The host's node and metric tables are hash-indexed on a host (one lookup a
+  metric at any plant size - 84.7 s to 0.9 s in the test), with limits (`nodeLimit()`, `metricLimit()`) and counted
+  refusals; its decode buffer is sized to each message (`mq_sparkplugMeasure()`) and given back. A sequence window
+  tells a late or duplicate message from a gap. Rebirth requests are held to one a node a `rebirthHoldoff()` - on
+  the host (5 s) and the node (2 s: a burst of 50 NCMDs made 54 births, now 2). The node's opt-in **replay
+  window** (`replayWindow()`) sends again, as `is_historical` after the next birth, values written into a link that
+  died without either end noticing (an UNSUBSCRIBE probe proves what was delivered): a 7-hour flaky-link soak lost
+  6,772 values before, none now. `MqttSparkplugHistory::save()` / `restore()` keep the ring across a restart.
+  `commandLimit()`, `mq_spArrayNext()`, linear-time DataSet reading. Each managed connection has
+  `connect_timeout_seconds` (30) and `ack_timeout_seconds` (twice the keep-alive, at least 120) for slow links.
+
 - **Kafka as a connection's link** (`ConnectionSpec.kafka`: `cluster`, `kafka_topic`, `kafka_topics` or
   `kafka_topic_pattern`, `key`, `consumer_group`, `state_connection`): a managed connection with Kafka in the middle
   instead of another broker. Its client talks to a broker of its own inside the server - loopback, a login made for
@@ -152,6 +171,27 @@ minor version may change the API or the configuration, and says how here.
   code — so an application can say why a device is not getting through. A board build compiles none of it.
 
 ### Fixed
+
+- **A long transfer over a slow link is no longer ended by the keep-alive and retried for ever**: bytes moving
+  either way are signs of life, no PINGREQ waits behind a backlog, and "sent" - for the keep-alive and for the
+  acknowledgement deadline - means its last byte has left. A Server Keep Alive of 0 no longer turns off dead-link
+  detection, and a long one no longer outlasts NAT timeouts: the client pings at the shorter of the two.
+- **A resumed session sent each in-flight QoS 1/2 publish twice** - as the DUP replay and again as a new message.
+  Once now.
+- **Day 50**: a connection up 49.7 days counted as unstable when it dropped; `MqttDevice::isFresh()` and
+  `MqttPoller` called a value silent for 49.7 days fresh; a Sparkplug node's timestamps jumped back 49.7 days.
+- **ESP32: a reconnect no longer stalls `loop()`**: `MqttDevice` and the Sparkplug classes open an adopted channel
+  on a task of their own (inline if there is no memory for one), bounded by the connect timeout where the channel
+  allows (TinyGSM's own default is 75 s); and a channel write is at most 1 KB a call, never into a full socket, at
+  most 20 ms a poll - `WiFiClient::write` waited up to 10 s on a dead link. Node and host never retarget the
+  transport while a connect is reading the host name. The cellular example no longer sends AT commands while a
+  connect is dialling.
+- **A host TLS connection that moved to a second address ran its handshake over the socket it had just closed.**
+- **Sparkplug host**: repeated DBIRTHs grew its tables for ever (a DBIRTH now replaces its device's metrics); a
+  birth with more than four properties on a metric lost the node (the extra properties are counted now); a STATE
+  timestamp that overflowed read as 0; a primary host never asked a node it had no birth for; a late or duplicate
+  message counted as a gap. Node: command values grew without limit (`TooLarge` past `commandLimit()`), a reused
+  property slot kept old data, alias lookup was linear.
 
 - **A Kafka mapping changed while records were being read could crash the server** (use after free): a record
   published into the broker reached the pipe's own offer() on the same thread, which took the new plan there and

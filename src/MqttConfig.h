@@ -188,6 +188,29 @@ struct MqttClientConfig {
     mq_time_t reconnectInitialMs = 1000;
     mq_time_t reconnectMaximumMs = 60000;
 
+    // THE FIRST CONNECT AFTER begin(), SPREAD OVER UP TO THIS MANY
+    // MILLISECONDS. Off (0) by default.
+    //
+    // The reconnect backoff is jittered; the first attempt was not, and on a
+    // fleet that is the one that matters most. A site's power comes back and
+    // every controller on it boots in the same second - and a regional outage
+    // does the same to every site at once. Without a spread the broker meets
+    // the whole fleet's TLS handshakes and session restores in one burst, and
+    // the ones it cannot serve fall into the backoff together.
+    //
+    // OFF BY DEFAULT, as in Paho, the AWS IoT device SDKs and HiveMQ's client:
+    // the first connect of a device on a bench, or of a gateway restarted by
+    // an engineer, should not wait for no reason anybody can see - and a
+    // cellular fleet already arrives spread by however long each modem takes
+    // to register. Set it where many devices share a broker and a power
+    // supply: 30000 spreads a thousand controllers over half a minute, about
+    // thirty connects a second. Deterministic, like the backoff - drawn from
+    // the client identifier, because a board has no entropy at power-up - so
+    // the same device always waits the same time and two devices almost never
+    // wait the same. Only the FIRST connect() after begin(): an application
+    // calling connect() again later is asking for now.
+    mq_time_t firstConnectSpreadMs = 0;
+
     // Whether to reconnect at all. Off means a lost connection is reported and
     // left; the application decides.
     bool autoReconnect = true;

@@ -85,6 +85,17 @@
 #define MQTT_CONNECT_STEP_MS 2
 #endif
 
+// Bytes, for the task MqttDevice and the Sparkplug classes put an ARDUINO
+// CLIENT's connect on (WiFiClient, WiFiClientSecure, EthernetClient,
+// TinyGsmClient - whichever the sketch gave them). The same 8 kB Arduino's own
+// loop() task has on an ESP32, because that is where those connects ran until
+// now and where every one of them is known to fit: WiFiClientSecure's mbedTLS
+// handshake and certificate parse, a modem's AT exchange. Held only while an
+// attempt runs; nothing while the link is up.
+#ifndef MQTT_CONNECT_CHANNEL_STACK
+#define MQTT_CONNECT_CHANNEL_STACK 8192
+#endif
+
 class MqttConnectTask : public MqttTransport {
 public:
     explicit MqttConnectTask(uint32_t stackBytes = MQTT_CONNECT_STACK)
@@ -112,6 +123,12 @@ public:
     // Why begin() refused without starting anything; empty otherwise.
     const char* lastError() const { return _error; }
 
+    // End the medium and WAIT until no attempt is running - for an owner about
+    // to free the medium (a destructor, a channel being replaced). The one
+    // call here that waits, and only ever for the medium's own connect to
+    // return, which connectWithin() bounds.
+    void settle();
+
     // --- MqttTransport ---
     bool begin() override;
     void end() override;
@@ -124,6 +141,7 @@ public:
     bool peerClosed() const override;
     bool connectFailed() const override;
     bool openFailed() const override;
+    void connectWithin(uint32_t milliseconds) override;
     const char* peerName() const override;
     const char* peerCertificateName() const override;
     const char* peerCertificateFingerprint() const override;

@@ -517,7 +517,9 @@ Nothing else in the sketch changes. The transport is a template over any
 Arduino network channel, so the library is the same on all of them.
 
 What *does* differ is timing — a cellular modem's connect can take seconds, and
-that is not something any library can make instant.
+that is not something any library can make instant. On an ESP32 it no longer
+holds up `loop()`: the connect runs on a task of its own, and while
+`mqtt.connecting()` is true the sketch should leave the modem alone.
 **[transports.md](transports.md) covers all of it**, including what to do about
 that in a scan cycle.
 

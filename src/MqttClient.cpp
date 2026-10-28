@@ -158,6 +158,9 @@ void MqttClient::begin(MqttTransport& transport,
     _activeVersion = connection.version;
     _fallbackTried = false;
     _restarting = false;
+    _firstConnectAsked = false;
+    _firstConnectHeld = false;
+    _stable = false;
 
     _link.begin(transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize);
 #if MQTT_LEAN
@@ -340,6 +343,22 @@ MqttResult MqttClient::connect() {
     // A new attempt has had no answer yet. See MqttStatus::connectReasonCode
     // for why this is not lastReasonCode.
     _status.connectReasonCode = 0;
+
+    // THE FIRST CONNECT SINCE begin(), SPREAD - see firstConnectSpreadMs. It
+    // waits exactly as a reconnect waits, in Reconnecting, and is started by
+    // the same code when its moment comes; poll() never waits for it.
+    const bool first = !_firstConnectAsked;
+    _firstConnectAsked = true;
+    if (!first) _firstConnectHeld = false;     // asked again: that is for now
+    if (first && _behaviour.firstConnectSpreadMs != 0) {
+        const uint32_t seed = deviceSeed(_connection.clientId, this) ^ 0x9E3779B9u;
+        _reconnectAt = mq_millis() + spread(seed, _behaviour.firstConnectSpreadMs + 1);
+        _firstConnectHeld = true;
+        enterState(MqttState::Reconnecting);
+        return MqttResult::Queued;
+    }
+
+    _transport->connectWithin(_behaviour.connectTimeoutMs);
     if (!_transport->begin()) {
         // Opening the medium failed outright, which is a different thing from
         // a peer refusing us and is reported as such.
@@ -444,7 +463,8 @@ void MqttClient::serviceAcknowledgements() {
     const size_t given =
         _operations.concludeOverdue(mq_millis(),
                                     _behaviour.acknowledgementTimeoutMs,
-                                    MqttResult::AckTimeout);
+                                    MqttResult::AckTimeout,
+                                    (uint32_t)_link.bytesSent());
     if (given == 0) return;
 
     // Counted as publish failures, because that is what they are from the
@@ -515,6 +535,9 @@ void MqttClient::poll() {
         return;
 
     case MqttState::Connected:
+        if (!_stable && mq_elapsed(_stateSince, mq_millis()) >= (mq_time_t)MQ_RECONNECT_STABLE_MS) {
+            _stable = true;
+        }
         serviceTransmit();
         serviceReceive();
         if (_status.state != MqttState::Connected) return;   // receive may have closed us
@@ -559,8 +582,19 @@ bool MqttClient::sendPacket(const MqttPacket& packet) {
     // Any packet at all resets the keepalive timer. [V5:3.1.2.10] measures the
     // interval from the last byte SENT, not from the last PINGREQ, so a busy
     // link never needs to ping at all.
-    _keepAlive.noteSent(mq_millis());
+    noteTransmitted();
     return true;
+}
+
+// "The point at which the Client finishes transmitting one MQTT Control
+// Packet" [V5:3.1.2.10] - which is when its last byte has LEFT, not when it
+// was queued. Marking it at the queue meant a packet that took three minutes
+// to cross a slow link had "been sent" before its first byte went, and the
+// keepalive measured from a moment that had not happened. So the keepalive is
+// told only when the link has nothing left to send; serviceTransmit() tells it
+// when a backlog finally drains.
+void MqttClient::noteTransmitted() {
+    if (_link.transmitIdle()) _keepAlive.noteSent(mq_millis());
 }
 
 void MqttClient::serviceTransmit() {
@@ -568,6 +602,7 @@ void MqttClient::serviceTransmit() {
 
     const size_t before = _link.transmitPending();
     _link.serviceTransmit();
+    if (before > 0 && _link.transmitIdle()) _keepAlive.noteSent(mq_millis());
 
     // A transport that took nothing and is no longer connected has gone. The
     // link reports what it found and does not decide - closing a connection is
@@ -829,14 +864,34 @@ void MqttClient::handleConnAck(const MqttPacket& packet) {
     _flow.reset(_capabilities.receiveMaximum);
     _aliases.reset(_capabilities.topicAliasMaximum, _connection.topicAliasMaximum);
 
-    // V5:3.2.2.3.14 - a Server Keep Alive REPLACES ours, and an implementation
-    // that kept measuring against what it asked for pings at the wrong rate.
-    const uint16_t effective = _capabilities.keepAliveOverridden
-                                   ? _capabilities.keepAlive
-                                   : _connection.keepAlive;
+    // V5:3.2.2.3.14 - a Server Keep Alive REPLACES ours as the interval we
+    // are OBLIGED to keep, and an implementation that kept measuring against
+    // what it asked for would ping too rarely for a broker that wants less.
+    //
+    // BUT IT DOES NOT GET TO SWITCH OFF OUR DEAD-LINK DETECTION. [V5:3.12.4]
+    // "The Client can send PINGREQ at any time, irrespective of the Keep
+    // Alive value, and check for a corresponding PINGRESP to determine that
+    // the network and the Server are available." Taken literally, a Server
+    // Keep Alive of 0 turned the keepalive off - and with it the only
+    // watchdog a half-open cellular link has - and one of an hour let a
+    // carrier's NAT, which forgets an idle mapping in minutes, drop the
+    // connection silently in between. So the client runs at the SHORTER of
+    // the two: never less often than the broker requires, never less often
+    // than the application asked for. Only the application's own 0 turns it
+    // off, because that is a decision somebody made (and the host sockets
+    // keep the kernel's backstop under it - mq_socket::tuneDialledSocket).
+    const uint16_t ours = _connection.keepAlive;
+    const uint16_t theirs = _capabilities.keepAlive;
+    uint16_t effective = ours;
+    if (_capabilities.keepAliveOverridden && theirs != 0) {
+        effective = (ours == 0 || theirs < ours) ? theirs : ours;
+    }
     _keepAlive.begin(effective, mq_millis());
+    _seenReceived = _link.bytesReceived();
+    _seenRelieved = _link.bytesRelieved();
 
     _status.connects++;
+    _stable = false;                 // earned again by this connection, on the poll
     // NOT a reset of the backoff. A CONNACK says the broker answered, not that
     // the connection works: one that accepts and then drops this client at
     // once would have it back every second for ever. The backoff starts again
@@ -874,6 +929,33 @@ void MqttClient::establishSession(bool sessionPresent) {
         // Packet Identifier.
         _session.markAllUnsent();
         _operations.markAllUnsent();
+
+        // BUT A PUBLISH THE SESSION IS REPLAYING IS NOT ALSO SENT AFRESH.
+        //
+        // The operation and the session's stored copy are two records of ONE
+        // message, and the replay belongs to the copy: same bytes, same
+        // Packet Identifier, DUP set. Putting the operation back as unsent as
+        // well sent it a second time on the next drain - as a NEW message,
+        // under a new identifier. Two deliveries at QoS 1, and at QoS 2 the
+        // very duplicate exactly-once exists to prevent, with nothing at the
+        // receiver able to tell them apart. Every reconnect onto a present
+        // session did it, for every publish that was in flight.
+        //
+        // Only those the session actually holds: anything it does not (a
+        // subscribe, a copy that could not be stored) goes again as before.
+        //
+        // Its acknowledgement deadline starts again now, not from the send on
+        // the connection that was lost - and again when the replay leaves.
+        const mq_time_t now = mq_millis();
+        for (size_t index = 0;; index++) {
+            MqttOperation* op = _operations.at(index);
+            if (op == nullptr) break;
+            if (!op->inUse() || op->kind != MqttOpKind::Publish || op->qos == MQ_QOS_0) continue;
+            if (op->packetId == MQ_PACKET_ID_NONE) continue;
+            if (_session.findOutbound(op->packetId) == nullptr) continue;
+            op->sent = true;
+            op->sentAt = now;
+        }
     }
 
     // R7: THE HOOK RUNS BEFORE ANYTHING QUEUED IS SENT, AND WHAT IT QUEUES
@@ -1180,6 +1262,22 @@ void MqttClient::handleSubAck(const MqttFixedHeader& header, const MqttPacket& p
 void MqttClient::serviceKeepAlive() {
     const mq_time_t now = mq_millis();
 
+    // SIGNS OF LIFE SHORT OF A WHOLE PACKET. Bytes of a large inbound packet
+    // still arriving, and our own backlog draining after the transport had
+    // refused it, both say the link is alive and merely slow. See
+    // MqttKeepAlive for why counting only complete packets reconnected a slow
+    // link in the middle of every large transfer, for ever.
+    const uint64_t received = _link.bytesReceived();
+    if (received != _seenReceived) {
+        _seenReceived = received;
+        _keepAlive.noteBytesReceived(now);
+    }
+    const uint64_t relieved = _link.bytesRelieved();
+    if (relieved != _seenRelieved) {
+        _seenRelieved = relieved;
+        _keepAlive.noteProgress(now);
+    }
+
     if (_keepAlive.responseOverdue(now)) {
         // THE ONLY WATCHDOG THERE IS. Nothing else in the library watches a
         // clock for the peer, because [V5:MQTT-4.4.0-1] forbids retransmitting
@@ -1193,7 +1291,12 @@ void MqttClient::serviceKeepAlive() {
         return;
     }
 
-    if (_keepAlive.pingDue(now)) {
+    // NOT BEHIND A BACKLOG. A PINGREQ queued behind a packet still leaving
+    // cannot be answered before that packet has gone, so its deadline would
+    // be measuring the link's bandwidth rather than the peer's health - and
+    // the bytes leaving already prove what the ping would. A backlog that has
+    // stopped moving is caught by the silence rule above instead.
+    if (_link.transmitIdle() && _keepAlive.pingDue(now)) {
         MqttPacket ping;
         ping.header.type = MQ_PKT_PINGREQ;
         if (sendPacket(ping)) _keepAlive.notePingSent(now);
@@ -1221,8 +1324,16 @@ void MqttClient::serviceQueue() {
         }
         if (!_link.queue(stored->encoded.data(), stored->encoded.size())) break;
         stored->sent = true;
-        _keepAlive.noteSent(mq_millis());
+
+        // The operation this copy belongs to - kept as sent across the
+        // reconnect, see establishSession() - has its deadline started again
+        // from this send, and from where these bytes end.
+        MqttOperation* owner = _operations.findByPacketId(stored->packetId);
+        if (owner != nullptr && owner->sent) {
+            _operations.markSent(*owner, stored->packetId, _link.transmitMark());
+        }
         serviceTransmit();
+        noteTransmitted();
     }
 
     while (_link.transmitPending() == 0) {
@@ -1376,7 +1487,8 @@ void MqttClient::serviceQueue() {
             // place and goes out on a later poll.
             break;
         }
-        _keepAlive.noteSent(mq_millis());
+        noteTransmitted();
+        const uint32_t mark = _link.transmitMark();
 
         if (op->kind == MqttOpKind::Publish && op->qos > MQ_QOS_0) {
             _session.storeOutbound(packetId, op->qos, encoded, encodedLength);
@@ -1392,7 +1504,7 @@ void MqttClient::serviceQueue() {
             if (stored) stored->sent = true;
         }
 
-        _operations.markSent(*op, packetId);
+        _operations.markSent(*op, packetId, mark);
 
         if (op->kind == MqttOpKind::Publish) {
             if (op->qos == MQ_QOS_0) {
@@ -1464,9 +1576,10 @@ void MqttClient::closeConnection(MqttResult reason) {
     // so a broker that accepts and immediately drops this device is retried
     // at a doubling interval rather than once a second. _stateSince is when
     // Connected was entered - enterState() sets it on every change.
-    if (wasUp && mq_elapsed(_stateSince, mq_millis()) >= (mq_time_t)MQ_RECONNECT_STABLE_MS) {
+    if (wasUp && (_stable || mq_elapsed(_stateSince, mq_millis()) >= (mq_time_t)MQ_RECONNECT_STABLE_MS)) {
         _reconnectDelay = _behaviour.reconnectInitialMs;
     }
+    _stable = false;
 
     if (_transport) _transport->end();
 
@@ -1596,17 +1709,22 @@ void MqttClient::scheduleReconnect() {
 void MqttClient::serviceReconnect() {
     if (mq_isFuture(mq_millis(), _reconnectAt)) return;
 
-    _status.reconnects++;
+    // The held first connect is the first attempt, not a reconnect.
+    const bool first = _firstConnectHeld;
+    _firstConnectHeld = false;
+    if (!first) _status.reconnects++;
 
     // A new attempt has had no answer yet. See MqttStatus::connectReasonCode
     // for why this is not lastReasonCode.
     _status.connectReasonCode = 0;
+    _transport->connectWithin(_behaviour.connectTimeoutMs);
     if (!_transport->begin()) {
         scheduleReconnect();
         return;
     }
 #if MQTT_LEAN
-    _openFailure = MqttResult::Ok;
+    // A first connect answers a failed open as connect() itself would have.
+    _openFailure = first ? MqttResult::ConnectionLost : MqttResult::Ok;
 #endif
     enterState(MqttState::Connecting);
 }

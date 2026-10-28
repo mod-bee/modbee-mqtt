@@ -337,6 +337,28 @@ struct MqttSparkplugPayload {
     // what it had.
     bool reserve(size_t metricCapacity, size_t nameBytes);
 
+    // Exactly this much room, smaller as well as larger, and EMPTIED. What a
+    // long-lived decode payload uses to give back what one large message
+    // made it take (MqttSparkplugHost): reserve() only ever grows, so a host
+    // that met one birth of ten thousand metrics held two megabytes for the
+    // rest of its life. False when the memory is not there; the payload then
+    // keeps what it had.
+    bool resize(size_t metricCapacity, size_t nameBytes);
+
+    // PROPERTIES THIS PAYLOAD COULD NOT KEEP, as it was decoded: a metric
+    // carries at most MQ_SP_MAX_PROPERTIES, and the rest of its property set
+    // is read, checked and counted here rather than kept.
+    //
+    // It failed the whole decode, and was reported as TooManyMetrics - so a
+    // host met an Ignition birth carrying engUnit, engLow, engHigh, Quality
+    // and a Tooltip on one tag, could not read the birth at all, and lost
+    // the node; and its retry loop doubled the name arena until it passed
+    // the message's size, because "too many metrics" said to grow. A
+    // property is a description of a metric, never its value: the metric
+    // with its first four is worth far more than no metric, and the count
+    // says that something was left out.
+    uint32_t propertiesDropped = 0;
+
     // --- Name storage, owned here ---
     //
     // A decoded metric name cannot be a span. It arrives length-prefixed and
@@ -449,6 +471,17 @@ size_t mq_sparkplugEncode(uint8_t* out, size_t capacity,
 MqttSparkplugError mq_sparkplugDecode(const uint8_t* in, size_t length,
                                       MqttSparkplugPayload& out);
 
+// What decoding these bytes will need: how many metrics, and how many bytes
+// of names, property keys and uuid (each with its terminator). One walk, no
+// allocation, and never more than the message could carry - so a host sizes
+// its decode payload ONCE, to the message in hand, instead of doubling and
+// decoding again (which cost it about 208 bytes for every byte a large
+// message held). An over-estimate never an under-estimate: every property key
+// is counted, including any past MQ_SP_MAX_PROPERTIES the decode will drop.
+// The error a malformed message would give, or None.
+MqttSparkplugError mq_sparkplugMeasure(const uint8_t* in, size_t length,
+                                       size_t& metrics, size_t& nameBytes);
+
 // --- Templates: a PLC's STRUCT or UDT ---
 //
 // A Template metric's value is the encoded Payload.Template. A DEFINITION is
@@ -560,7 +593,21 @@ size_t mq_sparkplugEncodeDataSet(uint8_t* out, size_t capacity,
 // and a String cell are spans into it. open() checks the whole of it once -
 // as many names and types as columns, a cell for every column in every row,
 // each in its column's field - so column() and cell() cannot meet a
-// malformed one. Each walks to what it is asked for: a table is read once.
+// malformed one.
+//
+// LINEAR IN THE TABLE, read in order. open() checked every cell against its
+// column by walking the column list again for each one, and cell() walked
+// from the first row for each call: a hostile 400 kB table of one-cell rows
+// kept a host's poll busy for minutes, and an honest one of ten thousand rows
+// read in a loop was quadratic. Now open() is one pass with the column types
+// cached (MQ_SP_DATASET_TYPE_CACHE of them in the reader, any more in a
+// buffer allocated for the pass and freed), and cell() resumes from the cell
+// it read last, so a row-major loop costs one step a cell. Random access
+// still works; it walks from the nearest point it knows.
+#ifndef MQ_SP_DATASET_TYPE_CACHE
+#define MQ_SP_DATASET_TYPE_CACHE 32
+#endif
+
 class MqttSparkplugDataSetReader {
 public:
     MqttSparkplugError open(const uint8_t* data, size_t length);
@@ -577,10 +624,24 @@ public:
     bool cell(size_t row, size_t column, MqttSparkplugValue& out) const;
 
 private:
+    bool typeOf(size_t column, MqttSparkplugDataType& type) const;
+
     const uint8_t* _data = nullptr;
     size_t _length = 0;
     size_t _columns = 0;
     size_t _rows = 0;
+
+    // The first columns' types, read once by open().
+    uint8_t _types[MQ_SP_DATASET_TYPE_CACHE] = {};
+
+    // Where the last cell() left off: the row it read, the offset of that
+    // row's field in the table, and the offset of the cell after the one it
+    // returned. A row-major loop resumes here rather than starting again.
+    mutable size_t _cursorRow = 0;
+    mutable size_t _cursorRowAt = 0;     // offset of row _cursorRow's tag
+    mutable size_t _cursorColumn = 0;    // the next cell's column
+    mutable size_t _cursorCellAt = 0;    // offset of that cell's tag in the row
+    mutable bool _cursorValid = false;
 };
 
 // --- PropertySets as values ---

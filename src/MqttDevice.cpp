@@ -154,7 +154,29 @@ MqttDevice::~MqttDevice() {
     // The client concludes everything outstanding on the way down, so a caller
     // holding a slot per publish gets every one of them back.
     if (_begun) _client.end();
-    if (_destroy && _transport) _destroy(_transport);
+    // A connect still running on its task is using the channel's transport,
+    // so it is waited for (bounded by the connect timeout) before that goes.
+#if MQTT_CONNECT_TASK
+    if (_channel != nullptr) _task.settle();
+#endif
+    if (_destroy && _channel) _destroy(_channel);
+}
+
+void MqttDevice::connectInBackground(bool enabled) {
+#if MQTT_CONNECT_TASK
+    if (_channel == nullptr || _task.busy()) return;
+    _transport = enabled ? static_cast<MqttTransport*>(&_task) : _channel;
+#else
+    (void)enabled;
+#endif
+}
+
+bool MqttDevice::connecting() const {
+#if MQTT_CONNECT_TASK
+    return _channel != nullptr && _task.busy();
+#else
+    return false;
+#endif
 }
 
 void MqttDevice::applyDefaults() {
@@ -559,6 +581,12 @@ bool MqttDevice::connect(const char* host, uint16_t port) {
     if (host == nullptr || host[0] == '\0') return false;
     if (_transport == nullptr) return false;
 
+    // NOT WHILE THE LAST ATTEMPT IS STILL OPENING THE CHANNEL. It is reading
+    // the host string this would overwrite, on another task; and it could not
+    // be followed by a new one until it returned anyway. It is bounded by the
+    // connect timeout, and the client takes it from there.
+    if (connecting()) return false;
+
     _host = host;
     if (port == 0) port = defaultPort();
 
@@ -569,7 +597,7 @@ bool MqttDevice::connect(const char* host, uint16_t port) {
     // and reconfiguring it here would silently undo whatever they set.
     if (_ownTransport) {
 #if defined(MQTT_PLATFORM_ARDUINO)
-        if (_retarget) _retarget(_transport, _host.c_str(), port);
+        if (_retarget) _retarget(_channel, _host.c_str(), port);
 #elif defined(MQTT_PLATFORM_HOST)
 #if MQTT_TLS_SOCKETS
         if (_useTls) _tls.configure(_host.c_str(), port);
@@ -648,6 +676,13 @@ void MqttDevice::disconnectNow() {
 
 void MqttDevice::poll() {
     if (!_begun) return;
+
+    // "Last heard" never ages past MQ_AGE_CEILING_MS, so isFresh() and
+    // sinceMessage() cannot wrap round to young after 49.7 days of silence.
+    const mq_time_t now = mq_millis();
+    for (size_t i = 0; i < MQTT_DEVICE_MAX_SUBSCRIPTIONS; i++) {
+        if (_subscriptions[i].everReceived) mq_ageCeiling(_subscriptions[i].lastMessageAt, now);
+    }
 
     // Handled here rather than inside the state-change callback, so the client
     // is not restarted from within one of its own notifications.

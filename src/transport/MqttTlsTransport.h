@@ -52,6 +52,13 @@ public:
 
     void configure(const char* host, uint16_t port);
 
+    // The same two as MqttTcpTransport: how long the host name's last known
+    // addresses may be dialled when DNS does not answer (seconds, 24 hours
+    // unless set, 0 never), and the kernel's give-up time for unacknowledged
+    // data (milliseconds, two minutes unless set, 0 the kernel's default).
+    void setStaleAddressLimit(uint32_t seconds) { _addresses.setStaleAddressLimit(seconds); }
+    void setDeadLinkTimeout(uint32_t milliseconds) { _addresses.setDeadLinkTimeout(milliseconds); }
+
     // The certificate authority to trust. Either a PEM file, or the system
     // store when neither is set.
     void setCaFile(const char* path);
@@ -98,7 +105,7 @@ public:
     size_t read(uint8_t* into, size_t length) override;
     size_t write(const uint8_t* buffer, size_t length) override;
     bool isConnected() const override;
-    int waitHandle() const override { return _socket; }
+    int waitHandle() const override { return _socket >= 0 ? _socket : _addresses.waitHandle(); }
     // Our own buffer OR the engine's. SSL_pending() is the half a readiness
     // set cannot see: a TLS record arrives whole, is decrypted whole, and the
     // plaintext of several MQTT packets can be sitting inside the SSL object
@@ -166,7 +173,7 @@ private:
     // across polls because a non-blocking connect completes later, and only
     // then is it known whether this candidate worked.
     mq_socket::AddressList _addresses;
-    bool nextAddress();
+    void exhausted();
     bool finishTcp();
     bool finishHandshake();
     bool fill();

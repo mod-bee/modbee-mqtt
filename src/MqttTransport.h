@@ -150,6 +150,19 @@ public:
     // that cannot tell keeps that behaviour rather than guessing.
     virtual bool connectFailed() const { return false; }
 
+    // The longest the caller will wait for an open begin() starts - the
+    // client's connect timeout, told before every attempt.
+    //
+    // A HINT FOR A MEDIUM WHOSE OPEN BLOCKS. A host socket's connect never
+    // waits, and is bounded by the caller's own clock. An Arduino Client's
+    // connect() does wait, and for as long as ITS default says: TinyGSM's is
+    // 75 seconds, and the ESP32 core's TLS handshake allows 120. A connect
+    // that outlives the caller's patience is not merely wasted - on a connect
+    // task it holds the medium, so the next attempt cannot start until it
+    // returns. A medium that can be told passes this on (MqttStreamTransport);
+    // the rest ignore it.
+    virtual void connectWithin(uint32_t milliseconds) { (void)milliseconds; }
+
 #if MQTT_LEAN
     // A board only: whether the attempt begin() accepted never OPENED - what
     // begin() returning false has always meant, reported a poll later because

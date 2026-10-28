@@ -547,6 +547,24 @@ private:
     mq_time_t _reconnectAt = 0;
     mq_time_t _reconnectDelay = 0;
 
+    // The connection has stayed up for MQ_RECONNECT_STABLE_MS. Decided WHILE
+    // it is up, on the poll, rather than by subtracting at the moment it
+    // drops: a connection that had been up for 49.7 days and a few seconds
+    // subtracted to "a few seconds", looked unstable, and kept whatever
+    // backoff it had before it connected - a minute's wait after seven weeks
+    // of good service.
+    bool _stable = false;
+
+    // The link's byte counters as the keepalive last saw them: bytes that
+    // moved since are a sign of life even when no packet has finished - see
+    // MqttKeepAlive. Taken afresh when a connection comes up.
+    uint64_t _seenReceived = 0;
+    uint64_t _seenRelieved = 0;
+
+    // The send queue's obligation is met when the bytes have LEFT, not when
+    // they were queued: the keepalive is told only once the link is idle.
+    void noteTransmitted();
+
     MqttMessageFn _onMessage = nullptr;
     void* _messageContext = nullptr;
     MqttSessionFn _onSession = nullptr;
@@ -568,6 +586,12 @@ private:
 #endif
     // restart() is under way: the close it causes reconnects at once.
     bool _restarting = false;
+
+    // MqttClientConfig::firstConnectSpreadMs: whether the first connect()
+    // since begin() has been asked for, and whether the attempt it scheduled
+    // is still to come - which is not a reconnect, and is not counted as one.
+    bool _firstConnectAsked = false;
+    bool _firstConnectHeld = false;
 #if MQTT_LEAN
     // The reason an open that failed on a connect task is answered with
     // (MqttTransport::openFailed()): the one connect() gives a false begin(),

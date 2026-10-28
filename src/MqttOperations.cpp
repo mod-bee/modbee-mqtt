@@ -212,12 +212,14 @@ MqttOperation* MqttOperations::nextUnsent() {
     return found >= 0 ? &_ops[found] : nullptr;
 }
 
-void MqttOperations::markSent(MqttOperation& operation, uint16_t packetId) {
+void MqttOperations::markSent(MqttOperation& operation, uint16_t packetId, uint32_t mark) {
     operation.sent = true;
     operation.packetId = packetId;
     // Stamped HERE, in the one place that marks an operation sent, so an
-    // acknowledgement deadline cannot be started from the wrong moment.
+    // acknowledgement deadline cannot be started from the wrong moment - and
+    // with where its bytes end, so it is not started while they are queued.
     operation.sentAt = mq_millis();
+    operation.sentMark = mark;
 }
 
 void MqttOperations::markAllUnsent() {
@@ -272,7 +274,7 @@ size_t MqttOperations::withdraw(const MQ_AREA_BYTES& topic,
 }
 
 size_t MqttOperations::concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
-                                       MqttResult result) {
+                                       MqttResult result, uint32_t leftLink) {
     if (timeoutMs == 0) return 0;   // no deadline; wait for ever, as before
 
     // THE SAME SNAPSHOT DISCIPLINE AS concludeAll(), and for the same reason:
@@ -287,6 +289,13 @@ size_t MqttOperations::concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
         if (!_ops[index].sent) continue;
         // QoS 0 has nothing to wait for: it concludes when it is written.
         if (_ops[index].packetId == MQ_PACKET_ID_NONE) continue;
+        // STILL LEAVING: its last byte is queued behind the link's cursor. No
+        // peer can acknowledge what it has not received, so the clock starts
+        // when the bytes have gone - restamped on every pass until they have.
+        if ((int32_t)(_ops[index].sentMark - leftLink) > 0) {
+            _ops[index].sentAt = now;
+            continue;
+        }
         if (mq_elapsed(_ops[index].sentAt, now) < timeoutMs) continue;
 
         retireAt(index, result);

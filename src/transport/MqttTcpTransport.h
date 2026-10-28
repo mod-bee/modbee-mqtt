@@ -41,6 +41,17 @@ public:
     // at the next begin().
     void setLocalAddress(const char* address) { _addresses.setLocalAddress(address); }
 
+    // How long the last addresses this host name resolved to may still be
+    // dialled when DNS does not answer, in seconds - 24 hours unless set; 0
+    // never uses them. A fresh answer always wins; see mq_socket::KnownAddresses
+    // for exactly when a remembered one is used.
+    void setStaleAddressLimit(uint32_t seconds) { _addresses.setStaleAddressLimit(seconds); }
+
+    // Milliseconds of unacknowledged data before the kernel itself ends the
+    // connection (TCP_USER_TIMEOUT) - a backstop under the MQTT keepalive, two
+    // minutes unless set; 0 leaves the kernel's default. Next begin().
+    void setDeadLinkTimeout(uint32_t milliseconds) { _addresses.setDeadLinkTimeout(milliseconds); }
+
     // Starts the connection and returns. Whether it completed is what
     // isConnected() answers on a later poll.
     bool begin() override;
@@ -50,7 +61,10 @@ public:
     size_t read(uint8_t* into, size_t length) override;
     size_t write(const uint8_t* buffer, size_t length) override;
     bool isConnected() const override;
-    int waitHandle() const override { return _socket; }
+    // While the addresses are being raced, the newest attempt's socket: one
+    // to wait on, and the race is looked at again on every poll whichever
+    // attempt woke it.
+    int waitHandle() const override { return _socket >= 0 ? _socket : _addresses.waitHandle(); }
     bool hasBufferedInput() const override { return _receiveHead < _receiveTail; }
     bool peerClosed() const override;
     bool connectFailed() const override { return _failed; }
@@ -101,7 +115,7 @@ private:
     // across polls: a non-blocking connect completes later, and only then is
     // it known whether this candidate worked.
     mq_socket::AddressList _addresses;
-    bool nextAddress();
+    void exhausted();
 
     // Pulls whatever the socket has into the buffer. False when nothing came.
     bool fill();

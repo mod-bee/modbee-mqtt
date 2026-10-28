@@ -156,6 +156,14 @@ struct MqttOperation {
     // PUBLISHED still climbing because the QoS 0 traffic was unaffected.
     mq_time_t sentAt = 0;
 
+    // WHERE ITS LAST BYTE IS in the link's transmit stream (MqttLink::
+    // transmitMark). The deadline above does not start while that byte is
+    // still queued: on a slow link a large publish can take longer to leave
+    // this device than the whole acknowledgement timeout, and timing it from
+    // when it was QUEUED reported a message as unacknowledged while it was
+    // still being sent - see concludeOverdue().
+    uint32_t sentMark = 0;
+
     // Goes ahead of everything already queued.
     //
     // For the session-established hook and nothing else. R7 says that hook
@@ -214,7 +222,7 @@ public:
     // what was accepted first leaves first.
     MqttOperation* nextUnsent();
 
-    void markSent(MqttOperation& operation, uint16_t packetId);
+    void markSent(MqttOperation& operation, uint16_t packetId, uint32_t mark = 0);
 
     // --- Concluding ---
     //
@@ -242,8 +250,11 @@ public:
     // the acknowledgement arriving for an operation nobody remembers.
     size_t withdraw(const MQ_AREA_BYTES& topic, MqttResult result);
 
+    // `leftLink` is how far the link has sent (MqttLink::bytesSent, as 32
+    // bits): an operation whose last byte has not got that far yet is still
+    // leaving, and its deadline starts again from `now`.
     size_t concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
-                           MqttResult result);
+                           MqttResult result, uint32_t leftLink);
 
     // Everything that has NOT been sent. Used when a connection drops: what
     // was sent has moved into the session and will be retransmitted, what was

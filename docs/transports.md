@@ -127,13 +127,14 @@ it changes enough to deserve its own settings:
 mqtt.rememberSession(3600);   // an outage becomes a pause, not a loss
 mqtt.queueSize(64);           // room to hold readings through one
 mqtt.keepAlive(300);          // fewer pings; a plan is sold by the megabyte
-mqtt.autoReconnect(false);    // reconnect where you can afford the stall - below
+mqtt.autoReconnect(false);    // not on an ESP32 - see "the one place something blocks"
 ```
 
 **Keep alive is a trade, not a default.** It is the only thing that notices a
 link that went away without saying so — a bearer that vanished, a NAT entry
 that timed out — so a longer interval is less data and a slower failure. Pick
-it deliberately.
+it deliberately. A broker's Server Keep Alive can shorten it but never switch it
+off or stretch it - see [Slow links](#slow-links-keepalive-and-acknowledgements).
 
 Full example: `examples/arduino/Remote_Site_Cellular`.
 
@@ -155,8 +156,14 @@ it.** It does a DNS lookup and a TCP handshake and returns when they are done.
 | `EthernetClient`, static address, local broker | milliseconds |
 | `EthernetClient`, DNS name | one DNS round trip, plus the handshake |
 | `WiFiClientSecure` / `SSLClient` | the above, plus a TLS handshake — the slow part on a small board |
-| `TinyGsmClient` | **seconds** — it is a sequence of AT commands |
+| `TinyGsmClient` | **seconds** — it is a sequence of AT commands (TinyGSM's own limit is 75 s; the library tells it the client's connect timeout, 20 s by default) |
 | `MqttChannelTlsTransport` over any of these | only the plain channel's `connect()`; the TLS handshake runs a step per `poll()` and never waits for the network, though a step's arithmetic is the poll's |
+
+**The connect is bounded by the client's connect timeout where the channel can
+be told one**: TinyGSM's `connect(host, port, seconds)`, and the ESP32 core's
+`WiFiClientSecure` handshake (`setHandshakeTimeout`, 120 s by its own default).
+Only ever shortened, never lengthened; any other channel connects exactly as
+before.
 
 ### Where it can happen
 
@@ -175,6 +182,22 @@ when the modem's buffer is full on a slow link. On a cellular board, the
 modem's own PPP mode with the board's lwIP sockets (an ordinary `WiFiClient`-
 style client over the PPP interface) avoids that, where the modem and core
 support it.
+
+**What the library does about a channel's `write()`.** An Arduino channel's
+`write()` returns when it has taken everything or given up, and on a dead link
+giving up is slow: the ESP32 core's `WiFiClient` waits up to ten seconds for
+room, its `WiFiClientSecure` until the socket timeout. So `MqttStreamTransport`
+(and `MqttChannelTlsTransport` underneath its TLS):
+
+- hands the channel at most `MQTT_STREAM_WRITE_CHUNK` (1024) bytes per call;
+- on an ESP32, does not call `write()` at all when the socket has no room
+  (`select()` on the channel's `fd()`), so a full socket costs nothing;
+- stops writing for this `poll()` once it has spent
+  `MQTT_STREAM_WRITE_BUDGET_MS` (20 ms) in `write()` - the rest goes on the
+  next poll, from exactly where it stopped.
+
+A 200 kB publish through a modem is therefore spread over many polls instead
+of being one `poll()` that lasts the whole transfer.
 
 ### What to do about the second one
 
@@ -203,10 +226,38 @@ void loop() {
 `examples/arduino/Remote_Site_Cellular` does exactly this, including bringing
 the bearer back up.
 
-### On an ESP32: put the connect on a task of its own
+### On an ESP32: the connect runs on a task of its own - automatically
 
-Every ESP32 runs FreeRTOS, so there the stall can be moved off your loop
-altogether. `MqttConnectTask` wraps the transport that opens the medium; its
+Every ESP32 runs FreeRTOS, so there the stall is moved off your loop
+altogether, **and `MqttDevice` and the Sparkplug classes now do it for the
+channel you give them**: `MqttDevice mqtt(net)` on an ESP32 puts `net`'s
+connect on a short task of its own (`MqttConnectTask`, 8 kB of stack while an
+attempt runs, nothing while the link is up). Auto-reconnect can stay on; a
+reconnect no longer stops `loop()` for the modem's connect time. A Sparkplug
+edge node, which always reconnects by itself, gets the same.
+
+**The one thing this asks of a sketch: while `mqtt.connecting()` is true,
+leave the channel and the modem alone.** The attempt is using them on another
+task, and TinyGSM is not safe to call from two tasks at once - asking the modem
+for its signal or bearer state mid-attempt interleaves its AT commands with
+the connect's. Guard such calls:
+
+```cpp
+if (!mqtt.isConnected() && !mqtt.connecting() && !modem.isGprsConnected()) {
+    bringBearerUp();
+}
+```
+
+or keep the old behaviour - the stall, in your loop - with
+`mqtt.connectInBackground(false)`. `connect()` itself returns false while an
+attempt is still opening the channel; the running attempt carries on.
+
+If the heap has no room for the task's stack, that attempt opens the channel
+inline instead, as before - a device that could never connect again because
+its heap was fragmented would be worse than one stall.
+
+The rest of this section is how to do the same by hand, for a transport you
+build yourself. `MqttConnectTask` wraps the transport that opens the medium; its
 `begin()` starts a short task that calls the medium's `begin()` - and, for
 `MqttChannelTlsTransport`, drives the whole handshake - then hands the medium
 back. Meanwhile the client is `Connecting`, `poll()` returns at once, and the
@@ -227,13 +278,118 @@ medium's connect returns. Never free the medium while `busy()`: hand it to
 `retire()`, which frees it after the attempt. The task exists only while an
 attempt runs. `MQTT_CLIENT`, the OpenPLC block, does all of this on an ESP32.
 A board without threads (`MQTT_CONNECT_TASK` 0) keeps the stall where it was.
-`MqttSparkplugNode` reconnects by itself, so on a cellular modem give it a
-transport wrapped in `MqttConnectTask` this way - it cannot use the
-`autoReconnect(false)` pattern above.
+`MqttSparkplugNode` reconnects by itself; given a channel on an ESP32 it now
+puts it on a task as above, and a transport you build yourself should be
+wrapped in `MqttConnectTask` this way - it cannot use the `autoReconnect(false)`
+pattern above.
 
 On a **host** none of this applies: `MqttTcpTransport` and `MqttTlsTransport`
 are non-blocking throughout, connect included. The limitation is Arduino's
 `Client` interface, not the design.
+
+---
+
+## How a host dials: every address, raced, and DNS that is allowed to fail
+
+`MqttTcpTransport` and `MqttTlsTransport` (Linux gateways, containers, a PLC
+runtime) look the name up and connect without ever waiting inside `poll()`.
+Two things make that hold up on a flaky link.
+
+### Every address, raced (RFC 8305, Happy Eyeballs)
+
+A name with several addresses is not tried one at a time. The addresses are
+put in an order that alternates IPv6 and IPv4, the first is dialled, and if it
+has not connected within **250 ms** (`MQTT_CONNECT_ATTEMPT_DELAY_MS`) the next
+is started *beside* it - the first is not abandoned, so a slow cellular round
+trip still wins on its first address. An address that fails starts the next
+at once; the first to connect wins and the rest are closed. Up to eight are in
+flight at once.
+
+So a **blackholed** address - an IPv6 route that is broken, an A record for a
+server that was switched off, whose SYNs are simply never answered - costs
+250 ms, not the whole connect timeout. Before, the connect sat on it until the
+kernel gave up (about two minutes) and the client's 20 s timeout ended the
+attempt first: the working address behind it was never tried.
+
+### The last good address, when DNS is down (RFC 8767, serve-stale)
+
+The resolver is the piece of a carrier network that fails first. So the last
+answer each **host name** resolved to is remembered (per name, so a failover
+server under its own name is remembered separately), and used under these
+rules - and only these:
+
+| When | What is dialled |
+| --- | --- |
+| DNS answers within 1.8 s | **the fresh answer**, always. It also replaces what is remembered, at once. |
+| DNS fails ("temporary failure", no answer, too many lookups already stuck) | the remembered addresses, if the answer is **less than 24 hours old** |
+| DNS has not answered after **1.8 s** (`MQTT_DNS_STALE_AFTER_MS`) | the remembered addresses, if under 24 hours old; the lookup carries on in the background and, when it answers, replaces what is remembered for the next attempt |
+| Nothing remembered, or older than 24 hours | nothing: the attempt waits for DNS (up to the connect timeout) and fails if it does not answer. An entry past its age is deleted. |
+
+- **Every attempt looks the name up first**, including the one after a
+  connection made on a remembered address. The memory is never used in
+  preference to an answer, so a server that moves is followed on the next
+  attempt that DNS answers.
+- **24 hours is counted from when the answer was received**; using it does not
+  make it younger. Change it per transport with
+  `setStaleAddressLimit(seconds)` (`0` turns the memory off), or for a build
+  with `MQTT_DNS_STALE_LIMIT_S`. `getaddrinfo()` does not report the record's
+  TTL, so this bound is all there is.
+- **A remembered address that is refused or times out is forgotten at once**,
+  and not tried again until DNS gives it back. A failure that says this machine
+  has no network at all (network unreachable, network down) does not count
+  against the address.
+- A numeric address (`192.168.1.10`) is never a lookup and never remembered.
+- An error reached on remembered addresses says so: "... (DNS is not answering;
+  these were its last known addresses)".
+
+### The kernel's backstop
+
+Each dialled socket also gets `SO_KEEPALIVE` (120 s idle, then four probes
+30 s apart), `TCP_USER_TIMEOUT` of 120 s (`setDeadLinkTimeout()`, 0 for the
+kernel's own fifteen minutes), where the platform has them. They matter when the MQTT keepalive is off or long: a dead
+path with data outstanding ends within two minutes rather than fifteen.
+
+---
+
+## Slow links: keepalive and acknowledgements
+
+A kilobyte a second is an ordinary cellular link on a weak signal. At that
+rate a 30 kB packet takes half a minute to cross, and nothing whole arrives
+from the broker meanwhile because it is waiting for the rest of it. The
+library's timers are measured accordingly:
+
+- **Bytes count as signs of life**, not only whole packets: bytes of a large
+  packet still arriving, and our own backlog draining after the transport had
+  refused it (the far end acknowledging data). The keepalive still ends a
+  connection on which **nothing has moved, in either direction, for two
+  intervals** - a link that has stopped is still found.
+- **A PINGREQ is not queued behind a backlog**: it could not be answered until
+  the backlog had gone, and the bytes leaving already prove what it would.
+- **"Sent" means the last byte has left** the library's buffer, for the
+  keepalive and for `acknowledgementTimeoutMs`: a QoS 1 or 2 publish's
+  acknowledgement deadline starts when its last byte has gone, not when it was
+  queued. (On a host the kernel may still hold some of it; the deadline's
+  default leaves room for that.)
+- **A broker's Server Keep Alive** is the interval the client is obliged to
+  keep, but the client pings at the **shorter** of the broker's and its own:
+  a Server Keep Alive of 0 does not switch off dead-link detection, and one of
+  an hour does not let a carrier NAT forget the connection in between. Only the
+  application's own `keepAlive(0)` turns it off. `activeKeepAlive()` reports
+  the interval in force.
+
+### A fleet that powers up together
+
+The reconnect backoff is jittered (full jitter, doubling to a minute). The
+**first** connect after `begin()` is not, by default - as in the common
+clients, so a bench device or a restarted gateway connects at once. Where
+many devices share a broker and a power supply, spread it:
+
+```cpp
+mqtt.behaviour().firstConnectSpreadMs = 30000;   // a thousand devices: ~30 a second
+```
+
+Each device waits a fixed time drawn from its client identifier, between 0 and
+the setting.
 
 ---
 

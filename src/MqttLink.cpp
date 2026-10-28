@@ -62,6 +62,7 @@ void MqttLink::begin(MqttTransport& transport, size_t receiveCapacity,
     _receiveLength = 0;
     _transmitLength = 0;
     _transmitCursor = 0;
+    _backpressured = false;
     _lastEncodeError = MqttError::None;
 }
 
@@ -75,6 +76,7 @@ void MqttLink::reset() {
     _receiveLength = 0;
     _transmitLength = 0;
     _transmitCursor = 0;
+    _backpressured = false;
     _lastEncodeError = MqttError::None;
 }
 
@@ -349,11 +351,15 @@ void MqttLink::serviceTransmit() {
             // No room now. The rest goes on a later poll FROM WHERE IT
             // STOPPED - never from the beginning, which would put the middle
             // of a packet on the wire twice and desynchronise permanently.
+            _backpressured = true;
             return;
         }
+        // Room again after there was none: the far end took delivery.
+        if (_backpressured) _bytesRelieved += sent;
         _transmitCursor += sent;
         _bytesSent += sent;
     }
+    _backpressured = false;
     _transmitCursor = 0;
     _transmitLength = 0;
 

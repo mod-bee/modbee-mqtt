@@ -230,14 +230,24 @@ bool mq_spArrayCount(const MqttSparkplugValue& array, size_t& count);
 bool mq_spArrayAt(const MqttSparkplugValue& array, size_t index,
                   MqttSparkplugValue& element);
 
+// The elements in order, each step constant time: start `cursor` at 0 and
+// call until it returns false. For a StringArray, mq_spArrayAt() has to walk
+// every string before the one asked for, so a loop over it is quadratic -
+// fifty thousand tags took seconds - and this is the loop to write instead.
+// The cursor is opaque (an offset for a StringArray, an index otherwise).
+bool mq_spArrayNext(const MqttSparkplugValue& array, size_t& cursor,
+                    MqttSparkplugValue& element);
+
 // --- A value's bytes, owned ---
 //
 // A span value - text, bytes, an array, a dataset, a template - points into
 // someone's buffer, and a receive buffer is reused for the next message. What
 // keeps a value past its message (a node's last-published copy and its
-// commands, a host's current picture) copies it here. Grows to the largest it
-// has held and never shrinks, in PSRAM where the board has some; it was a
-// 127-character text field on a board, which cut every longer value.
+// commands, a host's current picture) copies it here. Grows with the value,
+// in PSRAM where the board has some, and gives memory back when the value
+// shrinks to a quarter of what it holds - it kept the largest it had ever
+// held, for ever. It was a 127-character text field on a board, which cut
+// every longer value.
 class MqttSparkplugBytes {
 public:
     MqttSparkplugBytes() noexcept = default;
@@ -255,6 +265,9 @@ public:
 
     const uint8_t* data() const noexcept { return _data; }
     size_t size() const noexcept { return _size; }
+    // What is held. A little over the largest recent value; given back when
+    // a value shrinks to a quarter of it (above 256 bytes).
+    size_t capacity() const noexcept { return _capacity; }
 
     // `value` with its span pointed here, after assign()ing its bytes. A null
     // value, or a number, is returned as it is.

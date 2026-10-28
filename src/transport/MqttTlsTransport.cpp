@@ -82,44 +82,24 @@ void MqttTlsTransport::closeAll() {
 }
 
 mq_socket::AddressList::Resolution MqttTlsTransport::openSocket() {
-    // Every address the name has, not the first one. See mq_socket::AddressList
-    // for why the obvious loop was only ever trying one - and looked up WITHOUT
-    // WAITING, see mq_socket::NameLookup. A name still resolving is collected
-    // by finishTcp() on a later poll.
+    // Every address the name has, RACED - see mq_socket::AddressList - and
+    // looked up WITHOUT WAITING, see mq_socket::NameLookup. A name still
+    // resolving is collected by finishTcp() on a later poll, which is also
+    // where the race is run.
     const mq_socket::AddressList::Resolution resolution =
         _addresses.start(_host.c_str(), _port);
     if (resolution == mq_socket::AddressList::Unresolvable) {
         _lastError = "cannot resolve " + _host + ": " + _addresses.why();
         _failed = true;
-        return resolution;
     }
-    if (resolution == mq_socket::AddressList::Resolving) return resolution;
-    return nextAddress() ? mq_socket::AddressList::Resolved
-                         : mq_socket::AddressList::Unresolvable;
+    return resolution;
 }
 
-// Start connecting to the next candidate, or give up having named how many
-// were tried. Called from openSocket() and again from finishTcp() whenever an
-// attempt turns out to have failed.
-bool MqttTlsTransport::nextAddress() {
-    int handle = -1;
-    switch (_addresses.connectNext(handle)) {
-    case mq_socket::AddressList::Connected:
-        _socket = handle;
-        _connecting = false;
-        return true;
-    case mq_socket::AddressList::InProgress:
-        _socket = handle;
-        _connecting = true;
-        return true;
-    default:
-        break;
-    }
-
-    // NAMED, and it used to be silent. A connect that never completed left
-    // _lastError empty, so the timeout above it reported a failure with no
-    // reason at all - which is how an intermittent public-broker failure went
-    // uninvestigated.
+// Every address has failed. NAMED, and it used to be silent: a connect that
+// never completed left _lastError empty, so the timeout above it reported a
+// failure with no reason at all - which is how an intermittent public-broker
+// failure went uninvestigated.
+void MqttTlsTransport::exhausted() {
     char note[96];
     // Why, from the last address tried (connection refused, timed out, no route): a person acts on that.
     const std::string why = mq_socket::connectErrorWords(_connectError);
@@ -127,12 +107,11 @@ bool MqttTlsTransport::nextAddress() {
     else if (!why.empty()) snprintf(note, sizeof note, ": none of %u address(es) answered (the last: %s)", _addresses.tried(), why.c_str());
     else snprintf(note, sizeof note, ": none of %u address(es) answered",
              _addresses.tried());
+    const bool stale = _addresses.servingStale();
+    closeAll();
     _lastError = "cannot connect to " + _host + note;
-    _addresses.reset();
-    _socket = -1;
-    _connecting = false;
+    if (stale) _lastError += " (DNS is not answering; these were its last known addresses)";
     _failed = true;
-    return false;
 }
 
 bool MqttTlsTransport::begin() {
@@ -201,21 +180,24 @@ bool MqttTlsTransport::begin() {
         }
     }
 
-    switch (openSocket()) {
-    case mq_socket::AddressList::Unresolvable:
+    // THE SESSION IS ATTACHED ONLY TO THE SOCKET THAT WON. It used to be
+    // attached to the first address's socket as soon as that connect had been
+    // started - and when that address failed and the next was dialled, the
+    // TLS session was still holding the descriptor of the one just closed. It
+    // worked only because the kernel happened to hand the same number to the
+    // next socket; with another thread opening a file in between, the
+    // handshake would have run over somebody else's descriptor.
+    if (openSocket() == mq_socket::AddressList::Unresolvable) {
         closeAll();
         return false;
-    case mq_socket::AddressList::Resolving:
-        // The session is attached once there is a socket to attach it to.
-        _connecting = true;
-        _handshaking = true;
-        return true;
-    default:
-        return startSession();
     }
+    _connecting = true;
+    _handshaking = true;
+    finishTcp();                 // the first attempt starts now, as it always did
+    return !_failed;
 }
 
-// The TLS session over the socket nextAddress() opened. Split from begin()
+// The TLS session over the socket that won the race. Split from begin()
 // because with a name still being looked up there is no socket yet, and
 // finishTcp() calls this once there is.
 bool MqttTlsTransport::startSession() {
@@ -251,17 +233,14 @@ bool MqttTlsTransport::startSession() {
 }
 
 bool MqttTlsTransport::finishTcp() {
-    if (!_connecting) return true;
+    if (!_connecting) return _socket >= 0;
 
     if (_addresses.resolving()) {
         switch (_addresses.collect()) {
         case mq_socket::AddressList::Resolving:
             return false;                       // still looking; ask again
         case mq_socket::AddressList::Resolved:
-            if (!nextAddress()) { closeAll(); _failed = true; return false; }
-            if (!startSession()) return false;  // fail() has said why
-            if (!_connecting) return true;      // connected on the spot
-            break;                              // the connect is now under way
+            break;                              // the race starts below
         default:
             _lastError = "cannot resolve " + _host + ": " + _addresses.why();
             closeAll();
@@ -270,21 +249,20 @@ bool MqttTlsTransport::finishTcp() {
         }
     }
 
-    int connectError = 0;
-    const mq_socket::ConnectOutcome outcome = mq_socket::connectOutcome(_socket, &connectError);
-    if (outcome == mq_socket::ConnectOutcome::Failed && connectError != 0) _connectError = connectError;
-    if (outcome == mq_socket::ConnectOutcome::Pending) return false;
-    if (outcome == mq_socket::ConnectOutcome::Failed) {
-        // THIS ADDRESS failed - not the host. Close it and try the next one;
-        // nextAddress() is what finally gives up, and only once every
-        // candidate has been tried.
-        MQ_CLOSE(_socket);
-        _socket = -1;
-        return nextAddress() && !_connecting;
+    // One step of the race. Never waits.
+    int handle = -1;
+    switch (_addresses.race(handle, _connectError)) {
+    case mq_socket::AddressList::InProgress:
+        return false;
+    case mq_socket::AddressList::Connected:
+        _socket = handle;
+        _connecting = false;
+        _addresses.reset();          // connected: the rest are not needed
+        return startSession();       // fail() has said why, if it could not
+    default:
+        exhausted();
+        return false;
     }
-    _connecting = false;
-    _addresses.reset();          // connected: the rest are not needed
-    return true;
 }
 
 bool MqttTlsTransport::finishHandshake() {

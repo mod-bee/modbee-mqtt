@@ -68,6 +68,7 @@
 #include "MqttOwnedProperties.h"
 #include "MqttTransport.h"
 #include "transport/MqttStreamTransport.h"
+#include "transport/MqttConnectTask.h"
 #include "transport/MqttTcpTransport.h"
 #include "transport/MqttTlsTransport.h"
 
@@ -313,7 +314,15 @@ public:
         static_assert(alignof(Stream) <= alignof(void*),
                       "network channel transport wants an alignment this storage "
                       "does not give it");
-        _transport = new (_storage) Stream(channel);
+        Stream* stream = new (_storage) Stream(channel);
+        _channel = stream;
+        _transport = stream;
+#if MQTT_CONNECT_TASK
+        // ON ITS OWN TASK, on an ESP32 - see connectInBackground().
+        _task.wrap(*stream);
+        _task.stackBytes(MQTT_CONNECT_CHANNEL_STACK);
+        _transport = &_task;
+#endif
         _retarget = &retargetStream<ChannelType>;
         _destroy = &destroyStream<ChannelType>;
         _ownTransport = true;
@@ -777,6 +786,30 @@ public:
     // Whether a lost link is reconnected automatically. On by default.
     void autoReconnect(bool enabled);
 
+    // WHETHER THE CHANNEL'S CONNECT RUNS ON A TASK OF ITS OWN - an ESP32 with
+    // a channel (WiFiClient, TinyGsmClient...) only. ON BY DEFAULT.
+    //
+    // Arduino's Client::connect() blocks: a few seconds on Wi-Fi when the
+    // broker cannot be reached, up to the modem's own timeout through TinyGSM.
+    // With autoReconnect on, every reconnect attempt ran inside poll() - so
+    // loop() stood still for that long, again and again, for as long as the
+    // broker was away. On its own task the attempt runs beside loop(), which
+    // polls on and sees "connecting" until it is done.
+    //
+    // THE ONE THING THIS ASKS OF A SKETCH: while connecting() is true, leave
+    // the channel and the modem alone. The attempt is using them on another
+    // task, and TinyGSM is not safe to call from two at once - a sketch that
+    // asks the modem for its signal strength or bearer state mid-attempt
+    // would interleave its AT commands with the connect's. Check
+    // `!mqtt.connecting()` first, or turn this off and keep the old stall.
+    //
+    // Takes effect at the next connect(); ignored while an attempt is running.
+    void connectInBackground(bool enabled);
+
+    // An attempt to open the network channel is running on its task (see
+    // connectInBackground). Always false where there is no such task.
+    bool connecting() const;
+
     // --- Host TLS ---
     //
     // On Arduino there is nothing here to call: a secure channel IS an Arduino
@@ -911,6 +944,13 @@ private:
     // transport, the only kind a board builds here - how to point it at a
     // host, and where it lives. Null for a transport the caller brought.
     void (*_destroy)(void* transport) = nullptr;
+
+    // The sketch's channel transport, which _retarget and _destroy act on.
+    // Behind the connect task where there is one, so not always _transport.
+    MqttTransport* _channel = nullptr;
+#if MQTT_CONNECT_TASK
+    MqttConnectTask _task;
+#endif
 #if defined(MQTT_PLATFORM_ARDUINO)
     void (*_retarget)(void* transport, const char* host, uint16_t port) = nullptr;
     alignas(void*) unsigned char _storage[kStorageSize];

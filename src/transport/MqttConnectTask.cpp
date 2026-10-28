@@ -97,12 +97,33 @@ bool MqttConnectTask::begin() {
     }
     _error = "";
     if (!startTask(&MqttConnectTask::run, this, _stackBytes)) {
-        Locked locked;
-        _phase = Idle;
-        _error = "no memory for the connect task";
-        return false;
+        {
+            Locked locked;
+            _phase = Idle;
+        }
+        // NO ROOM FOR A TASK: OPEN HERE INSTEAD, as before this existed. A
+        // heap too fragmented for one stack used to fail every attempt the
+        // same way, for ever - a device that never connected again, with a
+        // backoff politely spacing out the failures. Opening inline stalls
+        // this one call for the medium's connect time, which is what every
+        // attempt did before, and the link comes back.
+        _error = "no memory for the connect task - connected inline";
+        return _medium->begin();
     }
     return true;
+}
+
+void MqttConnectTask::settle() {
+    if (_medium == nullptr) return;
+    end();
+    while (busy()) waitStep();
+    _medium->end();
+}
+
+void MqttConnectTask::connectWithin(uint32_t milliseconds) {
+    // Only between attempts: while one runs the medium is the task's, and the
+    // value it was opened with is the one it keeps.
+    if (ours()) _medium->connectWithin(milliseconds);
 }
 
 void MqttConnectTask::run(void* argument) {

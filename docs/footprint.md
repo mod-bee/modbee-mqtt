@@ -19,7 +19,7 @@ Measured 2026-10-04: buffer growth alone is about 1 kB of the long form.
 
 | | Flash |
 | --- | ---: |
-| the whole library - client, broker, bridge, typed layer, Sparkplug | 294439 |
+| the whole library - client, broker, bridge, typed layer, Sparkplug | 312730 |
 
 ## What this means
 
@@ -51,8 +51,8 @@ is meaningfully smaller**, because every `std::string` and
 
 | | |
 | --- | ---: |
-| `MqttClient` | 2296 bytes |
-| `MqttDevice` | 11336 bytes |
+| `MqttClient` | 2336 bytes |
+| `MqttDevice` | 12928 bytes |
 | `MqttOperations (the send queue)` | 80 bytes |
 | `MqttSession` | 584 bytes |
 | `one queue slot (MqttOperation)` | 112 bytes |
@@ -86,9 +86,9 @@ Measured rather than asserted: two programs, one written against
 
 | | |
 | --- | ---: |
-| `MqttClient`, long form | 49380 bytes |
-| `MqttDevice`, short form | 66248 bytes |
-| **the facade costs** | **16868 bytes** |
+| `MqttClient`, long form | 53734 bytes |
+| `MqttDevice`, short form | 70268 bytes |
+| **the facade costs** | **16534 bytes** |
 
 That buys the subscription table, per-filter routing, the change
 reporter, the NUL-terminated payload copy, the conversions on it -

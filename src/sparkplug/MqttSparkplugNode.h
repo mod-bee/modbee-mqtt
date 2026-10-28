@@ -78,6 +78,27 @@
 // and -host-offline-reconnect require a node to move to the NEXT server in its
 // list when the primary host goes offline, so a list is a feature rather than a
 // configuration convenience. Three is the specification's own worked example.
+// THE LARGEST VALUE A HOST MAY WRITE to a text, bytes, array, DataSet or
+// Template metric - what commandLimit() starts at. A command's value is copied
+// into the metric's own storage (and into each queue slot, with
+// queueWrites()), so without a limit a host - or anybody who can publish on
+// NCMD - could make a board allocate whatever it sent: a megabyte string to
+// each writable metric and the heap was gone. Refused and counted past it
+// (MqttSparkplugCommandOutcome::TooLarge).
+#ifndef MQ_SP_COMMAND_LIMIT
+    #if MQTT_LEAN
+        #define MQ_SP_COMMAND_LIMIT 4096
+    #else
+        #define MQ_SP_COMMAND_LIMIT 1048576
+    #endif
+#endif
+
+// The default for rebirthHoldoff(): no more than one birth sequence answers
+// rebirth requests in this many milliseconds.
+#ifndef MQ_SP_REBIRTH_HOLDOFF
+#define MQ_SP_REBIRTH_HOLDOFF 2000
+#endif
+
 #ifndef MQ_SP_MAX_SERVERS
 #define MQ_SP_MAX_SERVERS 4
 #endif
@@ -104,6 +125,7 @@ enum class MqttSparkplugCommandOutcome : uint8_t {
     ReadOnly,        // declared, but not with declareWritable()
     WrongType,       // a value that is not the declared datatype
     NotARequest,     // a Rebirth metric whose value is false, which asks nothing
+    TooLarge,        // a value longer than commandLimit()
 };
 
 const char* mq_sparkplugCommandOutcomeName(MqttSparkplugCommandOutcome outcome);
@@ -664,6 +686,82 @@ public:
     // directly.
     bool rebirth();
 
+    // --- How often a host can make this node rebirth ---
+    //
+    // A rebirth request is answered by the whole birth sequence - the largest
+    // messages this node sends - and nothing stops a host, a misconfigured
+    // second host, or anybody who can publish on NCMD from asking again and
+    // again: each request was a full NBIRTH and every DBIRTH, on whatever link
+    // the node had. So a request within this many milliseconds of the last
+    // birth is NOT ignored - data stops at once, as
+    // [tck-id-operational-behavior-data-commands-rebirth-action-1] requires -
+    // but the birth that answers it waits until the time is up, and every
+    // request in between is answered by that one birth (rebirthsHeld() counts
+    // them). The first request after a quiet spell is answered immediately.
+    // Zero answers every request with its own birth. rebirth() called by the
+    // application is never held.
+    void rebirthHoldoff(mq_time_t milliseconds) { _rebirthHoldoff = milliseconds; }
+    mq_time_t rebirthHoldoff() const { return _rebirthHoldoff; }
+    uint32_t rebirthsHeld() const { return _rebirthsHeld; }
+
+    // --- The largest value a host may write ---
+    //
+    // Bytes, for a text, bytes, array, DataSet or Template metric; a longer
+    // write is refused (TooLarge) before anything is copied. Default
+    // MQ_SP_COMMAND_LIMIT: 4 kB on a board, 1 MB on a host.
+    void commandLimit(size_t bytes) { _commandLimit = bytes; }
+    size_t commandLimit() const { return _commandLimit; }
+
+    // --- THE REPLAY WINDOW: what a dead link swallowed, sent again ---
+    //
+    // A cellular link can die without either end being told. Until the
+    // keepalive notices - up to one and a half keepalive intervals - the node
+    // is "born" and every NDATA it writes goes into a socket that leads
+    // nowhere. Sparkplug data is QoS 0, so nothing says it was lost; and the
+    // NBIRTH after the reconnect carries only current values. A tank that
+    // filled and emptied in that minute never did, as far as the historian
+    // knows.
+    //
+    // With a window, the node keeps the last `entries` values it published,
+    // each with its point and its own timestamp, until it has PROOF the broker
+    // has them: every so often (replayProbe(), half the keepalive by default)
+    // while values are held, it sends one UNSUBSCRIBE for a filter it never
+    // subscribed to, and the broker's UNSUBACK - on the same connection, after
+    // everything written before it - proves every value published before the
+    // probe arrived. Those are let go. If the session then ends WITHOUT the
+    // node meaning it to (the link lost, not disconnect() or a host's offline
+    // STATE), what is still held is published again after the next birth -
+    // NBIRTH first, then each device's DBIRTH, then the held values, oldest
+    // first, every one marked is_historical with the time it was first sent,
+    // and only then the live data that waited behind them. A host files them
+    // in its history and does not let them overwrite the live picture. Some
+    // may have arrived the first time: a historian sees the same value at the
+    // same timestamp twice, which is a duplicate, not a lie.
+    //
+    // This is the in-flight half of what Cirrus Link's MQTT Transmission calls
+    // store and forward; the outage half - values recorded while the node
+    // cannot publish at all - is MqttSparkplugHistory and publishRecords().
+    //
+    // OFF BY DEFAULT, on a host and a board: it changes what goes on the wire
+    // after a reconnect, which a host should be ready for. `entries` of 24
+    // bytes each, allocated here, once (mq_allocLarge: PSRAM first) - 64 is
+    // 1.5 kB - and `maxAgeMs`, if not zero, drops anything older than that
+    // when the time comes to send it. Numbers, booleans and dates only: a
+    // text or other span value is not kept (replayLost() counts it). False,
+    // and no window, without the memory. replayWindow(0) turns it off.
+    bool replayWindow(size_t entries, uint32_t maxAgeMs = 0);
+    size_t replayDepth() const { return _replayDepth; }
+    // Held now, not yet proven delivered.
+    size_t replayHeld() const { return _replayCount; }
+    // Sent again after an unclean end.
+    uint32_t replayed() const { return _replayedCount; }
+    // Values the window could not keep: it was full, too old to send, a span,
+    // or for a device that did not birth again.
+    uint32_t replayLost() const { return _replayLost; }
+    // How often to prove delivery while values are held; 0 (the default)
+    // means half the keepalive.
+    void replayProbe(mq_time_t milliseconds) { _replayProbeEvery = milliseconds; }
+
     // --- Commands in. Callback AND pollable, because R4 ---
 
     void onCommand(MqttSparkplugCommandFn handler);
@@ -826,6 +924,7 @@ private:
     bool subscribeCommands();
 
     void advanceServer();
+    bool connectInFlight() const;
     void nextSequence();
     void endBirth();
 
@@ -908,6 +1007,24 @@ private:
                                 uint16_t packetId);
     static void stateSubscribed(void* context, MqttResult result, uint16_t packetId);
     static void commandSubscribed(void* context, MqttResult result, uint16_t packetId);
+    static void replayProbed(void* context, MqttResult result, uint16_t packetId);
+
+    // --- The replay window ---
+    struct ReplayEntry {
+        uint64_t bits = 0;
+        uint64_t timestamp = 0;
+        uint32_t point = 0;
+        uint16_t epoch = 0;
+        uint8_t isNull = 0;
+        uint8_t spare = 0;
+    };
+    void replayRecord(const MqttSparkplugPayload& payload, int16_t device);
+    void replayKeep(size_t point, const MqttSparkplugValue& value,
+                    uint64_t timestamp);
+    void replayService();
+    bool replayFlush();
+    void replayForget();
+    void withdrawData();
     // --- The client's events, as a layer on it (MqttClientHook) ---
     void prepareConnect(MqttConnectionConfig& connection) override;
     void sessionEstablished(bool sessionPresent) override;
@@ -951,6 +1068,7 @@ private:
     Server _servers[MQ_SP_MAX_SERVERS];
     size_t _serverCount = 0;
     size_t _serverIndex = 0;
+    bool _retargetOwed = false;   // applyConnectionConfig() during an attempt
 
     MQ_STRING(MQ_SP_MAX_TOPIC) _primaryHostId;
     bool _primaryHostOnline = false;
@@ -1130,10 +1248,38 @@ private:
     // that does not own the queue.
     bool _rebirthPending = false;
 
+    // rebirthHoldoff(): when the last birth went, and whether a request is
+    // waiting for the holdoff to pass.
+    mq_time_t _rebirthHoldoff = MQ_SP_REBIRTH_HOLDOFF;
+    mq_time_t _lastBirthAt = 0;
+    bool _rebirthDeferred = false;
+    uint32_t _rebirthsHeld = 0;
+    size_t _commandLimit = MQ_SP_COMMAND_LIMIT;
+
+    // The replay window (replayWindow()), a ring of _replayDepth entries.
+    ReplayEntry* _replay = nullptr;
+    size_t _replayDepth = 0;
+    size_t _replayFirst = 0;
+    size_t _replayCount = 0;
+    uint32_t _replayMaxAge = 0;
+    mq_time_t _replayProbeEvery = 0;
+    mq_time_t _replayProbedAt = 0;
+    uint16_t _replayEpoch = 0;      // the probe new entries wait for
+    bool _replayProbeInFlight = false;
+    bool _replayCarried = false;    // the last session ended uncleanly
+    bool _replayOwed = false;       // the held entries go after this birth
+    size_t _replayOwedCount = 0;    // ... this many, at the front of the ring
+    mq_time_t _replayOwedAt = 0;
+    bool _leaving = false;          // this end of the session is ours
+    uint32_t _replayedCount = 0;
+    uint32_t _replayLost = 0;
+
     // The wall clock. `_epochAtBoot` is UTC milliseconds at the moment
     // mq_millis() read `_epochSetAt`, so now() is a subtraction away.
-    uint64_t _epochAtBoot = 0;
-    mq_time_t _epochSetAt = 0;
+    // Mutable: utcNow() moves the anchor forward as it reads it, so the
+    // 32-bit millisecond counter's wrap never reaches the sum (see utcNow()).
+    mutable uint64_t _epochAtBoot = 0;
+    mutable mq_time_t _epochSetAt = 0;
     bool _epochSet = false;
 
     // UTC milliseconds now, for a payload timestamp.

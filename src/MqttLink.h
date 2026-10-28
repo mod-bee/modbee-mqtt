@@ -185,6 +185,20 @@ public:
     uint64_t bytesSent() const { return _bytesSent; }
     uint64_t bytesReceived() const { return _bytesReceived; }
 
+    // WHERE THE LAST BYTE QUEUED SO FAR WILL BE, counted in bytesSent(). A
+    // packet whose end is at mark M has wholly left this link once
+    // bytesSent() reaches M - which is when an acknowledgement can first be
+    // owed for it, and so when its deadline should start. 32 bits, compared
+    // with wrapping arithmetic: four gigabytes is far longer than any packet
+    // waits here.
+    uint32_t transmitMark() const { return (uint32_t)(_bytesSent + transmitPending()); }
+
+    // Bytes the transport took AFTER it had refused some - a full buffer
+    // draining. Proof that the far end is acknowledging what it is sent (see
+    // MqttKeepAlive::noteProgress), where an ordinary write is only proof that
+    // there was room in this machine.
+    uint64_t bytesRelieved() const { return _bytesRelieved; }
+
 private:
     MqttTransport* _transport = nullptr;
 
@@ -247,4 +261,6 @@ private:
     uint32_t _packetsReceived = 0;
     uint64_t _bytesSent = 0;
     uint64_t _bytesReceived = 0;
+    uint64_t _bytesRelieved = 0;
+    bool _backpressured = false;   // the transport refused bytes still queued
 };

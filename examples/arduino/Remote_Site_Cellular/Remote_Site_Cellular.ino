@@ -94,8 +94,9 @@ void setup() {
   // back is the level NOW, not every value it passed through in the dark.
   mqtt.report(TOPIC_LEVEL, &reservoirLevel, 0.05, 300000, MQ_QOS_1);
 
-  // OFF. See the note at the top: a reconnect inside poll() would stall the
-  // loop for as long as the modem takes.
+  // OFF, so the bearer is brought back by this sketch before each try. (On an
+  // ESP32 a connect no longer stalls the loop - it runs on a task of its own -
+  // but the bearer still has to be up first, and only this sketch knows how.)
   mqtt.autoReconnect(false);
 
   if (bearerUp) mqtt.connect(BROKER, "bore-7");
@@ -109,7 +110,10 @@ void loop() {
   mqtt.poll();          // never stalls, whatever the modem is doing
 
   // --- Reconnecting, on our terms ---
-  if (!mqtt.isConnected() && millis() >= nextConnectAttempt) {
+  // Not while a connect is still dialling: on an ESP32 it runs on a task of
+  // its own, and TinyGSM is not safe from two tasks at once - an AT command
+  // from here would land in the middle of the dial's.
+  if (!mqtt.isConnected() && !mqtt.connecting() && millis() >= nextConnectAttempt) {
     // Back off, so a site with no coverage does not spend its battery and its
     // data allowance discovering that once a second.
     nextConnectAttempt = millis() + reconnectDelay;
@@ -132,7 +136,7 @@ void loop() {
   // hand rather than reported, because it is a diagnostic rather than a
   // process value and hourly is plenty.
   static unsigned long lastSignal = 0;
-  if (millis() - lastSignal >= 3600000) {
+  if (millis() - lastSignal >= 3600000 && !mqtt.connecting()) {
     lastSignal = millis();
     mqtt.publish(TOPIC_SIGNAL, modem.getSignalQuality(), MQ_QOS_0, true);
   }

@@ -235,6 +235,8 @@ std::string toJson(const AppConnectionSpec& s) {
     o.add("receiveMaximum", (long long)s.receiveMaximum);
     o.add("topicAliasMaximum", (long long)s.topicAliasMaximum);
     o.add("maximumPacketSize", (long long)s.maximumPacketSize);
+    if (s.connectTimeoutSeconds) o.add("connectTimeout", (long long)s.connectTimeoutSeconds);
+    if (s.ackTimeoutSeconds) o.add("ackTimeout", (long long)s.ackTimeoutSeconds);
     if (s.storeAndForward) {
         json::Object k;
         k.add("messages", (long long)s.storeMaxMessages);
@@ -296,6 +298,8 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
     s.receiveMaximum = (uint16_t)v.integer("receiveMaximum");
     s.topicAliasMaximum = (uint16_t)v.integer("topicAliasMaximum");
     s.maximumPacketSize = (uint32_t)v.integer("maximumPacketSize");
+    s.connectTimeoutSeconds = (uint32_t)v.integer("connectTimeout");
+    s.ackTimeoutSeconds = (uint32_t)v.integer("ackTimeout");
     if (v.has("store")) {
         const json::Value& k = v["store"];
         s.storeAndForward = true;
@@ -897,7 +901,15 @@ void AppConnections::open(Connection& c) {
     // A Kafka link's broker acknowledges once Kafka has the record, however long
     // Kafka is away: the acknowledgement is not given up on (what is held is
     // in order, in librdkafka's queue, and goes when Kafka is back).
-    if (c.spec.kafka) behaviour.acknowledgementTimeoutMs = 0;
+    if (c.spec.kafka) {
+        behaviour.acknowledgementTimeoutMs = 0;
+    } else {
+        const uint32_t ack = c.spec.ackTimeoutSeconds
+                                 ? c.spec.ackTimeoutSeconds
+                                 : std::max<uint32_t>(120, 2 * std::max<uint32_t>(c.spec.keepaliveSeconds, 1));
+        behaviour.acknowledgementTimeoutMs = (mq_time_t)ack * 1000;
+    }
+    behaviour.connectTimeoutMs = (mq_time_t)(c.spec.connectTimeoutSeconds ? c.spec.connectTimeoutSeconds : 30) * 1000;
     behaviour.autoReconnect = false;     // the manager decides: which server, and when
     behaviour.queueCapacity = 256;       // room for store and forward's window as well
     behaviour.receiveBufferSize = buffer;

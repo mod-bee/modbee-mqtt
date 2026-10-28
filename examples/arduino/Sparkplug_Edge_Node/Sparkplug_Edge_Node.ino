@@ -64,6 +64,13 @@ void setup() {
   node.declareWritable("Tank/Setpoint", MqttSparkplugDataType::Float);
   node.onCommand(&onCommand);
 
+  // A link that dies without saying so - WiFi out of range, a cellular modem
+  // that has lost its bearer - swallows what is written into it until the
+  // keepalive notices. Keep the last 64 values until the broker has proved
+  // it has them, and send any it may not have again, as history, after the
+  // next birth. 1.5 kB of heap; leave it out and nothing is kept.
+  node.replayWindow(64);
+
   node.connect();   // returns at once; the birth goes when the link is up
 }
 

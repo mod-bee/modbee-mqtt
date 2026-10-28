@@ -58,6 +58,7 @@
 #include "../MqttTransport.h"
 #include "MqttByteChannel.h"
 #include "MqttChannelTls.h"
+#include "MqttStreamTransport.h"   // mq_stream: a channel's connect timeout, its room to write
 
 #if MQTT_CHANNEL_TLS
 
@@ -138,8 +139,12 @@ public:
             _channel.stop();
             return false;
         }
+        // Bounded by the caller's connect timeout where the channel can be
+        // told one - see MqttStreamTransport::begin().
         if (_port == 0 ||
-            (!_channel.connected() && _channel.connect(_host, _port) != 1)) {
+            (!_channel.connected() &&
+             mq_stream::open(_channel, _host, _port, _within,
+                             std::integral_constant<bool, mq_stream::IsTinyGsm<ChannelType>::value>()) != 1)) {
             _session.unreachable(_host, _port);
             return false;
         }
@@ -151,6 +156,8 @@ public:
         _session.end();
         _channel.stop();
     }
+
+    void connectWithin(uint32_t milliseconds) override { _within = milliseconds; }
 
     bool isConnected() const override {
         if (_session.pump() != 1) return false;
@@ -192,7 +199,16 @@ public:
 
     // --- MqttByteChannel: where the engine's records go ---
 
+    // NEVER INTO A FULL SOCKET, and a chunk at a time - for the reason
+    // MqttStreamTransport::write() gives: an ESP32 channel's write() waits up
+    // to ten seconds for room, inside poll(). "Nothing taken" is the engine's
+    // WANT_WRITE, and it resends the rest of the record on a later poll.
     int channelSend(const uint8_t* data, int length) override {
+        if (!mq_stream::hasRoom(_channel,
+                                std::integral_constant<bool, mq_stream::HasSocket<ChannelType>::value>())) {
+            return _channel.connected() ? 0 : -1;
+        }
+        if (length > MQTT_STREAM_WRITE_CHUNK) length = MQTT_STREAM_WRITE_CHUNK;
         const int sent = (int)_channel.write(data, (size_t)length);
         if (sent > 0) return sent;
         return _channel.connected() ? 0 : -1;
@@ -217,6 +233,7 @@ private:
     ChannelType& _channel;
     const char* _host = nullptr;
     uint16_t _port = 0;
+    uint32_t _within = 0;      // connectWithin(); 0 is the channel's own default
     MqttChannelTlsSession::Trust _trust;
     char _pin[160] = {0};
     // Mutable because the handshake advances from isConnected(), which the

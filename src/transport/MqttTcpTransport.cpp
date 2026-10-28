@@ -79,17 +79,17 @@ bool MqttTcpTransport::begin() {
         return false;
     }
 
-    // Every address the name has. See mq_socket::AddressList: a non-blocking
-    // connect returns EINPROGRESS for any address, so the loop this replaced
-    // committed to the first one and freed the rest before anybody could find
-    // out whether it worked.
-    //
-    // And looked up WITHOUT WAITING - see mq_socket::NameLookup. A name still
-    // being resolved is "connecting" exactly as a connect in progress is, and
+    // Every address the name has, RACED - see mq_socket::AddressList. And
+    // looked up WITHOUT WAITING (mq_socket::NameLookup): a name still being
+    // resolved is "connecting" exactly as a connect in progress is, and
     // finishConnecting() collects it on a later poll.
     switch (_addresses.start(_host.c_str(), _port)) {
     case mq_socket::AddressList::Resolved:
-        return nextAddress();
+        // The first attempt starts now, as it always did. One that is refused
+        // on the spot by every address fails begin() rather than a poll later.
+        _connecting = true;
+        finishConnecting();
+        return !_failed;
     case mq_socket::AddressList::Resolving:
         _connecting = true;
         _connected = false;
@@ -100,30 +100,8 @@ bool MqttTcpTransport::begin() {
     }
 }
 
-// Start connecting to the next candidate, or give up having said how many were
-// tried. Called from begin() and again from finishConnecting() each time an
-// attempt turns out to have failed.
-bool MqttTcpTransport::nextAddress() {
-    int handle = -1;
-    switch (_addresses.connectNext(handle)) {
-    case mq_socket::AddressList::Connected:
-        _socket = handle;
-        _connected = true;
-        _connecting = false;
-        _addresses.reset();
-        return true;
-    case mq_socket::AddressList::InProgress:
-        // The normal case, and the reason this is not a blocking call: the
-        // handshake finishes on its own and finishConnecting() collects it on
-        // a later poll.
-        _socket = handle;
-        _connecting = true;
-        _connected = false;
-        return true;
-    default:
-        break;
-    }
-
+// Every address has failed: say how many were tried, and why the last one did.
+void MqttTcpTransport::exhausted() {
     char note[96];
     // Why, from the last address tried (connection refused, timed out, no route): a person acts on that.
     const std::string why = mq_socket::connectErrorWords(_connectError);
@@ -132,23 +110,23 @@ bool MqttTcpTransport::nextAddress() {
     else snprintf(note, sizeof note, ": none of %u address(es) answered",
              _addresses.tried());
     _lastError = "cannot connect to " + _host + note;
+    if (_addresses.servingStale()) _lastError += " (DNS is not answering; these were its last known addresses)";
     _addresses.reset();
     _socket = -1;
     _connecting = false;
     _connected = false;
     _failed = true;
-    return false;
 }
 
 bool MqttTcpTransport::finishConnecting() {
-    if (_connecting && _addresses.resolving()) {
+    if (!_connecting) return _connected && _socket >= 0;
+
+    if (_addresses.resolving()) {
         switch (_addresses.collect()) {
         case mq_socket::AddressList::Resolving:
             return false;                         // still looking; ask again
         case mq_socket::AddressList::Resolved:
-            if (!nextAddress()) return false;
-            if (_connected) return true;
-            break;                                // connect now in progress
+            break;                                // the race starts below
         default:
             _lastError = "cannot resolve " + _host + ": " + _addresses.why();
             _addresses.reset();
@@ -158,24 +136,23 @@ bool MqttTcpTransport::finishConnecting() {
             return false;
         }
     }
-    if (!_connecting || _socket < 0) return _connected;
 
-    int connectError = 0;
-    const mq_socket::ConnectOutcome outcome = mq_socket::connectOutcome(_socket, &connectError);
-    if (outcome == mq_socket::ConnectOutcome::Failed && connectError != 0) _connectError = connectError;
-    if (outcome == mq_socket::ConnectOutcome::Pending) return false;
-    if (outcome == mq_socket::ConnectOutcome::Failed) {
-        // THIS ADDRESS failed, not the host. Take the next one; nextAddress()
-        // is what finally gives up, and only once every candidate is spent.
-        MQ_CLOSE(_socket);
-        _socket = -1;
-        return nextAddress() && _connected;
+    // ONE STEP OF THE RACE: every attempt under way is looked at, and the next
+    // address is started when its turn has come. Never waits.
+    int handle = -1;
+    switch (_addresses.race(handle, _connectError)) {
+    case mq_socket::AddressList::InProgress:
+        return false;
+    case mq_socket::AddressList::Connected:
+        _socket = handle;
+        _connecting = false;
+        _connected = true;
+        _addresses.reset();          // connected: the rest are not needed
+        return true;
+    default:
+        exhausted();
+        return false;
     }
-
-    _connecting = false;
-    _connected = true;
-    _addresses.reset();          // connected: the rest are not needed
-    return true;
 }
 
 void MqttTcpTransport::end() { closeSocket(); }

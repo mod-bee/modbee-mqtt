@@ -351,23 +351,33 @@ bool mq_spArrayCount(const MqttSparkplugValue& array, size_t& count) {
 
 bool mq_spArrayAt(const MqttSparkplugValue& array, size_t index,
                   MqttSparkplugValue& element) {
+    if (array.type == MqttSparkplugDataType::StringArray) {
+        // ONE WALK, to the element and no further. It counted every string
+        // first and then walked again, so even the first element of a large
+        // array cost the whole array; and a loop over it costs half as much
+        // as it did. A loop should use mq_spArrayNext(), which is linear.
+        if (!array.isArray() || array.isNull) return false;
+        const uint8_t* data = array.as.bytes.data;
+        const size_t length = array.as.bytes.length;
+        if (length == 0 || data == nullptr || data[length - 1] != 0) return false;
+        size_t at = 0;
+        for (size_t skipped = 0; skipped < index; skipped++) {
+            const void* end = memchr(data + at, 0, length - at);
+            at = (size_t)((const uint8_t*)end - data) + 1;
+            if (at >= length) return false;
+        }
+        const uint8_t* end = (const uint8_t*)memchr(data + at, 0, length - at);
+        element = MqttSparkplugValue();
+        element.type = MqttSparkplugDataType::String;
+        element.as.bytes.data = data + at;
+        element.as.bytes.length = (uint32_t)(end - (data + at));
+        return true;
+    }
     size_t count = 0;
     if (!mq_spArrayCount(array, count) || index >= count) return false;
     const uint8_t* data = array.as.bytes.data;
     element = MqttSparkplugValue();
     element.type = mq_sparkplugArrayElement(array.type);
-    if (array.type == MqttSparkplugDataType::StringArray) {
-        size_t at = 0;
-        for (size_t skipped = 0; skipped < index; skipped++) {
-            while (data[at] != 0) at++;
-            at++;
-        }
-        size_t end = at;
-        while (data[end] != 0) end++;
-        element.as.bytes.data = data + at;
-        element.as.bytes.length = (uint32_t)(end - at);
-        return true;
-    }
     if (array.type == MqttSparkplugDataType::BooleanArray) {
         element.as.boolean = ((data[4 + index / 8] >> (7 - index % 8)) & 1u) != 0;
         return true;
@@ -401,6 +411,30 @@ bool mq_spArrayAt(const MqttSparkplugValue& array, size_t index,
 
 // --- A value's bytes, owned ---
 
+bool mq_spArrayNext(const MqttSparkplugValue& array, size_t& cursor,
+                    MqttSparkplugValue& element) {
+    if (array.type != MqttSparkplugDataType::StringArray) {
+        // Every other array is fixed-width or counted: the cursor is the
+        // index, and each step is constant time already.
+        if (!mq_spArrayAt(array, cursor, element)) return false;
+        cursor++;
+        return true;
+    }
+    // A StringArray's cursor is the byte offset of the next string.
+    if (!array.isArray() || array.isNull) return false;
+    const uint8_t* data = array.as.bytes.data;
+    const size_t length = array.as.bytes.length;
+    if (length == 0 || data == nullptr || data[length - 1] != 0) return false;
+    if (cursor >= length) return false;
+    const uint8_t* end = (const uint8_t*)memchr(data + cursor, 0, length - cursor);
+    element = MqttSparkplugValue();
+    element.type = MqttSparkplugDataType::String;
+    element.as.bytes.data = data + cursor;
+    element.as.bytes.length = (uint32_t)(end - (data + cursor));
+    cursor = (size_t)(end - data) + 1;
+    return true;
+}
+
 MqttSparkplugBytes::~MqttSparkplugBytes() noexcept { mq_freeLarge(_data); }
 
 MqttSparkplugBytes::MqttSparkplugBytes(MqttSparkplugBytes&& other) noexcept
@@ -432,7 +466,13 @@ bool MqttSparkplugBytes::assign(const uint8_t* data, size_t length) noexcept {
         _size = 0;
         return false;
     }
-    if (length > _capacity) {
+    // GIVEN BACK when the value has shrunk to a quarter of what is held, and
+    // what is held is worth giving back. A command slot that once took a
+    // host's megabyte string, or a host's copy of a value that was briefly
+    // large, held that megabyte for ever - per metric, per queue slot - and
+    // a hostile peer could pin the whole heap one write at a time.
+    const bool shrink = _capacity > 256 && length < _capacity / 4;
+    if (length > _capacity || shrink) {
         // A little over, so a value that grows by a character does not
         // allocate again on the next scan. The old block is freed only after
         // the copy: `data` may be inside it.
