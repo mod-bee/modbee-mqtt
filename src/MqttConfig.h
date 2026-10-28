@@ -180,6 +180,13 @@ struct MqttClientConfig {
     // what should be offered as our Maximum Packet Size.
     size_t receiveBufferSize = 4096;
     size_t transmitBufferSize = 4096;
+    // Non-zero: both buffers START this small and grow towards the sizes above
+    // only for a packet that needs the room, then shrink back (MqttLink).
+    // Zero - the default - gives them their full size at begin(). Host builds
+    // only (MQTT_LINK_GROWS); a board's buffers are fixed. What lets a client
+    // that must accept a rare large message - a Sparkplug birth of thousands
+    // of metrics - offer megabytes without holding them.
+    size_t initialBufferSize = 0;
 
     // Reconnect backoff, in milliseconds. Doubling from the first to the
     // second, with deterministic jitter so two nodes restarting together do

@@ -27,13 +27,23 @@ uint64_t hostUtcNow() {
 MqttSparkplugHost::MqttSparkplugHost() MQ_NOEXCEPT : _client(_ownClient) {
     memset(_scratch, 0, sizeof _scratch);
     _topic[0] = '\0';
+    _behaviour.receiveBufferSize = MQ_SP_HOST_PACKET;
+    _behaviour.initialBufferSize = 4096;   // grown only for a large message
 }
 
 MqttSparkplugHost::MqttSparkplugHost(MqttTransport& transport) MQ_NOEXCEPT
     : _client(_ownClient) {
     memset(_scratch, 0, sizeof _scratch);
     _topic[0] = '\0';
+    _behaviour.receiveBufferSize = MQ_SP_HOST_PACKET;
+    _behaviour.initialBufferSize = 4096;
     _net.borrow(transport);
+}
+
+bool MqttSparkplugHost::maximumPacket(size_t bytes) {
+    if (_shared || _begun || bytes < 1024 || bytes > 0x0FFFFFFFu) return false;
+    _behaviour.receiveBufferSize = bytes;
+    return true;
 }
 
 MqttSparkplugHost::MqttSparkplugHost(MqttClient& shared) MQ_NOEXCEPT
@@ -136,6 +146,8 @@ void MqttSparkplugHost::applyConnectionConfig() {
     }
 
     if (_connection.clientId.empty()) _connection.clientId = _hostId;
+    // What it can receive, said (MQTT 5): see MQ_SP_HOST_PACKET.
+    if (!_shared) _connection.maximumPacketSize = (uint32_t)_behaviour.receiveBufferSize;
 }
 
 void MqttSparkplugHost::retarget() {

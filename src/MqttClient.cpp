@@ -162,7 +162,8 @@ void MqttClient::begin(MqttTransport& transport,
     _firstConnectHeld = false;
     _stable = false;
 
-    _link.begin(transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize);
+    _link.begin(transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize,
+                _behaviour.initialBufferSize);
 #if MQTT_LEAN
     sizeArea();
 #else
@@ -1476,7 +1477,7 @@ void MqttClient::serviceQueue() {
             // never be sent - retrying is a spin that concludes nothing and
             // holds the queue's head for ever. It is OUR limit rather than the
             // peer's, which is what PacketTooLarge means: raise bufferSize().
-            if (needed > _link.transmitCapacity()) {
+            if (needed > _link.transmitLimit()) {
                 if (op->kind == MqttOpKind::Publish) _status.publishFailures++;
                 _operations.concludeByOpId(op->opId, MqttResult::PacketTooLarge);
                 continue;
@@ -2042,7 +2043,7 @@ bool MqttClient::reserveTransmit(size_t bytes) {
     if (_status.state == MqttState::Idle || _status.state == MqttState::Reconnecting) {
         applyTransmitReservation();
     }
-    return _link.transmitCapacity() >= bytes;
+    return _link.transmitLimit() >= bytes;
 }
 
 void MqttClient::applyTransmitReservation() {
@@ -2050,7 +2051,8 @@ void MqttClient::applyTransmitReservation() {
     // being replaced.
     if (_transport == nullptr || _transmitWanted <= _behaviour.transmitBufferSize) return;
     _behaviour.transmitBufferSize = _transmitWanted;
-    _link.begin(*_transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize);
+    _link.begin(*_transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize,
+                _behaviour.initialBufferSize);
 #if MQTT_LEAN
     sizeArea();
 #endif

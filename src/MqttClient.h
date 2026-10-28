@@ -342,7 +342,7 @@ public:
     // restart() brings that forward), or that memory could not be found -
     // transmitCapacity() says which.
     bool reserveTransmit(size_t bytes);
-    size_t transmitCapacity() const { return _link.transmitCapacity(); }
+    size_t transmitCapacity() const { return _link.transmitLimit(); }
 
     // --- Operations ---
     MqttResult publish(const char* topic, const uint8_t* payload, size_t length,

@@ -113,6 +113,21 @@
     #endif
 #endif
 
+// THE LARGEST MESSAGE A HOST CAN RECEIVE, which is the largest birth it can
+// read. It was the client's 4 kB default: an NBIRTH of more than about seventy
+// metrics never arrived, so the host asked for it again every rebirthHoldoff()
+// for ever, and the node's data could not be named. A thousand-metric birth is
+// 67 kB, a plant's tens of thousands of tags megabytes. Offered as the MQTT 5
+// Maximum Packet Size too, so a broker skips what will not fit rather than
+// sending it and having the connection fail. host.maximumPacket() changes it.
+#ifndef MQ_SP_HOST_PACKET
+    #if MQTT_LEAN
+        #define MQ_SP_HOST_PACKET 16384
+    #else
+        #define MQ_SP_HOST_PACKET 4194304
+    #endif
+#endif
+
 // The longest broker name a host dials (one more for the terminator): a DNS
 // name is at most 253 characters.
 #ifndef MQ_SP_DIAL_HOST
@@ -429,6 +444,11 @@ public:
     // Zero disables it: a gap then asks for a rebirth immediately, which is
     // what a host on a reliable local broker wants.
     void reorderTimeout(mq_time_t milliseconds) { _reorderTimeout = milliseconds; }
+
+    // The largest message this host will receive (MQ_SP_HOST_PACKET to start
+    // with). Before connect(); a host on a shared client takes the owner's.
+    bool maximumPacket(size_t bytes);
+    size_t maximumPacket() const { return _behaviour.receiveBufferSize; }
 
     // --- How often a rebirth may be asked of one node ---
     //

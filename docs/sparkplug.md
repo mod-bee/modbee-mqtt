@@ -651,6 +651,13 @@ The value must be the metric's declared type; the birth says what that is
 (`host.findNode(...)->find(name)->type`), and the
 [`sparkplug_host`](../examples/cpp/sparkplug_host) example converts with it.
 
+**Large births.** A host receives messages of up to 4 MB (`MQ_SP_HOST_PACKET`;
+`host.maximumPacket(bytes)` before `connect()`), and tells the broker so; the
+buffer starts at 4 kB and grows only for a message that needs it. A broker
+with a lower limit drops a birth larger than its own: Mosquitto takes 256 MB,
+`modbee-mqtt serve` 64 kB unless `--max-packet` says more - a thousand-metric
+birth is about 67 kB.
+
 **Each host needs its own host id.** It is also the MQTT client id, so two
 hosts sharing one keep taking over each other's connection.
 

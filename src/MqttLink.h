@@ -89,6 +89,9 @@ public:
     MqttTransport* transport() const { return _transport; }
     bool isOpen() const { return _transport != nullptr && _transport->isConnected(); }
     size_t transmitCapacity() const { return _transmit.size(); }
+    // What the transmit buffer may grow to (its capacity, where it does not
+    // grow): the largest packet this link can send.
+    size_t transmitLimit() const { return _transmitLimit > _transmit.size() ? _transmitLimit : _transmit.size(); }
 
     // --- Receiving ---
 

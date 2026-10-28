@@ -178,6 +178,11 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug host: a birth over 4 kB never arrived.** `MqttSparkplugHost` kept the client's 4 kB receive buffer, so an
+  NBIRTH of more than about seventy metrics failed the connection (or, at 5.0, was never sent), the host asked for it
+  again for ever and could name none of the node's data. It now takes up to `MQ_SP_HOST_PACKET` (4 MB on a host,
+  16 kB on a board; `host.maximumPacket()`), says so as its Maximum Packet Size, and holds the memory only while a
+  large message needs it (`MqttClientConfig::initialBufferSize`, new: buffers that start small and grow).
 - **On a board, a message over 64 kB went out cut to its last 16 bits of length.** The board build's byte area and its
   views (`MqttByteArea`, `MqttAreaBytes`, `MQTT_LEAN`) kept a length in 16 bits: an NBIRTH of a thousand metrics
   (67,093 bytes) was published as its first 1,557 bytes, which no host could decode, and every rebirth repeated it.
