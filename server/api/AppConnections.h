@@ -50,6 +50,30 @@ struct AppEndpoint {
     uint16_t port = 0;           // 0: 1883, or 8883 with TLS
 };
 
+// A connection whose link is Kafka: its client is connected to a broker of
+// its own, inside this server, which a Kafka pipe of its own bridges to these
+// topics in the envelope (server/kafka/KafkaEnvelope.h) - so everything a
+// connection does works on it unchanged. AppKafkaLinks makes that broker.
+struct AppKafkaLinkSpec {
+    std::string cluster;                   // "": the only one there is
+    std::vector<std::string> inTopics;     // read from
+    std::string inPattern;                 // a regular expression, instead
+    std::string outTopic;                  // written to; "": nothing is
+    std::string key;                       // topic ("") | clientid | none | a template
+    std::string consumerGroup;             // "": modbee-conn-<id>
+    // An MQTT connection carrying a Sparkplug host's STATE on this one -
+    // Kafka has no Will. spBv1.0/STATE/# is then not written to Kafka.
+    std::string stateConnection;
+};
+
+struct AppKafkaLinkStatus {
+    bool reachable = false;
+    uint64_t recordsOut = 0, recordsOutFailed = 0;   // Kafka has them; refused or given up
+    uint64_t recordsIn = 0, recordsInInvalid = 0;    // read and handed on; could not be
+    int64_t lag = -1;                                // records not read yet; -1 not known
+    uint64_t held = 0;                               // publishes on it waiting for Kafka now
+};
+
 struct AppConnectionSpec {
     std::string id;
     std::vector<AppEndpoint> servers;
@@ -57,6 +81,9 @@ struct AppConnectionSpec {
     // servers needed (reachThisServer() says where, and with what login).
     // What a Sparkplug host or edge node on the server's own devices runs on.
     bool thisServer = false;
+    // Kafka as the link instead (AppKafkaLinkSpec): no servers either.
+    bool kafka = false;
+    AppKafkaLinkSpec link;
     std::string clientId;
     bool hasUsername = false;
     std::string username;
@@ -100,6 +127,7 @@ struct AppConnectionInfo {
     int64_t oldestStoredMs = 0;             // when the oldest of them was taken; 0: none
     uint64_t storedDropped = 0;             // given up to make room (store_and_forward.when_full)
     uint64_t storedExpired = 0;             // their Message Expiry Interval ran out while they waited
+    AppKafkaLinkStatus link;                // spec.kafka: what its link is doing
 };
 
 // A Sparkplug B Host Application the server runs on one of its connections
@@ -209,6 +237,33 @@ struct AppSparkplugSet {
     uint64_t timestamp = 0;                // 0: now
 };
 
+// Where a connection's client connects when it is not to another broker:
+// this server itself, or a Kafka link's own broker.
+struct AppLocalAddress {
+    std::string host = "127.0.0.1";
+    uint16_t port = 0;
+    bool tls = false;
+    bool hasLogin = false;
+    std::string user, password;
+};
+
+// What makes a Kafka link's broker (server/kafka/KafkaLinks), where Kafka is
+// built; none, and a connection with `kafka` is refused. Called on the
+// manager's thread.
+class AppKafkaLinks {
+public:
+    virtual ~AppKafkaLinks() {}
+    // Whether `link` can be run: its cluster exists, its topics are Kafka's.
+    virtual bool check(const std::string& id, const AppKafkaLinkSpec& link, std::string& error) = 0;
+    // Its broker running - made, or made again when `link` changed - and
+    // where the connection's client reaches it.
+    virtual bool open(const std::string& id, const AppKafkaLinkSpec& link, AppLocalAddress& where,
+                      std::string& error) = 0;
+    // Stopped: what it holds for Kafka given a few seconds to get there.
+    virtual void close(const std::string& id) = 0;
+    virtual bool status(const std::string& id, AppKafkaLinkStatus& out) const = 0;
+};
+
 class AppConnections {
 public:
     // `stateDirectory` holds connections.json (and any TLS material given as
@@ -223,14 +278,11 @@ public:
     // address and port, whether that port is TLS (loopback, so its certificate
     // is not checked), and the login the server keeps for its own clients.
     // False: it cannot be reached now. Set before start().
-    struct ThisServer {
-        std::string host = "127.0.0.1";
-        uint16_t port = 0;
-        bool tls = false;
-        bool hasLogin = false;
-        std::string user, password;
-    };
+    typedef AppLocalAddress ThisServer;
     void reachThisServer(std::function<bool(ThisServer&)> where) { _thisServer = std::move(where); }
+    // What makes Kafka links (not owned; outlives stop()). Set before start().
+    void linkKafka(AppKafkaLinks* links) { _links = links; }
+    bool kafkaLinks() const { return _links != nullptr; }
 
     // Opens what was kept, and starts the thread.
     bool start(std::string& error);
@@ -293,6 +345,7 @@ private:
     std::string _directory;
     bool _syncFull = false;
     std::function<bool(ThisServer&)> _thisServer;
+    AppKafkaLinks* _links = nullptr;
     ConnectionOutbox _outbox;                 // the manager's thread only
     mutable std::mutex _lock;                 // the maps and the queue
     std::condition_variable _wake;
@@ -325,9 +378,14 @@ private:
     bool loadHosts(std::string& error);
     void startEdgeNode(Connection& connection);
     void serviceEdgeNode(Connection& connection);
+    // A host on a Kafka link: its STATE on the link's state connection.
+    void serviceHostState(Connection& connection);
+    void serviceLink(Connection& connection);
     void post(std::function<void()> command);
     // Runs `command` on the manager's thread and waits for it: every
     // connection is touched there and nowhere else.
     void call(std::function<void()> command) const;
     AppConnectionInfo infoOf(const Connection& connection) const;
+    // The Kafka connection whose host's STATE `id` carries; "" none.
+    std::string stateUser(const std::string& id) const;
 };

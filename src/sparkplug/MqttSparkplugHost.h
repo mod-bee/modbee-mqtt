@@ -319,7 +319,10 @@ private:
     void beginClient();
     void applyConnectionConfig();
     bool publishBirth();
-    bool publishDeath();
+    // `awaited`: with the completion a disconnect waits for. A shared
+    // client's host stands down without one - it may be destroyed before
+    // the acknowledgement comes, and nothing waits for it.
+    bool publishDeath(bool awaited = true);
     void serviceReorder();
 
     void handleMessage(const MqttMessage& message);

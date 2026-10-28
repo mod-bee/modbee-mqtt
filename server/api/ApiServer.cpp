@@ -305,6 +305,13 @@ void groupTo(const AppGroupInfo& info, v1::GroupInfo& group) {
     group.set_refused(info.refused);
 }
 
+// A Put refused: a kafka connection in a build without Kafka is not the
+// caller's mistake.
+grpc::Status putRefused(const AppConnections& connections, const v1::ConnectionSpec& wire, const std::string& error) {
+    if (wire.has_kafka() && !connections.kafkaLinks()) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error);
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error);
+}
+
 AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     AppConnectionSpec s;
     s.id = wire.id();
@@ -329,6 +336,17 @@ AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     s.reconnectWhenAsked = wire.reconnect() == v1::RECONNECT_WHEN_ASKED;
     s.primaryCheckSeconds = wire.primary_check_seconds() ? wire.primary_check_seconds() : 60;
     s.thisServer = wire.this_server();
+    if (wire.has_kafka()) {
+        const v1::KafkaLink& k = wire.kafka();
+        s.kafka = true;
+        s.link.cluster = k.cluster();
+        s.link.inTopics.assign(k.kafka_topics().begin(), k.kafka_topics().end());
+        s.link.inPattern = k.kafka_topic_pattern();
+        s.link.outTopic = k.kafka_topic();
+        s.link.key = k.key();
+        s.link.consumerGroup = k.consumer_group();
+        s.link.stateConnection = k.state_connection();
+    }
     s.willDelaySeconds = wire.will_delay_seconds();
     s.receiveMaximum = (uint16_t)std::min<uint32_t>(wire.receive_maximum(), 65535);
     s.topicAliasMaximum = (uint16_t)std::min<uint32_t>(wire.topic_alias_maximum(), 65535);
@@ -369,6 +387,24 @@ void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
         propertiesTo(info.spec.will.properties, *will->mutable_properties());
     }
     s->set_this_server(info.spec.thisServer);
+    if (info.spec.kafka) {
+        v1::KafkaLink* k = s->mutable_kafka();
+        k->set_cluster(info.spec.link.cluster);
+        for (const std::string& t : info.spec.link.inTopics) k->add_kafka_topics(t);
+        k->set_kafka_topic_pattern(info.spec.link.inPattern);
+        k->set_kafka_topic(info.spec.link.outTopic);
+        k->set_key(info.spec.link.key);
+        k->set_consumer_group(info.spec.link.consumerGroup);
+        k->set_state_connection(info.spec.link.stateConnection);
+        v1::KafkaLinkStatus* status = wire.mutable_kafka();
+        status->set_reachable(info.link.reachable);
+        status->set_records_out(info.link.recordsOut);
+        status->set_records_out_failed(info.link.recordsOutFailed);
+        status->set_records_in(info.link.recordsIn);
+        status->set_records_in_invalid(info.link.recordsInInvalid);
+        status->set_lag(info.link.lag);
+        status->set_held_acknowledgements(info.link.held);
+    }
     s->set_will_delay_seconds(info.spec.willDelaySeconds);
     s->set_receive_maximum(info.spec.receiveMaximum);
     s->set_topic_alias_maximum(info.spec.topicAliasMaximum);
@@ -1555,9 +1591,9 @@ private:
 class SystemService final : public v1::System::CallbackService {
 public:
     SystemService(const ApiServerConfig& config, bool authority, AppHub* messages, bool connections, bool admin,
-                  bool aware = false, bool kafka = false)
+                  bool aware = false, bool kafka = false, bool kafkaLinks = false)
         : _config(config), _authority(authority), _hub(messages), _messages(messages != nullptr),
-          _connections(connections), _admin(admin), _aware(aware), _kafka(kafka) {}
+          _connections(connections), _admin(admin), _aware(aware), _kafka(kafka), _kafkaLinks(kafkaLinks) {}
 
     grpc::ServerBidiReactor<v1::AttachUp, v1::AttachDown>* Attach(grpc::CallbackServerContext* context) override {
         return new AttachReactor(_hub, allowed(context, _config.token));
@@ -1577,6 +1613,8 @@ public:
         if (_messages) reply->add_features("messages");
         if (_connections) reply->add_features("connections");
         if (_connections) reply->add_features("connections.subscriptions");
+        // ConnectionSpec.kafka: Kafka as a connection's link.
+        if (_kafkaLinks) reply->add_features("connections.kafka");
         if (_admin) reply->add_features("admin");
         if (_admin) reply->add_features("admin.listeners");
         if (_messages) reply->add_features("events.handshake");
@@ -1602,6 +1640,7 @@ private:
     bool _admin;
     bool _aware;
     bool _kafka;
+    bool _kafkaLinks;
 };
 
 
@@ -1979,6 +2018,7 @@ grpc::Status status(KafkaControl& kafka, v1::KafkaStatus& reply) {
         out->set_published(m.published);
         out->set_invalid(m.invalid);
         out->set_refused(m.refused);
+        out->set_lag(m.toKafka ? 0 : m.lag);
     }
     return grpc::Status::OK;
 }
@@ -2033,7 +2073,7 @@ public:
         AppConnectionInfo info;
         std::string error;
         if (!_connections.put(specOf(*spec), &info, error)) {
-            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            reactor->Finish(putRefused(_connections, *spec, error));
             return reactor;
         }
         infoTo(info, *reply);
@@ -2840,7 +2880,8 @@ bool ApiServer::start(const ApiServerConfig& config, const Services& services, s
     self.admin.reset(new AdminService(self.config, *self.core));
     self.system.reset(new SystemService(self.config, authority != nullptr, messages, connections != nullptr,
                                          services.admin != nullptr, (bool)services.sparkplugAware,
-                                         services.kafka != nullptr && services.kafka->available()));
+                                         services.kafka != nullptr && services.kafka->available(),
+                                         connections != nullptr && connections->kafkaLinks()));
     self.authority.reset(new AuthorityService(self.config, authority));
     if (messages) self.messages.reset(new MessagesService(self.config, *messages));
     if (connections) self.connections.reset(new ConnectionsService(self.config, *connections));
@@ -3259,7 +3300,7 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
                 auto out = made<v1::ConnectionInfo>();
                 const bool put = connections.put(specOf(r), &info, error);
                 if (put) infoTo(info, *out);
-                answer(out, put ? grpc::Status::OK : grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+                answer(out, put ? grpc::Status::OK : putRefused(connections, r, error));
             }
         } else if (method == "DELETE") {
             answer(made<v1::DeleteConnectionReply>(), connections.remove(name) ? grpc::Status::OK : missing);

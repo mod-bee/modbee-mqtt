@@ -5,6 +5,7 @@
 
 #include "KafkaPipe.h"
 #include "KafkaCommon.h"
+#include "KafkaEnvelope.h"
 
 #include "MqttTopic.h"
 
@@ -128,18 +129,6 @@ std::string expandTopic(const std::string& pattern, const char* kafkaTopic,
     return out;
 }
 
-bool headerWanted(const MqttToKafkaConfig& mapping, const char* placeholder) {
-    if (mapping.allHeaders) return true;
-    for (const KafkaHeaderSpec& h : mapping.headers) {
-        if (!h.fixed && h.name == placeholder) return true;
-    }
-    return false;
-}
-
-void addHeader(rd_kafka_headers_t* headers, const char* name, const void* value, size_t size) {
-    rd_kafka_header_add(headers, name, -1, value, (ssize_t)size);
-}
-
 } // namespace
 
 // --- The plan: the clusters and mappings, replaced whole ---------------------
@@ -235,6 +224,8 @@ rd_kafka_conf_t* consumerConf(const KafkaClusterConfig& cluster, const KafkaToMq
         kafkaSet(conf, "enable.auto.commit", "true", error) &&
         kafkaSet(conf, "enable.auto.offset.store", "false", error) &&
         kafkaSet(conf, "auto.offset.reset", "latest", error) &&
+        // Consumer lag, for status (onConsumerStatistics). The file can change it.
+        kafkaSet(conf, "statistics.interval.ms", "5000", error) &&
         kafkaPassThrough(conf, cluster, error);
     if (!ok) {
         rd_kafka_conf_destroy(conf);
@@ -253,6 +244,13 @@ rd_kafka_topic_conf_t* topicConf(rd_kafka_t* producer, const MqttToKafkaConfig& 
     char why[512];
     if (rd_kafka_topic_conf_set(conf, "acks", acksText(mapping.acks), why, sizeof why) != RD_KAFKA_CONF_OK ||
         rd_kafka_topic_conf_set(conf, "partitioner", mapping.uniform ? "random" : "murmur2_random", why,
+                                sizeof why) != RD_KAFKA_CONF_OK) {
+        rd_kafka_topic_conf_destroy(conf);
+        error = "kafka mapping " + mapping.id + ": " + why;
+        return nullptr;
+    }
+    if (mapping.messageTimeoutMs >= 0 &&
+        rd_kafka_topic_conf_set(conf, "message.timeout.ms", std::to_string(mapping.messageTimeoutMs).c_str(), why,
                                 sizeof why) != RD_KAFKA_CONF_OK) {
         rd_kafka_topic_conf_destroy(conf);
         error = "kafka mapping " + mapping.id + ": " + why;
@@ -313,6 +311,7 @@ struct KafkaPipe::Shard {
     static void onDelivery(rd_kafka_t*, const rd_kafka_message_t* message, void* opaque);
     static void onError(rd_kafka_t*, int error, const char* reason, void* opaque);
     static int onStatistics(rd_kafka_t*, char* json, size_t length, void* opaque);
+    static int onConsumerStatistics(rd_kafka_t*, char* json, size_t length, void* opaque);
     // Takes the pipe's current plan, if it is not the one running.
     bool reconcile(std::string* error);
     Producer* makeProducer(const KafkaClusterConfig& cluster, const std::string& signature, bool allAcks,
@@ -346,6 +345,25 @@ int KafkaPipe::Shard::onStatistics(rd_kafka_t*, char* json, size_t length, void*
     const bool up = stats.find("\"state\":\"UP\"") != std::string::npos;
     shard.pipe->_brokersDown.store(!up, std::memory_order_relaxed);
     return 0;   // librdkafka frees the document
+}
+
+// A consumer's statistics, inside rd_kafka_consumer_poll() on the shard's own
+// thread: its lag is the sum of every assigned partition's consumer_lag (-1,
+// not known, for one it has no position in yet). A scan, not a parse, as above.
+int KafkaPipe::Shard::onConsumerStatistics(rd_kafka_t*, char* json, size_t length, void* opaque) {
+    const Consumer& consumer = *static_cast<const Consumer*>(opaque);
+    const std::string stats(json, length);
+    static const char kLag[] = "\"consumer_lag\":";
+    int64_t lag = 0;
+    bool known = false;
+    for (size_t at = stats.find(kLag); at != std::string::npos; at = stats.find(kLag, at + 1)) {
+        const long long one = std::strtoll(stats.c_str() + at + sizeof kLag - 1, nullptr, 10);
+        if (one < 0) continue;
+        lag += one;
+        known = true;
+    }
+    consumer.from->counters->lag.store(known ? lag : -1, std::memory_order_relaxed);
+    return 0;
 }
 
 // Runs inside rd_kafka_poll(), on the shard's own thread.
@@ -561,6 +579,8 @@ bool KafkaPipe::Shard::makeConsumer(Consumer& consumer, const KafkaClusterConfig
     const KafkaToMqttConfig& mapping = consumer.from->config;
     rd_kafka_conf_t* conf = consumerConf(cluster, mapping, error);
     if (conf == nullptr) return false;
+    rd_kafka_conf_set_stats_cb(conf, &Shard::onConsumerStatistics);
+    rd_kafka_conf_set_opaque(conf, &consumer);
     char reason[512];
     rd_kafka_t* handle = rd_kafka_new(RD_KAFKA_CONSUMER, conf, reason, sizeof reason);
     if (handle == nullptr) {
@@ -786,6 +806,9 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
         for (const std::string& filter : mapping.filters) {
             if (mq_topicMatches(spanOf(filter), message.topic)) { matches = true; break; }
         }
+        for (const std::string& filter : mapping.excludeFilters) {
+            if (matches && mq_topicMatches(spanOf(filter), message.topic)) matches = false;
+        }
         if (!matches) continue;
         // Never back where it came from: that is a loop, not a mapping.
         if (origin != nullptr && origin->cluster != nullptr && *origin->cluster == mapping.cluster &&
@@ -809,59 +832,14 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
         case KafkaKeyMode::Template: key = expandKey(mapping.keyTemplate, message.topic, message.clientId); break;
         }
 
-        // HEADERS: the placeholders asked for, then the fixed ones.
+        // HEADERS: the envelope (KafkaEnvelope.h), or the placeholders asked
+        // for; then the fixed ones.
         rd_kafka_headers_t* headers = nullptr;
         size_t headerBytes = 0;
-        const MqttProperties* p = message.properties;
         if (mapping.allHeaders || !mapping.headers.empty()) {
             headers = rd_kafka_headers_new(8);
-            const auto add = [&](const char* name, const void* value, size_t size) {
-                addHeader(headers, name, value, size);
-                headerBytes += std::strlen(name) + size;
-            };
-            const auto addText = [&](const char* name, const std::string& value) {
-                add(name, value.data(), value.size());
-            };
-            if (headerWanted(mapping, "mqtt-topic")) add("mqtt-topic", message.topic.data, message.topic.length);
-            if (headerWanted(mapping, "mqtt-qos")) addText("mqtt-qos", std::to_string(message.qos));
-            if (headerWanted(mapping, "mqtt-retain")) addText("mqtt-retain", message.retain ? "true" : "false");
-            if (headerWanted(mapping, "mqtt-clientid") && message.clientId.length > 0) {
-                add("mqtt-clientid", message.clientId.data, message.clientId.length);
-            }
-            // Who published it - the login the broker checked, so a reader knows whose message this is
-            // without trusting anything in the payload or the topic. A Will carries its session's.
-            if (headerWanted(mapping, "mqtt-username") && message.userName.length > 0) {
-                add("mqtt-username", message.userName.data, message.userName.length);
-            }
-            if (p != nullptr) {
-                if (headerWanted(mapping, "mqtt-content-type") && p->has(MQ_PROP_CONTENT_TYPE)) {
-                    add("mqtt-content-type", p->contentType.data, p->contentType.length);
-                }
-                if (headerWanted(mapping, "mqtt-correlation-data") && p->has(MQ_PROP_CORRELATION_DATA)) {
-                    add("mqtt-correlation-data", p->correlationData.data, p->correlationData.length);
-                }
-                if (headerWanted(mapping, "mqtt-payload-format-indicator") &&
-                    p->has(MQ_PROP_PAYLOAD_FORMAT_INDICATOR)) {
-                    addText("mqtt-payload-format-indicator", std::to_string(p->payloadFormatIndicator));
-                }
-                if (headerWanted(mapping, "mqtt-response-topic") && p->has(MQ_PROP_RESPONSE_TOPIC)) {
-                    add("mqtt-response-topic", p->responseTopic.data, p->responseTopic.length);
-                }
-                if (headerWanted(mapping, "mqtt-message-expiry-interval") &&
-                    p->has(MQ_PROP_MESSAGE_EXPIRY_INTERVAL)) {
-                    addText("mqtt-message-expiry-interval", std::to_string(p->messageExpiryInterval));
-                }
-                if (headerWanted(mapping, "mqtt-user-properties")) {
-                    for (uint8_t u = 0; u < p->userCount; u++) {
-                        std::string name = toText(p->user[u].key);
-                        if (name.compare(0, 5, "mqtt-") == 0) name = kUserPropertyEscape + name;
-                        add(name.c_str(), p->user[u].value.data, p->user[u].value.length);
-                    }
-                }
-            }
-            for (const KafkaHeaderSpec& h : mapping.headers) {
-                if (h.fixed) addText(h.name.c_str(), h.value);
-            }
+            headerBytes = kafkaWriteEnvelope(headers, &mapping, message.topic, message.qos, message.retain,
+                                             message.clientId, message.userName, message.properties);
         }
 
         // TOO LARGE FOR THIS MAPPING: never sent, never truncated. At MQTT 5
@@ -942,34 +920,29 @@ void KafkaPipe::Shard::publishRecord(FromKafka& from, const rd_kafka_message_t* 
     std::vector<std::pair<std::string, std::string>> users = mapping.userProperties;
 
     rd_kafka_headers_t* headers = nullptr;
-    if (mapping.fromHeaders && rd_kafka_message_headers(record, &headers) == RD_KAFKA_RESP_ERR_NO_ERROR) {
-        users.clear();
-        contentType.clear();
-        responseTopic.clear();
-        hasFormat = hasExpiry = false;
-        const char* name;
-        const void* value;
-        size_t size;
-        for (size_t i = 0; rd_kafka_header_get_all(headers, i, &name, &value, &size) ==
-                           RD_KAFKA_RESP_ERR_NO_ERROR; i++) {
-            const std::string v = value ? std::string((const char*)value, size) : std::string();
-            if (std::strcmp(name, "mqtt-topic") == 0) topics.assign(1, v);
-            else if (std::strcmp(name, "mqtt-qos") == 0) qos = (uint8_t)(v == "2" ? 2 : v == "1" ? 1 : 0);
-            else if (std::strcmp(name, "mqtt-retain") == 0) retain = v == "true";
-            else if (std::strcmp(name, "mqtt-content-type") == 0) contentType = v;
-            else if (std::strcmp(name, "mqtt-response-topic") == 0) responseTopic = v;
-            else if (std::strcmp(name, "mqtt-correlation-data") == 0) { correlation = v; hasCorrelation = true; }
-            else if (std::strcmp(name, "mqtt-payload-format-indicator") == 0) { hasFormat = true; format = v == "1" ? 1 : 0; }
-            else if (std::strcmp(name, "mqtt-message-expiry-interval") == 0) {
-                hasExpiry = true;
-                expiry = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
-            }
-            else if (std::strncmp(name, kUserPropertyEscape, sizeof kUserPropertyEscape - 1) == 0) {
-                users.push_back(std::make_pair(std::string(name + sizeof kUserPropertyEscape - 1), v));
-            }
-            else if (std::strncmp(name, "mqtt-", 5) == 0) { /* mqtt-clientid and the like: informational */ }
-            else users.push_back(std::make_pair(std::string(name), v));
+    const bool hasHeaders = rd_kafka_message_headers(record, &headers) == RD_KAFKA_RESP_ERR_NO_ERROR;
+    KafkaEnvelope envelope;
+    const bool readable = !hasHeaders || kafkaReadEnvelope(headers, envelope);
+    // One this link wrote itself: Kafka has no No Local, so the link has it here.
+    if (!mapping.skipLink.empty() && envelope.link == mapping.skipLink) return;
+    if (mapping.fromHeaders && hasHeaders) {
+        if (!readable) {
+            // A later version of the envelope: not guessed at.
+            from.counters->invalid.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
+        if (envelope.hasTopic) topics.assign(1, envelope.topic);
+        if (envelope.hasQos) qos = envelope.qos;
+        if (envelope.hasRetain) retain = envelope.retain;
+        contentType = envelope.contentType;
+        responseTopic = envelope.responseTopic;
+        correlation = envelope.correlation;
+        hasCorrelation = envelope.hasCorrelation;
+        hasFormat = envelope.hasFormat;
+        format = envelope.format;
+        hasExpiry = envelope.hasExpiry;
+        expiry = envelope.expiry;
+        users = envelope.users;
     }
     if (topics.empty()) {
         for (const std::string& pattern : mapping.mqttTopics) {
@@ -1110,6 +1083,7 @@ KafkaPipeStatus KafkaPipe::status() const {
         m.published = from->counters->published.load();
         m.invalid = from->counters->invalid.load();
         m.refused = from->counters->refused.load();
+        m.lag = from->counters->lag.load();
         out.mappings.push_back(m);
     }
     for (const std::unique_ptr<Shard>& shard : _shards) out.heldAcknowledgements += shard->held.load();

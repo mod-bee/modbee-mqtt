@@ -13,6 +13,30 @@ minor version may change the API or the configuration, and says how here.
 
 ### Added
 
+- **Kafka as a connection's link** (`ConnectionSpec.kafka`: `cluster`, `kafka_topic`, `kafka_topics` or
+  `kafka_topic_pattern`, `key`, `consumer_group`, `state_connection`): a managed connection with Kafka in the middle
+  instead of another broker. Its client talks to a broker of its own inside the server - loopback, a login made for
+  it at random - bridged to its Kafka topics by a pipe of its own, so Consume, Publish, store and forward,
+  request/response and a Sparkplug host or edge node work on it unchanged, and its topics are not this server's. A
+  publish is acknowledged once Kafka has the record, and while Kafka is away nothing is given up: records wait, in
+  order (tested: Kafka stopped mid-stream, every message in Kafka once, in order). `BACKING_OFF` "Kafka cannot be
+  reached" in `Get` and `Watch` meanwhile; `ConnectionInfo.kafka` says records in and out, refusals, the lag and the
+  publishes waiting. One Kafka topic both ways works as one bus: a link never reads back a record it wrote (the
+  `mqtt-link` header - Kafka has no No Local). A **Sparkplug host** on it keeps its STATE on the MQTT connection
+  `state_connection` names, that connection's Will the offline STATE, since Kafka has no Will; `spBv1.0/STATE/#` is
+  then not written to Kafka. A cluster a connection uses cannot be deleted, and a change to it is taken live. About
+  25 MB of memory per link. Hello says `connections.kafka`; a build without Kafka answers `FAILED_PRECONDITION`.
+- **The envelope, as a contract** (docs/kafka.md): one MQTT message is one Kafka record - the payload untouched, the
+  topic, QoS, retain and every MQTT 5 property in `mqtt-*` headers - now with **`mqtt-envelope: 1`** on every
+  `headers: all` record, and read by one piece of code everywhere. A record in a version this cannot read is refused
+  and counted (`invalid`); one without the header is read as version 1.
+- **`modbee-mqtt pub|sub|req --kafka <bootstrap> --kafka-topic T`**: records written and read in the envelope, for
+  testing the far side of a link - `sub` prints them as the MQTT messages they carry (`--json`, `--sparkplug`), with
+  no consumer group unless `--kafka-group`; `req` reads the reply topic before it writes the request. TLS and SASL
+  (`--kafka-tls`, `--kafka-ca`, `--kafka-cert`, `--kafka-sasl scram-sha512`, `--kafka-password-file`, ...) and any
+  librdkafka setting (`--kafka-set`).
+- **Consumer lag** of each kafka-to-mqtt mapping in `Kafka.Status` (`lag`), from librdkafka's statistics.
+
 - **`Admin.Backup`** (`modbee-mqtt logins backup`, `POST /v1/backups`): a copy of the login database made in its
   backups folder, as `modbee-mqtt backup` does over MQTT, and named; with `contents`, its bytes too. Hello says
   `admin.backup`.
@@ -128,6 +152,15 @@ minor version may change the API or the configuration, and says how here.
   code — so an application can say why a device is not getting through. A board build compiles none of it.
 
 ### Fixed
+
+- **A Sparkplug host or edge node sharing a connection could be used after it was freed.** Standing down (a server's
+  `DeleteHost`, `DeleteEdgeNode`, or a host put again) it published its offline STATE or NDEATH with a completion
+  callback pointing at itself, and was then destroyed; the acknowledgement arriving later called into freed memory.
+  It shows once the acknowledgement takes longer - over a Kafka link, it waits for Kafka. Nothing waits on it there,
+  so it now goes without one. 59 bytes in the library.
+- **The Docker image ran the server for the Application API's commands**: `docker run <image> connections list` (and
+  `messages`, `kafka-clusters`, ...) started a broker instead, the entrypoint knowing only the older commands. Any
+  first word that is not an option is now a command.
 
 - **A Sparkplug host could read another message's text**: `MqttSparkplugHost` kept a String, Text or Bytes value as a
   pointer into its receive buffer, which the next message reuses, so `read()` could return the wrong bytes. It keeps

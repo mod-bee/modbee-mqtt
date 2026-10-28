@@ -1505,7 +1505,7 @@ void MqttSparkplugNode::disconnect() {
         // version, and the next CONNECT goes without it.
         _disconnectAfterDeath = false;
         _reconnectAfterOffline = false;
-        if (_willArmed && _client.isConnected()) publishNodeDeath();
+        if (_willArmed && _client.isConnected()) publishNodeDeath(false);
         _client.releaseWill(*this);
         endBirth();
         return;
@@ -1546,7 +1546,7 @@ void MqttSparkplugNode::disconnect() {
     endBirth();
 }
 
-bool MqttSparkplugNode::publishNodeDeath() {
+bool MqttSparkplugNode::publishNodeDeath(bool awaited) {
     // Its own one-metric payload: bdSeq's name is a literal, so no arena.
     MqttSparkplugPayload payload(1, 0);
 
@@ -1576,7 +1576,8 @@ bool MqttSparkplugNode::publishNodeDeath() {
     // QoS 1 and a completion handler, so the DISCONNECT that follows waits for
     // the PUBACK. At QoS 0 there would be nothing to wait for.
     return mq_accepted(_client.publishSeries(_topic, _scratch, wrote, MQ_QOS_1,
-                                             false, &deathTrampoline, this));
+                                             false, awaited ? &deathTrampoline : nullptr,
+                                             awaited ? this : nullptr));
 }
 
 void MqttSparkplugNode::deathTrampoline(void* context, MqttResult result,

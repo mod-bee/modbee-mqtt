@@ -37,6 +37,9 @@
 #include "KafkaControl.h"
 #if defined(MODBEE_HAVE_KAFKA)
 #include "KafkaPipe.h"
+#if defined(MODBEE_HAVE_APP_API)
+#include "KafkaLinks.h"
+#endif
 #include "KafkaRetained.h"
 #endif
 
@@ -600,6 +603,11 @@ int cmdServe(int argc, char** argv) {
     // THE APPLICATION API, once every shard is running: its calls reach them -
     // and the MQTT connections it keeps for the application, opened again from
     // what was kept.
+#if defined(MODBEE_HAVE_KAFKA)
+    // Connections whose link is Kafka: each its own broker and pipe. Made
+    // before the connections, gone after them.
+    std::unique_ptr<KafkaLinks> links(new KafkaLinks(kafka));
+#endif
     std::unique_ptr<AppConnections> connections;
     ApiServer api;
     if (!file.api.grpc.empty()) {
@@ -631,6 +639,9 @@ int cmdServe(int argc, char** argv) {
             where.password = internalPassword;
             return where.port != 0;
         });
+#if defined(MODBEE_HAVE_KAFKA)
+        connections->linkKafka(links.get());
+#endif
         if (read && !connections->start(why)) read = false;
         ApiServer::Services s;
         s.authority = authority.get();

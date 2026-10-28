@@ -24,6 +24,7 @@
 #include "ServerConfig.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -40,6 +41,7 @@ struct KafkaMappingCounters {
     std::atomic<uint64_t> published{0};   //   published into the broker
     std::atomic<uint64_t> invalid{0};     //   could not be published (bad topic, ...)
     std::atomic<uint64_t> refused{0};     //   the broker could not take it (a queue or the retained store full)
+    std::atomic<int64_t> lag{-1};         //   records behind the end of its partitions, at the last statistics; -1 not known
 };
 
 struct KafkaPipeStatus {
@@ -48,6 +50,7 @@ struct KafkaPipeStatus {
         bool toKafka = true;
         uint64_t send = 0, success = 0, failed = 0, tooLarge = 0, latencyMicros = 0;
         uint64_t polled = 0, published = 0, invalid = 0, refused = 0;
+        int64_t lag = -1;
     };
     std::vector<Mapping> mappings;
     uint64_t heldAcknowledgements = 0;    // PUBACK/PUBRECs waiting on Kafka now
@@ -87,6 +90,17 @@ public:
 
     bool available() const { return _live != nullptr; }
 
+    // The clusters' other users - connections whose link is Kafka
+    // (KafkaLinks): `usedBy` says who uses a cluster ("" nobody), asked
+    // before one is deleted; `changed` is told the section after every change
+    // that went through. Both are called under this object's lock, so neither
+    // may call back into it. Set before the API serves.
+    void share(std::function<std::string(const std::string& cluster)> usedBy,
+               std::function<void(const ServerConfig& section)> changed) {
+        _usedBy = std::move(usedBy);
+        _changed = std::move(changed);
+    }
+
     enum class Result { Ok, NotFound, Invalid, InUse, Unavailable, Failed };
 
     // Create, or replace by id. A cluster given with no password keeps the
@@ -108,4 +122,6 @@ private:
     std::string _path;                     // <state>/kafka.json, or ""
     std::string _retainedCluster;
     KafkaLive* _live;
+    std::function<std::string(const std::string&)> _usedBy;
+    std::function<void(const ServerConfig&)> _changed;
 };

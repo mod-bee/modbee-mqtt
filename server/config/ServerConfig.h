@@ -135,6 +135,12 @@ struct MqttToKafkaConfig {
     std::vector<KafkaHeaderSpec> headers;
     bool uniform = false;              // partition-strategy: uniform (ignore the key)
     bool acknowledgeOnKafka = true;    // PUBACK when Kafka has it; false: when routed
+    // Not in the file - what a connection whose link is Kafka (server/kafka/
+    // KafkaLinks) asks of its private pipe: filters NOT carried (a host's
+    // STATE, kept on MQTT), and how long a record may wait for Kafka
+    // (0: until it is there; -1: the producer's 30 s).
+    std::vector<std::string> excludeFilters;
+    int messageTimeoutMs = -1;
     size_t line = 0;
 };
 
@@ -156,6 +162,9 @@ struct KafkaToMqttConfig {
     bool hasMessageExpiry = false;
     uint32_t messageExpiry = 0;
     std::vector<std::pair<std::string, std::string>> userProperties;
+    // Not in the file: a record whose mqtt-link header is this is one the
+    // link wrote itself, and is not read back (Kafka's No Local).
+    std::string skipLink;
     size_t line = 0;
 };
 

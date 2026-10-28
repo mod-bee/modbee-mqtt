@@ -12,9 +12,12 @@
 // correlation is the whole point of the mechanism.
 
 #include "Common.h"
+#include "KafkaCli.h"
 
 #include <cstdio>
 #include <cstring>
+
+#include <unistd.h>
 
 namespace {
 
@@ -54,14 +57,64 @@ void onMessage(void*, const MqttMessage& message) {
     }
 }
 
+#if defined(MODBEE_HAVE_KAFKA)
+// The request as a record in the envelope, its Response Topic and Correlation
+// Data in it; the reply, a record on the reply topic carrying the same
+// correlation - read from before the request went, so it cannot be missed.
+int reqKafka(const Args& args, long long qos, long long wait) {
+    const std::string kafkaTopic = args.get("kafka-topic");
+    if (kafkaTopic.empty()) {
+        std::fprintf(stderr, "modbee-mqtt req: --kafka needs --kafka-topic (the Kafka topic to write)\n");
+        return 2;
+    }
+    const std::string replyTopic = args.get("kafka-reply-topic", kafkaTopic.c_str());
+    CliKafka kafka;
+    std::string error;
+    if (!kafka.configure(args, error) || !kafka.openConsumer({replyTopic}, error) || !kafka.openProducer(error)) {
+        std::fprintf(stderr, "modbee-mqtt req: %s\n", error.c_str());
+        return 3;
+    }
+    ReqState state;
+    state.json = args.has("json");
+    state.correlation = "modbee-req-" + std::to_string((long)::getpid()) + "-" + std::to_string((unsigned long)mq_millis());
+    g_req = &state;
+    const std::string responseTopic = args.get("response-topic", ("modbee/reply/" + state.correlation).c_str());
+    MqttOwnedProperties properties;
+    properties.setResponseTopic(responseTopic.c_str());
+    properties.setCorrelationData((const uint8_t*)state.correlation.data(), state.correlation.size());
+    const std::string payload = args.get("message");
+    size_t failed = 0;
+    if (!kafka.produce(kafkaTopic, args.get("topic"), (const uint8_t*)payload.data(), payload.size(), (uint8_t)qos,
+                       false, properties, error) ||
+        !kafka.flush((int)wait * 1000, failed) || failed > 0) {
+        std::fprintf(stderr, "modbee-mqtt req: the request was not written: %s\n",
+                     error.empty() ? "Kafka refused it" : error.c_str());
+        g_req = nullptr;
+        return 1;
+    }
+    const mq_time_t start = mq_millis();
+    while (!state.answered && !cliStopRequested() && mq_millis() - start < (mq_time_t)wait * 1000) {
+        MqttMessage message;
+        if (!kafka.next(100, message)) continue;
+        if (message.topic.length == responseTopic.size() &&
+            std::memcmp(message.topic.data, responseTopic.data(), responseTopic.size()) == 0) {
+            onMessage(nullptr, message);
+        }
+    }
+    if (!state.answered) std::fprintf(stderr, "modbee-mqtt req: no reply within %llds\n", wait);
+    g_req = nullptr;
+    return state.answered ? 0 : 1;
+}
+#endif
+
 const std::vector<ArgSpec>& reqSpecs() {
-    static const std::vector<ArgSpec> specs = withConnectionSpecs({
+    static const std::vector<ArgSpec> specs = withKafkaSpecs(withConnectionSpecs({
         {"topic", 't', true, "request topic (required)"},
         {"message", 'm', true, "request payload text (default empty)"},
         {"response-topic", 'e', true, "where the reply should go (default modbee/reply/<id>)"},
         {"qos", 'q', true, "QoS for request and reply: 0, 1 or 2 (default 1)"},
         {"wait", 'W', true, "seconds to wait for the reply (default 10)"},
-    });
+    }));
     return specs;
 }
 
@@ -89,6 +142,13 @@ int cmdReq(int argc, char** argv) {
     }
 
     cliInstallSignalHandlers();
+    bool refused = false;
+    if (kafkaAsked(args, "req", refused)) {
+#if defined(MODBEE_HAVE_KAFKA)
+        return reqKafka(args, qos, wait);
+#endif
+    }
+    if (refused) return 2;
     CliClient cli;
     std::string error;
     if (!cli.configure(args, "modbee-req", error)) {

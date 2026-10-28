@@ -171,6 +171,29 @@ written twice, and retries never reorder a partition. Setting a mapping to
   are not headers: they belong to one hop of one connection, not to the
   message.
 
+### The envelope: one MQTT message, one Kafka record
+
+`headers: all` is **the envelope**, and it is a contract: every part of modbee
+that puts MQTT into Kafka or takes it out - the pipe, a [connection whose link
+is Kafka](#kafka-as-a-connections-link), and `modbee-mqtt pub|sub|req --kafka` -
+reads and writes exactly this, from one piece of code (`server/kafka/KafkaEnvelope`).
+
+- The value is the payload, untouched: binary, empty, whatever it was.
+- The headers are the table above, plus **`mqtt-envelope: 1`**, the version of
+  this contract. A connection over Kafka also writes **`mqtt-link`**: its
+  consumer group, so it never reads its own records back.
+- Every property survives the round trip: correlation data as raw bytes, user
+  properties in order with their repeats, a payload format indicator, an
+  expiry (what is left of it, as MQTT forwards it), an empty payload, the
+  retain flag. Tested in `internal/test/test_kafka_link.cpp`.
+- **Versions.** A reader refuses a record whose `mqtt-envelope` is a version
+  it does not know - counted as `invalid`, not guessed at. A record with no
+  `mqtt-envelope` at all (written by another producer, or before the header
+  existed) is read as version 1. The version goes up only when a header's
+  meaning changes; adding a header does not change it.
+- **Not in it**, deliberately: the packet identifier, DUP, a topic alias,
+  subscription identifiers - one hop's, not the message's.
+
 - **Each message is produced once**, by the broker it was published on,
   however many shards there are.
 
@@ -266,6 +289,151 @@ different partitions, and are read out of order.[^sparkplug-key]
 [^sparkplug-key]: A template giving group and node,
     `"${MQTT_TOPIC_LEVEL_1}/${MQTT_TOPIC_LEVEL_3}"`, also keeps one node's
     messages together, and does not depend on the node's client id.
+
+---
+
+## Kafka as a connection's link
+
+The pipe joins **this broker** to Kafka. A **connection whose link is Kafka**
+is the other half: one of the MQTT connections the server keeps for an
+application (`Connections.Put`, [app-api.md](app-api.md#connections-to-other-brokers)) with
+Kafka in the middle instead of another broker - so an application, a
+Sparkplug host or an edge node that works over an MQTT connection works over
+Kafka unchanged.
+
+```
+ application ──API──► modbee-mqtt serve
+                       └ connection "plant" ──MQTT──► its own broker ══ envelope ══► Kafka topics
+                                                      (inside serve,   ◄══ envelope ══
+                                                       127.0.0.1 only)
+```
+
+Each such connection gets **a broker of its own** inside the server, reached
+over loopback with a login made for it at random, and a Kafka pipe of its own
+between that broker and the connection's Kafka topics. The connection's MQTT
+client connects to it like to any broker, and everything a connection does
+works as it does elsewhere: Consume and Publish, store and forward, request
+and response, per-filter subscription options, a Sparkplug host or edge node.
+Its topics are its own - nothing published on it reaches this server's
+clients, and nothing of theirs reaches it.
+
+```bash
+modbee-mqtt kafka-clusters put --id main --bootstrap-servers kafka-1:9092
+modbee-mqtt connections put --id plant --kafka.cluster main \
+    --kafka.kafka-topic plant-up --kafka.kafka-topics plant-down
+```
+
+| `kafka.` | |
+| --- | --- |
+| `cluster` | A cluster from `Kafka.PutCluster` (TLS and login are the cluster's); `""` the only one there is. A cluster a connection uses cannot be deleted. A change to it is taken live. |
+| `kafka_topic` | Written to: every message published on the connection, one record each, in the envelope |
+| `kafka_topics`, `kafka_topic_pattern` | Read from: each record becomes a message on the connection, as its headers say (a record with none comes on the Kafka topic's own name) |
+| `key` | The record key: `topic` (default), `clientid`, `none`, or a template - as for a mapping |
+| `consumer_group` | Default `modbee-conn-<id>`. Starts at the latest offset, like a mapping's |
+| `state_connection` | An MQTT connection for a Sparkplug host's STATE (below) |
+
+What it means:
+
+- **An acknowledgement means Kafka has it.** A QoS 1 or 2 publish on the
+  connection is acknowledged once Kafka has the record (`CONFIRM_DELIVERED`
+  says `DELIVERED` then). While Kafka cannot be reached nothing is given up
+  on: records wait, in order, and go when it is back. The connection reports
+  `BACKING_OFF`, "Kafka cannot be reached", in `Get` and `Watch` meanwhile, and
+  a publish without store and forward is answered `NOT_CONNECTED`.
+- **Store and forward** works as on any connection, and is what to use for
+  messages that must survive a restart: kept on disk until Kafka has them.
+  Tested with Kafka stopped and started mid-stream: every message in Kafka
+  once, in order.
+- **One Kafka topic both ways** is allowed (`kafka_topic` among
+  `kafka_topics`): many servers can share one topic as one bus. A connection
+  never reads back a record it wrote itself - Kafka has no No Local, so the
+  `mqtt-link` header does that job - and a record read from a topic is never
+  written back to it. Its own messages reach its own subscriptions once, from
+  its broker, as on one MQTT broker.
+- **`ConnectionInfo.kafka`**: whether Kafka can be reached, records written
+  and refused, records read and refused, the lag (records not read yet,
+  every 5 s), publishes waiting for Kafka now.
+- **Wills.** A Will is sent when a session ends without a clean disconnect.
+  A Kafka connection's session is inside the server, so that does not happen
+  while it runs, and **a crash of the whole server sends nothing: Kafka has
+  no Will.** What needs to know that a party went away should use the
+  Sparkplug STATE below, or its own heartbeat. A Sparkplug edge node on a
+  Kafka connection sends its NDEATH into Kafka when it is deleted or the
+  server stops cleanly - by hand, as Sparkplug does on a shared connection.
+- **Its messages are up to 1 MiB**, Kafka's own default record size.
+- **Each costs about 25 MB of memory** while idle - its broker and two Kafka
+  clients (measured on a release build) - so it is a link, not a per-device
+  object: a few per server, not thousands.
+
+### A Sparkplug host on Kafka, its STATE on MQTT
+
+A Sparkplug Host Application announces itself with a retained STATE message
+whose offline form is its MQTT Will - and Kafka has no Will. So a host whose
+data comes through Kafka keeps its STATE on a real MQTT connection: name one
+as the Kafka connection's `state_connection` - a connection to the broker the
+edge nodes are on, or `this_server` - and the server publishes the host's
+online STATE there, with its Will the offline one carrying the same
+timestamp [tck-id-payloads-state-birth-payload]. One owner, the server, so
+no lock is needed between instances. The STATE topic (`spBv1.0/STATE/#`) is
+then not written to Kafka. The state connection is an ordinary MQTT
+connection with no Will, host or edge node of its own.
+
+```bash
+modbee-mqtt connections put --id state --this-server
+modbee-mqtt connections put --id scada-in --kafka.kafka-topics spb-data --kafka.kafka-topic spb-commands \
+    --kafka.state-connection state
+modbee-mqtt sparkplug-hosts put --id scada --connection scada-in --host-id scada1
+```
+
+Its births, data, aliases, `ListNodes` and rebirth requests (NCMD, written to
+Kafka) work as on MQTT; tested with an edge node on another Kafka connection.
+The host is online while its link runs and the state connection is up; if
+the server crashes, the state connection's Will says offline. Without a
+`state_connection` the STATE goes into Kafka like any message, with no Will.
+
+An **edge node** on a Kafka connection needs nothing special. One gated on a
+primary host (`primary_host_id`) waits for that host's STATE to come in
+through Kafka.
+
+### A bridge with Kafka at one end
+
+On a **board**, Kafka is reached the way a board reaches anything: MQTT, to
+a server whose connection is over Kafka. A board never has a Kafka client
+(librdkafka is host-only), see [bridge.md](bridge.md#kafka-at-one-end).
+
+On a **server**, a bridge with a Kafka end *is* a connection over Kafka: the
+library's bridge (or an application relaying Consume to Publish) connects to
+its broker like to any other. The bridge's loop prevention holds over it -
+No Local at 5.0 on the MQTT side, and on the Kafka side a link never reads
+its own records. Tested both ways between two sites over one Kafka topic:
+each message arrives once on the other site, nothing comes back, Kafka holds
+each once.
+
+### Testing a link from the command line
+
+`pub`, `sub` and `req` take `--kafka <bootstrap>` and talk to Kafka directly,
+in the envelope - what a person needs to test the far side of a link:
+
+```bash
+modbee-mqtt sub --kafka kafka-1:9092 --kafka-topic plant-up -t 'plant/#' -v      # records, printed as MQTT messages
+modbee-mqtt sub --kafka kafka-1:9092 --kafka-topic spb-data --sparkplug          # Sparkplug decoded, JSON lines
+modbee-mqtt pub --kafka kafka-1:9092 --kafka-topic plant-down -t plant/cmd -m start -q 1
+modbee-mqtt req --kafka kafka-1:9092 --kafka-topic svc-in --kafka-reply-topic svc-out -t svc/time -m now
+```
+
+`sub` reads every partition from its end (`--kafka-from-start` from its
+start) with no consumer group unless `--kafka-group` names one; `pub` writes
+one record per message as the pipe would; `req` reads the reply topic before
+it writes the request, and prints the record carrying its correlation data.
+TLS and SASL as a cluster takes them: `--kafka-tls`, `--kafka-ca`,
+`--kafka-cert`/`--kafka-key-file`, `--kafka-insecure`, `--kafka-sasl
+plain|scram-sha256|scram-sha512`, `--kafka-user`, `--kafka-password` or
+`--kafka-password-file`, and `--kafka-set name=value` for any librdkafka
+setting. A build without librdkafka refuses `--kafka`, saying so.
+
+**Compared with TBMQ.** TBMQ 2.3's Kafka integration goes one way, MQTT to
+Kafka; it has no Kafka to MQTT, so nothing like a connection, a Sparkplug
+host, request/response or store and forward over Kafka.
 
 ---
 

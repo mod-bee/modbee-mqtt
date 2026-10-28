@@ -128,6 +128,11 @@ void applyWill(const AppConnectionSpec& spec, MqttConnectionConfig& connection) 
     connection.will.delayInterval = spec.willDelaySeconds;
 }
 
+// A Sparkplug host's STATE, as the library writes it (QoS 1, retained).
+std::string stateJson(bool online, uint64_t timestamp) {
+    return std::string("{\"online\":") + (online ? "true" : "false") + ",\"timestamp\":" + std::to_string(timestamp) + "}";
+}
+
 std::vector<std::string> topicParts(const std::string& topic) {
     std::vector<std::string> parts;
     size_t start = 0;
@@ -174,6 +179,17 @@ std::string toJson(const AppConnectionSpec& s) {
     }
     o.add("whenAsked", s.reconnectWhenAsked);
     if (s.thisServer) o.add("thisServer", true);
+    if (s.kafka) {
+        json::Object k;
+        k.add("cluster", s.link.cluster);
+        k.raw("in", json::array(s.link.inTopics));
+        k.add("pattern", s.link.inPattern);
+        k.add("out", s.link.outTopic);
+        k.add("key", s.link.key);
+        k.add("group", s.link.consumerGroup);
+        k.add("stateConnection", s.link.stateConnection);
+        o.raw("kafka", k.str());
+    }
     o.add("primaryCheck", (long long)s.primaryCheckSeconds);
     o.add("receiveMaximum", (long long)s.receiveMaximum);
     o.add("topicAliasMaximum", (long long)s.topicAliasMaximum);
@@ -224,6 +240,17 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
     }
     s.reconnectWhenAsked = v.flag("whenAsked");
     s.thisServer = v.flag("thisServer");
+    if (v.has("kafka")) {
+        const json::Value& k = v["kafka"];
+        s.kafka = true;
+        s.link.cluster = k.str("cluster");
+        k.strings("in", s.link.inTopics);
+        s.link.inPattern = k.str("pattern");
+        s.link.outTopic = k.str("out");
+        s.link.key = k.str("key");
+        s.link.consumerGroup = k.str("group");
+        s.link.stateConnection = k.str("stateConnection");
+    }
     s.primaryCheckSeconds = (uint32_t)v.integer("primaryCheck", 60);
     s.receiveMaximum = (uint16_t)v.integer("receiveMaximum");
     s.topicAliasMaximum = (uint16_t)v.integer("topicAliasMaximum");
@@ -235,7 +262,7 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
         s.storeMaxBytes = (uint64_t)k.integer("bytes", 64ll << 20);
         s.storeDropOldest = k.flag("dropOldest");
     }
-    return !s.id.empty() && (!s.servers.empty() || s.thisServer);
+    return !s.id.empty() && (!s.servers.empty() || s.thisServer || s.kafka);
 }
 
 bool sameSpec(const AppConnectionSpec& a, const AppConnectionSpec& b) { return toJson(a) == toJson(b); }
@@ -554,13 +581,49 @@ struct AppConnections::Connection {
         self.owner->_hub.connectionMessage(self.spec.id, m);
     }
 
-    // This server itself, as reachThisServer() says now; or one of `servers`.
+    // This server itself, as reachThisServer() says now, or a Kafka link's
+    // own broker; or one of `servers`.
     AppEndpoint here;
     bool hereTls = false;
+    bool local() const { return spec.thisServer || spec.kafka; }
     const AppEndpoint& endpoint(uint32_t index) const {
-        return spec.thisServer || spec.servers.empty() ? here : spec.servers[index % spec.servers.size()];
+        return local() || spec.servers.empty() ? here : spec.servers[index % spec.servers.size()];
     }
-    bool usesTls() const { return spec.thisServer ? hereTls : spec.tls; }
+    bool usesTls() const { return local() ? hereTls : spec.tls; }
+
+    // --- A Kafka link: what it is doing, looked at twice a second ---
+    AppKafkaLinkStatus link;
+    Clock::time_point linkPolled;
+
+    // --- The STATE connection of a host on a Kafka link (AppKafkaLinkSpec::
+    // stateConnection): its Will the host's offline STATE, chosen at
+    // `stateTimestamp`, and the online one published on each session it was
+    // armed for - Kafka has no Will, so the STATE lives here.
+    bool stateWill = false;                    // the next CONNECT carries it
+    bool stateArmed = false;                   // ...and this session's did
+    bool stateBorn = false;                    // online published on this session
+    std::string stateTopic;
+    uint64_t stateTimestamp = 0;
+    bool stateReleasing = false;               // reconnect without it, once the offline STATE has gone
+    Clock::time_point stateReleaseAt;
+
+    // The host stopped: offline by hand, and its Will let go - its CONNECT
+    // still carries the old offline STATE, which would be published, retained,
+    // over a newer host's if it dropped. The reconnect waits a moment, so the
+    // offline STATE leaves before the DISCONNECT.
+    void releaseState() {
+        if (!stateWill) return;
+        if (stateBorn && client.isConnected()) {
+            const std::string offline = stateJson(false, (uint64_t)utcNowMs());
+            client.publish(stateTopic.c_str(), (const uint8_t*)offline.data(), offline.size(), MQ_QOS_1, true);
+        }
+        stateBorn = false;
+        stateWill = false;
+        if (client.state() != MqttState::Idle) {
+            stateReleasing = true;
+            stateReleaseAt = Clock::now() + std::chrono::milliseconds(500);
+        }
+    }
     uint16_t portOf(const AppEndpoint& e) const { return e.port ? e.port : (usesTls() ? 8883 : 1883); }
 
     // Last, so they go before the client they are attached to.
@@ -575,6 +638,31 @@ struct AppConnections::Connection {
         owner->announce(*this);
     }
 };
+
+namespace {
+
+// The Will this connection's next CONNECT carries: its own, or - the STATE
+// connection of a host on a Kafka link - that host's offline STATE.
+void willOf(AppConnections::Connection& c, MqttConnectionConfig& connection) {
+    applyWill(c.spec, connection);
+    c.stateArmed = c.stateWill;
+    if (!c.stateWill) return;
+    const std::string offline = stateJson(false, c.stateTimestamp);
+    connection.will = MqttWillConfig();
+    connection.will.set(c.stateTopic.c_str(), (const uint8_t*)offline.data(), offline.size(), MQ_QOS_1, true);
+    connection.will.delayInterval = 0;
+}
+
+// Its client's login, from where it connects to (this server, or a link's broker).
+void loginOf(const AppLocalAddress& where, MqttConnectionConfig& connection) {
+    if (!where.hasLogin) return;
+    connection.userName = where.user.c_str();
+    connection.hasUserName = true;
+    connection.password.assign(where.password.begin(), where.password.end());
+    connection.hasPassword = true;
+}
+
+} // namespace
 
 // =============================================================================
 // THE MANAGER
@@ -677,15 +765,20 @@ void AppConnections::open(Connection& c) {
         if (_thisServer && _thisServer(where)) {
             c.here = AppEndpoint{where.host, where.port};
             c.hereTls = where.tls;
-            if (where.hasLogin) {
-                connection.userName = where.user.c_str();
-                connection.hasUserName = true;
-                connection.password.assign(where.password.begin(), where.password.end());
-                connection.hasPassword = true;
-            }
+            loginOf(where, connection);
         }
     }
-    applyWill(c.spec, connection);
+    if (c.spec.kafka) {
+        // Its own broker, bridged to Kafka: made now (or kept, its link unchanged).
+        AppLocalAddress where;
+        std::string why;
+        c.hereTls = false;
+        if (_links && _links->open(c.spec.id, c.spec.link, where, why)) {
+            c.here = AppEndpoint{where.host, where.port};
+            loginOf(where, connection);
+        }
+    }
+    willOf(c, connection);
     connection.receiveMaximum = c.spec.receiveMaximum;
     connection.topicAliasMaximum = c.spec.topicAliasMaximum;
     connection.maximumPacketSize = c.spec.maximumPacketSize;
@@ -721,6 +814,10 @@ void AppConnections::open(Connection& c) {
     c.stored = kept.messages;
     c.storedBytes = kept.bytes;
     MqttClientConfig behaviour;
+    // A Kafka link's broker acknowledges once Kafka has the record, however long
+    // Kafka is away: the acknowledgement is not given up on (what is held is
+    // in order, in librdkafka's queue, and goes when Kafka is back).
+    if (c.spec.kafka) behaviour.acknowledgementTimeoutMs = 0;
     behaviour.autoReconnect = false;     // the manager decides: which server, and when
     behaviour.queueCapacity = 256;       // room for store and forward's window as well
     behaviour.receiveBufferSize = 65536;
@@ -870,6 +967,72 @@ void AppConnections::serviceHost(Connection& c) {
     h.wasBorn = born;
 }
 
+// A KAFKA LINK: Connections.Watch sees it go down when Kafka cannot be
+// reached, and up again when it can - its client stays connected to the
+// link's broker throughout, and what is published waits there for Kafka.
+void AppConnections::serviceLink(Connection& c) {
+    if (!c.spec.kafka || _links == nullptr) return;
+    const Clock::time_point now = Clock::now();
+    if (now < c.linkPolled) return;
+    c.linkPolled = now + std::chrono::milliseconds(500);
+    _links->status(c.spec.id, c.link);
+    if (!c.client.isConnected()) return;
+    if (c.link.reachable && c.state != AppConnectionState::Connected) {
+        c.setState(AppConnectionState::Connected);
+    } else if (!c.link.reachable && c.state == AppConnectionState::Connected) {
+        c.setState(AppConnectionState::BackingOff, "Kafka cannot be reached");
+    }
+}
+
+// A SPARKPLUG HOST ON A KAFKA LINK, ITS STATE ON MQTT. Kafka has no Will, so
+// the host's STATE is published on the link's state connection, by the one
+// owner there is - this server - and that connection's Will is the offline
+// STATE: its CONNECT carries {"online":false,"timestamp":T} and the online
+// STATE that follows carries the same T [tck-id-payloads-state-birth-payload].
+// The host itself runs on the link's own broker as it would anywhere; its
+// STATE there is not written to Kafka (KafkaLinks leaves spBv1.0/STATE/# out).
+// It goes offline when its session on the link ends; born again, with a new
+// T, which takes a new CONNECT of the state connection (an edge node ignores
+// a STATE older than the last it saw).
+void AppConnections::serviceHostState(Connection& c) {
+    if (!c.spec.kafka || c.spec.link.stateConnection.empty()) return;
+    auto at = _connections.find(c.spec.link.stateConnection);
+    if (at == _connections.end() || at->second.get() == &c) return;
+    Connection& s = *at->second;
+    const bool want = c.host && c.client.isConnected() && c.host->library->isBorn();
+    if (want) {
+        const std::string topic = "spBv1.0/STATE/" + c.host->spec.hostId;
+        if (!s.stateWill || s.stateTopic != topic) {
+            if (s.stateBorn && s.client.isConnected()) {
+                // Another host id: the old one's STATE dies first.
+                const std::string offline = stateJson(false, (uint64_t)utcNowMs());
+                s.client.publish(s.stateTopic.c_str(), (const uint8_t*)offline.data(), offline.size(), MQ_QOS_1, true);
+            }
+            s.stateWill = true;
+            s.stateReleasing = false;
+            s.stateTopic = topic;
+            s.stateTimestamp = (uint64_t)utcNowMs();
+            s.stateBorn = false;
+            // A new CONNECT, to carry it: a clean DISCONNECT first, which sends no Will.
+            if (s.client.state() != MqttState::Idle) s.client.disconnect();
+            if (s.state == AppConnectionState::Waiting) s.state = AppConnectionState::Connecting;
+            s.asked = true;
+            return;
+        }
+        if (s.client.isConnected() && s.stateArmed && !s.stateBorn) {
+            const std::string online = stateJson(true, s.stateTimestamp);
+            if (mq_accepted(s.client.publish(s.stateTopic.c_str(), (const uint8_t*)online.data(), online.size(),
+                                             MQ_QOS_1, true))) {
+                s.stateBorn = true;
+            }
+        }
+    } else {
+        // Not running (its link's session ended, or it was deleted): offline
+        // now - and armed afresh when it is born again.
+        s.releaseState();
+    }
+}
+
 void AppConnections::close(Connection& c) {
     // A host's STATE dies first, on purpose rather than by its Will.
     if (c.host || c.edge) {
@@ -909,8 +1072,15 @@ void AppConnections::close(Connection& c) {
 void AppConnections::service(Connection& c) {
     const Clock::time_point now = Clock::now();
     c.client.poll();
+    if (c.stateReleasing && now >= c.stateReleaseAt) {
+        c.stateReleasing = false;
+        if (c.client.state() != MqttState::Idle) c.client.disconnect();
+        c.asked = true;
+    }
     serviceHost(c);
+    serviceHostState(c);
     serviceEdgeNode(c);
+    serviceLink(c);
     // CONFIRM_DELIVERED past its deadline: kept, and sent when it can be.
     for (size_t i = 0; i < c.waiting.size(); i++) {
         if (now < c.waiting[i].deadline) continue;
@@ -952,11 +1122,22 @@ void AppConnections::service(Connection& c) {
             }
             c.here = AppEndpoint{where.host, where.port};
         }
-        const AppEndpoint& e = c.endpoint(c.serverIndex);
         MqttConnectionConfig connection = c.client.connection();
+        if (c.spec.kafka) {
+            AppLocalAddress where;
+            std::string why = "this server was built without Kafka";
+            if (!_links || !_links->open(c.spec.id, c.spec.link, where, why)) {
+                c.nextAttempt = now + std::chrono::seconds(1);
+                c.setState(AppConnectionState::BackingOff, why);
+                return;
+            }
+            c.here = AppEndpoint{where.host, where.port};
+            loginOf(where, connection);
+        }
+        const AppEndpoint& e = c.endpoint(c.serverIndex);
         connection.host = e.host.c_str();
         connection.port = c.portOf(e);
-        applyWill(c.spec, connection);
+        willOf(c, connection);
         c.client.reconfigure(connection);
 #if MQTT_TLS_SOCKETS
         if (c.usesTls()) static_cast<MqttTlsTransport*>(c.transport.get())->configure(e.host.c_str(), c.portOf(e));
@@ -979,6 +1160,7 @@ void AppConnections::service(Connection& c) {
         c.seen = state;
         if (state == MqttState::Connected) {
             c.reachedThisAttempt = true;
+            c.stateBorn = false;
             c.backoffMs = 0;
             c.filtersChanged = true;
             c.subscribed.clear();
@@ -1057,6 +1239,14 @@ void AppConnections::service(Connection& c) {
 
 // --- The API's side ----------------------------------------------------------
 
+std::string AppConnections::stateUser(const std::string& id) const {
+    for (const auto& one : _connections) {
+        const AppConnectionSpec& spec = one.second->spec;
+        if (spec.kafka && spec.link.stateConnection == id) return one.first;
+    }
+    return std::string();
+}
+
 AppConnectionInfo AppConnections::infoOf(const Connection& c) const {
     AppConnectionInfo info;
     info.spec = c.spec;
@@ -1073,6 +1263,7 @@ AppConnectionInfo AppConnections::infoOf(const Connection& c) const {
     info.storedBytes = c.storedBytes;
     info.storedDropped = c.storedDropped;
     info.storedExpired = c.storedExpired;
+    info.link = c.link;
     if (c.stored != 0) info.oldestStoredMs = const_cast<ConnectionOutbox&>(_outbox).totals(c.spec.id).oldestMs;
     return info;
 }
@@ -1097,13 +1288,80 @@ bool AppConnections::put(const AppConnectionSpec& spec, AppConnectionInfo* info,
         error = "a connection needs an id";
         return false;
     }
-    if (spec.servers.empty() && !spec.thisServer) {
-        error = "a connection needs at least one server (or this_server)";
+    if (spec.servers.empty() && !spec.thisServer && !spec.kafka) {
+        error = "a connection needs at least one server (or this_server, or kafka)";
         return false;
     }
+    if ((int)!spec.servers.empty() + (int)spec.thisServer + (int)spec.kafka > 1) {
+        error = "a connection is to servers, to this_server, or over kafka - one of them";
+        return false;
+    }
+    if (spec.kafka) {
+        if (_links == nullptr) {
+            error = "this server was built without Kafka (librdkafka), so a connection cannot have kafka";
+            return false;
+        }
+        if (spec.tls) {
+            error = "a kafka connection's TLS is its Kafka cluster's (Kafka.PutCluster), not the connection's";
+            return false;
+        }
+        if (spec.link.stateConnection == spec.id) {
+            error = "state_connection names this connection: it has to be an MQTT one";
+            return false;
+        }
+    }
+    bool ok = true;
     call([&] {
+        if (spec.kafka && !_links->check(spec.id, spec.link, error)) {
+            ok = false;
+            return;
+        }
+        // A STATE CONNECTION (another connection's link.stateConnection) is
+        // MQTT, and its Will is the host's: none of its own, and it reconnects
+        // by itself.
+        const auto unfitForState = [&](const AppConnectionSpec& state, const std::string& user) {
+            std::string why;
+            if (state.kafka) why = "it is over Kafka itself";
+            else if (state.hasWill) why = "it has a Will of its own (a STATE connection's Will is the host's)";
+            else if (state.reconnectWhenAsked) why = "it reconnects only when asked";
+            for (const auto& h : _hosts) {
+                if (h.second.connection == state.id) why = "a host runs on it: \"" + h.first + "\"";
+            }
+            for (const auto& e : _edgeNodes) {
+                if (e.second.connection == state.id) why = "an edge node runs on it: \"" + e.first + "\"";
+            }
+            if (!why.empty()) {
+                error = "\"" + state.id + "\" cannot carry the STATE of \"" + user + "\": " + why;
+                return true;
+            }
+            return false;
+        };
+        if (spec.kafka && !spec.link.stateConnection.empty()) {
+            auto state = _connections.find(spec.link.stateConnection);
+            if (state != _connections.end() && unfitForState(state->second->spec, spec.id)) {
+                ok = false;
+                return;
+            }
+        }
+        for (const auto& one : _connections) {
+            const AppConnectionSpec& other = one.second->spec;
+            if (other.kafka && other.link.stateConnection == spec.id && one.first != spec.id &&
+                unfitForState(spec, other.id)) {
+                ok = false;
+                return;
+            }
+        }
         std::unique_ptr<Connection>& slot = _connections[spec.id];
         if (!slot || !sameSpec(slot->spec, spec)) {
+            if (slot && slot->spec.kafka) {
+                // Its host's STATE was on another connection: let go there.
+                if (!slot->spec.link.stateConnection.empty() &&
+                    slot->spec.link.stateConnection != spec.link.stateConnection) {
+                    auto state = _connections.find(slot->spec.link.stateConnection);
+                    if (state != _connections.end()) state->second->releaseState();
+                }
+                if (!spec.kafka && _links) _links->close(spec.id);
+            }
             if (slot) close(*slot);
             slot.reset(new Connection());
             slot->spec = spec;
@@ -1112,7 +1370,7 @@ bool AppConnections::put(const AppConnectionSpec& spec, AppConnectionInfo* info,
         }
         if (info) *info = infoOf(*slot);
     });
-    return true;
+    return ok;
 }
 
 bool AppConnections::get(const std::string& id, AppConnectionInfo& info) const {
@@ -1139,7 +1397,14 @@ bool AppConnections::remove(const std::string& id) {
     call([&] {
         auto at = _connections.find(id);
         if (at == _connections.end()) return;
+        const AppConnectionSpec& spec = at->second->spec;
+        if (spec.kafka && !spec.link.stateConnection.empty()) {
+            auto state = _connections.find(spec.link.stateConnection);
+            if (state != _connections.end()) state->second->releaseState();
+        }
+        const bool kafka = spec.kafka;
         close(*at->second);
+        if (kafka && _links) _links->close(id);
         _connections.erase(at);
         _outbox.dropAll(id);              // nobody left to send it to
         found = true;
@@ -1204,7 +1469,10 @@ void AppConnections::publish(const AppPublish& message, std::function<void(const
             store(*at->second, message, done);
             return;
         }
-        if (at == _connections.end() || !at->second->client.isConnected()) {
+        // A Kafka link whose Kafka cannot be reached is down, as any other
+        // connection would be (store and forward keeps them, above).
+        if (at == _connections.end() || !at->second->client.isConnected() ||
+            (at->second->spec.kafka && !at->second->link.reachable)) {
             AppPublishResult result;
             result.outcome = AppPublishOutcome::NotConnected;
             done(result);
@@ -1335,6 +1603,18 @@ void AppConnections::forward(Connection& c) {
 
 namespace {
 
+// Whether a host's connection is up: on a Kafka link with a state connection,
+// that one too, with the host's online STATE published on it.
+bool hostConnected(const std::map<std::string, std::unique_ptr<AppConnections::Connection>>& connections,
+                   const std::string& id) {
+    auto at = connections.find(id);
+    if (at == connections.end() || !at->second->client.isConnected()) return false;
+    const AppConnectionSpec& spec = at->second->spec;
+    if (!spec.kafka || spec.link.stateConnection.empty()) return true;
+    auto state = connections.find(spec.link.stateConnection);
+    return state != connections.end() && state->second->client.isConnected() && state->second->stateBorn;
+}
+
 AppSparkplugHostInfo hostInfoOf(const AppSparkplugHostSpec& spec, const AppConnections::Host* host,
                                 bool connected) {
     AppSparkplugHostInfo info;
@@ -1378,6 +1658,12 @@ bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostI
                 return;
             }
         }
+        if (!stateUser(spec.connection).empty()) {
+            error = "the connection \"" + spec.connection + "\" carries the STATE of \"" + stateUser(spec.connection) +
+                    "\": one Will each";
+            ok = false;
+            return;
+        }
         auto had = _hosts.find(spec.id);
         const std::string before = had == _hosts.end() ? std::string() : had->second.connection;
         _hosts[spec.id] = spec;
@@ -1395,7 +1681,7 @@ bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostI
         }
         auto at = _connections.find(spec.connection);
         if (info) {
-            const bool up = at != _connections.end() && at->second->client.isConnected();
+            const bool up = hostConnected(_connections, spec.connection);
             *info = hostInfoOf(spec, at != _connections.end() ? at->second->host.get() : nullptr, up);
         }
     });
@@ -1408,7 +1694,7 @@ bool AppConnections::getHost(const std::string& id, AppSparkplugHostInfo& info) 
         auto spec = _hosts.find(id);
         if (spec == _hosts.end()) return;
         auto at = _connections.find(spec->second.connection);
-        const bool up = at != _connections.end() && at->second->client.isConnected();
+        const bool up = hostConnected(_connections, spec->second.connection);
         info = hostInfoOf(spec->second, at != _connections.end() ? at->second->host.get() : nullptr, up);
         found = true;
     });
@@ -1420,7 +1706,7 @@ std::vector<AppSparkplugHostInfo> AppConnections::hosts() const {
     call([&] {
         for (const auto& spec : _hosts) {
             auto at = _connections.find(spec.second.connection);
-            const bool up = at != _connections.end() && at->second->client.isConnected();
+            const bool up = hostConnected(_connections, spec.second.connection);
             out.push_back(hostInfoOf(spec.second, at != _connections.end() ? at->second->host.get() : nullptr, up));
         }
     });
@@ -1642,6 +1928,12 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
                 ok = false;
                 return;
             }
+        }
+        if (!stateUser(spec.connection).empty()) {
+            error = "the connection \"" + spec.connection + "\" carries the STATE of \"" + stateUser(spec.connection) +
+                    "\": one Will each";
+            ok = false;
+            return;
         }
         for (const auto& one : _edgeNodes) {
             if (one.first != spec.id && one.second.connection == spec.connection) {

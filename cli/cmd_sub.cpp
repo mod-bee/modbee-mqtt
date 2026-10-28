@@ -11,6 +11,7 @@
 // come.
 
 #include "Common.h"
+#include "KafkaCli.h"
 
 #include <cstdio>
 
@@ -92,8 +93,52 @@ void onMessage(void*, const MqttMessage& message) {
     }
 }
 
+#if defined(MODBEE_HAVE_KAFKA)
+bool anyMatches(const std::vector<std::string>& filters, const MqttSpan& topic) {
+    for (const std::string& f : filters) {
+        MqttSpan filter;
+        filter.data = (const uint8_t*)f.data();
+        filter.length = (uint32_t)f.size();
+        if (mq_topicMatches(filter, topic)) return true;
+    }
+    return false;
+}
+
+// Records from Kafka, printed as the MQTT messages they are - the same lines
+// as from a broker. -t narrows them by their MQTT topic.
+int subKafka(const Args& args, const std::vector<std::string>& filters, SubState& state, long long wait) {
+    const std::vector<std::string> topics = args.all("kafka-topic");
+    if (topics.empty()) {
+        std::fprintf(stderr, "modbee-mqtt sub: --kafka needs --kafka-topic (the Kafka topics to read)\n");
+        return 2;
+    }
+    CliKafka kafka;
+    std::string error;
+    if (!kafka.configure(args, error) || !kafka.openConsumer(topics, error)) {
+        std::fprintf(stderr, "modbee-mqtt sub: %s\n", error.c_str());
+        return 3;
+    }
+    for (const std::string& t : topics) {
+        if (state.json) std::printf("{\"event\":\"subscribe\",\"kafka_topic\":%s,\"ok\":true}\n", jsonString(t).c_str());
+        else std::fprintf(stderr, "reading Kafka topic %s\n", t.c_str());
+    }
+    std::fflush(stdout);
+    const mq_time_t start = mq_millis();
+    while (!cliStopRequested()) {
+        if (state.limit > 0 && state.received >= state.limit) break;
+        if (wait > 0 && mq_millis() - start >= (mq_time_t)wait * 1000) break;
+        MqttMessage message;
+        if (!kafka.next(100, message)) continue;
+        if (!anyMatches(filters, message.topic)) continue;
+        onMessage(nullptr, message);
+        std::fflush(stdout);
+    }
+    return 0;
+}
+#endif
+
 const std::vector<ArgSpec>& subSpecs() {
-    static const std::vector<ArgSpec> specs = withConnectionSpecs({
+    static const std::vector<ArgSpec> specs = withKafkaSpecs(withConnectionSpecs({
         {"topic", 't', true, "filter to subscribe to (repeatable, required)"},
         {"qos", 'q', true, "maximum QoS to ask for: 0, 1 or 2 (default 0)"},
         {"verbose", 'v', false, "print the topic before each payload"},
@@ -103,7 +148,7 @@ const std::vector<ArgSpec>& subSpecs() {
         {"sparkplug", 0, false, "print Sparkplug B messages decoded, as JSON lines (every datatype, aliases as sent)"},
         {"retain-as-published", 0, false, "MQTT 5: keep the retain flag as published"},
         {"retain-handling", 0, true, "MQTT 5: 0 send, 1 send if new, 2 never"},
-    });
+    }));
     return specs;
 }
 
@@ -120,7 +165,11 @@ int cmdSub(int argc, char** argv) {
         Args::printHelp("modbee-mqtt sub -t <filter> [-t <filter>...] [options]", specs);
         return 0;
     }
-    const std::vector<std::string> filters = args.all("topic");
+    bool refused = false;
+    const bool overKafka = kafkaAsked(args, "sub", refused);
+    if (refused) return 2;
+    std::vector<std::string> filters = args.all("topic");
+    if (filters.empty() && overKafka) filters.push_back("#");
     if (filters.empty()) {
         std::fprintf(stderr, "modbee-mqtt sub: at least one --topic is required\n");
         return 2;
@@ -135,6 +184,25 @@ int cmdSub(int argc, char** argv) {
     }
 
     cliInstallSignalHandlers();
+#if defined(MODBEE_HAVE_KAFKA)
+    if (overKafka) {
+        SubState state;
+        state.json = args.has("json");
+        state.verbose = args.has("verbose");
+        state.sparkplug = args.has("sparkplug");
+#if !defined(MODBEE_HAVE_APP_API)
+        if (state.sparkplug) {
+            std::fprintf(stderr, "modbee-mqtt sub: --sparkplug needs a build with the Application API (gRPC)\n");
+            return 2;
+        }
+#endif
+        state.limit = count;
+        g_state = &state;
+        const int result = subKafka(args, filters, state, wait);
+        g_state = nullptr;
+        return result;
+    }
+#endif
     CliClient cli;
     std::string error;
     if (!cli.configure(args, "modbee-sub", error)) {

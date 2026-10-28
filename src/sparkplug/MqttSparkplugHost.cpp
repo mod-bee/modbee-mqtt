@@ -218,7 +218,7 @@ void MqttSparkplugHost::disconnect() {
         // The connection stays up for everybody else, so the offline STATE
         // goes by hand and the next CONNECT goes without it.
         _disconnectAfterDeath = false;
-        if (_willArmed && _client.isConnected()) publishDeath();
+        if (_willArmed && _client.isConnected()) publishDeath(false);
         _client.releaseWill(*this);
         _born = false;
         return;
@@ -363,7 +363,7 @@ bool MqttSparkplugHost::publishBirth() {
     return ok;
 }
 
-bool MqttSparkplugHost::publishDeath() {
+bool MqttSparkplugHost::publishDeath(bool awaited) {
     char json[64];
     const size_t jsonLength =
         mq_sparkplugWriteState(json, sizeof json, false, hostUtcNow());
@@ -377,7 +377,8 @@ bool MqttSparkplugHost::publishDeath() {
     // for the PUBACK. At QoS 0 there would be nothing to wait for.
     return mq_accepted(_client.publishSeries(_topic, (const uint8_t*)json,
                                              jsonLength, MQ_QOS_1, true,
-                                             &deathTrampoline, this));
+                                             awaited ? &deathTrampoline : nullptr,
+                                             awaited ? this : nullptr));
 }
 
 // =============================================================================

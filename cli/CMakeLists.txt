@@ -17,6 +17,7 @@ add_executable(modbee
     cmd_admin.cpp
     cmd_service.cpp
     cmd_api.cpp
+    KafkaCli.cpp
     # The JSON the admin topics speak - plain C++, so the admin commands work
     # from any computer, not only where the server tier builds.
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/auth/Json.cpp
@@ -52,6 +53,10 @@ endif()
 # The Application API, where gRPC was found (server/CMakeLists.txt).
 if(TARGET modbee-api)
     target_link_libraries(modbee PRIVATE modbee-api)
+    # Connections whose link is Kafka, where both are.
+    if(TARGET modbee-kafka-link)
+        target_link_libraries(modbee PRIVATE modbee-kafka-link)
+    endif()
 endif()
 
 # `cmake --install build` puts it in <prefix>/bin - /usr/local/bin by default.

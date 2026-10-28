@@ -912,6 +912,7 @@ message KafkaMappingStatus {
   uint64 published = 9;
   uint64 invalid = 10;                     //   could not be published (a topic that is not one, ...)
   uint64 refused = 11;                     //   the broker could not take it
+  int64 lag = 12;                          //   records behind the end of its partitions, at the last statistics; -1 not known yet
 }
 
 // =============================================================================
@@ -957,6 +958,36 @@ message ConnectionSpec {
   // server's own devices runs on. Over loopback, on the plain listener (or the TLS one), with a login the server
   // keeps for it - an ordinary one: every topic but the $ ones.
   bool this_server = 19;
+  // Kafka as the link instead (docs/kafka.md, "Kafka as a connection's link"): the connection's client is connected
+  // to a broker of its own inside this server, which is bridged to these Kafka topics in the envelope - so Consume,
+  // Publish, store and forward, request/response, Wills and a Sparkplug host or edge node work on it as on any
+  // connection, and its topics are not this server's. One of `servers`, `this_server` or `kafka`. Its TLS and login
+  // are the cluster's (Kafka.PutCluster); FAILED_PRECONDITION in a build without Kafka.
+  KafkaLink kafka = 20;
+}
+
+message KafkaLink {
+  string cluster = 1;              // a Kafka cluster's id (Kafka.PutCluster); "": the only one there is
+  repeated string kafka_topics = 2; // read: each record a message on the connection, as its mqtt-* headers say
+  string kafka_topic_pattern = 3;  // a regular expression ("^plant\\..*"), instead of kafka_topics
+  string kafka_topic = 4;          // written: every message published on the connection, one record each
+  string key = 5;                  // the record key: topic (default) | clientid | none | a template (${MQTT_TOPIC}, ...)
+  string consumer_group = 6;       // default modbee-conn-<id>; a record this link wrote is never read back by it
+  // An MQTT connection (`servers` or `this_server`, no Will of its own) for a Sparkplug host's STATE: Kafka has no Will,
+  // so the host's online STATE is published there and its Will is the offline one. The STATE topic is then not
+  // written to Kafka.
+  string state_connection = 7;
+}
+
+// What a Kafka link is doing.
+message KafkaLinkStatus {
+  bool reachable = 1;              // false from "every Kafka broker is down" until one answers again
+  uint64 records_out = 2;          // Kafka has them
+  uint64 records_out_failed = 3;   // refused, or too large
+  uint64 records_in = 4;           // read, and handed to the connection
+  uint64 records_in_invalid = 5;   // read, and could not be: not a topic, a later envelope, nobody could take it
+  int64 lag = 6;                   // records not read yet, at the last statistics (every 5 s); -1 not known yet
+  uint64 held_acknowledgements = 7; // publishes on it waiting for Kafka now
 }
 
 // What a bridge does (EMQX's buffer, HiveMQ Edge, Mosquitto's bridge queue): every publish on the connection is
@@ -1018,6 +1049,7 @@ message ConnectionInfo {
   int64 oldest_stored_ms = 11;     // when the oldest of them was taken (ms since 1970 UTC); 0: none
   uint64 stored_dropped = 12;      // given up to make room (WHEN_FULL_DROP_OLDEST)
   uint64 stored_expired = 13;      // their Message Expiry Interval ran out while they waited
+  KafkaLinkStatus kafka = 14;      // spec.kafka: its link
 }
 
 enum ConnectionState {

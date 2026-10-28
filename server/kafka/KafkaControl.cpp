@@ -66,9 +66,11 @@ KafkaControl::Result KafkaControl::change(ServerConfig next, std::string& error)
         // second live change nobody asked for.
         error = "applied, but not kept: " + why;
         _section = checked;
+        if (_changed) _changed(_section);
         return Result::Failed;
     }
     _section = checked;
+    if (_changed) _changed(_section);
     return Result::Ok;
 }
 
@@ -156,6 +158,11 @@ KafkaControl::Result KafkaControl::deleteCluster(const std::string& id, std::str
     }
     if (!_retainedCluster.empty() && id == _retainedCluster) {
         error = "the retained store writes to cluster \"" + id + "\" (retained: store: kafka)";
+        return Result::InUse;
+    }
+    const std::string user = _usedBy ? _usedBy(id) : std::string();
+    if (!user.empty()) {
+        error = user + " uses cluster \"" + id + "\"; delete it first";
         return Result::InUse;
     }
     for (const MqttToKafkaConfig& m : _section.toKafka) {

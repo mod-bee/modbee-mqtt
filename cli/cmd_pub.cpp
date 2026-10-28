@@ -12,11 +12,13 @@
 // silently dropped, and its own tool should not be the exception.
 
 #include "Common.h"
+#include "KafkaCli.h"
 
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <thread>
 
 namespace {
 
@@ -69,7 +71,7 @@ void onComplete(void* context, MqttResult result, uint16_t) {
 }
 
 const std::vector<ArgSpec>& pubSpecs() {
-    static const std::vector<ArgSpec> specs = withConnectionSpecs({
+    static const std::vector<ArgSpec> specs = withKafkaSpecs(withConnectionSpecs({
         {"topic", 't', true, "topic to publish to (required)"},
         {"message", 'm', true, "payload text"},
         {"file", 'f', true, "payload read from a file, sent as bytes"},
@@ -86,9 +88,66 @@ const std::vector<ArgSpec>& pubSpecs() {
         {"utf8", 0, false, "MQTT 5 Payload Format Indicator: UTF-8 text"},
         {"user-property", 0, true, "MQTT 5 user property key=value (repeatable)"},
         {"wait", 'W', true, "seconds to wait for the broker (default 10)"},
-    });
+    }));
     return specs;
 }
+
+#if defined(MODBEE_HAVE_KAFKA)
+// Records written as the pipe writes them: one per message, in the envelope.
+// The answer is Kafka's: every record acknowledged, or how many were not.
+int pubKafka(const Args& args, const std::string& topic, const std::vector<std::vector<uint8_t>>& payloads,
+             bool fromStdin, long long count, long long interval, long long wait, uint8_t qos, bool retain,
+             const MqttOwnedProperties& properties) {
+    const std::string kafkaTopic = args.get("kafka-topic");
+    if (kafkaTopic.empty()) {
+        std::fprintf(stderr, "modbee-mqtt pub: --kafka needs --kafka-topic (the Kafka topic to write)\n");
+        return 2;
+    }
+    CliKafka kafka;
+    std::string error;
+    if (!kafka.configure(args, error) || !kafka.openProducer(error)) {
+        std::fprintf(stderr, "modbee-mqtt pub: %s\n", error.c_str());
+        return 3;
+    }
+    size_t written = 0;
+    const auto send = [&](const std::vector<uint8_t>& payload) {
+        if (!kafka.produce(kafkaTopic, topic, payload.data(), payload.size(), qos, retain, properties, error)) {
+            std::fprintf(stderr, "modbee-mqtt pub: %s\n", error.c_str());
+            return false;
+        }
+        written++;
+        return true;
+    };
+    if (fromStdin) {
+        std::string line;
+        while (!cliStopRequested() && std::getline(std::cin, line)) {
+            if (!send(std::vector<uint8_t>(line.begin(), line.end()))) break;
+        }
+    } else {
+        for (long long n = 0; n < count && !cliStopRequested(); n++) {
+            if (!send(payloads[0])) break;
+            if (interval > 0 && n + 1 < count) {
+                const mq_time_t until = mq_millis() + (mq_time_t)interval;
+                while (mq_isFuture(mq_millis(), until) && !cliStopRequested()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+        }
+    }
+    size_t failed = 0;
+    const bool answered = kafka.flush((int)wait * 1000, failed);
+    if (args.has("json")) {
+        std::printf("{\"event\":\"publish\",\"kafka_topic\":%s,\"topic\":%s,\"records\":%zu,\"failed\":%zu,\"ok\":%s}\n",
+                    jsonString(kafkaTopic).c_str(), jsonString(topic).c_str(), written, failed,
+                    answered && failed == 0 ? "true" : "false");
+    } else {
+        std::printf("%s: %zu record(s) written to Kafka topic %s%s\n", topic.c_str(), written - failed,
+                    kafkaTopic.c_str(), failed ? (", " + std::to_string(failed) + " refused").c_str() : "");
+    }
+    if (!answered) std::fprintf(stderr, "modbee-mqtt pub: Kafka did not answer within %llds\n", wait);
+    return answered && failed == 0 && written > 0 ? 0 : 1;
+}
+#endif
 
 bool readFile(const std::string& path, std::vector<uint8_t>& out) {
     std::ifstream in(path, std::ios::binary);
@@ -163,6 +222,14 @@ int cmdPub(int argc, char** argv) {
     }
 
     cliInstallSignalHandlers();
+    bool refused = false;
+    if (kafkaAsked(args, "pub", refused)) {
+#if defined(MODBEE_HAVE_KAFKA)
+        return pubKafka(args, args.get("topic"), payloads, args.has("stdin-line"), count, interval, wait, (uint8_t)qos,
+                        args.has("retain"), properties);
+#endif
+    }
+    if (refused) return 2;
     CliClient cli;
     std::string error;
     if (!cli.configure(args, "modbee-pub", error)) {

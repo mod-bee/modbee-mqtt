@@ -820,7 +820,9 @@ private:
     bool publishDeviceBirth(Device& device);
     void deviceBirthRefused(bool refused);
     bool publishData(int16_t device, bool onlyChanged);
-    bool publishNodeDeath();
+    // `awaited`: as MqttSparkplugHost::publishDeath - a shared client's
+    // node stands down without the completion, and may be destroyed then.
+    bool publishNodeDeath(bool awaited = true);
     bool subscribeCommands();
 
     void advanceServer();

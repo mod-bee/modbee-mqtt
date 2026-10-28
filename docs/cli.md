@@ -163,6 +163,42 @@ echo:ping
 
 It needs MQTT 5, because 3.1.1 has neither property.
 
+## With Kafka in the middle: `--kafka`
+
+`pub`, `sub` and `req` can talk to **Kafka** instead of a broker, writing and
+reading records in the envelope the server's Kafka pipe and its connections
+over Kafka use ([kafka.md](kafka.md#the-envelope-one-mqtt-message-one-kafka-record)) -
+for testing the far side of a link:
+
+```bash
+modbee-mqtt sub --kafka kafka-1:9092 --kafka-topic plant-up -t 'plant/#' -v
+modbee-mqtt pub --kafka kafka-1:9092 --kafka-topic plant-down -t plant/cmd -m start -q 1
+plant/cmd: 1 record(s) written to Kafka topic plant-down
+modbee-mqtt req --kafka kafka-1:9092 --kafka-topic svc-in --kafka-reply-topic svc-out -t svc/time -m now
+```
+
+- **`pub`** writes one record per message, its value the payload, its key the
+  MQTT topic (`--kafka-key none` or a fixed text instead), its headers the
+  topic, QoS, retain and every property given (`--content-type`,
+  `--correlation`, `--user-property`, ...). It ends when Kafka has answered
+  every record.
+- **`sub`** prints each record as the MQTT message it carries - the same
+  lines, `--json` and `--sparkplug` as from a broker; `-t` narrows by the MQTT
+  topic (default `#`); `--kafka-topic` repeats. It reads every partition from
+  its end, with no consumer group, so nothing waits for one to form;
+  `--kafka-from-start` from the start, `--kafka-group <name>` as a member of a
+  group.
+- **`req`** reads the reply topic (`--kafka-reply-topic`, default the request's)
+  before it writes the request, then prints the record carrying its
+  correlation value.
+- **TLS and login**, as a Kafka cluster takes them: `--kafka-tls`,
+  `--kafka-ca <file>`, `--kafka-cert <file>` with `--kafka-key-file <file>`,
+  `--kafka-insecure` (no host name check), `--kafka-sasl
+  plain|scram-sha256|scram-sha512` with `--kafka-user` and `--kafka-password` or
+  `--kafka-password-file`; `--kafka-set name=value` passes any librdkafka
+  setting.
+- A build without librdkafka refuses `--kafka` and says so.
+
 ## Serving
 
 ```bash

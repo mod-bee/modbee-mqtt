@@ -1056,9 +1056,25 @@ void kafkaWithoutKafka(Server& server) {
     v1::HelloRequest hello;
     v1::HelloReply reply;
     system->Hello(&h, hello, &reply);
-    bool listed = false;
-    for (const std::string& f : reply.features()) listed |= f == "kafka";
+    bool listed = false, links = false;
+    for (const std::string& f : reply.features()) {
+        listed |= f == "kafka";
+        links |= f == "connections.kafka";
+    }
     ok(!listed, "  and Hello does not list kafka");
+    ok(!links, "  nor connections.kafka");
+
+    // A connection whose link is Kafka: refused, saying why - not a mistake in the request.
+    auto connections = v1::Connections::NewStub(server.channel());
+    grpc::ClientContext p;
+    authorize(p);
+    v1::ConnectionSpec spec;
+    spec.set_id("over-kafka");
+    spec.mutable_kafka()->set_kafka_topic("plant-out");
+    v1::ConnectionInfo info;
+    const grpc::Status put = connections->Put(&p, spec, &info);
+    ok(put.error_code() == grpc::StatusCode::FAILED_PRECONDITION, "Connections.Put with kafka: FAILED_PRECONDITION");
+    ok(put.error_message().find("without Kafka") != std::string::npos, "  saying the build has no Kafka");
 }
 
 void sparkplugAware(Server& server) {
