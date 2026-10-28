@@ -916,6 +916,7 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
         const bool renamed = entry.name != metric.name || entry.device != device;
         entry.name = metric.name;
         entry.alias = metric.hasAlias ? metric.alias : 0;
+        entry.hasAlias = metric.hasAlias;
         entry.type = metric.value.type;
         entry.device = device;
 #if MQ_SP_HOST_INDEX

@@ -2056,17 +2056,15 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
             info.gaps = n->gaps;
             info.rebirthsRequested = n->rebirthsRequested;
             info.offlineAt = n->offlineAt;
-            // The library keeps an alias, not whether there was one: a birth that gave any gave them all
-            // ([tck-id-payloads-alias-birth-requirement]), 0 among them.
-            bool aliases = false;
-            for (size_t m = 0; m < n->metricCount; m++) aliases = aliases || n->metrics[m].alias != 0;
             for (size_t m = 0; m < n->metricCount; m++) {
                 const MqttSparkplugTrackedMetric& tracked = n->metrics[m];
                 AppSparkplugMetricInfo metric;
                 metric.name = tracked.name;
                 metric.device = tracked.device;
                 metric.alias = tracked.alias;
-                metric.hasAlias = aliases;
+                // Per metric: a birth may alias some and not others (the TCK's edge node does), and a write
+                // to one without must go by name.
+                metric.hasAlias = tracked.hasAlias;
                 metric.stale = tracked.stale;
                 metric.staleAt = tracked.staleAt;
                 metric.datatype = (uint32_t)tracked.type;

@@ -189,6 +189,9 @@ private:
 struct MqttSparkplugTrackedMetric {
     std::string name;
     uint64_t alias = 0;
+    // Whether the birth gave it an alias at all: 0 is a valid alias, and a
+    // birth may alias some metrics and not others (the Eclipse TCK's does).
+    bool hasAlias = false;
     MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
 
     // Which device it belongs to, or empty for a node-level metric. Kept

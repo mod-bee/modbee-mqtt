@@ -178,6 +178,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Application API: `Sparkplug.Write` to a metric the birth gave no alias went by alias 0.** A birth may alias some
+  metrics and not others (the Eclipse TCK's edge node does); the server took "any alias" to mean "all", so the NCMD
+  carried alias 0 and no name. The host now keeps, per metric, whether it had an alias, and such a write goes by name.
 - **Application API: `Sparkplug.ListNodes` says what died.** Each node's `offline_at` and `devices_online`, and each
   metric's `stale` and `stale_at` - what the server's host now keeps (above). The Eclipse Sparkplug TCK's Host profile
   passes through the API with them: 128 assertions, none failed.
