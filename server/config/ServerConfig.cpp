@@ -530,6 +530,7 @@ void readBroker(Loader& loader, Section broker, BrokerSection& out) {
     if (broker.integer("shards", n, 0, 1024)) out.shards = (size_t)n;
     broker.integer("max-connections", out.maxConnections, 1, 100000000);
     broker.integer("max-connect-rate", out.maxConnectRate, 0, 10000000);
+    broker.integer("receive-maximum", out.receiveMaximum, 1, 65535);
     broker.integer("max-sessions", out.maxSessions, 0, 100000000);
     if (broker.integer("max-packet", n, 64, 268435455)) out.maxPacket = (uint32_t)n;
     if (broker.integer("queue", n, 1, 1000000)) out.queue = (size_t)n;

@@ -249,7 +249,9 @@ guessing.
 
 These are the library's defaults. `modbee-mqtt serve` sets its own, from
 `modbee.yaml` or its flags: `max-packet` 65536 (both buffers and the
-advertised Maximum Packet Size), `max-retained` 10000, `max-connect-rate` 1000 (new connections a second, the
+advertised Maximum Packet Size), `max-retained` 10000, `receive-maximum` 1024 (`receiveMaximum`; a client
+pipelining a burst to several shards has more in flight than to one, and MQTT.js
+does not keep to it), `max-connect-rate` 1000 (new connections a second, the
 whole server's: a storm past it waits in the kernel's backlog), `queue` 1000 (its slots in blocks of sixteen, taken as a
 backlog needs them, so the limit costs a session nothing until it is used),
 `max-session-expiry` 3600 (`maximumSessionExpiry`, below) - and it can

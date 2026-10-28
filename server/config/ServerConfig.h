@@ -67,6 +67,12 @@ struct BrokerSection {
     // New connections taken a second, whole server (ShardedBrokerConfig::
     // connectRate); 0: no limit.
     long long maxConnectRate = 1000;
+    // QoS 1 and 2 PUBLISHes a client may have unacknowledged towards us, stated
+    // in CONNACK and enforced (0x93). 1024: on a server of several shards an
+    // acknowledgement waits for the others, so a client pipelining a burst
+    // has more in flight than on one - and MQTT.js (Node-RED's client) does
+    // not keep to the limit, so the library's 32 disconnected it.
+    long long receiveMaximum = 1024;
     long long maxSessions = 0;         // 0: = maxConnections
     uint32_t maxPacket = 65536;
     size_t queue = 1000;               // messages held per session (its slots grow as a backlog needs)

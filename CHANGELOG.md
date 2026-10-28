@@ -178,6 +178,10 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **MQTT.js (Node-RED's client) was disconnected (0x93) by `serve` when it pipelined QoS 1 publishes**: it does not
+  keep to the server's Receive Maximum, and on a server of several shards an acknowledgement waits for the others, so
+  a burst of 300 was really in flight against the library's 32. `serve` states 1024 now (`--receive-maximum`,
+  `broker: receive-maximum`), still enforced.
 - **A message larger than `--queue-bytes` (1 MiB) reached nobody**, idle subscribers included, once `--max-packet` was
   raised past it - a 60,000-row Sparkplug DataSet birth was lost this way. A session holding nothing now takes one
   message whatever its size (still bounded by the max packet and the whole server's `--queue-bytes-total`).

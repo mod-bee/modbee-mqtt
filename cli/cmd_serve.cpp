@@ -69,6 +69,7 @@ const std::vector<ArgSpec>& serveSpecs() {
         {"shards", 's', true, "brokers, one per core (default: one per core)"},
         {"max-connections", 'c', true, "connections, whole server (default 100000)"},
         {"max-connect-rate", 0, true, "new connections taken a second, whole server; the rest wait (default 1000, 0 no limit)"},
+        {"receive-maximum", 0, true, "QoS 1/2 publishes a client may have unacknowledged (default 1024)"},
         {"max-sessions", 0, true, "sessions, whole server (default = connections)"},
         {"max-packet", 0, true, "largest packet accepted, bytes (default 65536)"},
         {"queue", 0, true, "messages held per session (default 1000)"},
@@ -262,6 +263,7 @@ int cmdServe(int argc, char** argv) {
         !flag("shards", 0, 0, 1024, shards) ||
         !flag("max-connections", 100000, 1, 100000000, b.maxConnections) ||
         !flag("max-connect-rate", 1000, 0, 10000000, b.maxConnectRate) ||
+        !flag("receive-maximum", 1024, 1, 65535, b.receiveMaximum) ||
         !flag("max-sessions", 0, 0, 100000000, b.maxSessions) ||
         !flag("max-packet", 65536, 64, 268435455, packet) ||
         !flag("queue", 1000, 1, 1000000, queue) ||
@@ -394,6 +396,7 @@ int cmdServe(int argc, char** argv) {
     config.broker.maxConnections = ShardedBroker::perShard((size_t)b.maxConnections, count);
     config.maxConnectionsTotal = (size_t)b.maxConnections;
     config.connectRate = (uint32_t)b.maxConnectRate;
+    config.broker.receiveMaximum = (uint16_t)b.receiveMaximum;
     const long long totalSessions = b.maxSessions > 0 ? b.maxSessions : b.maxConnections;
     config.broker.maxSessions = ShardedBroker::perShard((size_t)totalSessions, count);
     // Every connection has a session, so max-connections can be raised while
