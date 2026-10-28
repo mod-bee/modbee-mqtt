@@ -2113,11 +2113,17 @@ bool MqttSparkplugNode::buildPayload(MqttSparkplugPayload& payload,
         // [tck-id-operational-behavior-data-commands-rebirth] Every NBIRTH MUST
         // include a metric named Node Control/Rebirth.
         // -rebirth-datatype: Boolean. -rebirth-value: false in the NBIRTH.
+        // AND NO ALIAS. [tck-id-operational-behavior-data-commands-rebirth-name-aliases]:
+        // "When aliases are being used by an Edge Node an NBIRTH message MUST
+        // NOT include an alias for the Node Control/Rebirth metric" - so that
+        // a host that has never seen this birth can still ask for one, by
+        // name. It carried MQ_SP_ALIAS_NODE_REBIRTH for a while, to satisfy
+        // a reading of -alias-birth-requirement as "every metric"; the Eclipse
+        // TCK failed it. A request by that alias is still honoured (a host
+        // may have cached it), see handleCommand().
         MqttSparkplugMetric rebirthMetric;
         rebirthMetric.name = MQ_SP_METRIC_NODE_REBIRTH;
         rebirthMetric.value = mq_spBool(false);
-        rebirthMetric.alias = MQ_SP_ALIAS_NODE_REBIRTH;
-        rebirthMetric.hasAlias = true;
         if (!payload.addMetric(rebirthMetric)) {
             _lastPayloadError = MqttSparkplugError::TooManyMetrics;
             return false;

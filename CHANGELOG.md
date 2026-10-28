@@ -178,6 +178,9 @@ minor version may change the API or the configuration, and says how here.
 
 ### Fixed
 
+- **Sparkplug: `Node Control/Rebirth` is born without an alias.** The Eclipse Sparkplug TCK failed the node on
+  [tck-id-operational-behavior-data-commands-rebirth-name-aliases]: an NBIRTH MUST NOT give it one, so a host that never
+  saw the birth can still ask for a rebirth by name. A request by the old alias (0xFFFFFFFE) is still honoured.
 - **A server edge node's birth carried old values after an outage, and nulls after a restart.** A value set while it
   was not born went only into its history, which a host files and never shows, so the NBIRTH said the value from
   before the outage (265 s stale in the cellular rig) and the host kept showing it. It is now the metric's current
