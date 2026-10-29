@@ -122,12 +122,16 @@ jobs:
             --overlay-triplets=.github/vcpkg-triplets --triplet $env:TRIPLET --host-triplet $env:TRIPLET `
             --x-buildtrees-root=D:\vcpkg-bt --x-packages-root=D:\vcpkg-pk --clean-after-build
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      # Named by what is in it, not by the run: GitHub keeps 10 GB a repository
+      # and drops the oldest past that, and a 2 GB copy saved on every push
+      # pushed the release's Linux packages out. An unchanged set has the same
+      # name, so it is not saved again.
       - name: vcpkg packages, saved
         if: always()
         uses: actions/cache/save@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ env.TRIPLET }}-${{ github.run_id }}
+          key: vcpkg-${{ env.TRIPLET }}-${{ hashFiles('vcpkg-cache/**') }}
       - name: Build
         shell: pwsh
         run: |

@@ -11,6 +11,12 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release rebuilt gRPC from source (40 minutes a Linux build) after a few pushes**: CI saved a new 2 GB copy
+  of its Windows packages on every run, and GitHub, which keeps 10 GB a repository, dropped the release's Linux
+  packages to make room. Each set of packages is now saved once, named by what is in it.
+
 ## [0.1.1]
 
 Reliability, for cellular links and Sparkplug: dropouts, outages, dead links, a broker restart and a failed DNS on the
