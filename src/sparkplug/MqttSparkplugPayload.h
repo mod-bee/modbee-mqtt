@@ -169,6 +169,12 @@ struct MqttSparkplugProperty {
     MqttSparkplugDataType type = MqttSparkplugDataType::Unknown;
     bool isNull = false;
 
+    // PROPERTIES ALREADY ENCODED (mq_spEncodedProperties): `as.text` is the
+    // body of a PropertySet - its keys, then its values - written as it is
+    // after the others, so it may hold any number of properties, of any
+    // type, in one slot. No key and no type of its own. Never decoded into.
+    bool encoded = false;
+
     union {
         int64_t signedValue;
         uint64_t unsignedValue;
@@ -205,6 +211,12 @@ MqttSparkplugProperty mq_spDescription(const char* text);
 // own type: a range is a display hint, not a value.
 MqttSparkplugProperty mq_spEngLow(double low);
 MqttSparkplugProperty mq_spEngHigh(double high);
+
+// Properties the caller encoded (mq_sparkplugEncodePropertySet, or any
+// encoder's PropertySet), carried in one slot: a metric's descriptions past
+// the four a payload holds. Not copied.
+MqttSparkplugProperty mq_spEncodedProperties(const uint8_t* body,
+                                             uint32_t length);
 
 // --- One metric ---
 //

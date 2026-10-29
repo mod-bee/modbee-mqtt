@@ -58,4 +58,9 @@ bool decodeValue(uint32_t datatype, const std::string& bytes, modbee::app::v1::S
 bool encodeTemplate(const modbee::app::v1::SparkplugTemplate& value, std::string& out, std::string& error);
 bool decodeTemplate(const std::string& bytes, modbee::app::v1::SparkplugTemplate& out, std::string& error);
 
+// A PropertySet as its encoded body (its keys, then its values) - what an edge node's births carry of a metric
+// beside engUnit, Quality and the range - and back.
+bool encodePropertySet(const modbee::app::v1::SparkplugPropertySet& set, std::string& out, std::string& error);
+bool decodePropertySet(const std::string& bytes, modbee::app::v1::SparkplugPropertySet& out, std::string& error);
+
 } // namespace sparkplug_codec

@@ -42,6 +42,7 @@ MqttSparkplugNode::~MqttSparkplugNode() {
         for (size_t index = 0; index < _pointCount; index++) {
             freeQueue(_points[index].queue);
             freeText(_points[index].text);
+            freeProperties(_points[index].properties);
         }
         for (size_t index = 0; index < _pointCapacity; index++) {
             _points[index].~MqttSparkplugPoint();
@@ -762,7 +763,7 @@ void MqttSparkplugNode::markPublished(size_t index) {
         state.flags &= (uint16_t)~kPublishedNull;
     }
     state.flags |= kEverPublished;
-    state.flags &= (uint16_t)~kReportNext;
+    state.flags &= (uint16_t)~(kReportNext | kQualityOwed);
 }
 
 bool MqttSparkplugNode::putValue(size_t index, const MqttSparkplugValue& value,
@@ -995,6 +996,12 @@ void MqttSparkplugNode::freeText(MqttSparkplugPointText* text) {
     mq_freeLarge(text);
 }
 
+void MqttSparkplugNode::freeProperties(MqttSparkplugBytes* properties) {
+    if (properties == nullptr) return;
+    properties->~MqttSparkplugBytes();
+    mq_freeLarge(properties);
+}
+
 #if MQTT_LEAN
 // On a board every writable metric's queue is made here, when the node
 // connects, so a command arriving later never allocates.
@@ -1146,6 +1153,48 @@ bool MqttSparkplugNode::rangeAt(size_t index, double low, double high) {
     return true;
 }
 
+bool MqttSparkplugNode::propertiesAt(size_t index, const uint8_t* encoded,
+                                     size_t length) {
+    if (index >= _pointCount) return false;
+    MqttSparkplugPoint& point = _points[index];
+    if (encoded == nullptr || length == 0) {
+        freeProperties(point.properties);
+        point.properties = nullptr;
+        return true;
+    }
+    if (point.properties == nullptr) {
+        void* raw = mq_allocLarge(sizeof(MqttSparkplugBytes));
+        if (raw == nullptr) {
+            _outOfMemory = true;
+            return false;
+        }
+        point.properties = new (raw) MqttSparkplugBytes();
+    }
+    if (!point.properties->assign(encoded, length)) {
+        _outOfMemory = true;
+        return false;
+    }
+    return true;
+}
+
+bool MqttSparkplugNode::qualityAt(size_t index, int32_t quality) {
+    if (index >= _pointCount) return false;
+    if (quality != MQ_SP_QUALITY_GOOD && quality != MQ_SP_QUALITY_BAD &&
+        quality != MQ_SP_QUALITY_STALE) {
+        return false;
+    }
+    MqttSparkplugPoint& point = _points[index];
+    if (point.quality == quality) return false;
+    point.quality = quality;
+    _state[index].flags |= kQualityOwed;
+    markChanged(index);
+    return true;
+}
+
+int32_t MqttSparkplugNode::qualityOf(size_t index) const {
+    return index < _pointCount ? _points[index].quality : MQ_SP_QUALITY_BAD;
+}
+
 bool MqttSparkplugNode::pointChanged(size_t index) const {
     const PointState& state = _state[index];
     if (!(state.flags & kEverPublished)) return true;
@@ -1153,6 +1202,8 @@ bool MqttSparkplugNode::pointChanged(size_t index) const {
     if (state.flags & kReportNext) return true;
     // A held metric goes on its own clock - reportAt() - never for moving.
     if (state.flags & kHeld) return false;
+    // Its quality moved: news, whatever the deadband says of its value.
+    if (state.flags & kQualityOwed) return true;
     if (!(state.flags & kText)) {
         if (!mq_spBitsDiffer((state.flags & kValueNull) != 0, state.value,
                              (state.flags & kPublishedNull) != 0,
@@ -1189,7 +1240,7 @@ bool MqttSparkplugNode::pointChanged(size_t index) const {
 bool MqttSparkplugNode::pointOwed(size_t index) const {
     const PointState& state = _state[index];
     if (!(state.flags & kEverPublished)) return true;
-    if (state.flags & kReportNext) return true;
+    if (state.flags & (kReportNext | kQualityOwed)) return true;
     if (!(state.flags & kText)) {
         return mq_spBitsDiffer((state.flags & kValueNull) != 0, state.value,
                                (state.flags & kPublishedNull) != 0,
@@ -1312,6 +1363,129 @@ bool MqttSparkplugNode::deviceOffline(const char* deviceId) {
 bool MqttSparkplugNode::deviceIsOnline(const char* deviceId) const {
     const int index = findDeviceIndex(deviceId);
     return index >= 0 && _devices[index].online;
+}
+
+// =============================================================================
+// DECLARATIONS CHANGED WHILE RUNNING
+// =============================================================================
+
+size_t MqttSparkplugNode::removeMetrics(const char* deviceId) {
+    int16_t device = -1;
+    if (deviceId != nullptr && *deviceId != '\0') {
+        const int found = findDeviceIndex(deviceId);
+        if (found < 0) return 0;
+        device = (int16_t)found;
+    }
+    if (_pointCount == 0) return 0;
+    uint8_t* removed = (uint8_t*)mq_allocLarge(_pointCount);
+    if (removed == nullptr) {
+        _outOfMemory = true;
+        return 0;
+    }
+    size_t count = 0;
+    for (size_t index = 0; index < _pointCount; index++) {
+        removed[index] = _state[index].device == device ? 1 : 0;
+        count += removed[index];
+    }
+    if (count > 0) compactPoints(removed);
+    mq_freeLarge(removed);
+    return count;
+}
+
+bool MqttSparkplugNode::removeDevice(const char* deviceId) {
+    const int index = findDeviceIndex(deviceId);
+    if (index < 0) return false;
+    deviceOffline(deviceId);
+    removeMetrics(deviceId);
+    // The devices after it move down, and their metrics' numbers with them.
+    for (size_t at = (size_t)index; at + 1 < _deviceCount; at++) {
+        _devices[at] = std::move(_devices[at + 1]);
+    }
+    _deviceCount--;
+    _devices[_deviceCount] = Device();
+    for (size_t point = 0; point < _pointCount; point++) {
+        if (_points[point].device > index) {
+            _points[point].device--;
+            _state[point].device--;
+        }
+    }
+    rebuildPointIndex();     // a device's number is in each name's hash
+    return true;
+}
+
+void MqttSparkplugNode::rebuildPointIndex() {
+    if (_pointSlots == 0) return;
+    memset(_pointIndex, 0, _pointSlots * sizeof(uint32_t));
+    const size_t mask = _pointSlots - 1;
+    for (size_t index = 0; index < _pointCount; index++) {
+        size_t slot = mq_spPointHash(_points[index].name.c_str(),
+                                     _points[index].device) & mask;
+        while (_pointIndex[slot] != 0) slot = (slot + 1) & mask;
+        _pointIndex[slot] = (uint32_t)(index + 1);
+    }
+}
+
+void MqttSparkplugNode::removeTemplates() {
+    for (size_t index = 0; index < _templateCount; index++) {
+        _templates[index].bytes.clear();
+    }
+    _templateCount = 0;
+}
+
+void MqttSparkplugNode::compactPoints(const uint8_t* removed) {
+    // Where each one goes; past the end for one removed.
+    const size_t before = _pointCount;
+    uint32_t* moved = (uint32_t*)mq_allocLarge(before * sizeof(uint32_t));
+    if (moved == nullptr) {
+        _outOfMemory = true;
+        return;
+    }
+    // The change lists are links between indices: emptied, and made again
+    // below from the marks each metric carries with it.
+    _nodeChanges = ChangeList();
+    for (size_t index = 0; index < _deviceCount; index++) {
+        _devices[index].changes = ChangeList();
+    }
+    size_t kept = 0;
+    for (size_t index = 0; index < before; index++) {
+        if (removed[index]) {
+            freeQueue(_points[index].queue);
+            freeText(_points[index].text);
+            freeProperties(_points[index].properties);
+            _points[index].queue = nullptr;
+            _points[index].text = nullptr;
+            _points[index].properties = nullptr;
+            moved[index] = 0xFFFFFFFFu;
+            continue;
+        }
+        if (kept != index) {
+            _points[kept] = std::move(_points[index]);
+            _state[kept] = _state[index];
+        }
+        moved[index] = (uint32_t)kept;
+        kept++;
+    }
+    for (size_t index = kept; index < before; index++) {
+        _points[index] = MqttSparkplugPoint();
+        _state[index] = PointState();
+    }
+    _pointCount = kept;
+
+    rebuildPointIndex();
+    for (size_t index = 0; index < _pointCount; index++) {
+        PointState& state = _state[index];
+        if (!(state.flags & kListed)) continue;
+        state.flags &= (uint16_t)~kListed;
+        state.nextChanged = 0;
+        markChanged(index);
+    }
+    // The replay window's, by their new numbers; a removed one's is never
+    // sent (replayFlush() counts it lost).
+    for (size_t at = 0; at < _replayCount; at++) {
+        ReplayEntry& entry = _replay[(_replayFirst + at) % _replayDepth];
+        entry.point = entry.point < before ? moved[entry.point] : 0xFFFFFFFFu;
+    }
+    mq_freeLarge(moved);
 }
 
 // =============================================================================
@@ -2220,6 +2394,15 @@ bool MqttSparkplugNode::addPointMetric(MqttSparkplugPayload& payload,
     if (isBirth && point.description.length() > 0) {
         metric.addProperty(mq_spDescription(point.description.c_str()));
     }
+    if (isBirth && point.properties != nullptr) {
+        metric.addProperty(mq_spEncodedProperties(
+            point.properties->data(), (uint32_t)point.properties->size()));
+    }
+    // In data: a quality that moved, and one that is not Good, every time.
+    if (!isBirth && (point.quality != MQ_SP_QUALITY_GOOD ||
+                     (_state[index].flags & kQualityOwed))) {
+        metric.addProperty(mq_spQuality(point.quality));
+    }
 
     if (!payload.addMetric(metric)) {
         _lastPayloadError = MqttSparkplugError::TooManyMetrics;
@@ -2384,6 +2567,20 @@ bool MqttSparkplugNode::publishDeviceBirth(Device& device) {
 
     const int deviceIndex = findDeviceIndex(device.id.c_str());
     if (deviceIndex < 0) return false;
+
+    // A device declared since the buffers were sized (removeMetrics() and a
+    // declaration again, a device added) may need more room than any birth
+    // before it.
+    size_t metrics = 0, names = 1;
+    for (size_t index = 0; index < _pointCount; index++) {
+        if (_state[index].device != (int16_t)deviceIndex) continue;
+        metrics++;
+        names += _points[index].name.size() + 1;
+    }
+    if ((metrics > _outbound.capacity() || names > _outbound.nameCapacity()) &&
+        !sizeBuffers()) {
+        _outOfMemory = true;
+    }
 
     // [tck-id-payloads-dbirth-seq-inc] Every DBIRTH message MUST include a
     // sequence number value that is one greater than the previous sequence
@@ -2587,6 +2784,11 @@ bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
         metric.timestamp = records[i].timestamp;
         metric.hasTimestamp = true;
         metric.isHistorical = historical;
+        // Not Good, or live and not what the metric's quality was: said.
+        if (records[i].quality != MQ_SP_QUALITY_GOOD ||
+            (!historical && records[i].quality != point.quality)) {
+            metric.addProperty(mq_spQuality(records[i].quality));
+        }
         if (!_outbound.addMetric(metric)) {
             _lastPayloadError = MqttSparkplugError::TooManyMetrics;
             return false;
@@ -2612,6 +2814,7 @@ bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
         // list it stays there until the next look, which finds it settled.)
         for (size_t i = 0; i < count; i++) {
             storeValue(records[i].index, records[i].value);
+            _points[records[i].index].quality = records[i].quality;
             markPublished(records[i].index);
         }
     }
@@ -2687,7 +2890,7 @@ void MqttSparkplugNode::replayForget() {
 }
 
 void MqttSparkplugNode::replayKeep(size_t point, const MqttSparkplugValue& value,
-                                   uint64_t timestamp) {
+                                   uint64_t timestamp, int32_t quality) {
     if (value.isSpan()) {
         // Not kept: its bytes are in a buffer that moves on, and copying them
         // would put an allocation on every publish.
@@ -2706,6 +2909,7 @@ void MqttSparkplugNode::replayKeep(size_t point, const MqttSparkplugValue& value
     entry.isNull = value.isNull ? 1 : 0;
     entry.bits = value.isNull ? 0 : mq_spBitsOf(value);
     entry.epoch = _replayEpoch;
+    entry.quality = quality;
     _replayCount++;
 }
 
@@ -2719,8 +2923,12 @@ void MqttSparkplugNode::replayRecord(const MqttSparkplugPayload& payload,
             point = findPointIndex(metric.name, device);
         }
         if (point < 0) continue;   // bdSeq and the like: not a point
+        const MqttSparkplugProperty* quality =
+            metric.findProperty(MQ_SP_PROPERTY_QUALITY);
         replayKeep((size_t)point, metric.value,
-                   metric.hasTimestamp ? metric.timestamp : payload.timestamp);
+                   metric.hasTimestamp ? metric.timestamp : payload.timestamp,
+                   quality ? (int32_t)quality->as.signedValue
+                           : MQ_SP_QUALITY_GOOD);
     }
 }
 
@@ -2852,6 +3060,9 @@ bool MqttSparkplugNode::replayFlush() {
             metric.timestamp = entry.timestamp;
             metric.hasTimestamp = true;
             metric.isHistorical = true;
+            if (entry.quality != MQ_SP_QUALITY_GOOD) {
+                metric.addProperty(mq_spQuality(entry.quality));
+            }
             _outbound.addMetric(metric);
         }
         if (_outbound.metricCount > 0) {

@@ -24,7 +24,9 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 
 using check::Client;
@@ -846,6 +848,510 @@ void sparkplugEdgeNode(Server& server) {
     ok(fleet.until([&] { return births("spBv1.0/plant2/NDEATH/gw-9") >= 1; }), "  its NDEATH first");
 }
 
+// What a gateway needs of the edge node in the server: a quality with each
+// value, properties in the births, devices changed in the session, store and
+// forward's limits and rate, events before samples, watching, and a host that
+// keeps what the births said.
+void sparkplugEdgeChanges(Server& server) {
+    section("an edge node changed while it runs: quality, properties, devices in the session, history limits and rate");
+    auto connections = v1::Connections::NewStub(server.channel());
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    auto decode = [&](const check::Got& g) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDecodeRequest request;
+        request.set_topic(g.topic);
+        request.set_payload(g.payload);
+        v1::SparkplugMessage out;
+        sparkplug->Decode(&c, request, &out);
+        return out;
+    };
+    Fleet fleet(server.broker.port());
+    Client& watcher = fleet.make("edge-changes-watcher");
+    watcher.subscribe("spBv1.0/plant4/#", MQ_QOS_1);
+    ok(fleet.connected(watcher) && fleet.until([&] { return watcher.subscribed >= 1; }), "a watcher on the group");
+    auto on = [&](const std::string& topic) {
+        std::vector<v1::SparkplugMessage> out;
+        for (const check::Got& g : watcher.got) {
+            if (g.topic == topic) out.push_back(decode(g));
+        }
+        return out;
+    };
+    auto count = [&](const std::string& topic) {
+        size_t n = 0;
+        for (const check::Got& g : watcher.got) n += g.topic == topic ? 1 : 0;
+        return n;
+    };
+    auto property = [](const v1::SparkplugMetric& m, const std::string& key) -> const v1::SparkplugProperty* {
+        for (const v1::SparkplugProperty& p : m.properties()) {
+            if (p.key() == key) return &p;
+        }
+        return nullptr;
+    };
+    auto quality = [&](const v1::SparkplugMetric& m) {
+        const v1::SparkplugProperty* p = property(m, "Quality");
+        return p ? (int)p->value().int_value() : -1;
+    };
+    for (const char* id : {"edge4", "host4", "edge5"}) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::ConnectionSpec spec;
+        spec.set_id(id);
+        spec.set_this_server(true);
+        spec.set_client_id(std::string(id) + "-client");
+        v1::ConnectionInfo info;
+        connections->Put(&c, spec, &info);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostSpec host;
+        host.set_id("h4");
+        host.set_connection("host4");
+        host.set_host_id("reader4");
+        host.set_group("plant4");
+        v1::SparkplugHostInfo info;
+        ok(sparkplug->PutHost(&c, host, &info).ok(), "a host in the server, following the group");
+    }
+    // Online before the node is born: a host whose session begins asks every node it knows to be born again.
+    fleet.until([&] {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostRef ref;
+        ref.set_id("h4");
+        v1::SparkplugHostInfo info;
+        return sparkplug->GetHost(&c, ref, &info).ok() && info.online();
+    });
+    v1::SparkplugEdgeNodeSpec spec;
+    spec.set_id("gw4");
+    spec.set_connection("edge4");
+    spec.set_group("plant4");
+    spec.set_node("gw-4");
+    spec.set_primary_host_id("ph4");
+    spec.add_devices("plc1");
+    spec.set_history_rate(20);
+    {
+        v1::SparkplugMetricDeclaration* alarm = spec.add_metrics();
+        alarm->set_name("Alarm");
+        alarm->set_datatype(v1::DATATYPE_STRING);
+        alarm->set_history_first(true);
+        v1::SparkplugMetricDeclaration* level = spec.add_metrics();
+        level->set_name("Level");
+        level->set_datatype(v1::DATATYPE_DOUBLE);
+        level->set_units("m");
+        level->set_low(0);
+        level->set_high(10);
+        v1::SparkplugProperty* description = level->add_properties();
+        description->set_key("Description");
+        description->set_type(v1::DATATYPE_STRING);
+        description->mutable_value()->set_string_value(std::string(200, 'd') + " - raw water tank level");
+        v1::SparkplugProperty* format = level->add_properties();
+        format->set_key("Format");
+        format->set_type(v1::DATATYPE_STRING);
+        format->mutable_value()->set_string_value("%.2f");
+        v1::SparkplugProperty* readOnly = level->add_properties();
+        readOnly->set_key("readOnly");
+        readOnly->set_type(v1::DATATYPE_BOOLEAN);
+        readOnly->mutable_value()->set_boolean_value(true);
+        v1::SparkplugMetricDeclaration* flow = spec.add_metrics();
+        flow->set_name("Flow");
+        flow->set_device("plc1");
+        flow->set_datatype(v1::DATATYPE_FLOAT);
+    }
+    {
+        v1::SparkplugEdgeNodeSpec wrong = spec;
+        v1::SparkplugProperty* q = wrong.mutable_metrics(1)->add_properties();
+        q->set_key("Quality");
+        q->set_type(v1::DATATYPE_INT32);
+        q->mutable_value()->set_int_value(192);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        equal<int>("a declaration's Quality property: INVALID_ARGUMENT (a value's)",
+                   sparkplug->PutEdgeNode(&c, wrong, &info).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, spec, &info).ok() && !info.born() && info.spec().history_rate() == 20,
+           "PutEdgeNode with properties, history_first and a history rate; waiting for its primary host");
+    }
+    // Watched from the start.
+    grpc::ClientContext watchContext;
+    authorize(watchContext);
+    v1::SparkplugWatchEdgeNodesRequest watchRequest;
+    watchRequest.add_ids("gw4");
+    std::unique_ptr<grpc::ClientReader<v1::SparkplugEdgeNodeInfo>> watch(sparkplug->WatchEdgeNodes(&watchContext, watchRequest));
+    std::mutex watchedLock;
+    std::vector<v1::SparkplugEdgeNodeInfo> watched;
+    std::thread watching([&] {
+        v1::SparkplugEdgeNodeInfo info;
+        while (watch->Read(&info)) {
+            std::lock_guard<std::mutex> guard(watchedLock);
+            watched.push_back(info);
+        }
+    });
+    auto watchedThat = [&](const std::function<bool(const v1::SparkplugEdgeNodeInfo&)>& what) {
+        std::lock_guard<std::mutex> guard(watchedLock);
+        return std::any_of(watched.begin(), watched.end(), what);
+    };
+    ok(fleet.until([&] { return watchedThat([](const v1::SparkplugEdgeNodeInfo& i) { return !i.born(); }); }),
+       "WatchEdgeNodes: its state now, not born");
+
+    auto set = [&](const std::string& device, std::function<void(v1::SparkplugValuesRequest&)> fill) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugValuesRequest request;
+        request.set_edge_node("gw4");
+        request.set_device(device);
+        fill(request);
+        v1::SparkplugValuesReply reply;
+        sparkplug->SetValues(&c, request, &reply);
+        return reply;
+    };
+    auto withQuality = [](v1::SparkplugMetric* m, int64_t q) {
+        v1::SparkplugProperty* p = m->add_properties();
+        p->set_key("Quality");
+        p->set_type(v1::DATATYPE_INT32);
+        p->mutable_value()->set_int_value(q);
+    };
+    const uint64_t t0 = 1793000000000ull;
+    uint32_t kept = 0;
+    for (int i = 1; i <= 40; i++) {
+        kept += set("", [&](v1::SparkplugValuesRequest& r) {
+                    v1::SparkplugMetric* m = r.add_metrics();
+                    m->set_name("Level");
+                    m->mutable_value()->set_double_value(i);
+                    m->set_timestamp(t0 + (uint64_t)i);
+                }).kept();
+    }
+    kept += set("", [&](v1::SparkplugValuesRequest& r) {
+                v1::SparkplugMetric* m = r.add_metrics();
+                m->set_name("Alarm");
+                m->mutable_value()->set_string_value("high level");
+                m->set_timestamp(t0 + 50);
+            }).kept();
+    kept += set("plc1", [&](v1::SparkplugValuesRequest& r) {
+                v1::SparkplugMetric* m = r.add_metrics();
+                m->set_name("Flow");
+                m->mutable_value()->set_float_value(2.5f);
+                withQuality(m, 0);
+            }).kept();
+    equal<uint32_t>("its host away: 42 values kept, a Bad one among them", kept, 42);
+    {
+        v1::SparkplugValuesReply reply = set("", [&](v1::SparkplugValuesRequest& r) {
+            v1::SparkplugMetric* a = r.add_metrics();
+            a->set_name("Level");
+            a->mutable_value()->set_double_value(1);
+            v1::SparkplugProperty* d = a->add_properties();
+            d->set_key("Description");
+            d->set_type(v1::DATATYPE_STRING);
+            d->mutable_value()->set_string_value("x");
+            v1::SparkplugMetric* b = r.add_metrics();
+            b->set_name("Level");
+            b->mutable_value()->set_double_value(1);
+            withQuality(b, 7);
+            v1::SparkplugMetric* c = r.add_metrics();
+            c->set_name("Level");
+            c->mutable_value()->set_double_value(1);
+            c->mutable_metadata()->set_content_type("text/plain");
+        });
+        ok(reply.refused_size() == 3 && reply.kept() == 0 && reply.refused(0).find("Description") != std::string::npos &&
+               reply.refused(1).find("500") != std::string::npos && reply.refused(2).find("metadata") != std::string::npos,
+           "SetValues refuses another property, a quality Sparkplug does not have, and metadata - never drops them");
+    }
+    Client& primary = fleet.make("ph4-host");
+    ok(fleet.connected(primary), "the primary host comes online");
+    primary.publish("spBv1.0/STATE/ph4", "{\"online\":true,\"timestamp\":1793000000000}", MQ_QOS_1, true);
+    ok(fleet.until([&] { return count("spBv1.0/plant4/NBIRTH/gw-4") >= 1 && count("spBv1.0/plant4/DBIRTH/gw-4/plc1") >= 1; }),
+       "  born: NBIRTH and DBIRTH");
+    const auto bornAt = std::chrono::steady_clock::now();
+    std::map<std::string, uint64_t> alias;
+    {
+        const v1::SparkplugMessage birth = on("spBv1.0/plant4/NBIRTH/gw-4")[0];
+        bool all = false;
+        for (const v1::SparkplugMetric& m : birth.payload().metrics()) {
+            alias[m.name()] = m.alias();
+            if (m.name() != "Level") continue;
+            const v1::SparkplugProperty* d = property(m, "Description");
+            all = property(m, "engUnit") && property(m, "engUnit")->value().string_value() == "m" &&
+                  property(m, "engLow") && property(m, "engHigh") && property(m, "engHigh")->value().double_value() == 10 &&
+                  quality(m) == 192 && d && d->value().string_value().size() > 200 && property(m, "Format") &&
+                  property(m, "readOnly") && property(m, "readOnly")->value().boolean_value();
+        }
+        ok(all, "  its NBIRTH: engUnit, engLow, engHigh, Quality, and Description (uncut), Format, readOnly");
+        const v1::SparkplugMessage device = on("spBv1.0/plant4/DBIRTH/gw-4/plc1")[0];
+        ok(device.payload().metrics_size() == 1 && quality(device.payload().metrics(0)) == 0 &&
+               device.payload().metrics(0).value().float_value() == 2.5f,
+           "  its DBIRTH: Flow at 2.5, Quality 0 - the quality it was given while not born");
+        alias["Flow"] = device.payload().metrics(0).alias();
+    }
+    // History: the event first, then the samples, at 20 a second.
+    auto historical = [&](const std::string& topic) {
+        std::vector<v1::SparkplugMetric> out;
+        for (const v1::SparkplugMessage& m : on(topic)) {
+            for (const v1::SparkplugMetric& x : m.payload().metrics()) {
+                if (x.is_historical()) out.push_back(x);
+            }
+        }
+        return out;
+    };
+    ok(fleet.until([&] { return !historical("spBv1.0/plant4/NDATA/gw-4").empty(); }), "  what it kept is sent");
+    ok(historical("spBv1.0/plant4/NDATA/gw-4")[0].alias() == alias["Alarm"],
+       "  history_first's first: the alarm before the forty samples kept before it");
+    fleet.until([&] { return std::chrono::steady_clock::now() - bornAt > std::chrono::milliseconds(1000); }, 3000);
+    const size_t inASecond = historical("spBv1.0/plant4/NDATA/gw-4").size();
+    ok(inASecond < 41, "  at history_rate: " + std::to_string(inASecond) + " of 41 within a second of the birth");
+    ok(fleet.until([&] { return historical("spBv1.0/plant4/NDATA/gw-4").size() >= 41; }, 8000),
+       "  and all of it, in time");
+    ok(fleet.until([&] {
+           const std::vector<v1::SparkplugMetric> sent = historical("spBv1.0/plant4/DDATA/gw-4/plc1");
+           return sent.size() == 1 && quality(sent[0]) == 0;
+       }),
+       "  the device's kept value went with its Quality 0");
+    ok(fleet.until([&] { return watchedThat([](const v1::SparkplugEdgeNodeInfo& i) { return i.born() && i.births() >= 2; }); }),
+       "WatchEdgeNodes: born, its births counted");
+
+    // Live: a quality that moves is news, the value the same or not.
+    set("plc1", [&](v1::SparkplugValuesRequest& r) {
+        v1::SparkplugMetric* m = r.add_metrics();
+        m->set_name("Flow");
+        m->mutable_value()->set_float_value(2.5f);
+        withQuality(m, 192);
+    });
+    ok(fleet.until([&] {
+           for (const v1::SparkplugMessage& m : on("spBv1.0/plant4/DDATA/gw-4/plc1")) {
+               for (const v1::SparkplugMetric& x : m.payload().metrics()) {
+                   if (!x.is_historical() && quality(x) == 192) return true;
+               }
+           }
+           return false;
+       }),
+       "the same value, Good again: a DDATA saying Quality 192");
+
+    // The host in the server kept what the births said.
+    auto nodeMetric = [&](const std::string& device, const std::string& name) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugNodesRequest request;
+        request.set_host("h4");
+        request.set_node("gw-4");
+        v1::SparkplugNodesReply reply;
+        sparkplug->ListNodes(&c, request, &reply);
+        v1::SparkplugNodeMetric out;
+        for (const v1::SparkplugNode& n : reply.nodes()) {
+            for (const v1::SparkplugNodeMetric& m : n.metrics()) {
+                if (m.device() == device && m.name() == name) out = m;
+            }
+        }
+        return out;
+    };
+    ok(fleet.until([&] {
+           const v1::SparkplugNodeMetric level = nodeMetric("", "Level");
+           bool description = false, format = false;
+           for (const v1::SparkplugProperty& p : level.properties()) {
+               description = description || (p.key() == "Description" && p.value().string_value().size() > 200);
+               format = format || p.key() == "Format";
+           }
+           return description && format && level.has_quality() && level.quality() == 192;
+       }),
+       "ListNodes: Level's birth properties (Description, Format) and its Quality");
+    ok(fleet.until([&] {
+           const v1::SparkplugNodeMetric flow = nodeMetric("plc1", "Flow");
+           return flow.has_quality() && flow.quality() == 192;
+       }),
+       "  Flow's quality the latest a DDATA gave");
+
+    // Devices changed in the session: no NDEATH, no new bdSeq.
+    uint32_t bdSeq = 0;
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id("gw4");
+        v1::SparkplugEdgeNodeInfo info;
+        sparkplug->GetEdgeNode(&c, ref, &info);
+        bdSeq = info.bd_seq();
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDeviceSpec device;
+        device.set_edge_node("gw4");
+        device.set_device("plc2");
+        v1::SparkplugMetricDeclaration* speed = device.add_metrics();
+        speed->set_name("Speed");
+        speed->set_datatype(v1::DATATYPE_DOUBLE);
+        v1::SparkplugDeviceInfo info;
+        ok(sparkplug->PutDevice(&c, device, &info).ok() && info.online() && info.metrics() == 1,
+           "PutDevice: a device added while the node is born");
+    }
+    ok(fleet.until([&] { return count("spBv1.0/plant4/DBIRTH/gw-4/plc2") == 1; }), "  its DBIRTH");
+    const size_t plc1Births = count("spBv1.0/plant4/DBIRTH/gw-4/plc1"), plc1Deaths = count("spBv1.0/plant4/DDEATH/gw-4/plc1");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDeviceSpec device;
+        device.set_edge_node("gw4");
+        device.set_device("plc1");
+        v1::SparkplugMetricDeclaration* flow = device.add_metrics();
+        flow->set_name("Flow");
+        flow->set_datatype(v1::DATATYPE_FLOAT);
+        v1::SparkplugMetricDeclaration* pressure = device.add_metrics();
+        pressure->set_name("Pressure");
+        pressure->set_datatype(v1::DATATYPE_DOUBLE);
+        v1::SparkplugDeviceInfo info;
+        ok(sparkplug->PutDevice(&c, device, &info).ok() && info.online() && info.metrics() == 2,
+           "PutDevice: a born device given another metric");
+    }
+    auto lastIndex = [&](const std::string& topic) {
+        long at = -1;
+        for (size_t i = 0; i < watcher.got.size(); i++) {
+            if (watcher.got[i].topic == topic) at = (long)i;
+        }
+        return at;
+    };
+    if (!ok(fleet.until([&] {
+               return count("spBv1.0/plant4/DDEATH/gw-4/plc1") == plc1Deaths + 1 &&
+                      count("spBv1.0/plant4/DBIRTH/gw-4/plc1") >= plc1Births + 1 &&
+                      lastIndex("spBv1.0/plant4/DDEATH/gw-4/plc1") < lastIndex("spBv1.0/plant4/DBIRTH/gw-4/plc1");
+           }),
+            "  its DDEATH, then a DBIRTH")) {
+        std::printf("    DDEATH %zu DBIRTH %zu NBIRTH %zu\n", count("spBv1.0/plant4/DDEATH/gw-4/plc1"),
+                    count("spBv1.0/plant4/DBIRTH/gw-4/plc1"), count("spBv1.0/plant4/NBIRTH/gw-4"));
+        for (const check::Got& g : watcher.got) {
+            if (g.topic.find("gw-4") != std::string::npos && g.topic.find("DATA") == std::string::npos) {
+                std::printf("      %s seq %llu\n", g.topic.c_str(), (unsigned long long)decode(g).payload().seq());
+            }
+        }
+    }
+    {
+        const std::vector<v1::SparkplugMessage> births = on("spBv1.0/plant4/DBIRTH/gw-4/plc1");
+        const v1::SparkplugPayload& again = births.back().payload();
+        uint64_t flowAlias = 0;
+        float flowValue = 0;
+        for (const v1::SparkplugMetric& m : again.metrics()) {
+            if (m.name() != "Flow") continue;
+            flowAlias = m.alias();
+            flowValue = m.value().float_value();
+        }
+        ok(again.metrics_size() == 2 && flowAlias != 0 && flowAlias != alias["Flow"] && flowValue == 2.5f,
+           "  with both metrics, Flow's value carried over and a new alias (never an old one)");
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugDeviceRef ref;
+        ref.set_edge_node("gw4");
+        ref.set_device("plc2");
+        v1::Empty none;
+        ok(sparkplug->DeleteDevice(&c, ref, &none).ok(), "DeleteDevice");
+    }
+    ok(fleet.until([&] { return count("spBv1.0/plant4/DDEATH/gw-4/plc2") == 1; }), "  its DDEATH");
+    const size_t nbirths = count("spBv1.0/plant4/NBIRTH/gw-4");
+    {
+        v1::SparkplugEdgeNodeSpec again = spec;
+        v1::SparkplugMetricDeclaration* mode = again.add_metrics();
+        mode->set_name("Mode");
+        mode->set_datatype(v1::DATATYPE_STRING);
+        again.clear_devices();
+        again.add_devices("plc1");
+        v1::SparkplugMetricDeclaration* pressure = again.add_metrics();
+        pressure->set_name("Pressure");
+        pressure->set_device("plc1");
+        pressure->set_datatype(v1::DATATYPE_DOUBLE);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, again, &info).ok() && info.born() && info.bd_seq() == bdSeq,
+           "PutEdgeNode with a node metric more: still born, the same bdSeq");
+    }
+    ok(fleet.until([&] { return count("spBv1.0/plant4/NBIRTH/gw-4") >= nbirths + 1; }), "  a rebirth in the session");
+    {
+        const v1::SparkplugMessage birth = on("spBv1.0/plant4/NBIRTH/gw-4").back();
+        bool mode = false;
+        for (const v1::SparkplugMetric& m : birth.payload().metrics()) mode = mode || m.name() == "Mode";
+        ok(mode, "  its NBIRTH declares Mode");
+    }
+    fleet.until([] { return false; }, 300);
+    equal<size_t>("and in all of it no NDEATH", count("spBv1.0/plant4/NDEATH/gw-4"), 0);
+    watchContext.TryCancel();
+    watching.join();
+
+    // What it keeps, by bytes and by age.
+    v1::SparkplugEdgeNodeSpec tight;
+    tight.set_id("gw5");
+    tight.set_connection("edge5");
+    tight.set_group("plant4");
+    tight.set_node("gw-5");
+    tight.set_primary_host_id("nobody");
+    tight.set_history_max_bytes(400);
+    {
+        v1::SparkplugMetricDeclaration* level = tight.add_metrics();
+        level->set_name("Level");
+        level->set_datatype(v1::DATATYPE_DOUBLE);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        sparkplug->PutEdgeNode(&c, tight, &info);
+    }
+    for (int i = 0; i < 50; i++) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugValuesRequest request;
+        request.set_edge_node("gw5");
+        v1::SparkplugMetric* m = request.add_metrics();
+        m->set_name("Level");
+        m->mutable_value()->set_double_value(i);
+        m->set_timestamp((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch()).count() - 60000);
+        v1::SparkplugValuesReply reply;
+        sparkplug->SetValues(&c, request, &reply);
+    }
+    auto gw5 = [&] {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id("gw5");
+        v1::SparkplugEdgeNodeInfo info;
+        sparkplug->GetEdgeNode(&c, ref, &info);
+        return info;
+    };
+    {
+        const v1::SparkplugEdgeNodeInfo info = gw5();
+        ok(info.history() > 0 && info.history() < 50 && info.history_bytes() <= 400 &&
+               info.history_lost() + info.history() == 50 && info.history_dropping(),
+           "history_max_bytes 400: " + std::to_string(info.history()) + " kept in " +
+               std::to_string(info.history_bytes()) + " bytes, the oldest dropped and counted, history_dropping");
+    }
+    tight.set_history_max_age_ms(30000);
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, tight, &info).ok(), "history_max_age_ms 30 s, changed live");
+    }
+    ok(fleet.until([&] { return gw5().history() == 0 && gw5().history_lost() == 50; }, 5000),
+       "  values a minute old are dropped, and counted");
+    for (const char* id : {"gw4", "gw5"}) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id(id);
+        v1::Empty none;
+        sparkplug->DeleteEdgeNode(&c, ref, &none);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostRef ref;
+        ref.set_id("h4");
+        v1::Empty none;
+        sparkplug->DeleteHost(&c, ref, &none);
+    }
+}
+
 void sparkplugStructures(Server& server) {
     section("an edge node in the server publishes a PLC struct (Template), an array, a DataSet and text; a host here reads them");
     auto connections = v1::Connections::NewStub(server.channel());
@@ -1312,6 +1818,7 @@ int main() {
     if (server.started) sparkplugAware(server);
     if (server.started) sparkplugEdgeNode(server);
     if (server.started) sparkplugStructures(server);
+    if (server.started) sparkplugEdgeChanges(server);
     if (server.started) kafkaWithoutKafka(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);

@@ -242,6 +242,12 @@ struct MqttSparkplugTrackedMetric {
     bool stale = false;
     uint64_t staleAt = 0;
 
+    // ITS QUALITY: the Quality property its birth gave, then the last a data
+    // message gave (192 Good, 0 Bad, 500 Stale) - one not given is not
+    // assumed. hasQuality false: none said since its birth.
+    int32_t quality = 0;
+    bool hasQuality = false;
+
     // A span value's bytes - text, bytes, an array, a dataset, a template -
     // and `value` points here. It pointed into the host's decode buffer, which
     // the next message reuses, so read() of a String could return another

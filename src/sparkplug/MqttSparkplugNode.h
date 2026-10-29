@@ -213,6 +213,8 @@ struct MqttSparkplugRecord {
     size_t index = 0;
     MqttSparkplugValue value;
     uint64_t timestamp = 0;   // UTC milliseconds
+    // Its Quality property when it is not Good (MQ_SP_QUALITY_*).
+    int32_t quality = MQ_SP_QUALITY_GOOD;
 };
 
 // WHAT A METRIC IS - its name, its alias, what its birth says about it - and
@@ -261,6 +263,10 @@ struct MqttSparkplugPoint {
 
     // The text it owns - a text metric's only; null for a number.
     MqttSparkplugPointText* text = nullptr;
+
+    // What its birth says beside engUnit, Quality and the range, encoded
+    // (propertiesAt()) - null for a metric with none.
+    MqttSparkplugBytes* properties = nullptr;
 
     // The writes not taken yet, when queueWrites() is on; see there.
     MqttSparkplugWriteQueue* queue = nullptr;
@@ -500,8 +506,9 @@ public:
     //
     // A STRUCT of a hundred members looked every one up by name, every scan:
     // ten thousand string compares to say what had changed. The index is
-    // stable for the life of the node - metrics are never removed - so a
-    // block looks each one up once, at declaration, and keeps the number.
+    // stable for the life of the node - unless the program removes metrics
+    // (removeMetrics(), removeDevice()), which no block does - so a block
+    // looks each one up once, at declaration, and keeps the number.
     // Every call refuses an index past pointCount() rather than trusting it.
     //
     // A null or empty device means a node metric. -1 when not declared.
@@ -572,6 +579,26 @@ public:
     bool unitsAt(size_t index, const char* units);
     bool rangeAt(size_t index, double low, double high);
 
+    // ANY OTHER PROPERTIES its birth carries - a description, a display
+    // format, read-only, a key of the application's own - as the body of an
+    // encoded PropertySet (mq_sparkplugEncodePropertySet), copied. They take
+    // one of a metric's MQ_SP_MAX_PROPERTIES slots, after engUnit, Quality and
+    // the range - with all of those there is no room left, so a metric with
+    // units, a range and these puts its engUnit, engLow and engHigh in here
+    // too (unitsAt() and rangeAt() unset). Null or 0 removes them. False for
+    // an unknown index, or out of memory.
+    bool propertiesAt(size_t index, const uint8_t* encoded, size_t length);
+
+    // ITS QUALITY: MQ_SP_QUALITY_GOOD (192), _BAD (0) or _STALE (500), the
+    // codes [tck-id-payloads-propertyset-quality-value-value] allows - any
+    // other is refused. Every birth carries it; a change puts the metric in
+    // the next data message (deadband or not, with the value it has now) with
+    // a Quality property, and every data message carries one while it is not
+    // Good - so a host that reads no Quality as Good, and one that keeps the
+    // last it read, both see the same. Whether it changed.
+    bool qualityAt(size_t index, int32_t quality);
+    int32_t qualityOf(size_t index) const;
+
     // --- Devices ---
 
     bool addDevice(const char* deviceId);
@@ -597,6 +624,36 @@ public:
     bool deviceOffline(const char* deviceId);
 
     bool deviceIsOnline(const char* deviceId) const;
+    // Its number - what MqttSparkplugPoint::device holds - or -1.
+    int deviceIndexOf(const char* deviceId) const { return findDeviceIndex(deviceId); }
+
+    // --- Declarations changed while the node runs ---
+    //
+    // A device's metrics replaced, a device gone, the node's own metrics
+    // redeclared - without ending the session: the same bdSeq, the same
+    // connection. What the caller then publishes is the Sparkplug way to say
+    // so: a device's DDEATH and a DBIRTH with its new metrics, or for the
+    // node's own a rebirth (NBIRTH and every DBIRTH), as a host's Rebirth
+    // asks.
+    //
+    // ALIASES ARE NEVER REUSED. A metric declared again takes the next one
+    // from the node's one counter, so no host can read an alias of the old
+    // declaration as the new one [tck-id-payloads-alias-uniqueness].
+    //
+    // INDICES MOVE: every metric after one removed moves down; look them up
+    // again (indexOf()). What the replay window held of a metric removed is
+    // let go, and counted (replayLost()).
+    //
+    // Removes every metric of the device (null or "": the node's own), and
+    // keeps the device. Says how many went. Nothing is published: a born
+    // device's metrics go only with its DDEATH (deviceOffline() first), the
+    // node's own with a rebirth().
+    size_t removeMetrics(const char* deviceId);
+    // The device and its metrics: its DDEATH first, when it is online. False
+    // for an unknown device.
+    bool removeDevice(const char* deviceId);
+    // Every Template definition, to be declared again before a rebirth().
+    void removeTemplates();
 
     // --- Connecting ---
 
@@ -911,6 +968,8 @@ private:
     // A span metric (text, bytes, array, dataset, template): its value is in
     // its MqttSparkplugPointText.
     static constexpr uint16_t kText = 1u << 8;
+    // Its quality changed since it was last published (qualityAt()).
+    static constexpr uint16_t kQualityOwed = 1u << 9;
 
     // THE METRICS THAT MAY HAVE TO GO, one list a slot - the node's own, and
     // each device's - threaded through PointState::nextChanged. A metric is
@@ -1016,6 +1075,7 @@ private:
     bool makeQueue(size_t index);
     static void freeQueue(MqttSparkplugWriteQueue* queue);
     static void freeText(MqttSparkplugPointText* text);
+    static void freeProperties(MqttSparkplugBytes* properties);
 
     // publishAtPoll(), paid.
     void publishOwed();
@@ -1043,10 +1103,14 @@ private:
         uint16_t epoch = 0;
         uint8_t isNull = 0;
         uint8_t spare = 0;
+        int32_t quality = MQ_SP_QUALITY_GOOD;
     };
     void replayRecord(const MqttSparkplugPayload& payload, int16_t device);
     void replayKeep(size_t point, const MqttSparkplugValue& value,
-                    uint64_t timestamp);
+                    uint64_t timestamp, int32_t quality);
+    // The metrics `removed` marks gone, the rest moved down (removeMetrics()).
+    void compactPoints(const uint8_t* removed);
+    void rebuildPointIndex();
     void replayService();
     bool replayFlush();
     void replayForget();

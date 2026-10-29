@@ -34,8 +34,10 @@
 
 #include "AppHub.h"
 #include "ConnectionOutbox.h"
+#include "sparkplug/MqttSparkplugTypes.h"
 #include "sparkplug/MqttSparkplugValue.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -178,6 +180,8 @@ struct AppSparkplugMetricInfo {
     uint64_t at = 0;                       // the value's timestamp (ms since 1970)
     bool stale = false;                    // its node or device died since its birth
     uint64_t staleAt = 0;                  // when: the DDEATH's timestamp, or the host's time of the NDEATH
+    int32_t quality = 0;                   // the last Quality its birth or data gave
+    bool hasQuality = false;
 };
 
 struct AppSparkplugNodeInfo {
@@ -191,6 +195,9 @@ struct AppSparkplugNodeInfo {
     std::vector<std::string> devices;
     std::vector<std::string> devicesOnline;
     std::vector<AppSparkplugMetricInfo> metrics;
+    // The births its metrics come from, as they arrived: device "" the NBIRTH,
+    // else that device's DBIRTH - every property they gave, for the API to read.
+    std::vector<std::pair<std::string, std::string>> births;
 };
 
 // A Sparkplug B Edge Node the server runs on one of its connections (the
@@ -200,8 +207,10 @@ struct AppSparkplugNodeInfo {
 // deadbands applied - a rebirth when a host asks, a primary host's STATE
 // waited for. While it is not born, values set are kept on disk (the
 // connections' outbox) and sent, oldest first, with is_historical once it is:
-// Sparkplug's own store and forward. The library's datatypes: numbers, bool,
-// text, bytes, DateTime - no arrays, datasets or templates.
+// Sparkplug's own store and forward. Every datatype, Templates' definitions
+// in the NBIRTH. A declaration changed while it runs is published in the
+// same session: a device's DDEATH and DBIRTH, or for the node's own metrics
+// a rebirth.
 struct AppSparkplugMetricDeclaration {
     std::string name, device;              // device "": the node's own
     uint32_t datatype = 0;
@@ -210,6 +219,10 @@ struct AppSparkplugMetricDeclaration {
     bool hasRange = false;
     double low = 0, high = 0;
     double deadband = 0, deadbandPercent = 0;
+    // What its births say beside engUnit, Quality and the range: the body of
+    // an encoded PropertySet (keys, then values), as long as it is.
+    std::string properties;
+    bool historyFirst = false;             // what it kept goes before the rest
 };
 
 // A Template definition, published in the NBIRTH: `encoded` is its
@@ -224,7 +237,13 @@ struct AppSparkplugEdgeNodeSpec {
     std::string primaryHostId;             // "": born whenever connected
     std::vector<std::string> devices;
     std::vector<AppSparkplugMetricDeclaration> metrics;
-    uint64_t historyMax = 100000;          // values kept while not born; full, the oldest go (counted)
+    // What it keeps while not born - values, bytes, age; 0: no limit of that
+    // kind. Past one, the oldest go (counted), samples before history_first's.
+    uint64_t historyMax = 100000;
+    uint64_t historyMaxBytes = 0, historyMaxAgeMs = 0;
+    // Values a second sent as history once it is born (0: as fast as the link
+    // takes); live values go at once, whatever history waits.
+    uint32_t historyRate = 1000;
     std::vector<AppSparkplugTemplateDefinition> templates;
 };
 
@@ -235,7 +254,10 @@ struct AppSparkplugEdgeNodeInfo {
     bool primaryHostOnline = false;
     uint32_t births = 0;
     uint64_t history = 0, historyLost = 0;
+    uint64_t historyBytes = 0;
+    bool historyDropping = false;          // a limit is dropping the oldest, since the history last emptied
     std::vector<std::string> devicesOnline;
+    bool deleted = false;                  // a watcher's: DeleteEdgeNode
 };
 
 // A value the application sets: `value` at the metric's datatype, `text` the
@@ -246,6 +268,8 @@ struct AppSparkplugSet {
     MqttSparkplugValue value;
     std::string text;
     uint64_t timestamp = 0;                // 0: now
+    bool hasQuality = false;               // its Quality changed with it: 192, 0 or 500
+    int32_t quality = MQ_SP_QUALITY_GOOD;
 };
 
 // Where a connection's client connects when it is not to another broker:
@@ -342,6 +366,24 @@ public:
                    std::vector<std::string>& refused, std::string& error);
     bool deviceState(const std::string& id, const std::string& device, bool online, std::string& error);
     bool rebirthEdgeNode(const std::string& id, std::string& error);
+    // One device of an edge node declared again - `metrics` its own, `templates`
+    // definitions they use that the node lacks - or added: its DDEATH if it was
+    // born, and its DBIRTH, in the same session. A new or changed definition is
+    // in the NBIRTH only, so the node is born again (same bdSeq). `online`:
+    // whether it is born now. `notFound`: no such edge node (or device, to remove).
+    bool putDevice(const std::string& id, const std::string& device,
+                   const std::vector<AppSparkplugMetricDeclaration>& metrics,
+                   const std::vector<AppSparkplugTemplateDefinition>& templates, bool& online,
+                   bool& notFound, std::string& error);
+    // Its DDEATH, and gone - with its metrics, and what was kept of them.
+    bool removeDevice(const std::string& id, const std::string& device, bool& notFound, std::string& error);
+    // Every change of these edge nodes (all, when `ids` is empty), starting
+    // with each one's state now: born or not, the primary host, births,
+    // devices online, history - its counts at most once a second. Without
+    // metrics or templates (getEdgeNode has them). Called on the manager's thread.
+    uint64_t watchEdgeNodes(const std::vector<std::string>& ids,
+                            std::function<void(const AppSparkplugEdgeNodeInfo&)> changed);
+    void unwatchEdgeNodes(uint64_t watcher);
 
     // From AppHub: a publish on a connection; a group on one opened or closed.
     void publish(const AppPublish& message, std::function<void(const AppPublishResult&)> done);
@@ -369,6 +411,12 @@ private:
         std::function<void(const AppConnectionInfo&)> changed;
     };
     std::map<uint64_t, Watcher> _watchers;
+    struct EdgeWatcher {
+        std::vector<std::string> ids;
+        std::function<void(const AppSparkplugEdgeNodeInfo&)> changed;
+    };
+    std::map<uint64_t, EdgeWatcher> _edgeWatchers;
+    std::atomic<bool> _edgeWatched{false};
     uint64_t _nextWatcher = 1;
     bool _quit = false;
     std::thread _thread;
@@ -393,6 +441,18 @@ private:
     // written when its bdSeq moves, and at most once a second as values do.
     void saveEdgeState(EdgeNode& edge, bool now);
     void loadEdgeState(EdgeNode& edge);
+    // A spec stored and applied: where it runs, born anew when its session
+    // must change (connection, group, node, primary host), else its
+    // declarations changed in the session it has.
+    bool applyEdgeNode(const AppSparkplugEdgeNodeSpec& spec, std::string& error);
+    void redeclare(Connection& connection, const AppSparkplugEdgeNodeSpec& next);
+    // Room for one more value of `bytes` in what it keeps, the oldest dropped
+    // for it; and what is older than its age limit, dropped.
+    void makeRoom(EdgeNode& edge, size_t bytes);
+    void expireHistory(EdgeNode& edge);
+    void sendHistory(Connection& connection);
+    void announceEdge(EdgeNode& edge, bool now);
+    void announceEdgeInfo(const AppSparkplugEdgeNodeInfo& info);
     // A host on a Kafka link: its STATE on the link's state connection.
     void serviceHostState(Connection& connection);
     void serviceLink(Connection& connection);

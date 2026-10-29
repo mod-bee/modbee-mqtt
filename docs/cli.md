@@ -337,8 +337,14 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
   FAILED_PRECONDITION: at most 400 connections without a restart ...` - and
   the exit code is `1` for a refusal, `3` when the server cannot be reached,
   `2` for a command that is not right.
-- `messages consume` acknowledges what it prints; `connections watch` prints
-  each change of state, one JSON line each.
+- `messages consume` acknowledges what it prints; `connections watch` and
+  `sparkplug-nodes watch` print each change of state, one JSON line each.
+- A device of a running Sparkplug edge node changes in its session:
+  `modbee-mqtt sparkplug-devices put --edge-node gw --device plc1-live
+  --metrics '{"name":"Flow","datatype":"DATATYPE_FLOAT"}'` (its DDEATH and a
+  new DBIRTH), and `sparkplug-devices delete` (its DDEATH). A value's quality
+  rides with it: `sparkplug-nodes set --edge-node gw --device plc1 --metrics
+  '{"name":"Flow","value":{"floatValue":0},"properties":[{"key":"Quality","type":"DATATYPE_INT32","value":{"intValue":0}}]}'`.
 - `logins` and `keys` are the same calls as `user` and `key`, over the API
   rather than MQTT; `settings` is `config`'s.
 
@@ -365,6 +371,9 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt sparkplug-nodes set` | `Sparkplug.SetValues` | - |
 | `modbee-mqtt sparkplug-nodes device` | `Sparkplug.SetDeviceState` | - |
 | `modbee-mqtt sparkplug-nodes rebirth` | `Sparkplug.RebirthEdgeNode` | - |
+| `modbee-mqtt sparkplug-nodes watch` | `Sparkplug.WatchEdgeNodes` | - |
+| `modbee-mqtt sparkplug-devices put` | `Sparkplug.PutDevice` | - |
+| `modbee-mqtt sparkplug-devices delete` | `Sparkplug.DeleteDevice` | - |
 | `modbee-mqtt sparkplug-aware get` | `Sparkplug.GetAware` | - |
 | `modbee-mqtt sparkplug-aware set` | `Sparkplug.PutAware` | - |
 | `modbee-mqtt messages consume` | `Messages.Consume` | - |

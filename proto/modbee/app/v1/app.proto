@@ -460,9 +460,15 @@ service Sparkplug {
   // what it declares (aliases its own), NDATA and DDATA as values are set - deadbands applied - a rebirth when a host
   // asks, and a primary host's STATE waited for. While it is not born, values set are kept on disk and sent, oldest
   // first, with is_historical once it is: Sparkplug's store and forward. A host's writes reach the application on the
-  // connection, as NCMD and DCMD (ConsumeOpen.sparkplug: names filled in). Kept in the state directory. Every metric
+  // connection, as NCMD and DCMD (ConsumeOpen.sparkplug: names filled in) - every one, to a metric declared writable
+  // or not, or one never declared: the node applies none itself, so the application checks `writable` (and the
+  // value) before it acts. Node Control/Rebirth the node answers itself. Kept in the state directory. Every metric
   // datatype: numbers, Boolean, String, Text, UUID, Bytes, File, DateTime, the arrays, DataSet, and Template - a PLC
   // struct or UDT, its definition in `templates` (published in the NBIRTH) and each Template metric an instance of one.
+  // Put again with the same connection, group, node and primary_host_id, a running node keeps its session (and its
+  // bdSeq): a device whose declarations changed gets its DDEATH and a new DBIRTH; a change to the node's own metrics
+  // or templates is a rebirth (NBIRTH and every DBIRTH); a device gone, its DDEATH; history limits, the rate,
+  // deadbands and history_first need no birth at all. A change to any of those four is a new session.
   rpc PutEdgeNode(SparkplugEdgeNodeSpec) returns (SparkplugEdgeNodeInfo);
   rpc GetEdgeNode(SparkplugEdgeNodeRef) returns (SparkplugEdgeNodeInfo);
   rpc ListEdgeNodes(Empty) returns (SparkplugEdgeNodeList);
@@ -470,6 +476,16 @@ service Sparkplug {
   rpc SetValues(SparkplugValuesRequest) returns (SparkplugValuesReply);
   rpc SetDeviceState(SparkplugDeviceStateRequest) returns (Empty);  // DBIRTH (online) or DDEATH
   rpc RebirthEdgeNode(SparkplugEdgeNodeRef) returns (Empty);
+  // One device declared - added, or its metrics replaced - while the node runs, in the same session: its DDEATH if it
+  // was born, and a DBIRTH with what it is now (new aliases from the node's one counter; values carry over for a
+  // metric of the same name and datatype). Born unless SetDeviceState took it offline. A Template definition it uses
+  // that the node lacks (or one changed) goes in the NBIRTH only, so the node is born again then (same bdSeq).
+  rpc PutDevice(SparkplugDeviceSpec) returns (SparkplugDeviceInfo);
+  rpc DeleteDevice(SparkplugDeviceRef) returns (Empty);       // its DDEATH; its metrics and what was kept of them go
+  // Every change of these edge nodes (all, when `ids` is empty), starting with each one's state now: born, its
+  // primary host, births, bdSeq, devices online, history dropping - at once; history's counts at most once a second;
+  // `deleted` when one is. Its spec without metrics or templates (GetEdgeNode has them). Ends when cancelled.
+  rpc WatchEdgeNodes(SparkplugWatchEdgeNodesRequest) returns (stream SparkplugEdgeNodeInfo);
 }
 
 message SparkplugEdgeNodeSpec {
@@ -480,8 +496,18 @@ message SparkplugEdgeNodeSpec {
   string primary_host_id = 5;      // born only while that host's STATE is online; "": whenever connected
   repeated string devices = 6;
   repeated SparkplugMetricDeclaration metrics = 7;
-  optional uint64 history_max = 8; // values kept while not born (default 100000; 0: none); full, the oldest go
+  // WHAT IT KEEPS while not born (Sparkplug's store and forward): at most history_max values (default 100000; 0: none),
+  // history_max_bytes bytes (default 0: no limit of its own) and values younger than history_max_age_ms (default 0:
+  // any age). Past a limit the oldest are dropped - samples first, history_first's only when no sample is left -
+  // counted in history_lost, said once in the log and to WatchEdgeNodes (history_dropping) when it starts. Kept on
+  // disk in the state directory's outbox.db, as it is: not encrypted (protect the data folder).
+  optional uint64 history_max = 8;
   repeated SparkplugTemplateDefinition templates = 9;
+  optional uint64 history_max_bytes = 10;
+  optional uint64 history_max_age_ms = 11;
+  // Values a second it sends as history once born (default 1000; 0: as fast as the link takes them), in messages of
+  // at most 64. Live values never wait for it: SetValues publishes them at once.
+  optional uint32 history_rate = 12;
 }
 // A Template definition the edge node publishes in its NBIRTH: the type of a PLC struct or UDT - its members (name,
 // datatype, default value; a member may itself be a Template instance, an array or a DataSet) and its parameters.
@@ -502,6 +528,11 @@ message SparkplugMetricDeclaration {
   optional double high = 7;        // engHigh
   double deadband = 8;             // published only when it has moved this much...
   double deadband_percent = 9;     // ...or this percent of its range
+  // What its births say of it beside engUnit, engLow, engHigh and Quality: Description, Format, readOnly, keys of
+  // your own - any type a property can be, PropertySets too, as long as they are. Not Quality (a value's: SetValues),
+  // nor engUnit / engLow / engHigh when units / low / high say them; a key once.
+  repeated SparkplugProperty properties = 10;
+  bool history_first = 11;         // what it keeps goes out before the rest: events before samples, oldest first in each
 }
 message SparkplugEdgeNodeRef {
   string id = 1;
@@ -515,6 +546,9 @@ message SparkplugEdgeNodeInfo {
   uint64 history = 6;              // values kept, waiting to be sent as history
   uint64 history_lost = 7;
   repeated string devices_online = 8;
+  uint64 history_bytes = 9;        // what `history` takes on disk
+  bool history_dropping = 10;      // a limit has dropped the oldest since what it kept was last empty
+  bool deleted = 11;               // WatchEdgeNodes: it was deleted (only spec.id is set)
 }
 message SparkplugEdgeNodeList {
   repeated SparkplugEdgeNodeInfo edge_nodes = 1;
@@ -522,7 +556,11 @@ message SparkplugEdgeNodeList {
 message SparkplugValuesRequest {
   string edge_node = 1;
   string device = 2;               // "": the node's own metrics
-  repeated SparkplugMetric metrics = 3; // name, value, and a timestamp if not now
+  // Name, value, a timestamp if not now, and a Quality property (Int32: 192 Good, 0 Bad, 500 Stale - the codes
+  // Sparkplug allows) when it changes: published with the value (a change of quality alone is news too), sent in every
+  // data message while it is not Good, kept with it as history, and in the next birth. Any other property, metadata,
+  // or another Quality is refused, never dropped. The datatype and alias are the declaration's.
+  repeated SparkplugMetric metrics = 3;
 }
 message SparkplugValuesReply {
   uint32 sent = 1;                 // set and published (deadbands, or no change, may hold some back)
@@ -534,6 +572,25 @@ message SparkplugDeviceStateRequest {
   string edge_node = 1;
   string device = 2;
   bool online = 3;
+}
+message SparkplugDeviceSpec {
+  string edge_node = 1;
+  string device = 2;               // a Sparkplug id; added to the node's devices if it is not one
+  repeated SparkplugMetricDeclaration metrics = 3;   // all of its metrics (their `device` is this one)
+  repeated SparkplugTemplateDefinition templates = 4; // definitions they use: added to the node's, or replacing one
+}
+message SparkplugDeviceRef {
+  string edge_node = 1;
+  string device = 2;
+}
+message SparkplugDeviceInfo {
+  string edge_node = 1;
+  string device = 2;
+  bool online = 3;                 // born now (not while the node is not, nor once SetDeviceState took it offline)
+  uint32 metrics = 4;
+}
+message SparkplugWatchEdgeNodesRequest {
+  repeated string ids = 1;         // empty: every edge node
 }
 
 // Every NBIRTH and DBIRTH the server's clients publish kept, retained, on
@@ -598,6 +655,11 @@ message SparkplugNodeMetric {
   uint64 timestamp = 6;
   bool stale = 7;                  // its device or node died since its birth (the value is the last known)
   uint64 stale_at = 8;             // when: the DDEATH's timestamp, or the host's time of the NDEATH
+  // What its birth said of it - every property, engUnit, ranges, Description, Format, readOnly, a node's own keys -
+  // with Quality the latest: so an application that starts after the births reads them here and asks no node to be
+  // born again for them.
+  repeated SparkplugProperty properties = 9;
+  optional int32 quality = 10;     // the latest Quality: its birth's, then the last a data message gave; unset: none
 }
 
 message SparkplugRebirthRequest {

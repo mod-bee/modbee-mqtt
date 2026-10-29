@@ -24,8 +24,14 @@ application that has no Sparkplug code of its own, through the
 `modbee-mqtt sparkplug-nodes put`) on one of its connections - to another
 broker, to the server itself, or [over Kafka](kafka.md#a-sparkplug-host-on-kafka-its-state-on-mqtt) -
 payloads decoded and encoded for it, and Sparkplug Aware
-(`serve --sparkplug-aware`). `modbee-mqtt sub -t 'spBv1.0/#' --sparkplug`
-prints what goes by, decoded ([cli.md](cli.md#subscribing)).
+(`serve --sparkplug-aware`). The server's edge node takes a quality with each
+value, properties in its births, devices added, changed and removed in the
+same session (`Sparkplug.PutDevice`, `DeleteDevice`), and keeps what it
+cannot send within limits of count, bytes and age, sent at a set rate with
+events first; its host reports every birth's properties and each metric's
+latest quality ([app-api.md](app-api.md#sparkplug-b)).
+`modbee-mqtt sub -t 'spBv1.0/#' --sparkplug` prints what goes by, decoded
+([cli.md](cli.md#subscribing)).
 
 ---
 
@@ -188,6 +194,42 @@ node.rangeAt(level, 0.0, 4.5);
 
 They travel only in the birth, so a change shows at the next one.
 
+### Quality, and other properties
+
+A metric's **quality** says whether to trust its value: `MQ_SP_QUALITY_GOOD`
+(192), `_BAD` (0) or `_STALE` (500), the three codes Sparkplug allows
+([tck-id-payloads-propertyset-quality-value-value]; any other is refused).
+A read that failed sets it Bad and the device stays born:
+
+```cpp
+node.qualityAt(level, MQ_SP_QUALITY_BAD);    // the PLC answered with an error
+node.publishChanged();                       // an NDATA: the value as it was, Quality 0
+```
+
+Every birth carries each metric's quality. A change of quality puts the
+metric in the next data message whatever its deadband says, and every data
+message carries a `Quality` property while it is not Good - so a host that
+reads no `Quality` as Good and a host that keeps the last one it read agree.
+`MqttSparkplugRecord::quality` does the same for `publishRecords()`, and the
+replay window keeps each value's.
+
+**Other properties** - a description, a display format, read-only, a key of
+your own, of any type, PropertySets too - go in the birth as an encoded
+PropertySet (`mq_sparkplugEncodePropertySet`), copied:
+
+```cpp
+MqttSparkplugProperty more[2] = {mq_spDescription("Raw water tank level"), mq_spEngUnit("m")};
+uint8_t encoded[128];
+MqttSparkplugError error;
+const size_t length = mq_sparkplugEncodePropertySet(encoded, sizeof encoded, more, 2, error);
+node.propertiesAt(level, encoded, length);
+```
+
+They take one of a metric's four property slots (`MQ_SP_MAX_PROPERTIES`),
+after engUnit, Quality and the range: with units and a range as well there is
+no room, so put engUnit, engLow and engHigh in the encoded set too, as the
+server's edge node does.
+
 ### Many metrics from one block
 
 A wrapper binding a whole structure looks each metric up once and keeps its
@@ -313,6 +355,34 @@ node.deviceOnline("Pump-2");                     // DBIRTH, once the node has bi
 node.setFor("Pump-2", "Speed", mq_spFloat(1450.0f));
 node.deviceOffline("Pump-2");                    // DDEATH, when the device stops answering
 ```
+
+### Changing what it declares while it runs
+
+A gateway adds a tag, a PLC connection comes and goes: the session stays.
+The Sparkplug way to say a declaration changed is a device's DDEATH and a new
+DBIRTH, or for the node's own metrics a rebirth - the same bdSeq, the same
+connection, nothing else told the node died:
+
+```cpp
+node.deviceOffline("Pump-2");                    // DDEATH: the old declaration is over
+node.removeMetrics("Pump-2");                    // the device stays, its metrics go
+node.declareFor("Pump-2", "Speed", MqttSparkplugDataType::Double);
+node.deviceOnline("Pump-2");                     // DBIRTH, with what it is now
+
+node.removeDevice("Pump-3");                     // its DDEATH, and gone
+
+node.removeMetrics(nullptr);                     // the node's own
+node.removeTemplates();                          // ... and its Template definitions
+node.declare("Mode", MqttSparkplugDataType::String);
+node.rebirth();                                  // NBIRTH and every DBIRTH, the same bdSeq
+```
+
+A metric declared again takes a new alias from the node's one counter -
+never one an old declaration used, so no host can read the old meaning
+([tck-id-payloads-alias-uniqueness]). Indices after a removed metric move
+down: look them up again with `indexOf()`. What the replay window held of a
+removed metric is never sent. (A block that keeps indices, as the OpenPLC
+blocks do, never removes.)
 
 ### On a connection you already have
 
@@ -531,7 +601,7 @@ characters; it is not any more.)
 ### Records with their own time, and store-and-forward
 
 ```cpp
-struct MqttSparkplugRecord { size_t index; MqttSparkplugValue value; uint64_t timestamp; };
+struct MqttSparkplugRecord { size_t index; MqttSparkplugValue value; uint64_t timestamp; int32_t quality; };
 bool publishRecords(const MqttSparkplugRecord* records, size_t count, bool historical);
 uint64_t timestamp() const;   // the stamp the node would use now
 ```

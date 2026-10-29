@@ -33,6 +33,7 @@
 #include <deque>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
 
 #if !defined(_WIN32)
@@ -1540,34 +1541,38 @@ private:
     grpc::Status _status = grpc::Status::OK;
 };
 
-// Connections.Watch: every change of state, as it happens. A server stream:
-// it ends when the caller cancels it.
-class WatchReactor : public grpc::ServerWriteReactor<v1::ConnectionInfo> {
+// Connections.Watch and Sparkplug.WatchEdgeNodes: every change of state, as it
+// happens. A server stream: it ends when the caller cancels it. `watch` starts
+// the watcher with what to call on each change (on the manager's thread),
+// `unwatch` ends it, `to` puts one change on the wire.
+template <typename Wire, typename Info>
+class WatchReactor : public grpc::ServerWriteReactor<Wire> {
 public:
-    WatchReactor(AppConnections& connections, const std::vector<std::string>& ids, bool allowedIn)
-        : _connections(connections) {
-        if (!allowedIn) {
+    WatchReactor(std::function<uint64_t(std::function<void(const Info&)>)> watch, std::function<void(uint64_t)> unwatch,
+                 void (*to)(const Info&, Wire&), const grpc::Status& refused)
+        : _unwatch(std::move(unwatch)), _to(to) {
+        if (!refused.ok()) {
             _finished = true;
-            Finish(refusedToken());
+            this->Finish(refused);
             return;
         }
-        _watcher = _connections.watch(ids, [this](const AppConnectionInfo& info) {
-            v1::ConnectionInfo* next = nullptr;
+        _watcher = watch([this](const Info& info) {
+            Wire* next = nullptr;
             {
                 std::lock_guard<std::mutex> guard(_lock);
                 if (_ending) return;
                 _queue.emplace_back();
-                infoTo(info, _queue.back());
+                _to(info, _queue.back());
                 if (_writing) return;
                 _writing = true;
                 next = &_queue.front();
             }
-            StartWrite(next);
+            this->StartWrite(next);
         });
     }
 
     void OnWriteDone(bool ok) override {
-        v1::ConnectionInfo* next = nullptr;
+        Wire* next = nullptr;
         {
             std::lock_guard<std::mutex> guard(_lock);
             _queue.pop_front();
@@ -1577,29 +1582,30 @@ public:
                 _writing = false;
             }
         }
-        if (next) StartWrite(next);
+        if (next) this->StartWrite(next);
     }
 
     void OnCancel() override {
-        _connections.unwatch(_watcher);
+        if (_watcher) _unwatch(_watcher);
         std::lock_guard<std::mutex> guard(_lock);
         _ending = true;
         if (!_finished) {
             _finished = true;
-            Finish(grpc::Status::OK);
+            this->Finish(grpc::Status::OK);
         }
     }
 
     void OnDone() override {
-        _connections.unwatch(_watcher);
+        if (_watcher) _unwatch(_watcher);
         delete this;
     }
 
 private:
-    AppConnections& _connections;
+    std::function<void(uint64_t)> _unwatch;
+    void (*_to)(const Info&, Wire&);
     uint64_t _watcher = 0;
     std::mutex _lock;
-    std::deque<v1::ConnectionInfo> _queue;
+    std::deque<Wire> _queue;
     bool _writing = false, _ending = false, _finished = false;
 };
 
@@ -1642,6 +1648,16 @@ public:
         if (_connections) reply->add_features("sparkplug.edge");
         // Its edge node takes Template definitions, arrays and DataSets; ListNodes reports every value.
         if (_connections) reply->add_features("sparkplug.structures");
+        // The edge node: a Quality per value; properties in its births; devices changed in the session (PutDevice,
+        // DeleteDevice, PutEdgeNode without a new session); what it keeps limited by bytes and age; history sent
+        // at a set rate; history_first; WatchEdgeNodes. The host: ListNodes gives each birth's properties and Quality.
+        if (_connections) {
+            for (const char* f : {"sparkplug.edge.quality", "sparkplug.edge.properties", "sparkplug.edge.devices",
+                                  "sparkplug.edge.history-limits", "sparkplug.edge.history-rate",
+                                  "sparkplug.edge.history-first", "sparkplug.edge.watch", "sparkplug.host.properties"}) {
+                reply->add_features(f);
+            }
+        }
         if (_aware) reply->add_features("sparkplug.aware");
         if (_kafka) reply->add_features("kafka");           // Kafka.*, live
         if (_admin) reply->add_features("admin.backup");
@@ -2147,8 +2163,14 @@ public:
 
     grpc::ServerWriteReactor<v1::ConnectionInfo>* Watch(grpc::CallbackServerContext* context,
                                                         const v1::WatchConnectionsRequest* request) override {
-        return new WatchReactor(_connections, std::vector<std::string>(request->ids().begin(), request->ids().end()),
-                                allowed(context, _config.token));
+        const std::vector<std::string> ids(request->ids().begin(), request->ids().end());
+        AppConnections* connections = &_connections;
+        return new WatchReactor<v1::ConnectionInfo, AppConnectionInfo>(
+            [connections, ids](std::function<void(const AppConnectionInfo&)> changed) {
+                return connections->watch(ids, std::move(changed));
+            },
+            [connections](uint64_t watcher) { connections->unwatch(watcher); }, &infoTo,
+            allowed(context, _config.token) ? grpc::Status::OK : refusedToken());
     }
 
     grpc::ServerUnaryReactor* Reconnect(grpc::CallbackServerContext* context, const v1::ReconnectRequest* request,
@@ -2251,29 +2273,100 @@ private:
 // Sparkplug: the codec on its own
 // =============================================================================
 
+// A declaration from the wire, with what its births say of it encoded. False,
+// with `error`, for a property it does not carry: Quality (a value's), a key
+// twice, engUnit / engLow / engHigh given by units / low / high as well.
+bool declarationOf(const v1::SparkplugMetricDeclaration& d, AppSparkplugMetricDeclaration& m, std::string& error) {
+    m.name = d.name();
+    m.device = d.device();
+    m.datatype = (uint32_t)d.datatype();
+    m.writable = d.writable();
+    m.units = d.units();
+    m.hasRange = d.has_low() || d.has_high();
+    m.low = d.low();
+    m.high = d.high();
+    m.deadband = d.deadband();
+    m.deadbandPercent = d.deadband_percent();
+    m.historyFirst = d.history_first();
+    if (d.properties_size() == 0) return true;
+    std::set<std::string> keys;
+    v1::SparkplugPropertySet set;
+    for (const v1::SparkplugProperty& p : d.properties()) {
+        const std::string& k = p.key();
+        std::string why;
+        if (k.empty() || !keys.insert(k).second) why = "each property needs a key of its own";
+        else if (k == MQ_SP_PROPERTY_QUALITY) why = "Quality is a value's: SetValues gives it";
+        else if (k == "engUnit" && !m.units.empty()) why = "units says it: give it once";
+        else if ((k == "engLow" && d.has_low()) || (k == "engHigh" && d.has_high())) why = "low / high say it: give it once";
+        if (!why.empty()) {
+            error = "metric \"" + m.name + "\": property \"" + k + "\": " + why;
+            return false;
+        }
+        *set.add_properties() = p;
+    }
+    std::string why;
+    if (!sparkplug_codec::encodePropertySet(set, m.properties, why)) {
+        error = "metric \"" + m.name + "\": " + why;
+        return false;
+    }
+    return true;
+}
+
+bool templatesOf(const google::protobuf::RepeatedPtrField<v1::SparkplugTemplateDefinition>& wire,
+                 std::vector<AppSparkplugTemplateDefinition>& out, std::string& error) {
+    for (const v1::SparkplugTemplateDefinition& d : wire) {
+        AppSparkplugTemplateDefinition t;
+        t.name = d.name();
+        v1::SparkplugTemplate definition = d.definition();
+        definition.set_is_definition(true);
+        std::string why;
+        if (!sparkplug_codec::encodeTemplate(definition, t.encoded, why)) {
+            error = "template \"" + t.name + "\": " + why;
+            return false;
+        }
+        out.push_back(t);
+    }
+    return true;
+}
+
+void declarationTo(const AppSparkplugMetricDeclaration& m, v1::SparkplugMetricDeclaration& d) {
+    d.set_name(m.name);
+    d.set_device(m.device);
+    d.set_datatype((v1::SparkplugDataType)m.datatype);
+    d.set_writable(m.writable);
+    d.set_units(m.units);
+    if (m.hasRange) {
+        d.set_low(m.low);
+        d.set_high(m.high);
+    }
+    d.set_deadband(m.deadband);
+    d.set_deadband_percent(m.deadbandPercent);
+    d.set_history_first(m.historyFirst);
+    if (!m.properties.empty()) {
+        v1::SparkplugPropertySet set;
+        std::string ignored;
+        sparkplug_codec::decodePropertySet(m.properties, set, ignored);
+        for (const v1::SparkplugProperty& p : set.properties()) *d.add_properties() = p;
+    }
+}
+
 void edgeInfoTo(const AppSparkplugEdgeNodeInfo& info, v1::SparkplugEdgeNodeInfo& wire) {
     v1::SparkplugEdgeNodeSpec* s = wire.mutable_spec();
     s->set_id(info.spec.id);
+    if (info.deleted) {
+        wire.set_deleted(true);
+        return;
+    }
     s->set_connection(info.spec.connection);
     s->set_group(info.spec.group);
     s->set_node(info.spec.node);
     s->set_primary_host_id(info.spec.primaryHostId);
     for (const std::string& d : info.spec.devices) s->add_devices(d);
     s->set_history_max(info.spec.historyMax);
-    for (const AppSparkplugMetricDeclaration& m : info.spec.metrics) {
-        v1::SparkplugMetricDeclaration* d = s->add_metrics();
-        d->set_name(m.name);
-        d->set_device(m.device);
-        d->set_datatype((v1::SparkplugDataType)m.datatype);
-        d->set_writable(m.writable);
-        d->set_units(m.units);
-        if (m.hasRange) {
-            d->set_low(m.low);
-            d->set_high(m.high);
-        }
-        d->set_deadband(m.deadband);
-        d->set_deadband_percent(m.deadbandPercent);
-    }
+    s->set_history_max_bytes(info.spec.historyMaxBytes);
+    s->set_history_max_age_ms(info.spec.historyMaxAgeMs);
+    s->set_history_rate(info.spec.historyRate);
+    for (const AppSparkplugMetricDeclaration& m : info.spec.metrics) declarationTo(m, *s->add_metrics());
     for (const AppSparkplugTemplateDefinition& t : info.spec.templates) {
         v1::SparkplugTemplateDefinition* d = s->add_templates();
         d->set_name(t.name);
@@ -2287,6 +2380,8 @@ void edgeInfoTo(const AppSparkplugEdgeNodeInfo& info, v1::SparkplugEdgeNodeInfo&
     wire.set_history(info.history);
     wire.set_history_lost(info.historyLost);
     for (const std::string& d : info.devicesOnline) wire.add_devices_online(d);
+    wire.set_history_bytes(info.historyBytes);
+    wire.set_history_dropping(info.historyDropping);
 }
 
 // A value given in any field, as `type` holds it.
@@ -2355,34 +2450,23 @@ public:
         spec.primaryHostId = request->primary_host_id();
         spec.devices.assign(request->devices().begin(), request->devices().end());
         if (request->has_history_max()) spec.historyMax = request->history_max();
+        if (request->has_history_max_bytes()) spec.historyMaxBytes = request->history_max_bytes();
+        if (request->has_history_max_age_ms()) spec.historyMaxAgeMs = request->history_max_age_ms();
+        if (request->has_history_rate()) spec.historyRate = request->history_rate();
+        std::string error;
         for (const v1::SparkplugMetricDeclaration& d : request->metrics()) {
             AppSparkplugMetricDeclaration m;
-            m.name = d.name();
-            m.device = d.device();
-            m.datatype = (uint32_t)d.datatype();
-            m.writable = d.writable();
-            m.units = d.units();
-            m.hasRange = d.has_low() || d.has_high();
-            m.low = d.low();
-            m.high = d.high();
-            m.deadband = d.deadband();
-            m.deadbandPercent = d.deadband_percent();
-            spec.metrics.push_back(m);
-        }
-        for (const v1::SparkplugTemplateDefinition& d : request->templates()) {
-            AppSparkplugTemplateDefinition t;
-            t.name = d.name();
-            v1::SparkplugTemplate definition = d.definition();
-            definition.set_is_definition(true);
-            std::string why;
-            if (!sparkplug_codec::encodeTemplate(definition, t.encoded, why)) {
-                reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "template \"" + t.name + "\": " + why));
+            if (!declarationOf(d, m, error)) {
+                reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
                 return reactor;
             }
-            spec.templates.push_back(t);
+            spec.metrics.push_back(m);
+        }
+        if (!templatesOf(request->templates(), spec.templates, error)) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
         }
         AppSparkplugEdgeNodeInfo info;
-        std::string error;
         if (!_connections->putEdgeNode(spec, &info, error)) {
             reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
             return reactor;
@@ -2431,17 +2515,48 @@ public:
         if (!ready(context, reactor)) return reactor;
         // The declarations first: a value is read as its metric's datatype wants it.
         AppSparkplugEdgeNodeInfo info;
-        const bool declared = _connections->getEdgeNode(request->edge_node(), info);
+        std::map<std::string, uint32_t> datatypes;
+        if (_connections->getEdgeNode(request->edge_node(), info)) {
+            for (const AppSparkplugMetricDeclaration& d : info.spec.metrics) {
+                if (d.device == request->device()) datatypes[d.name] = d.datatype;
+            }
+        }
         std::vector<AppSparkplugSet> sets;
         std::vector<std::string> refused;
         for (const v1::SparkplugMetric& m : request->metrics()) {
-            uint32_t datatype = v1::DATATYPE_UNKNOWN;
-            for (const AppSparkplugMetricDeclaration& d : info.spec.metrics) {
-                if (declared && d.name == m.name() && d.device == request->device()) datatype = d.datatype;
-            }
+            auto declared = datatypes.find(m.name());
+            const uint32_t datatype = declared == datatypes.end() ? (uint32_t)v1::DATATYPE_UNKNOWN : declared->second;
             AppSparkplugSet set;
             set.name = m.name();
             set.timestamp = m.has_timestamp() ? m.timestamp() : 0;
+            // Beside the value, its Quality - and nothing else: what it cannot
+            // carry is refused, never dropped.
+            std::string why;
+            if (m.has_metadata()) why = "metadata is not carried (a value and its Quality are)";
+            for (const v1::SparkplugProperty& p : m.properties()) {
+                if (!why.empty()) break;
+                if (p.key() != MQ_SP_PROPERTY_QUALITY) {
+                    why = "property \"" + p.key() + "\" is not carried: a declaration's (properties) are in its births";
+                } else if (set.hasQuality) {
+                    why = "Quality given twice";
+                } else if ((p.type() != v1::DATATYPE_INT32 && p.type() != v1::DATATYPE_UNKNOWN) || p.is_null() ||
+                           (p.value().kind_case() != v1::SparkplugValue::kIntValue &&
+                            p.value().kind_case() != v1::SparkplugValue::kUintValue)) {
+                    why = "Quality is an Int32";
+                } else {
+                    const int64_t q = p.value().kind_case() == v1::SparkplugValue::kIntValue
+                                          ? p.value().int_value() : (int64_t)p.value().uint_value();
+                    if (q != MQ_SP_QUALITY_GOOD && q != MQ_SP_QUALITY_BAD && q != MQ_SP_QUALITY_STALE) {
+                        why = "Quality " + std::to_string(q) + ": Sparkplug allows 192 (Good), 0 (Bad) or 500 (Stale)";
+                    }
+                    set.hasQuality = true;
+                    set.quality = (int32_t)q;
+                }
+            }
+            if (!why.empty()) {
+                refused.push_back(m.name() + ": " + why);
+                continue;
+            }
             MqttSparkplugValue& v = set.value;
             v.type = (MqttSparkplugDataType)datatype;
             v.isNull = m.is_null();
@@ -2511,6 +2626,66 @@ public:
                             ? grpc::Status::OK
                             : grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error));
         return reactor;
+    }
+
+    grpc::ServerUnaryReactor* PutDevice(grpc::CallbackServerContext* context, const v1::SparkplugDeviceSpec* request,
+                                        v1::SparkplugDeviceInfo* reply) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        std::vector<AppSparkplugMetricDeclaration> metrics;
+        std::vector<AppSparkplugTemplateDefinition> templates;
+        std::string error;
+        for (const v1::SparkplugMetricDeclaration& d : request->metrics()) {
+            AppSparkplugMetricDeclaration m;
+            if (!declarationOf(d, m, error)) break;
+            if (!m.device.empty() && m.device != request->device()) {
+                error = "metric \"" + m.name + "\": its device is \"" + request->device() + "\"";
+                break;
+            }
+            metrics.push_back(m);
+        }
+        if (error.empty()) templatesOf(request->templates(), templates, error);
+        bool online = false, notFound = false;
+        if (error.empty() &&
+            _connections->putDevice(request->edge_node(), request->device(), metrics, templates, online, notFound,
+                                    error)) {
+            reply->set_edge_node(request->edge_node());
+            reply->set_device(request->device());
+            reply->set_online(online);
+            reply->set_metrics((uint32_t)metrics.size());
+            reactor->Finish(grpc::Status::OK);
+            return reactor;
+        }
+        reactor->Finish(grpc::Status(notFound ? grpc::StatusCode::NOT_FOUND : grpc::StatusCode::INVALID_ARGUMENT, error));
+        return reactor;
+    }
+
+    grpc::ServerUnaryReactor* DeleteDevice(grpc::CallbackServerContext* context, const v1::SparkplugDeviceRef* request,
+                                           v1::Empty*) override {
+        grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+        if (!ready(context, reactor)) return reactor;
+        bool notFound = false;
+        std::string error;
+        reactor->Finish(_connections->removeDevice(request->edge_node(), request->device(), notFound, error)
+                            ? grpc::Status::OK
+                            : grpc::Status(notFound ? grpc::StatusCode::NOT_FOUND
+                                                    : grpc::StatusCode::FAILED_PRECONDITION,
+                                           error));
+        return reactor;
+    }
+
+    grpc::ServerWriteReactor<v1::SparkplugEdgeNodeInfo>* WatchEdgeNodes(
+        grpc::CallbackServerContext* context, const v1::SparkplugWatchEdgeNodesRequest* request) override {
+        const std::vector<std::string> ids(request->ids().begin(), request->ids().end());
+        AppConnections* connections = _connections;
+        grpc::Status refused = grpc::Status::OK;
+        if (!allowed(context, _config.token)) refused = refusedToken();
+        else if (connections == nullptr) refused = grpc::Status(grpc::StatusCode::UNAVAILABLE, "this server keeps no connections");
+        return new WatchReactor<v1::SparkplugEdgeNodeInfo, AppSparkplugEdgeNodeInfo>(
+            [connections, ids](std::function<void(const AppSparkplugEdgeNodeInfo&)> changed) {
+                return connections->watchEdgeNodes(ids, std::move(changed));
+            },
+            [connections](uint64_t watcher) { connections->unwatchEdgeNodes(watcher); }, &edgeInfoTo, refused);
     }
 
     grpc::ServerUnaryReactor* GetAware(grpc::CallbackServerContext* context, const v1::Empty*,
@@ -2622,6 +2797,17 @@ public:
             return reactor;
         }
         for (const AppSparkplugNodeInfo& n : nodes) {
+            // What its births said of each metric, every property: read from
+            // the births as they arrived (the host's own table keeps four).
+            std::map<std::string, v1::SparkplugMessage> births;
+            std::map<std::pair<std::string, std::string>, const v1::SparkplugMetric*> said;
+            for (const auto& b : n.births) {
+                const std::string topic = "spBv1.0/" + n.group + (b.first.empty() ? "/NBIRTH/" + n.node
+                                                                                   : "/DBIRTH/" + n.node + "/" + b.first);
+                v1::SparkplugMessage& read = births[b.first];
+                sparkplug_codec::decode(topic, b.second, read);
+                for (const v1::SparkplugMetric& m : read.payload().metrics()) said[std::make_pair(b.first, m.name())] = &m;
+            }
             v1::SparkplugNode* out = reply->add_nodes();
             out->set_group(n.group);
             out->set_node(n.node);
@@ -2646,6 +2832,30 @@ public:
                 metric->set_timestamp(m.at);
                 metric->set_stale(m.stale);
                 metric->set_stale_at(m.staleAt);
+                // The birth's properties, its Quality the latest said.
+                bool quality = false;
+                auto birth = said.find(std::make_pair(m.device, m.name));
+                if (birth != said.end()) {
+                    for (const v1::SparkplugProperty& p : birth->second->properties()) {
+                        v1::SparkplugProperty* copy = metric->add_properties();
+                        *copy = p;
+                        if (p.key() != MQ_SP_PROPERTY_QUALITY) continue;
+                        quality = true;
+                        if (m.hasQuality) copy->mutable_value()->set_int_value(m.quality);
+                        else if (p.value().kind_case() == v1::SparkplugValue::kIntValue) {
+                            metric->set_quality((int32_t)p.value().int_value());
+                        }
+                    }
+                }
+                if (m.hasQuality) {
+                    metric->set_quality(m.quality);
+                    if (!quality) {
+                        v1::SparkplugProperty* q = metric->add_properties();
+                        q->set_key(MQ_SP_PROPERTY_QUALITY);
+                        q->set_type(v1::DATATYPE_INT32);
+                        q->mutable_value()->set_int_value(m.quality);
+                    }
+                }
                 switch (m.kind) {
                 case AppSparkplugMetricInfo::Signed: metric->mutable_value()->set_int_value(m.i); break;
                 case AppSparkplugMetricInfo::Unsigned: metric->mutable_value()->set_uint_value(m.u); break;

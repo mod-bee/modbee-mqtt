@@ -748,6 +748,24 @@ bool encodeTemplate(const v1::SparkplugTemplate& value, std::string& out, std::s
     return true;
 }
 
+bool encodePropertySet(const v1::SparkplugPropertySet& set, std::string& out, std::string& error) {
+    wire::Payload::PropertySet w;
+    if (!propertySetFor(set, w, error)) return false;
+    out = w.SerializeAsString();
+    return true;
+}
+
+bool decodePropertySet(const std::string& bytes, v1::SparkplugPropertySet& out, std::string& error) {
+    DecodeScope scope;
+    wire::Payload::PropertySet w;
+    if (!w.ParseFromString(bytes)) {
+        error = "not a PropertySet";
+        return false;
+    }
+    propertySetOf(w, out);
+    return true;
+}
+
 bool decodeTemplate(const std::string& bytes, v1::SparkplugTemplate& out, std::string& error) {
     DecodeScope scope;
     wire::Payload::Template w;

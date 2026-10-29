@@ -943,9 +943,11 @@ void MqttSparkplugHost::rememberMetrics(MqttSparkplugTrackedNode& tracked,
         }
 
         MqttSparkplugTrackedMetric& entry = tracked.metrics[(size_t)slot];
-        // Born: current again, whatever the slot held before.
+        // Born: current again, whatever the slot held before - its quality
+        // what this birth says, or nothing.
         entry.stale = false;
         entry.staleAt = 0;
+        entry.hasQuality = false;
         const bool renamed = entry.name != metric.name || entry.device != device;
         entry.name = metric.name;
         entry.alias = metric.hasAlias ? metric.alias : 0;
@@ -992,6 +994,15 @@ void MqttSparkplugHost::recordValues(MqttSparkplugTrackedNode& tracked,
         if (metric.isHistorical) continue;
 
         MqttSparkplugTrackedMetric& entry = tracked.metrics[(size_t)slot];
+
+        // Its Quality, when it says one: the last said stands until another.
+        const MqttSparkplugProperty* quality =
+            metric.findProperty(MQ_SP_PROPERTY_QUALITY);
+        if (quality != nullptr && !quality->isNull && !quality->encoded &&
+            quality->type == MqttSparkplugDataType::Int32) {
+            entry.quality = (int32_t)quality->as.signedValue;
+            entry.hasQuality = true;
+        }
 
         // A NULL metric is a positive statement that the value is not known,
         // so the entry stops offering a stale reading rather than keeping the

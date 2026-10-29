@@ -11,19 +11,16 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
-### Fixed
-
-- **The release rebuilt gRPC from source (40 minutes a Linux build) after a few pushes**: CI saved a new 2 GB copy
-  of its Windows packages on every run, and GitHub, which keeps 10 GB a repository, dropped the release's Linux
-  packages to make room. Each set of packages is now saved once, named by what is in it.
-
 ## [0.1.1]
 
 Reliability, for cellular links and Sparkplug: dropouts, outages, dead links, a broker restart and a failed DNS on the
 cellular rig lose no value; the Sparkplug edge node and host pass the Eclipse Sparkplug TCK and interoperate with
 Tahu (Java, JavaScript), Node-RED, Mosquitto, EMQX and HiveMQ; the MQTT client and server were tested against
 Mosquitto, EMQX, HiveMQ, NanoMQ and RabbitMQ and the Paho conformance tests. Builds on Windows (MSVC), macOS and
-Linux without warnings.
+Linux without warnings. The server's Sparkplug edge node is ready for a gateway to run on: a quality with each
+value, properties in its births, devices added, changed and removed without a new session, store and forward limited
+by count, bytes and age and sent at a set rate with events first, and a watch of its state; its host keeps what every
+birth said. Each is a feature `System.Hello` lists.
 
 Defaults that change on upgrade: `serve` holds up to 1000 messages a client (`--queue`, was 64), states a Receive
 Maximum of 1024 (`--receive-maximum`) and takes up to 1000 new connections a second (`--max-connect-rate`); a host
@@ -31,6 +28,40 @@ socket with nothing acknowledged for 300 s is closed as dead (`TCP_USER_TIMEOUT`
 timestamp, and a Sparkplug host asks every node to rebirth when its own session comes back.
 
 ### Added
+
+- **What a gateway needs of the server's Sparkplug edge node.** Each one is a
+  Hello feature, a `modbee-mqtt` command and in [app-api.md](docs/app-api.md#sparkplug-b):
+  - **A quality with each value** (`sparkplug.edge.quality`): `SetValues` takes a `Quality` property (192 Good, 0
+    Bad, 500 Stale - the codes Sparkplug allows) and publishes it with the value - a change of quality alone is news,
+    whatever the deadband - in every data message while it is not Good, with the value in history, in the next birth,
+    and across a restart. A read that failed goes Bad and its device stays born. Any other property, `metadata`, or
+    another code is `refused`; they were dropped without a word.
+  - **Properties in the births** (`sparkplug.edge.properties`): `SparkplugMetricDeclaration.properties` -
+    Description, Format, readOnly, keys of your own, any type, as long as they are - beside engUnit, the range and
+    Quality.
+  - **Devices changed in the session** (`sparkplug.edge.devices`): `Sparkplug.PutDevice` (`modbee-mqtt
+    sparkplug-devices put`) adds a device or replaces its metrics with its DDEATH and a new DBIRTH - the same bdSeq,
+    new aliases from the node's one counter, values carried over - and `DeleteDevice` sends its DDEATH. `PutEdgeNode`
+    again with the same connection, group, node and primary host now changes a running node the same way, and a
+    change to its own metrics or templates is a rebirth in the session: it was a new session, an NDEATH and every
+    device born again, for any change.
+  - **Store and forward's limits** (`sparkplug.edge.history-limits`): `history_max_bytes` and `history_max_age_ms`
+    beside `history_max`; the oldest go, samples first, counted in `history_lost`, a line in the log when dropping
+    starts, `history_bytes` and `history_dropping` in its info.
+  - **History at a set rate** (`sparkplug.edge.history-rate`): `history_rate`, 1000 values a second by default (0:
+    as fast as the link takes it); live values never wait behind it. **Events before samples**
+    (`sparkplug.edge.history-first`): a declaration's `history_first` drains ahead of the rest.
+  - **`Sparkplug.WatchEdgeNodes`** (`sparkplug.edge.watch`, `modbee-mqtt sparkplug-nodes watch`): every change of
+    an edge node as it happens - born, its primary host, births, devices online, history.
+- **The server's Sparkplug host keeps what the births said** (`sparkplug.host.properties`): `ListNodes` gives each
+  metric every property its birth had - engUnit, ranges, Description, Format, readOnly, a node's own keys - and its
+  latest `quality` (the birth's, then the last a data message gave), so an application restarted while the host
+  stayed up asks no node to be born again.
+- **In the library**: `MqttSparkplugNode::qualityAt()` / `qualityOf()`, `MqttSparkplugRecord::quality` (the replay
+  window keeps it too), `propertiesAt()` (an encoded PropertySet in the birth, `mq_spEncodedProperties()`), and
+  `removeMetrics()`, `removeDevice()`, `removeTemplates()` to declare again in the session;
+  `MqttSparkplugTrackedMetric::quality` on the host. On an ESP32 (`Sparkplug_Edge_Node`): 496 bytes more flash,
+  the same static RAM; on the heap a pointer more a metric and 8 bytes more a replay-window entry.
 
 - **New connections a second, whole server** (`serve --max-connect-rate`, `broker: max-connect-rate`, default 1000;
   `Admin.PutListeners` `connect_rate`, live; `0` no limit). A reconnect storm - the broker restarted, a tower back
@@ -195,7 +226,21 @@ timestamp, and a Sparkplug host asks every node to rebirth when its own session 
   `CLIENT_EVENT_PUBLISH_REFUSED` / `_SUBSCRIBE_REFUSED` / `_CONNECT_REFUSED` with the topic or filter and the reason
   code — so an application can say why a device is not getting through. A board build compiles none of it.
 
+### Changed
+
+- **The server's edge node refuses a declaration it would have dropped**: a device id that is not a Sparkplug id or
+  is given twice, and a metric declared twice, are `INVALID_ARGUMENT`. Every NCMD and DCMD reaches the application,
+  to a metric declared `writable` or not, as before - now said in app-api.md: check `writable` before acting.
+
 ### Fixed
+
+- **A kept value of a metric declared again as another datatype stopped the edge node's history for good**: it
+  could never be sent and stayed at the head. It is dropped and counted in `history_lost`, as one of a metric
+  removed now is (that one was dropped without being counted).
+
+- **The release rebuilt gRPC from source (40 minutes a Linux build) after a few pushes**: CI saved a new 2 GB copy
+  of its Windows packages on every run, and GitHub, which keeps 10 GB a repository, dropped the release's Linux
+  packages to make room. Each set of packages is now saved once, named by what is in it.
 
 - **The tree builds again on Windows, macOS, and Linux without the Application API**: a variable named `small` (a
   macro in the Windows headers) broke MSVC, an unused field broke clang's `-Werror`, and two names used only by the

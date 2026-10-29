@@ -367,6 +367,24 @@ int failed(const std::string& who, const grpc::Status& status) {
                : 1;
 }
 
+// A server stream, a line of JSON for each message as it comes, `count` at
+// most (0: until it ends).
+template <typename Info>
+int printEach(grpc::ClientContext& context, grpc::ClientReader<Info>& reader, long count, const std::string& who) {
+    Info info;
+    long seen = 0;
+    while (reader.Read(&info)) {
+        std::printf("%s\n", jsonText(info, false).c_str());
+        std::fflush(stdout);
+        if (count > 0 && ++seen >= count) {
+            context.TryCancel();
+            return 0;
+        }
+    }
+    const grpc::Status status = reader.Finish();
+    return status.ok() ? 0 : failed(who, status);
+}
+
 std::string environment(const char* name) {
     const char* value = std::getenv(name);
     return value ? value : "";
@@ -543,18 +561,13 @@ int cmdApi(int argc, char** argv) {
         auto stub = v1::Connections::NewStub(channel);
         std::unique_ptr<grpc::ClientReader<v1::ConnectionInfo>> reader(
             stub->Watch(&context, *static_cast<v1::WatchConnectionsRequest*>(request.get())));
-        v1::ConnectionInfo info;
-        long seen = 0;
-        while (reader->Read(&info)) {
-            std::printf("%s\n", jsonText(info, false).c_str());
-            std::fflush(stdout);
-            if (o.count > 0 && ++seen >= o.count) {
-                context.TryCancel();
-                return 0;
-            }
-        }
-        const grpc::Status status = reader->Finish();
-        return status.ok() ? 0 : failed(who, status);
+        return printEach(context, *reader, o.count, who);
+    }
+    if (call == "Sparkplug.WatchEdgeNodes") {
+        auto stub = v1::Sparkplug::NewStub(channel);
+        std::unique_ptr<grpc::ClientReader<v1::SparkplugEdgeNodeInfo>> reader(
+            stub->WatchEdgeNodes(&context, *static_cast<v1::SparkplugWatchEdgeNodesRequest*>(request.get())));
+        return printEach(context, *reader, o.count, who);
     }
     if (consume) {
         auto stub = v1::Messages::NewStub(channel);

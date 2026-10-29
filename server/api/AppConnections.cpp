@@ -343,6 +343,13 @@ struct AppConnections::Host {
     uint64_t rebirths = 0;
     bool wasBorn = false;
     uint32_t failures = 0;                                   // decode failures already answered
+    // Each node's births as they arrived - "" its NBIRTH, else a device's
+    // DBIRTH - for what they say of each metric beside its value (ListNodes):
+    // an application that starts after them reads them here, and no node is
+    // asked to be born again for it. An NBIRTH replaces them all.
+    std::map<std::string, std::map<std::string, std::string>> births;
+    bool birth = false, nodeBirth = false;                  // the message being received
+    std::string birthOf, birthDevice;
 
     static std::string keyOf(const char* group, const char* node) {
         return std::string(group ? group : "") + "/" + (node ? node : "");
@@ -368,6 +375,12 @@ struct AppConnections::Host {
         h.names.clear();
         h.flags = 0;
         h.fresh = true;
+        h.nodeBirth = in.type == MqttSparkplugType::NBirth;
+        h.birth = h.nodeBirth || in.type == MqttSparkplugType::DBirth;
+        if (h.birth) {
+            h.birthOf = keyOf(in.group, in.node);
+            h.birthDevice = in.device ? in.device : "";
+        }
         const MqttSparkplugTrackedNode* node = h.library->findNode(in.group, in.node);
         const bool data = in.type == MqttSparkplugType::NData || in.type == MqttSparkplugType::DData;
         bool unknownAlias = false;
@@ -409,18 +422,42 @@ struct AppConnections::Host {
 struct AppConnections::EdgeNode {
     AppSparkplugEdgeNodeSpec spec;
     std::unique_ptr<MqttSparkplugNode> library;
-    uint64_t history = 0, historyLost = 0;
+    uint64_t history = 0, historyLost = 0, historyBytes = 0;
     // The bytes of each span metric's current value, by its index: the
     // library's node keeps a span into them until the next value (a rebirth
-    // reads it), so they outlive the call that set them.
-    std::vector<std::string> values;
+    // reads it), so they outlive the call that set them - each in a buffer of
+    // its own, which stays put when metrics before it are removed and the
+    // table closes up (redeclare()).
+    std::vector<std::unique_ptr<std::string>> values;
+    // By index: its declaration's history_first - what it keeps goes first.
+    std::vector<char> first;
     // History sent this session, and when: QoS 0, so it leaves the outbox only
     // once the node has stayed born for two keep-alives after it went (as
     // MqttSparkplugNode::publishRecords asks) - lost with the link before then,
     // it goes again after the next birth, is_historical as before.
-    std::vector<std::pair<uint64_t, Clock::time_point>> sentHistory;
+    struct Sent {
+        uint64_t id;
+        Clock::time_point at;
+        size_t bytes;
+    };
+    std::vector<Sent> sentHistory;
     uint32_t walksSeen = 0;      // the node's serverWalks() last acted on
-    uint64_t sentUpTo = 0;
+    uint64_t sentUpTo[2] = {0, 0};   // by class: history_first's, then the rest
+    // history_rate: values it may send now, filled as time passes.
+    double tokens = 0;
+    Clock::time_point tokensAt;
+    // A limit dropped the oldest: said once, in the log and to watchers, until
+    // what it kept is empty again.
+    bool dropping = false;
+    uint64_t droppedSince = 0;
+    Clock::time_point expiredAt;
+    // Devices the application took offline (SetDeviceState): a declaration
+    // changed does not bring one back.
+    std::set<std::string> devicesOff;
+    // What a watcher was told last (announceEdge).
+    std::string announced;
+    uint64_t announcedCounts = 0;
+    Clock::time_point announcedAt;
     // WHAT OUTLIVES A RESTART (AppConnections::saveEdgeState): the bdSeq last
     // used, so a node started again moves on from it rather than from zero,
     // and every metric's current value with when it was set, so the birth
@@ -430,48 +467,73 @@ struct AppConnections::EdgeNode {
     int savedBdSeq = -1;
     bool valuesChanged = false, saveFailed = false;
     Clock::time_point savedAt;
+    // What it keeps, by class: history_first's drain before the rest.
     std::string key() const { return "sparkplug-node:" + spec.id; }
+    std::string firstKey() const { return "sparkplug-node-first:" + spec.id; }
     const char* device(const std::string& d) const { return d.empty() ? nullptr : d.c_str(); }
     // A metric's current value - what the next NDATA, or the next birth,
     // carries - its text in `values`. Whether it changed.
     bool setCurrent(size_t index, MqttSparkplugValue value, const std::string& text, uint64_t at) {
         if (value.isSpan() && !value.isNull) {
+            if (!values[index]) values[index].reset(new std::string());
             std::string owned = text;           // a buffer of its own: see `values`
-            values[index].swap(owned);
-            value.as.bytes.data = (const uint8_t*)values[index].data();
-            value.as.bytes.length = (uint32_t)values[index].size();
+            values[index]->swap(owned);
+            value.as.bytes.data = (const uint8_t*)values[index]->data();
+            value.as.bytes.length = (uint32_t)values[index]->size();
         }
         if (!library->setAt(index, value)) return false;
         setAtMs[index] = at;
         valuesChanged = true;
         return true;
     }
+    // The tables by index, as long as the library's.
+    void sized() {
+        const size_t n = library->pointCount();
+        values.resize(n);
+        setAtMs.resize(n, 0);
+        first.resize(n, 0);
+    }
 };
 
 namespace {
 
 // A value kept while the node was not born, as an outbox message: its metric
-// name the topic, its device the publisher, its time the broker time.
-AppMessage keptValue(const std::string& device, const AppSparkplugSet& set) {
+// name the topic, its device the publisher, its time the broker time. The
+// payload: its datatype (the top bit: a quality follows), null, the value's
+// bits, its quality when not Good, and a span's bytes. Read back from before
+// quality was kept too: none, Good.
+const uint32_t kKeptQuality = 0x80000000u;
+
+AppMessage keptValue(const std::string& device, const AppSparkplugSet& set, int32_t quality) {
     AppMessage m;
     m.topic = set.name;
     m.clientId = device;
     m.brokerTimeMs = (int64_t)set.timestamp;
-    const uint32_t type = (uint32_t)set.value.type;
+    const uint32_t type = (uint32_t)set.value.type | (quality != MQ_SP_QUALITY_GOOD ? kKeptQuality : 0);
     m.payload.assign((const char*)&type, sizeof type);
     m.payload.push_back(set.value.isNull ? 1 : 0);
     m.payload.append((const char*)&set.value.as.unsignedValue, sizeof set.value.as.unsignedValue);
+    if (quality != MQ_SP_QUALITY_GOOD) m.payload.append((const char*)&quality, sizeof quality);
     if (set.value.isSpan()) m.payload += set.text;
     return m;
 }
 
 bool valueOfKept(const AppMessage& m, AppSparkplugSet& set) {
-    const size_t head = sizeof(uint32_t) + 1 + sizeof(uint64_t);
+    size_t head = sizeof(uint32_t) + 1 + sizeof(uint64_t);
     if (m.payload.size() < head) return false;
     uint32_t type = 0;
     std::memcpy(&type, m.payload.data(), sizeof type);
     set.name = m.topic;
     set.timestamp = (uint64_t)m.brokerTimeMs;
+    set.quality = MQ_SP_QUALITY_GOOD;
+    set.hasQuality = false;
+    if (type & kKeptQuality) {
+        if (m.payload.size() < head + sizeof(int32_t)) return false;
+        std::memcpy(&set.quality, m.payload.data() + head, sizeof set.quality);
+        set.hasQuality = true;
+        head += sizeof(int32_t);
+        type &= ~kKeptQuality;
+    }
     set.value.type = (MqttSparkplugDataType)type;
     set.value.isNull = m.payload[sizeof type] != 0;
     std::memcpy(&set.value.as.unsignedValue, m.payload.data() + sizeof type + 1, sizeof(uint64_t));
@@ -479,6 +541,83 @@ bool valueOfKept(const AppMessage& m, AppSparkplugSet& set) {
         set.text = m.payload.substr(head);
         set.value.as.bytes.data = (const uint8_t*)set.text.data();
         set.value.as.bytes.length = (uint32_t)set.text.size();
+    }
+    return true;
+}
+
+// Declared on the node with what its births say; its index, or -1.
+int declareMetric(MqttSparkplugNode& node, const AppSparkplugMetricDeclaration& m) {
+    const MqttSparkplugDataType type = (MqttSparkplugDataType)m.datatype;
+    const char* device = m.device.empty() ? nullptr : m.device.c_str();
+    if (device) {
+        if (m.writable) node.declareWritableFor(device, m.name.c_str(), type);
+        else node.declareFor(device, m.name.c_str(), type);
+    } else {
+        if (m.writable) node.declareWritable(m.name.c_str(), type);
+        else node.declare(m.name.c_str(), type);
+    }
+    const int at = node.indexOf(device, m.name.c_str());
+    if (at < 0) return -1;
+    const bool range = m.hasRange && m.low < m.high;
+    if (m.properties.empty()) {
+        if (!m.units.empty()) node.unitsAt((size_t)at, m.units.c_str());
+        if (range) node.rangeAt((size_t)at, m.low, m.high);
+    } else {
+        // engUnit and the range go in with the rest: a metric has four
+        // property slots, and those three and Quality fill them
+        // (MqttSparkplugNode::propertiesAt).
+        MqttSparkplugProperty own[3];
+        size_t count = 0;
+        if (!m.units.empty()) own[count++] = mq_spEngUnit(m.units.c_str());
+        if (range) {
+            own[count++] = mq_spEngLow(m.low);
+            own[count++] = mq_spEngHigh(m.high);
+        }
+        std::string all;
+        if (count > 0) {
+            MqttSparkplugError error = MqttSparkplugError::None;
+            all.resize(mq_sparkplugEncodePropertySet(nullptr, 0, own, count, error));
+            if (!all.empty()) mq_sparkplugEncodePropertySet((uint8_t*)&all[0], all.size(), own, count, error);
+        }
+        all += m.properties;
+        node.propertiesAt((size_t)at, (const uint8_t*)all.data(), all.size());
+    }
+    if (m.deadband != 0 || m.deadbandPercent != 0) node.deadbandAt((size_t)at, m.deadband, m.deadbandPercent);
+    return at;
+}
+
+// What a birth says of it is the same: a change otherwise (a deadband, which
+// class its history is) needs no birth.
+bool sameInBirth(const AppSparkplugMetricDeclaration& a, const AppSparkplugMetricDeclaration& b) {
+    return a.name == b.name && a.device == b.device && a.datatype == b.datatype && a.writable == b.writable &&
+           a.units == b.units && a.hasRange == b.hasRange && (!a.hasRange || (a.low == b.low && a.high == b.high)) &&
+           a.properties == b.properties;
+}
+
+// The declarations of one device ("": the node's own), in order.
+std::vector<const AppSparkplugMetricDeclaration*> declarationsOf(const AppSparkplugEdgeNodeSpec& spec,
+                                                                const std::string& device) {
+    std::vector<const AppSparkplugMetricDeclaration*> out;
+    for (const AppSparkplugMetricDeclaration& m : spec.metrics) {
+        if (m.device == device) out.push_back(&m);
+    }
+    return out;
+}
+
+bool sameDeclarations(const AppSparkplugEdgeNodeSpec& a, const AppSparkplugEdgeNodeSpec& b,
+                      const std::string& device) {
+    const std::vector<const AppSparkplugMetricDeclaration*> x = declarationsOf(a, device), y = declarationsOf(b, device);
+    if (x.size() != y.size()) return false;
+    for (size_t i = 0; i < x.size(); i++) {
+        if (!sameInBirth(*x[i], *y[i])) return false;
+    }
+    return true;
+}
+
+bool sameTemplates(const AppSparkplugEdgeNodeSpec& a, const AppSparkplugEdgeNodeSpec& b) {
+    if (a.templates.size() != b.templates.size()) return false;
+    for (size_t i = 0; i < a.templates.size(); i++) {
+        if (a.templates[i].name != b.templates[i].name || a.templates[i].encoded != b.templates[i].encoded) return false;
     }
     return true;
 }
@@ -698,6 +837,11 @@ struct AppConnections::Connection {
             if (h.fresh) {
                 m->sparkplugNames.swap(h.names);
                 m->sparkplugFlags = h.flags;
+                if (h.birth) {
+                    std::map<std::string, std::string>& kept = h.births[h.birthOf];
+                    if (h.nodeBirth) kept.clear();
+                    kept[h.birthDevice] = m->payload;
+                }
             }
             h.fresh = false;
             // A payload the library could not read: its node is asked again.
@@ -996,44 +1140,42 @@ void AppConnections::startEdgeNode(Connection& c) {
         for (const AppSparkplugTemplateDefinition& t : e->spec.templates) {
             node.declareTemplate(t.name.c_str(), (const uint8_t*)t.encoded.data(), t.encoded.size());
         }
+        for (const AppSparkplugMetricDeclaration& m : e->spec.metrics) declareMetric(node, m);
+        e->sized();
         for (const AppSparkplugMetricDeclaration& m : e->spec.metrics) {
-            const MqttSparkplugDataType type = (MqttSparkplugDataType)m.datatype;
-            const char* device = e->device(m.device);
-            if (device) {
-                if (m.writable) node.declareWritableFor(device, m.name.c_str(), type);
-                else node.declareFor(device, m.name.c_str(), type);
-            } else {
-                if (m.writable) node.declareWritable(m.name.c_str(), type);
-                else node.declare(m.name.c_str(), type);
-            }
-            const int at = node.indexOf(device, m.name.c_str());
-            if (at < 0) continue;
-            if (!m.units.empty()) node.unitsAt((size_t)at, m.units.c_str());
-            if (m.hasRange) node.rangeAt((size_t)at, m.low, m.high);
-            if (m.deadband != 0 || m.deadbandPercent != 0) node.deadbandAt((size_t)at, m.deadband, m.deadbandPercent);
+            const int at = node.indexOf(e->device(m.device), m.name.c_str());
+            if (at >= 0) e->first[(size_t)at] = m.historyFirst ? 1 : 0;
         }
         for (const std::string& d : e->spec.devices) node.deviceOnline(d.c_str());
-        e->values.resize(node.pointCount());
-        e->setAtMs.resize(node.pointCount());
-        e->history = _outbox.totals(e->key()).messages;
+        for (const std::string& key : {e->key(), e->firstKey()}) {
+            const ConnectionOutbox::Totals kept = _outbox.totals(key);
+            e->history += kept.messages;
+            e->historyBytes += kept.bytes;
+        }
         // Its bdSeq and values from before a restart; then what it kept and
         // has not sent, the newest of which is each metric's current value.
         loadEdgeState(*e);
-        for (uint64_t after = 0;;) {
-            std::vector<ConnectionOutbox::Kept> page = _outbox.next(e->key(), after, 1024);
-            if (page.empty()) break;
-            for (const ConnectionOutbox::Kept& k : page) {
-                AppSparkplugSet set;
-                if (!valueOfKept(k.message, set)) continue;
-                const int at = node.indexOf(e->device(k.message.clientId), set.name.c_str());
-                if (at < 0 || node.pointAt((size_t)at)->type != set.value.type) continue;
-                if (set.timestamp >= e->setAtMs[(size_t)at]) e->setCurrent((size_t)at, set.value, set.text, set.timestamp);
+        for (const std::string& key : {e->key(), e->firstKey()}) {
+            for (uint64_t after = 0;;) {
+                std::vector<ConnectionOutbox::Kept> page = _outbox.next(key, after, 1024);
+                if (page.empty()) break;
+                for (const ConnectionOutbox::Kept& k : page) {
+                    AppSparkplugSet set;
+                    if (!valueOfKept(k.message, set)) continue;
+                    const int at = node.indexOf(e->device(k.message.clientId), set.name.c_str());
+                    if (at < 0 || node.pointAt((size_t)at)->type != set.value.type) continue;
+                    if (set.timestamp >= e->setAtMs[(size_t)at]) {
+                        e->setCurrent((size_t)at, set.value, set.text, set.timestamp);
+                        node.qualityAt((size_t)at, set.quality);
+                    }
+                }
+                after = page.back().id;
             }
-            after = page.back().id;
         }
         // What a link that died unnoticed swallowed, sent again after the next
-        // birth as history (MqttSparkplugNode::replayWindow): 4096 values, 96 kB.
+        // birth as history (MqttSparkplugNode::replayWindow): 4096 values, 128 kB.
         node.replayWindow(4096);
+        e->tokensAt = Clock::now();
         node.connect();                            // its NDEATH is this connection's Will from now on
         c.edge = std::move(e);
         return;
@@ -1063,54 +1205,144 @@ void AppConnections::serviceEdgeNode(Connection& c) {
     for (size_t i = 0; i < node.pointCount(); i++) {
         while (node.commandPendingAt(i) && node.takeAt(i, ignored)) {}
     }
-    // Born again: what was kept goes, oldest first, one device at a time.
+    expireHistory(e);
+    sendHistory(c);
+    if (e.dropping && e.history == 0) {
+        std::fprintf(stderr, "sparkplug edge node \"%s\": what it kept has gone; %llu of its oldest values were "
+                             "dropped for room\n",
+                     e.spec.id.c_str(), (unsigned long long)e.droppedSince);
+        e.dropping = false;
+        e.droppedSince = 0;
+    }
+    if (_edgeWatched) announceEdge(e, false);
+}
+
+// Born again: what was kept goes, oldest first, history_first's before the
+// rest, a device at a time, at most history_rate values a second - live
+// values never wait for it (setValues() publishes them at once).
+void AppConnections::sendHistory(Connection& c) {
+    EdgeNode& e = *c.edge;
+    MqttSparkplugNode& node = *e.library;
     if (!node.isBorn() || !c.client.isConnected()) {
         // The session ended before what was sent could be trusted to have arrived.
         e.sentHistory.clear();
-        e.sentUpTo = 0;
+        e.sentUpTo[0] = e.sentUpTo[1] = 0;
+        e.tokens = 0;
+        e.tokensAt = Clock::now();
         return;
     }
     const Clock::time_point now = Clock::now();
     const std::chrono::seconds hold(2 * std::max<uint32_t>(c.spec.keepaliveSeconds, 5));
     size_t confirmed = 0;
-    while (confirmed < e.sentHistory.size() && now - e.sentHistory[confirmed].second >= hold) {
-        _outbox.drop(e.sentHistory[confirmed].first);
+    while (confirmed < e.sentHistory.size() && now - e.sentHistory[confirmed].at >= hold) {
+        _outbox.drop(e.sentHistory[confirmed].id);
+        e.history -= std::min<uint64_t>(e.history, 1);
+        e.historyBytes -= std::min<uint64_t>(e.historyBytes, e.sentHistory[confirmed].bytes);
         confirmed++;
     }
-    if (confirmed) {
-        e.sentHistory.erase(e.sentHistory.begin(), e.sentHistory.begin() + (long)confirmed);
-        e.history -= std::min<uint64_t>(e.history, confirmed);
-    }
+    if (confirmed) e.sentHistory.erase(e.sentHistory.begin(), e.sentHistory.begin() + (long)confirmed);
     if (e.history <= e.sentHistory.size() || e.sentHistory.size() >= 65536) return;
-    std::vector<ConnectionOutbox::Kept> kept = _outbox.next(e.key(), e.sentUpTo, 64);
+    size_t batch = 64;
+    if (e.spec.historyRate != 0) {
+        const double rate = e.spec.historyRate;
+        e.tokens = std::min(e.tokens + rate * std::chrono::duration<double>(now - e.tokensAt).count(),
+                            std::max(rate, 64.0));
+        e.tokensAt = now;
+        if (e.tokens < 1) return;
+        batch = std::min<size_t>(batch, (size_t)e.tokens);
+    }
+    std::vector<ConnectionOutbox::Kept> kept;
+    int which = 0;
+    for (; which < 2 && kept.empty(); which++) {
+        kept = _outbox.next(which == 0 ? e.firstKey() : e.key(), e.sentUpTo[which], batch);
+    }
+    if (kept.empty()) return;
+    which--;
     std::vector<AppSparkplugSet> sets(kept.size());
     std::vector<MqttSparkplugRecord> records;
-    std::vector<uint64_t> sent;
+    std::vector<EdgeNode::Sent> sent;
     std::string device;
+    // Let go: unreadable, or of a metric a later declaration removed or gave
+    // another datatype - counted lost. (Gone from the outbox, so the next look
+    // does not meet it again.)
+    auto lose = [&](const ConnectionOutbox::Kept& k) {
+        _outbox.drop(k.id);
+        e.history -= std::min<uint64_t>(e.history, 1);
+        e.historyBytes -= std::min<uint64_t>(e.historyBytes, k.bytes);
+        e.historyLost++;
+    };
     for (size_t i = 0; i < kept.size(); i++) {
         if (!valueOfKept(kept[i].message, sets[i])) {
-            _outbox.drop(kept[i].id);           // unreadable: let go
-            e.history--;
+            lose(kept[i]);
             continue;
         }
         if (!records.empty() && kept[i].message.clientId != device) break;
-        device = kept[i].message.clientId;
-        const int at = node.indexOf(e.device(device), sets[i].name.c_str());
-        if (at < 0) {
-            _outbox.drop(kept[i].id);           // no longer declared
-            e.history--;
+        const int at = node.indexOf(e.device(kept[i].message.clientId), sets[i].name.c_str());
+        if (at < 0 || node.pointAt((size_t)at)->type != sets[i].value.type) {
+            lose(kept[i]);
             continue;
         }
+        device = kept[i].message.clientId;
         MqttSparkplugRecord r;
         r.index = (size_t)at;
         r.value = sets[i].value;
         r.timestamp = sets[i].timestamp;
+        r.quality = sets[i].quality;
         records.push_back(r);
-        sent.push_back(kept[i].id);
+        sent.push_back(EdgeNode::Sent{kept[i].id, now, kept[i].bytes});
     }
     if (records.empty() || !node.publishRecords(records.data(), records.size(), true)) return;
-    for (uint64_t id : sent) e.sentHistory.push_back(std::make_pair(id, now));
-    e.sentUpTo = sent.back();
+    for (const EdgeNode::Sent& one : sent) e.sentHistory.push_back(one);
+    e.sentUpTo[which] = sent.back().id;
+    if (e.spec.historyRate != 0) e.tokens -= (double)records.size();
+}
+
+void AppConnections::makeRoom(EdgeNode& e, size_t bytes) {
+    const AppSparkplugEdgeNodeSpec& s = e.spec;
+    auto full = [&] {
+        return (s.historyMax != 0 && e.history >= s.historyMax) ||
+               (s.historyMaxBytes != 0 && e.history != 0 && e.historyBytes + bytes > s.historyMaxBytes);
+    };
+    while (full()) {
+        // The oldest sample first; history_first's only when no sample is left.
+        ConnectionOutbox::Kept dropped;
+        if (!_outbox.dropOldest(e.key(), &dropped) && !_outbox.dropOldest(e.firstKey(), &dropped)) break;
+        e.history -= std::min<uint64_t>(e.history, 1);
+        e.historyBytes -= std::min<uint64_t>(e.historyBytes, dropped.bytes);
+        e.historyLost++;
+        e.droppedSince++;
+        if (!e.dropping) {
+            e.dropping = true;
+            std::fprintf(stderr, "sparkplug edge node \"%s\": what it keeps is full (%llu values, %llu bytes) - "
+                                 "its oldest values are dropped from now on\n",
+                         s.id.c_str(), (unsigned long long)e.history, (unsigned long long)e.historyBytes);
+        }
+    }
+}
+
+void AppConnections::expireHistory(EdgeNode& e) {
+    if (e.spec.historyMaxAgeMs == 0 || e.history == 0) return;
+    const Clock::time_point now = Clock::now();
+    if (now - e.expiredAt < std::chrono::seconds(1)) return;
+    e.expiredAt = now;
+    const uint64_t cutoff = (uint64_t)utcNowMs() - std::min<uint64_t>(e.spec.historyMaxAgeMs, (uint64_t)utcNowMs());
+    // Oldest first, and not what is on its way (its id is past sentUpTo).
+    for (int which = 0; which < 2; which++) {
+        const std::string key = which == 0 ? e.firstKey() : e.key();
+        for (;;) {
+            std::vector<ConnectionOutbox::Kept> page = _outbox.next(key, e.sentUpTo[which], 256);
+            size_t gone = 0;
+            for (const ConnectionOutbox::Kept& k : page) {
+                if ((uint64_t)k.message.brokerTimeMs >= cutoff) break;
+                _outbox.drop(k.id);
+                e.history -= std::min<uint64_t>(e.history, 1);
+                e.historyBytes -= std::min<uint64_t>(e.historyBytes, k.bytes);
+                e.historyLost++;
+                gone++;
+            }
+            if (gone < page.size() || page.empty()) break;
+        }
+    }
 }
 
 void AppConnections::saveEdgeState(EdgeNode& e, bool now) {
@@ -1137,6 +1369,7 @@ void AppConnections::saveEdgeState(EdgeNode& e, bool now) {
             o.add("bits", std::to_string(v.as.unsignedValue));
         }
         o.add("at", (long long)e.setAtMs[(size_t)index]);
+        if (node.qualityOf((size_t)index) != MQ_SP_QUALITY_GOOD) o.add("quality", (long long)node.qualityOf((size_t)index));
         values += (first ? "\n" : ",\n") + o.str();
         first = false;
     }
@@ -1177,6 +1410,7 @@ void AppConnections::loadEdgeState(EdgeNode& e) {
             value.as.unsignedValue = std::strtoull(m.str("bits").c_str(), nullptr, 10);
         }
         e.setCurrent((size_t)index, value, bytes, (uint64_t)m.integer("at"));
+        node.qualityAt((size_t)index, (int32_t)m.integer("quality", MQ_SP_QUALITY_GOOD));
     }
     e.valuesChanged = false;
 }
@@ -2125,6 +2359,8 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
                 metric.staleAt = tracked.staleAt;
                 metric.datatype = (uint32_t)tracked.type;
                 metric.at = tracked.at;
+                metric.quality = tracked.quality;
+                metric.hasQuality = tracked.hasQuality;
                 const MqttSparkplugValue& v = tracked.value;
                 if (tracked.hasValue && !v.isNull) {
                     switch (v.type) {
@@ -2164,6 +2400,10 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
             }
             for (const std::string& d : info.devices) {
                 if (n->deviceOnline(d.c_str())) info.devicesOnline.push_back(d);
+            }
+            auto births = at->second->host->births.find(Host::keyOf(n->group.c_str(), n->node.c_str()));
+            if (births != at->second->host->births.end()) {
+                for (const auto& one : births->second) info.births.push_back(one);
             }
             out.push_back(std::move(info));
         }
@@ -2215,11 +2455,26 @@ bool AppConnections::hostConnection(const std::string& host, std::string& connec
 
 namespace {
 
+// `withDeclarations` false: a watcher's, without metrics and templates.
 AppSparkplugEdgeNodeInfo edgeInfoOf(const AppSparkplugEdgeNodeSpec& spec, const AppConnections::EdgeNode* e,
-                                    uint64_t history) {
+                                    const ConnectionOutbox::Totals& kept, bool withDeclarations = true) {
     AppSparkplugEdgeNodeInfo info;
-    info.spec = spec;
-    info.history = history;
+    if (withDeclarations) {
+        info.spec = spec;
+    } else {
+        info.spec.id = spec.id;
+        info.spec.connection = spec.connection;
+        info.spec.group = spec.group;
+        info.spec.node = spec.node;
+        info.spec.primaryHostId = spec.primaryHostId;
+        info.spec.devices = spec.devices;
+        info.spec.historyMax = spec.historyMax;
+        info.spec.historyMaxBytes = spec.historyMaxBytes;
+        info.spec.historyMaxAgeMs = spec.historyMaxAgeMs;
+        info.spec.historyRate = spec.historyRate;
+    }
+    info.history = kept.messages;
+    info.historyBytes = kept.bytes;
     if (e == nullptr) return info;
     const MqttSparkplugNode& node = *e->library;
     info.born = node.isBorn();
@@ -2227,16 +2482,25 @@ AppSparkplugEdgeNodeInfo edgeInfoOf(const AppSparkplugEdgeNodeSpec& spec, const 
     info.primaryHostOnline = node.primaryHostOnline();
     info.births = node.birthCount();
     info.historyLost = e->historyLost;
+    info.historyDropping = e->dropping;
     for (const std::string& d : spec.devices) {
         if (node.deviceIsOnline(d.c_str())) info.devicesOnline.push_back(d);
     }
     return info;
 }
 
-} // namespace
+ConnectionOutbox::Totals keptBy(ConnectionOutbox& outbox, const std::string& id) {
+    ConnectionOutbox::Totals all;
+    for (const std::string& key : {"sparkplug-node:" + id, "sparkplug-node-first:" + id}) {
+        const ConnectionOutbox::Totals one = outbox.totals(key);
+        all.messages += one.messages;
+        all.bytes += one.bytes;
+    }
+    return all;
+}
 
-bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkplugEdgeNodeInfo* info,
-                                 std::string& error) {
+// What a spec says that needs no state: ids, datatypes, devices, definitions.
+bool checkEdgeSpec(const AppSparkplugEdgeNodeSpec& spec, std::string& error) {
     if (spec.id.empty() || spec.connection.empty()) {
         error = "an edge node needs an id and the connection it runs on";
         return false;
@@ -2244,6 +2508,13 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
     if (!mq_sparkplugValidId(spec.group.c_str()) || !mq_sparkplugValidId(spec.node.c_str())) {
         error = "group and node are Sparkplug ids (no '/', '+' or '#')";
         return false;
+    }
+    std::set<std::string> devices;
+    for (const std::string& d : spec.devices) {
+        if (!mq_sparkplugValidId(d.c_str()) || !devices.insert(d).second) {
+            error = "device \"" + d + "\": a Sparkplug id (no '/', '+' or '#'), once";
+            return false;
+        }
     }
     std::set<std::string> templates;
     for (const AppSparkplugTemplateDefinition& t : spec.templates) {
@@ -2261,6 +2532,7 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
             return false;
         }
     }
+    std::set<std::pair<std::string, std::string>> names;
     for (const AppSparkplugMetricDeclaration& m : spec.metrics) {
         if (!mq_sparkplugDataTypeSupported((MqttSparkplugDataType)m.datatype)) {
             error = "metric \"" + m.name + "\": a metric cannot be " +
@@ -2271,60 +2543,266 @@ bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkp
             error = "metric \"" + m.name + "\": a template definition has that name (both are NBIRTH metrics)";
             return false;
         }
-        if (!m.device.empty() && std::find(spec.devices.begin(), spec.devices.end(), m.device) == spec.devices.end()) {
+        if (!m.device.empty() && !devices.count(m.device)) {
             error = "metric \"" + m.name + "\": its device \"" + m.device + "\" is not in devices";
             return false;
         }
+        if (m.name.empty() || !names.insert(std::make_pair(m.device, m.name)).second) {
+            error = "metric \"" + m.name + "\"" + (m.device.empty() ? "" : " of device \"" + m.device + "\"") +
+                    ": declared once, with a name";
+            return false;
+        }
     }
+    return true;
+}
+
+// Born anew for these: they are its session's.
+bool sameSession(const AppSparkplugEdgeNodeSpec& a, const AppSparkplugEdgeNodeSpec& b) {
+    return a.connection == b.connection && a.group == b.group && a.node == b.node &&
+           a.primaryHostId == b.primaryHostId;
+}
+
+// The current values of one device's metrics (-1: the node's own), by name,
+// to be given back once it is declared again.
+struct Held {
+    MqttSparkplugValue value;
+    std::string text;
+    uint64_t at = 0;
+    int32_t quality = MQ_SP_QUALITY_GOOD;
+};
+
+std::map<std::string, Held> holdValues(const AppConnections::EdgeNode& e, int device) {
+    std::map<std::string, Held> held;
+    const MqttSparkplugNode& node = *e.library;
+    for (size_t i = 0; i < node.pointCount(); i++) {
+        const MqttSparkplugPoint* p = node.pointAt(i);
+        if (p->device != device || e.setAtMs[i] == 0) continue;
+        Held h;
+        h.value = node.valueAt(i);
+        if (h.value.isSpan() && !h.value.isNull) h.text.assign((const char*)h.value.as.bytes.data, h.value.as.bytes.length);
+        h.at = e.setAtMs[i];
+        h.quality = node.qualityOf(i);
+        held[p->name] = h;
+    }
+    return held;
+}
+
+// The server's tables by index, closed up as the library's are about to be
+// for the metrics of `device` (the library's number; -1 the node's own).
+void dropIndices(AppConnections::EdgeNode& e, int device) {
+    const MqttSparkplugNode& node = *e.library;
+    size_t kept = 0;
+    for (size_t i = 0; i < node.pointCount(); i++) {
+        if (node.pointAt(i)->device == device) continue;
+        if (kept != i) {
+            e.values[kept] = std::move(e.values[i]);
+            e.setAtMs[kept] = e.setAtMs[i];
+            e.first[kept] = e.first[i];
+        }
+        kept++;
+    }
+    e.values.resize(kept);
+    e.setAtMs.resize(kept);
+    e.first.resize(kept);
+}
+
+} // namespace
+
+// The declarations of an edge node changed in the session it has. A device's
+// changed: its DDEATH and a DBIRTH with what it is now. The node's own (or its
+// Template definitions, which only the NBIRTH carries): a rebirth - NBIRTH and
+// every DBIRTH, the same bdSeq - as a host's Rebirth asks. Aliases are new for
+// every metric declared again: the node's one counter goes on. Values carry
+// over for a metric declared again with the same name and datatype; what was
+// kept for one removed or given another datatype is dropped, counted lost,
+// when its turn comes.
+void AppConnections::redeclare(Connection& c, const AppSparkplugEdgeNodeSpec& next) {
+    EdgeNode& e = *c.edge;
+    MqttSparkplugNode& node = *e.library;
+    const AppSparkplugEdgeNodeSpec was = e.spec;
+    const bool rebirth = !sameDeclarations(was, next, "") || !sameTemplates(was, next);
+    auto declare = [&](const std::string& device, const std::map<std::string, Held>& held) {
+        for (const AppSparkplugMetricDeclaration* m : declarationsOf(next, device)) declareMetric(node, *m);
+        e.sized();
+        for (const AppSparkplugMetricDeclaration* m : declarationsOf(next, device)) {
+            const int at = node.indexOf(e.device(device), m->name.c_str());
+            auto h = held.find(m->name);
+            if (at < 0 || h == held.end() || node.pointAt((size_t)at)->type != h->second.value.type) continue;
+            e.setCurrent((size_t)at, h->second.value, h->second.text, h->second.at);
+            node.qualityAt((size_t)at, h->second.quality);
+        }
+    };
+    // Devices gone: their DDEATH, and their metrics with them.
+    for (const std::string& d : was.devices) {
+        if (std::find(next.devices.begin(), next.devices.end(), d) != next.devices.end()) continue;
+        e.devicesOff.erase(d);
+        const int index = node.deviceIndexOf(d.c_str());
+        if (index < 0) continue;
+        dropIndices(e, index);
+        node.removeDevice(d.c_str());
+    }
+    if (rebirth) {
+        const std::map<std::string, Held> held = holdValues(e, -1);
+        dropIndices(e, -1);
+        node.removeMetrics(nullptr);
+        node.removeTemplates();
+        for (const AppSparkplugTemplateDefinition& t : next.templates) {
+            node.declareTemplate(t.name.c_str(), (const uint8_t*)t.encoded.data(), t.encoded.size());
+        }
+        declare("", held);
+    }
+    std::vector<std::string> added;
+    for (const std::string& d : next.devices) {
+        const int index = node.deviceIndexOf(d.c_str());
+        const bool existed = index >= 0;
+        if (existed && sameDeclarations(was, next, d)) continue;
+        std::map<std::string, Held> held;
+        if (existed) {
+            // A rebirth births it again anyway; otherwise its death says the old declaration is over.
+            if (!rebirth) node.deviceOffline(d.c_str());
+            held = holdValues(e, index);
+            dropIndices(e, index);
+            node.removeMetrics(d.c_str());
+        } else {
+            node.addDevice(d.c_str());
+        }
+        declare(d, held);
+        if (!e.devicesOff.count(d) && (!existed || !rebirth)) added.push_back(d);
+    }
+    // What needs no birth: deadbands, and which history goes first.
+    for (const AppSparkplugMetricDeclaration& m : next.metrics) {
+        const int at = node.indexOf(e.device(m.device), m.name.c_str());
+        if (at < 0) continue;
+        node.deadbandAt((size_t)at, m.deadband, m.deadbandPercent);
+        e.first[(size_t)at] = m.historyFirst ? 1 : 0;
+    }
+    e.spec = next;
+    e.valuesChanged = true;
+    if (rebirth && node.isBorn()) node.rebirth();
+    for (const std::string& d : added) node.deviceOnline(d.c_str());
+}
+
+bool AppConnections::applyEdgeNode(const AppSparkplugEdgeNodeSpec& spec, std::string& error) {
+    auto on = _connections.find(spec.connection);
+    if (on != _connections.end() && on->second->spec.reconnectWhenAsked) {
+        error = whenAskedRefusal(on->second->spec, "edge node");
+        return false;
+    }
+    for (const auto& one : _hosts) {
+        if (one.second.connection == spec.connection) {
+            error = "the connection \"" + spec.connection + "\" has a host on it: one Will each";
+            return false;
+        }
+    }
+    if (!stateUser(spec.connection).empty()) {
+        error = "the connection \"" + spec.connection + "\" carries the STATE of \"" + stateUser(spec.connection) +
+                "\": one Will each";
+        return false;
+    }
+    for (const auto& one : _edgeNodes) {
+        if (one.first != spec.id && one.second.connection == spec.connection) {
+            error = "the connection \"" + spec.connection + "\" has an edge node already: \"" + one.first + "\"";
+            return false;
+        }
+    }
+    auto had = _edgeNodes.find(spec.id);
+    const std::string before = had == _edgeNodes.end() ? std::string() : had->second.connection;
+    _edgeNodes[spec.id] = spec;
+    saveHosts();
+    // Running, in the session it keeps: its declarations changed there.
+    if (on != _connections.end() && on->second->edge && on->second->edge->spec.id == spec.id &&
+        sameSession(on->second->edge->spec, spec)) {
+        redeclare(*on->second, spec);
+        announceEdge(*on->second->edge, true);
+        return true;
+    }
+    // Born anew where it runs: a new session, a new bdSeq, its births from this declaration.
+    for (const std::string& id : {before, spec.connection}) {
+        auto at = _connections.find(id);
+        if (at == _connections.end()) continue;
+        Connection& c = *at->second;
+        if (c.edge) {
+            c.edge->library->disconnect();
+            saveEdgeState(*c.edge, true);     // the new one moves on from its bdSeq
+            c.edge.reset();
+        }
+        startEdgeNode(c);
+    }
+    auto at = _connections.find(spec.connection);
+    if (at != _connections.end() && at->second->edge) announceEdge(*at->second->edge, true);
+    return true;
+}
+
+bool AppConnections::putEdgeNode(const AppSparkplugEdgeNodeSpec& spec, AppSparkplugEdgeNodeInfo* info,
+                                 std::string& error) {
+    if (!checkEdgeSpec(spec, error)) return false;
     bool ok = true;
     call([&] {
-        auto on = _connections.find(spec.connection);
-        if (on != _connections.end() && on->second->spec.reconnectWhenAsked) {
-            error = whenAskedRefusal(on->second->spec, "edge node");
-            ok = false;
-            return;
-        }
-        for (const auto& one : _hosts) {
-            if (one.second.connection == spec.connection) {
-                error = "the connection \"" + spec.connection + "\" has a host on it: one Will each";
-                ok = false;
-                return;
-            }
-        }
-        if (!stateUser(spec.connection).empty()) {
-            error = "the connection \"" + spec.connection + "\" carries the STATE of \"" + stateUser(spec.connection) +
-                    "\": one Will each";
-            ok = false;
-            return;
-        }
-        for (const auto& one : _edgeNodes) {
-            if (one.first != spec.id && one.second.connection == spec.connection) {
-                error = "the connection \"" + spec.connection + "\" has an edge node already: \"" + one.first + "\"";
-                ok = false;
-                return;
-            }
-        }
-        auto had = _edgeNodes.find(spec.id);
-        const std::string before = had == _edgeNodes.end() ? std::string() : had->second.connection;
-        _edgeNodes[spec.id] = spec;
-        saveHosts();
-        // Born anew where it runs: a new session, a new bdSeq, its births from this declaration.
-        for (const std::string& id : {before, spec.connection}) {
-            auto at = _connections.find(id);
-            if (at == _connections.end()) continue;
-            Connection& c = *at->second;
-            if (c.edge) {
-                c.edge->library->disconnect();
-                saveEdgeState(*c.edge, true);     // the new one moves on from its bdSeq
-                c.edge.reset();
-            }
-            startEdgeNode(c);
-        }
+        ok = applyEdgeNode(spec, error);
+        if (!ok || !info) return;
         auto at = _connections.find(spec.connection);
-        if (info) {
-            *info = edgeInfoOf(spec, at != _connections.end() ? at->second->edge.get() : nullptr,
-                               _outbox.totals("sparkplug-node:" + spec.id).messages);
+        *info = edgeInfoOf(spec, at != _connections.end() ? at->second->edge.get() : nullptr, keptBy(_outbox, spec.id));
+    });
+    return ok;
+}
+
+bool AppConnections::putDevice(const std::string& id, const std::string& device,
+                               const std::vector<AppSparkplugMetricDeclaration>& metrics,
+                               const std::vector<AppSparkplugTemplateDefinition>& templates, bool& online,
+                               bool& notFound, std::string& error) {
+    bool ok = false;
+    notFound = false;
+    online = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        if (spec == _edgeNodes.end()) {
+            notFound = true;
+            error = "no edge node \"" + id + "\"";
+            return;
         }
+        AppSparkplugEdgeNodeSpec next = spec->second;
+        if (std::find(next.devices.begin(), next.devices.end(), device) == next.devices.end()) {
+            next.devices.push_back(device);
+        }
+        next.metrics.erase(std::remove_if(next.metrics.begin(), next.metrics.end(),
+                                          [&](const AppSparkplugMetricDeclaration& m) { return m.device == device; }),
+                           next.metrics.end());
+        for (AppSparkplugMetricDeclaration m : metrics) {
+            m.device = device;
+            next.metrics.push_back(m);
+        }
+        for (const AppSparkplugTemplateDefinition& t : templates) {
+            auto same = std::find_if(next.templates.begin(), next.templates.end(),
+                                     [&](const AppSparkplugTemplateDefinition& d) { return d.name == t.name; });
+            if (same == next.templates.end()) next.templates.push_back(t);
+            else *same = t;
+        }
+        if (!checkEdgeSpec(next, error) || !applyEdgeNode(next, error)) return;
+        auto at = _connections.find(next.connection);
+        online = at != _connections.end() && at->second->edge && at->second->edge->library->deviceIsOnline(device.c_str());
+        ok = true;
+    });
+    return ok;
+}
+
+bool AppConnections::removeDevice(const std::string& id, const std::string& device, bool& notFound,
+                                  std::string& error) {
+    bool ok = false;
+    notFound = false;
+    call([&] {
+        auto spec = _edgeNodes.find(id);
+        if (spec == _edgeNodes.end() ||
+            std::find(spec->second.devices.begin(), spec->second.devices.end(), device) == spec->second.devices.end()) {
+            notFound = true;
+            error = spec == _edgeNodes.end() ? "no edge node \"" + id + "\"" : "no device \"" + device + "\" on it";
+            return;
+        }
+        AppSparkplugEdgeNodeSpec next = spec->second;
+        next.devices.erase(std::remove(next.devices.begin(), next.devices.end(), device), next.devices.end());
+        next.metrics.erase(std::remove_if(next.metrics.begin(), next.metrics.end(),
+                                          [&](const AppSparkplugMetricDeclaration& m) { return m.device == device; }),
+                           next.metrics.end());
+        ok = applyEdgeNode(next, error);
     });
     return ok;
 }
@@ -2336,7 +2814,7 @@ bool AppConnections::getEdgeNode(const std::string& id, AppSparkplugEdgeNodeInfo
         if (spec == _edgeNodes.end()) return;
         auto at = _connections.find(spec->second.connection);
         info = edgeInfoOf(spec->second, at != _connections.end() ? at->second->edge.get() : nullptr,
-                          const_cast<ConnectionOutbox&>(_outbox).totals("sparkplug-node:" + id).messages);
+                          keptBy(const_cast<ConnectionOutbox&>(_outbox), id));
         found = true;
     });
     return found;
@@ -2348,7 +2826,7 @@ std::vector<AppSparkplugEdgeNodeInfo> AppConnections::edgeNodes() const {
         for (const auto& spec : _edgeNodes) {
             auto at = _connections.find(spec.second.connection);
             out.push_back(edgeInfoOf(spec.second, at != _connections.end() ? at->second->edge.get() : nullptr,
-                                     const_cast<ConnectionOutbox&>(_outbox).totals("sparkplug-node:" + spec.first).messages));
+                                     keptBy(const_cast<ConnectionOutbox&>(_outbox), spec.first)));
         }
     });
     return out;
@@ -2370,10 +2848,15 @@ bool AppConnections::removeEdgeNode(const std::string& id) {
             c.edge.reset();
         }
         _outbox.dropAll("sparkplug-node:" + id);
+        _outbox.dropAll("sparkplug-node-first:" + id);
         if (!_directory.empty()) std::remove((_directory + "/" + edgeStateName(id)).c_str());
         _edgeNodes.erase(spec);
         saveHosts();
         found = true;
+        AppSparkplugEdgeNodeInfo gone;
+        gone.spec.id = id;
+        gone.deleted = true;
+        announceEdgeInfo(gone);
     });
     return found;
 }
@@ -2431,18 +2914,25 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
                 }
             }
             if (set.timestamp == 0) set.timestamp = (uint64_t)utcNowMs();
+            // Its quality moves with it, or stays what it was.
+            const bool qualityMoves = set.hasQuality && set.quality != node.qualityOf((size_t)index);
+            const bool moves = set.value.differsFrom(node.valueAt((size_t)index));
             if (born) {
                 // The same value again is not news: nothing to send, and not
                 // history either (it used to be kept, and sent as history).
-                if (!set.value.differsFrom(node.valueAt((size_t)index))) {
+                if (!moves && !qualityMoves) {
                     sent++;
                     continue;
                 }
-                if (e->setCurrent((size_t)index, set.value, set.text, set.timestamp)) {
-                    sent++;
-                } else {
+                if (moves && !e->setCurrent((size_t)index, set.value, set.text, set.timestamp)) {
                     refused.push_back(set.name + ": " + mq_sparkplugErrorName(node.lastPayloadError()));
+                    continue;
                 }
+                if (qualityMoves) {
+                    node.qualityAt((size_t)index, set.quality);
+                    e->valuesChanged = true;
+                }
+                sent++;
                 continue;
             }
             // Not born: its current value all the same - the NBIRTH carries the
@@ -2450,14 +2940,17 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
             // and the newer ones only as history (which a host files and does not
             // show) - and kept, to go as history once it is born.
             e->setCurrent((size_t)index, set.value, set.text, set.timestamp);
-            uint64_t ignored = 0;
-            while (e->history >= e->spec.historyMax && e->spec.historyMax != 0) {
-                if (!_outbox.dropOldest(e->key(), nullptr)) break;
-                e->history--;
-                e->historyLost++;
+            if (qualityMoves) {
+                node.qualityAt((size_t)index, set.quality);
+                e->valuesChanged = true;
             }
-            if (e->spec.historyMax != 0 && _outbox.push(e->key(), keptValue(device, set), ignored)) {
+            if (e->spec.historyMax == 0) continue;
+            const AppMessage message = keptValue(device, set, node.qualityOf((size_t)index));
+            makeRoom(*e, message.topic.size() + message.payload.size());
+            uint64_t ignored = 0;
+            if (_outbox.push(e->first[(size_t)index] ? e->firstKey() : e->key(), message, ignored)) {
                 e->history++;
+                e->historyBytes += message.topic.size() + message.payload.size();
                 kept++;
             }
         }
@@ -2475,9 +2968,15 @@ bool AppConnections::deviceState(const std::string& id, const std::string& devic
             error = "no edge node \"" + id + "\" running";
             return;
         }
-        MqttSparkplugNode& node = *at->second->edge->library;
+        EdgeNode& e = *at->second->edge;
+        MqttSparkplugNode& node = *e.library;
         done = online ? node.deviceOnline(device.c_str()) : node.deviceOffline(device.c_str());
-        if (!done) error = "no device \"" + device + "\" on it";
+        if (!done) {
+            error = "no device \"" + device + "\" on it";
+            return;
+        }
+        if (online) e.devicesOff.erase(device);
+        else e.devicesOff.insert(device);
     });
     return done;
 }
@@ -2495,6 +2994,86 @@ bool AppConnections::rebirthEdgeNode(const std::string& id, std::string& error) 
         if (!done) error = "it is not connected";
     });
     return done;
+}
+
+// --- Watching edge nodes --------------------------------------------------------
+
+uint64_t AppConnections::watchEdgeNodes(const std::vector<std::string>& ids,
+                                        std::function<void(const AppSparkplugEdgeNodeInfo&)> changed) {
+    uint64_t id;
+    {
+        std::lock_guard<std::mutex> guard(_lock);
+        id = _nextWatcher++;
+        _edgeWatchers[id] = EdgeWatcher{ids, changed};
+        _edgeWatched = true;
+    }
+    // Each one's state now, from the manager's thread - unless it was let go first.
+    post([this, id, ids, changed] {
+        {
+            std::lock_guard<std::mutex> guard(_lock);
+            if (!_edgeWatchers.count(id)) return;
+        }
+        for (const auto& spec : _edgeNodes) {
+            if (!ids.empty() && std::find(ids.begin(), ids.end(), spec.first) == ids.end()) continue;
+            auto at = _connections.find(spec.second.connection);
+            changed(edgeInfoOf(spec.second, at != _connections.end() ? at->second->edge.get() : nullptr,
+                               keptBy(_outbox, spec.first), false));
+        }
+    });
+    return id;
+}
+
+void AppConnections::unwatchEdgeNodes(uint64_t watcher) {
+    {
+        std::lock_guard<std::mutex> guard(_lock);
+        _edgeWatchers.erase(watcher);
+        _edgeWatched = !_edgeWatchers.empty();
+    }
+    // As unwatch(): a call under way on the manager's thread finishes first.
+    if (std::this_thread::get_id() != _thread.get_id()) call([] {});
+}
+
+// Told when what it is changes - born, its host, its births, its devices,
+// dropping - at once, and when only its history's counts do, at most once a
+// second.
+void AppConnections::announceEdge(EdgeNode& e, bool now) {
+    if (!_edgeWatched) return;
+    const MqttSparkplugNode& node = *e.library;
+    std::string state;
+    state += node.isBorn() ? 'B' : 'b';
+    state += node.primaryHostOnline() ? 'H' : 'h';
+    state += e.dropping ? 'D' : 'd';
+    state += std::to_string(node.birthCount()) + "/" + std::to_string(node.birthDeathSequence());
+    for (const std::string& d : e.spec.devices) {
+        if (node.deviceIsOnline(d.c_str())) state += "\n" + d;
+    }
+    const uint64_t counts = e.history * 1000003u + e.historyLost;
+    const Clock::time_point at = Clock::now();
+    if (!now && state == e.announced &&
+        (counts == e.announcedCounts || at - e.announcedAt < std::chrono::seconds(1))) {
+        return;
+    }
+    e.announced = state;
+    e.announcedCounts = counts;
+    e.announcedAt = at;
+    ConnectionOutbox::Totals kept;
+    kept.messages = e.history;
+    kept.bytes = e.historyBytes;
+    announceEdgeInfo(edgeInfoOf(e.spec, &e, kept, false));
+}
+
+void AppConnections::announceEdgeInfo(const AppSparkplugEdgeNodeInfo& info) {
+    std::vector<std::function<void(const AppSparkplugEdgeNodeInfo&)>> tell;
+    {
+        std::lock_guard<std::mutex> guard(_lock);
+        for (auto& w : _edgeWatchers) {
+            if (w.second.ids.empty() ||
+                std::find(w.second.ids.begin(), w.second.ids.end(), info.spec.id) != w.second.ids.end()) {
+                tell.push_back(w.second.changed);
+            }
+        }
+    }
+    for (auto& one : tell) one(info);
 }
 
 void AppConnections::saveHosts() {
@@ -2518,6 +3097,8 @@ void AppConnections::saveHosts() {
         json::Object o;
         o.add("id", n.id).add("connection", n.connection).add("group", n.group).add("node", n.node);
         o.add("primaryHostId", n.primaryHostId).add("historyMax", (long long)n.historyMax);
+        o.add("historyMaxBytes", (long long)n.historyMaxBytes).add("historyMaxAgeMs", (long long)n.historyMaxAgeMs);
+        o.add("historyRate", (long long)n.historyRate);
         o.raw("devices", json::array(n.devices));
         std::string metrics = "[";
         for (size_t i = 0; i < n.metrics.size(); i++) {
@@ -2527,6 +3108,8 @@ void AppConnections::saveHosts() {
             d.add("writable", m.writable).add("units", m.units).add("hasRange", m.hasRange);
             d.add("low", std::to_string(m.low)).add("high", std::to_string(m.high));
             d.add("deadband", std::to_string(m.deadband)).add("deadbandPercent", std::to_string(m.deadbandPercent));
+            if (!m.properties.empty()) d.add("properties", hexOf(m.properties));
+            if (m.historyFirst) d.add("historyFirst", true);
             metrics += (i ? "," : "") + d.str();
         }
         o.raw("metrics", metrics + "]");
@@ -2561,6 +3144,9 @@ bool AppConnections::loadHosts(std::string& error) {
             n.node = v.str("node");
             n.primaryHostId = v.str("primaryHostId");
             n.historyMax = (uint64_t)v.integer("historyMax", 100000);
+            n.historyMaxBytes = (uint64_t)v.integer("historyMaxBytes", 0);
+            n.historyMaxAgeMs = (uint64_t)v.integer("historyMaxAgeMs", 0);
+            n.historyRate = (uint32_t)v.integer("historyRate", 1000);
             v.strings("devices", n.devices);
             for (const json::Value& d : v["metrics"].items) {
                 AppSparkplugMetricDeclaration m;
@@ -2574,6 +3160,8 @@ bool AppConnections::loadHosts(std::string& error) {
                 m.high = std::atof(d.str("high").c_str());
                 m.deadband = std::atof(d.str("deadband").c_str());
                 m.deadbandPercent = std::atof(d.str("deadbandPercent").c_str());
+                m.properties = bytesOfHex(d.str("properties"));
+                m.historyFirst = d.flag("historyFirst");
                 n.metrics.push_back(m);
             }
             for (const json::Value& d : v["templates"].items) {

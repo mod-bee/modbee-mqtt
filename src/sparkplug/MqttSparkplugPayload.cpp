@@ -135,6 +135,18 @@ public:
         bytes((const uint8_t*)value, length);
     }
 
+    // Bytes already encoded, with no length before them.
+    void raw(const uint8_t* data, size_t length) {
+        if (!_ok || length == 0) return;
+        uint8_t* room = take(length);
+        if (room == nullptr) return;
+        if (data == nullptr) {
+            _ok = false;
+            return;
+        }
+        memcpy(room, data, length);
+    }
+
 private:
     uint8_t* take(size_t count) {
         if (!_ok) return nullptr;
@@ -375,6 +387,10 @@ size_t propertySetBodySize(const MqttSparkplugProperty* properties,
     size_t total = 0;
     for (size_t index = 0; index < count; index++) {
         const MqttSparkplugProperty& property = properties[index];
+        if (property.encoded) {
+            total += property.as.text.length;
+            continue;
+        }
         const size_t keyLength = property.key ? strlen(property.key) : 0;
         total += mq_pbTagSize(MQ_SP_F_PROPERTYSET_KEYS) +
                  mq_pbVarintSize(keyLength) + keyLength;
@@ -391,19 +407,29 @@ size_t propertySetBodySize(const MqttSparkplugProperty* properties,
 // a message's repeated fields - so the bytes compare equal with theirs. (They
 // were interleaved, key and value; just as valid, and caught only when a
 // PropertySet was compared byte for byte against Eclipse Tahu's.)
+//
+// Encoded properties go last, as they are: their keys after these keys and
+// their values after these values, which is how a decoder pairs them - each
+// repeated field is read in order, wherever its elements are.
 void writePropertySet(PbWriter& writer, const MqttSparkplugProperty* properties,
                       size_t count) {
     for (size_t index = 0; index < count; index++) {
+        if (properties[index].encoded) continue;
         writer.tag(MQ_SP_F_PROPERTYSET_KEYS, MQ_PB_LENGTH);
         writer.text(properties[index].key);
     }
     for (size_t index = 0; index < count; index++) {
         const MqttSparkplugProperty& property = properties[index];
+        if (property.encoded) continue;
         MqttSparkplugError ignored = MqttSparkplugError::None;
         const size_t valueBody = propertyValueBodySize(property, ignored);
         writer.tag(MQ_SP_F_PROPERTYSET_VALUES, MQ_PB_LENGTH);
         writer.varint(valueBody);
         writePropertyValue(writer, property);
+    }
+    for (size_t index = 0; index < count; index++) {
+        if (!properties[index].encoded) continue;
+        writer.raw(properties[index].as.text.data, properties[index].as.text.length);
     }
 }
 
@@ -1174,6 +1200,15 @@ MqttSparkplugProperty mq_spQuality(int32_t quality) {
         quality = MQ_SP_QUALITY_BAD;
     }
     out.as.signedValue = quality;
+    return out;
+}
+
+MqttSparkplugProperty mq_spEncodedProperties(const uint8_t* body,
+                                             uint32_t length) {
+    MqttSparkplugProperty out;
+    out.encoded = true;
+    out.as.text.data = body;
+    out.as.text.length = body ? length : 0;
     return out;
 }
 

@@ -50,6 +50,9 @@ static const ApiCommand kApiCommands[] = {
     {"sparkplug-nodes", "set", "Sparkplug.SetValues", ""},
     {"sparkplug-nodes", "device", "Sparkplug.SetDeviceState", ""},
     {"sparkplug-nodes", "rebirth", "Sparkplug.RebirthEdgeNode", ""},
+    {"sparkplug-nodes", "watch", "Sparkplug.WatchEdgeNodes", ""},
+    {"sparkplug-devices", "put", "Sparkplug.PutDevice", ""},
+    {"sparkplug-devices", "delete", "Sparkplug.DeleteDevice", ""},
     {"sparkplug-aware", "get", "Sparkplug.GetAware", ""},
     {"sparkplug-aware", "set", "Sparkplug.PutAware", ""},
 
