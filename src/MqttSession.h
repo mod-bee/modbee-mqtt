@@ -42,6 +42,7 @@
 // the form they will go out in, rather than copied field by field into a
 // structure that then has to be re-encoded identically.
 
+#include "MqttFeatures.h"
 #include "MqttResult.h"
 #include "MqttPacket.h"
 
@@ -72,14 +73,10 @@
 // been delivered upward, so a duplicate PUBLISH carrying it is acknowledged
 // again and NOT delivered twice. [V5:MQTT-4.3.3-10] At 5.0 the client states
 // it as its Receive Maximum, so a broker never has more in flight towards it
-// than this can tell apart (MqttClient, CONNECT). 255 on a host: a consumer
-// on a WAN link with only 16 in flight is held to 16 round trips' worth.
+// than this can tell apart (MqttClient, CONNECT). 255 on a host
+// (MqttFeatures.h).
 #ifndef MQTT_SESSION_MAX_INBOUND_QOS2
-#if defined(MQTT_PLATFORM_HOST)
-#define MQTT_SESSION_MAX_INBOUND_QOS2 255
-#else
 #define MQTT_SESSION_MAX_INBOUND_QOS2 16
-#endif
 #endif
 
 // An outbound publish waiting to be acknowledged.

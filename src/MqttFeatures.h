@@ -252,6 +252,15 @@
     #endif
 #endif
 
+// THE INBOUND QoS 2 TABLE on a host (MqttSession.h, MQTT_SESSION_MAX_INBOUND_QOS2):
+// 255, stated as the client's Receive Maximum at 5.0 - a consumer on a WAN link
+// with only a board's 16 in flight is held to 16 round trips' worth.
+#if defined(MQTT_PLATFORM_HOST)
+    #ifndef MQTT_SESSION_MAX_INBOUND_QOS2
+        #define MQTT_SESSION_MAX_INBOUND_QOS2 255
+    #endif
+#endif
+
 #if MQTT_TLS_AVAILABLE && defined(MQTT_PLATFORM_HOST)
     #define MQTT_TLS_SOCKETS 1
 #else
