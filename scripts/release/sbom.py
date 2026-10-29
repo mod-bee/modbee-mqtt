@@ -12,8 +12,8 @@ each package it installs, so name, version, licence and source are vcpkg's own
 (vcpkg-cmake and friends) are left out: they run while building and none of
 their code is in the binary.
 
-    sbom.py --installed <vcpkg>/installed/<triplet> --version 0.1.0 \\
-            --platform linux-x86_64 --out modbee-mqtt-0.1.0-linux-x86_64.cdx.json
+    sbom.py --installed <vcpkg>/installed/<triplet> --version 0.1.1 \\
+            --platform linux-x86_64 --out modbee-mqtt-0.1.1-linux-x86_64.cdx.json
 """
 
 import argparse

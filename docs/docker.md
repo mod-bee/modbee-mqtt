@@ -644,7 +644,7 @@ docker build --build-arg TLS_ENGINE=openssl -t modbee -f docker/Dockerfile .
 ```
 
 Which engine an image has, three ways: `docker run --rm <image> --version`
-prints `modbee-mqtt 0.1.0 (TLS: wolfSSL)`; `modbee-mqtt serve`'s start-up line says
+prints `modbee-mqtt 0.1.1 (TLS: wolfSSL)`; `modbee-mqtt serve`'s start-up line says
 `tls 8883 (wolfSSL, ...)`; and the image is labelled,
 `docker inspect -f '{{index .Config.Labels "io.modbee.tls-engine"}}' <image>`.
 TLS 1.2 and 1.3 only. The published

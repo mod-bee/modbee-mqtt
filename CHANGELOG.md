@@ -11,6 +11,19 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.1]
+
+Reliability, for cellular links and Sparkplug: dropouts, outages, dead links, a broker restart and a failed DNS on the
+cellular rig lose no value; the Sparkplug edge node and host pass the Eclipse Sparkplug TCK and interoperate with
+Tahu (Java, JavaScript), Node-RED, Mosquitto, EMQX and HiveMQ; the MQTT client and server were tested against
+Mosquitto, EMQX, HiveMQ, NanoMQ and RabbitMQ and the Paho conformance tests. Builds on Windows (MSVC), macOS and
+Linux without warnings.
+
+Defaults that change on upgrade: `serve` holds up to 1000 messages a client (`--queue`, was 64), states a Receive
+Maximum of 1024 (`--receive-maximum`) and takes up to 1000 new connections a second (`--max-connect-rate`); a host
+socket with nothing acknowledged for 300 s is closed as dead (`TCP_USER_TIMEOUT`); every Sparkplug metric carries its own
+timestamp, and a Sparkplug host asks every node to rebirth when its own session comes back.
+
 ### Added
 
 - **New connections a second, whole server** (`serve --max-connect-rate`, `broker: max-connect-rate`, default 1000;
@@ -427,5 +440,6 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mod-bee/modbee-mqtt/releases/tag/v0.1.0

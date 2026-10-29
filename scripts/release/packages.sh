@@ -9,7 +9,7 @@
 # (nfpm.yaml) - `sudo modbee-mqtt service install` does that. Runs on any x86-64
 # Linux, from the repository's root:
 #
-#   sh scripts/release/packages.sh 0.1.0
+#   sh scripts/release/packages.sh 0.1.1
 #
 # Leaves in dist/: modbee-mqtt_<v>-1_amd64.deb, modbee-mqtt_<v>-1_arm64.deb,
 # modbee-mqtt-<v>-1.x86_64.rpm, modbee-mqtt-<v>-1.aarch64.rpm.

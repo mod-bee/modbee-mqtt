@@ -21,7 +21,7 @@ the Application API and every command. It says so itself:
 
 ```
 $ modbee-mqtt --version
-modbee-mqtt 0.1.0 (TLS: OpenSSL)
+modbee-mqtt 0.1.1 (TLS: OpenSSL)
   Kafka pipe: librdkafka 2.15.1 (gzip snappy ssl sasl regex lz4 sasl_gssapi sasl_plain sasl_scram plugins zstd sasl_oauthbearer)
   Application API: gRPC 1.81.1
 ```
@@ -37,12 +37,12 @@ years ago - with nothing else installed. The packages carry that same binary.
 Put `modbee-mqtt` on the machine - one of these:
 
 ```sh
-sudo apt install ./modbee-mqtt_0.1.0-1_amd64.deb        # Debian, Ubuntu
-sudo dnf install ./modbee-mqtt-0.1.0-1.x86_64.rpm       # RHEL, Rocky, Alma, Fedora
-sudo install modbee-mqtt-0.1.0-linux-x86_64 /usr/local/bin/modbee-mqtt     # any Linux
+sudo apt install ./modbee-mqtt_0.1.1-1_amd64.deb        # Debian, Ubuntu
+sudo dnf install ./modbee-mqtt-0.1.1-1.x86_64.rpm       # RHEL, Rocky, Alma, Fedora
+sudo install modbee-mqtt-0.1.1-linux-x86_64 /usr/local/bin/modbee-mqtt     # any Linux
 ```
 
-On Windows, rename `modbee-mqtt-0.1.0-windows-x86_64.exe` to `modbee-mqtt.exe` and put
+On Windows, rename `modbee-mqtt-0.1.1-windows-x86_64.exe` to `modbee-mqtt.exe` and put
 it where it is to live ([windows.md](windows.md)).
 
 Then the same two commands everywhere (Windows: in an Administrator prompt,
@@ -90,7 +90,7 @@ repository's release workflow from the tagged commit, and not changed since.
 **GitHub's attestation** - every file has one; with the [GitHub CLI](https://cli.github.com):
 
 ```sh
-gh attestation verify modbee-mqtt_0.1.0-1_amd64.deb --repo mod-bee/modbee-mqtt
+gh attestation verify modbee-mqtt_0.1.1-1_amd64.deb --repo mod-bee/modbee-mqtt
 ```
 
 **The checksums, signed** - `SHA256SUMS` lists every file, and is signed
@@ -100,12 +100,12 @@ the files against it:
 
 ```sh
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity https://github.com/mod-bee/modbee-mqtt/.github/workflows/release.yml@refs/tags/v0.1.0 \
+  --certificate-identity https://github.com/mod-bee/modbee-mqtt/.github/workflows/release.yml@refs/tags/v0.1.1 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-On Windows: `Get-FileHash modbee-mqtt-0.1.0-windows-x86_64.exe` and compare with
+On Windows: `Get-FileHash modbee-mqtt-0.1.1-windows-x86_64.exe` and compare with
 its line in `SHA256SUMS`.
 
 ---
@@ -126,8 +126,8 @@ its line in `SHA256SUMS`.
 4. **Tag and push**:
 
    ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.1
+   git push origin v0.1.1
    ```
 
 The release workflow (`.github/workflows/release.yml`) refuses a tag that is
