@@ -11,6 +11,13 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+### Changed
+
+- The server may run with **no listener** when its Application API is on: `serve --no-plain --api ...` (no
+  `--tls-port`) starts with none, and `Admin.PutListeners` may turn the last one off and open one again later. A
+  gateway keeps its broker closed to devices this way instead of on an unused port. Without the API, no listener is
+  still refused (`serve`, and a config file with `plain: false`, no `tls` and no `api`).
+
 ## [0.1.1]
 
 Reliability, for cellular links and Sparkplug: dropouts, outages, dead links, a broker restart and a failed DNS on the

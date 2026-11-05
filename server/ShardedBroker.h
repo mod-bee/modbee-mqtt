@@ -45,7 +45,9 @@
 // nothing changed - and each shard swaps them in on its own thread. A
 // listener whose port moved keeps its connections (they hold their own
 // sockets); one turned off closes them, 0x98 Administrative action. The
-// address stays what the server started with.
+// address stays what the server started with. Both may be off: the server
+// then takes no connection, reached only through its Application API, until
+// one is turned on.
 //
 // SHARED SUBSCRIPTIONS. "$share/<name>/<filter>" means one member of the
 // group receives each message - one in the whole server, not one per shard.
@@ -193,7 +195,8 @@ public:
     ShardedBroker& operator=(const ShardedBroker&) = delete;
 
     // Binds every shard's listener and starts the threads. False, with
-    // lastError(), if any listener could not be opened.
+    // lastError(), if any listener could not be opened. With neither plain
+    // nor TLS asked for it runs with no listener (see changeListeners).
     bool start(const ShardedBrokerConfig& config);
 
     // Every client is told 0x8B Server shutting down, every transport is

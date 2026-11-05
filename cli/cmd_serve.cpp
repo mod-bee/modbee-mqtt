@@ -372,6 +372,13 @@ int cmdServe(int argc, char** argv) {
         std::fprintf(stderr, "modbee-mqtt serve: --cert, --key and --client-ca need --tls-port\n");
         return 2;
     }
+    // No listener is a server opened later through its Application API (Admin.PutListeners); without the API
+    // nothing could ever reach it.
+    if (!b.plain && !b.tls && file.api.grpc.empty()) {
+        std::fprintf(stderr, "modbee-mqtt serve: --no-plain without --tls-port leaves no listener: give --api to run "
+                             "with none and open one later (Admin.PutListeners)\n");
+        return 2;
+    }
 
     ShardedBrokerConfig config;
     config.address = b.address;

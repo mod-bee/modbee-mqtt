@@ -1805,6 +1805,32 @@ void listenersLive(Server& server) {
                    admin->PutListeners(&context, tooMany, &refused).error_code(),
                    grpc::StatusCode::FAILED_PRECONDITION);
     }
+    {
+        grpc::ClientContext context;
+        authorize(context);
+        v1::ListenersChange off;
+        off.set_port(0);
+        v1::Listeners none;
+        ok(admin->PutListeners(&context, off, &none).ok() && none.listeners_size() == 0,
+           "the last listener turned off: the server runs with none, reached through the API");
+        Fleet closed(moved);
+        Client& shut = closed.make("shut");
+        ok(!closed.connected(shut, 1000), "  nothing listens on its port");
+    }
+    {
+        grpc::ClientContext context;
+        authorize(context);
+        const uint16_t again = freePort();
+        v1::ListenersChange on;
+        on.set_port(again);
+        v1::Listeners one;
+        ok(admin->PutListeners(&context, on, &one).ok() && one.listeners_size() == 1 &&
+               one.listeners(0).port() == again,
+           "  and one opened again, live");
+        Fleet back(again);
+        Client& returning = back.make("returning");
+        ok(back.connected(returning), "  a device connects on it");
+    }
 }
 
 } // namespace

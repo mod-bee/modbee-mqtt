@@ -941,7 +941,6 @@ bool ShardedBroker::start(const ShardedBrokerConfig& config) {
         _shards.clear();
         return false;
     };
-    if (!config.plain && !config.tls.enabled) return abandon("no listener: neither plain nor TLS");
 #if !MQTT_TLS_SOCKETS
     if (config.tls.enabled) {
         return abandon("TLS was asked for, but this build has no TLS engine (engine: " +
@@ -1228,12 +1227,6 @@ bool ShardedBroker::changeListeners(const ListenerChange& change, std::string& e
     }
     const ShardedTlsConfig served = servedTls();
     const bool plainOn = _port != 0, tlsOn = _tlsPort != 0;
-    const bool plainAfter = change.setPlain ? change.plain : plainOn;
-    const bool tlsAfter = change.setTls ? change.tls.enabled : tlsOn;
-    if (!plainAfter && !tlsAfter) {
-        error = "no listener left: neither plain nor TLS";
-        return false;
-    }
     size_t perShardLimit = 0;
     if (change.maxConnections != 0) {
         perShardLimit = perShard(change.maxConnections, _shards.size());

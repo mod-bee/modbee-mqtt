@@ -544,10 +544,6 @@ void readBroker(Loader& loader, Section broker, BrokerSection& out) {
     broker.flag("pin-threads", out.pinThreads);
     broker.integer("status-every", out.statusEvery, 0, 86400);
     broker.finish();
-    if (!out.plain && !out.tls) {
-        loader.problem(broker.node(), broker.path(),
-                       "no listener: plain is false and there is no tls section");
-    }
 }
 
 void readCluster(Loader& loader, Section c, KafkaClusterConfig& out) {
@@ -838,6 +834,11 @@ void crossCheck(Loader& loader, ServerConfig& config) {
                        "optional client certificates need a client CA to verify them against "
                        "(broker.tls.client-ca or client-ca-pem); without one none is asked for",
                        true);
+    }
+    // No listener is a server opened later through its Application API (Admin.PutListeners).
+    if (!b.plain && !b.tls && config.api.grpc.empty()) {
+        loader.problem(nullptr, "broker.plain",
+                       "no listener: plain is false, there is no tls section and no api to open one later");
     }
     const AuthoritySection& authority = config.authentication.authority;
     if (authority.enabled && !config.authentication.database.empty()) {
