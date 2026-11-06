@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ModBeeMqtt
-    VERSION 0.1.1
+    VERSION 0.1.2
     DESCRIPTION "MQTT 3.1.1 and 5.0 client, broker and bridge for Arduino and Linux - nothing waits on the network"
     LANGUAGES CXX)
 

@@ -11,6 +11,10 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.2]
+
+A gateway's broker closed to devices listens on nothing.
+
 ### Changed
 
 - The server may run with **no listener** when its Application API is on: `serve --no-plain --api ...` (no
@@ -498,6 +502,7 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mod-bee/modbee-mqtt/releases/tag/v0.1.0
