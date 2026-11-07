@@ -3458,6 +3458,9 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         // every redelivery after a reconnect without DUP.
         packet.publish.dup = next->onWire;
 
+        MqttAliases::Choice alias;
+        const MqttSpan topicSpan = asSpan(next->topic);
+
         if (isV5) {
             restoreProperties(next->properties, MQ_PROPERTIES(packet, packet.publish));
 
@@ -3484,26 +3487,25 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
                 }
             }
 
-            if (_config.useOutboundTopicAliases && connection.peerTopicAliasMaximum > 0) {
-                const MqttSpan topicSpan = asSpan(next->topic);
-                uint16_t alias = connection.aliases.lookupOutbound(
-                    topicSpan.data, (uint16_t)topicSpan.length);
-                if (alias != 0) {
-                    // [V5:3.3.2.3.4] Once a mapping is established the topic
-                    // may be sent zero-length. The alias is only ever used
-                    // AFTER the full topic has gone once on this connection.
-                    packet.publish.topic.length = 0;
-                    MQ_PROPERTIES(packet, packet.publish).topicAlias = alias;
+            // [V5:3.3.2.3.4] Once a mapping is established the topic may be
+            // sent zero-length. The alias is only ever used AFTER the full
+            // topic has gone once on this connection - and it is recorded only
+            // once this packet is queued (below): a delivery that waits for
+            // room comes back here, and must carry the topic again.
+            //
+            // No replacement when the table is full: the first topics keep
+            // their aliases and the rest go in full. A subscriber's topics are
+            // the publishers', not ours to predict, and replacing on every
+            // miss would send topic and alias both, each time, for a set of
+            // topics one larger than the table.
+            if (_config.useOutboundTopicAliases && connection.peerTopicAliasMaximum > 0 &&
+                topicSpan.length <= 0xFFFF) {
+                alias = connection.aliases.chooseOutbound(
+                    topicSpan.data, (uint16_t)topicSpan.length, false);
+                if (alias.alias != 0) {
+                    if (alias.aliasOnly) packet.publish.topic.length = 0;
+                    MQ_PROPERTIES(packet, packet.publish).topicAlias = alias.alias;
                     MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_TOPIC_ALIAS);
-                } else {
-                    // false: lookupOutbound() has just missed on this exact
-                    // topic, so searching again would be the same walk twice.
-                    alias = connection.aliases.assignOutbound(
-                        topicSpan.data, (uint16_t)topicSpan.length, false);
-                    if (alias != 0) {
-                        MQ_PROPERTIES(packet, packet.publish).topicAlias = alias;
-                        MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_TOPIC_ALIAS);
-                    }
                 }
             }
         }
@@ -3553,6 +3555,11 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
                 session->releasePacketId(packetId);
             }
             return;
+        }
+
+        if (alias.alias != 0) {
+            connection.aliases.confirmOutbound(alias, topicSpan.data,
+                                               (uint16_t)topicSpan.length);
         }
 
         _status.delivered++;

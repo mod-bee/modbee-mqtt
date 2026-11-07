@@ -73,6 +73,10 @@ struct BrokerSection {
     // has more in flight than on one - and MQTT.js (Node-RED's client) does
     // not keep to the limit, so the library's 32 disconnected it.
     long long receiveMaximum = 1024;
+    // Topic aliases a client may use towards us, stated in CONNACK and
+    // enforced (0x94): up to MQTT_MAX_ALIASES (256), 0 for none. 64 - a
+    // Sparkplug gateway's data topics, its own and one per device.
+    long long topicAliasMaximum = 64;
     long long maxSessions = 0;         // 0: = maxConnections
     uint32_t maxPacket = 65536;
     size_t queue = 1000;               // messages held per session (its slots grow as a backlog needs)

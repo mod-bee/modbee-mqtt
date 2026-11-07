@@ -424,8 +424,8 @@ public:
         _reserved -= length < _reserved ? length : _reserved;
     }
 
-    // A new entry holding a copy of `length` bytes, or kFailed when there is
-    // no room or no free entry.
+    // A new entry holding a copy of `length` bytes (left unset when `bytes` is
+    // null), or kFailed when there is no room or no free entry.
     Entry put(const uint8_t* bytes, size_t length) noexcept ;
     void release(Entry entry) noexcept;
 
@@ -495,6 +495,11 @@ public:
 
     void assign(const uint8_t* first, const uint8_t* last) noexcept;
     void clear() noexcept { drop(); }
+
+    // `length` bytes of its own in the area, their contents unset, for a
+    // caller that writes them in place (an encoder). Bound only. False, and
+    // holding nothing, when the area cannot take them.
+    bool allocate(size_t length) noexcept;
 
     const uint8_t* data() const noexcept {
         return held() ? _area->at(_entry) : _view;

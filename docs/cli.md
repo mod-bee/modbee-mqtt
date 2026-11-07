@@ -223,7 +223,8 @@ modbee-mqtt serve --data /var/lib/app/broker --api unix:/run/app/broker.sock --a
   2000 by default), `--events` turns client events on, `--sparkplug-aware`
   keeps every Sparkplug birth on `$sparkplug/certificates/...`
   ([app-api.md](app-api.md#sparkplug-b)), `--queue`, `--queue-bytes` and
-  `--queue-bytes-total` cap what sessions hold, `--max-connect-rate` how many
+  `--queue-bytes-total` cap what sessions hold, `--topic-alias-maximum` how many
+  topic aliases a client may use (64; `0` none), `--max-connect-rate` how many
   new connections it takes a second (1000; `0` no limit - a reconnect storm
   past it waits in the kernel's backlog, a slower connect rather than a
   refusal). **`--set path=value`** sets

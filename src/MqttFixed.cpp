@@ -78,7 +78,7 @@ MqttByteArea::Entry MqttByteArea::put(const uint8_t* bytes, size_t length) noexc
         if (_length[entry] != kFree) continue;
         _offset[entry] = (uint32_t)_used;
         _length[entry] = (uint32_t)length;
-        if (length) memcpy(_bytes + _used, bytes, length);
+        if (length && bytes) memcpy(_bytes + _used, bytes, length);
         _used += length;
         return (Entry)entry;
     }
@@ -126,6 +126,14 @@ void MqttAreaBytes::assign(const uint8_t* first, const uint8_t* last) noexcept {
     if (fromArea && old < MqttByteArea::kFailed) _area->release(old);
     _view = nullptr;
     _size = held() ? (uint32_t)length : 0;
+}
+
+bool MqttAreaBytes::allocate(size_t length) noexcept {
+    drop();
+    if (!_area || length == 0) return false;
+    _entry = _area->put(nullptr, length);
+    _size = held() ? (uint32_t)length : 0;
+    return held();
 }
 
 void MqttAreaBytes::drop() noexcept {

@@ -134,6 +134,11 @@ void MqttProperties::markPresent(uint8_t identifier) {
     if (index >= 0) present |= (1u << index);
 }
 
+void MqttProperties::markAbsent(uint8_t identifier) {
+    const int index = indexOf(identifier);
+    if (index >= 0) present &= ~(1u << index);
+}
+
 bool MqttProperties::addUserProperty(const MqttSpan& key, const MqttSpan& value) {
     if (userCount >= MQTT_MAX_USER_PROPERTIES) return false;
     user[userCount].key = key;

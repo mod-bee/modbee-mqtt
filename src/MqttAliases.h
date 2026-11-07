@@ -48,6 +48,8 @@
 #define MQTT_ALIAS_TOPIC 128
 #endif
 
+// HOW MANY ALIASES EACH DIRECTION HOLDS. A board's tables are fixed, so 8; a
+// host's grow as aliases are used, up to MQTT_MAX_ALIASES (MqttFeatures.h).
 #ifndef MQTT_MAX_ALIASES
 #define MQTT_MAX_ALIASES 8
 #endif
@@ -83,17 +85,39 @@ public:
     }
 
     // --- Outbound ---
+    //
+    // CHOSEN, THEN CONFIRMED. chooseOutbound() says what the next PUBLISH to a
+    // topic should carry and changes nothing; confirmOutbound() records it once
+    // that PUBLISH is in the transmit queue. A packet that could not be queued
+    // - the buffer busy for a moment, the packet too large - must not leave a
+    // mapping behind: the retry would find it, send the alias alone, and the
+    // peer, which never saw the topic go with it, would close the connection
+    // with 0x94.
+
+    struct Choice {
+        uint16_t alias = 0;      // 0: the topic goes in full, with no alias
+        bool aliasOnly = false;  // true: the alias alone, a zero-length topic
+    };
+
+    // What a PUBLISH to this topic carries. The alias alone when the peer has
+    // already been sent this topic with it on this connection; otherwise the
+    // topic AND an alias - the next unused one, or, when every alias the peer
+    // allows is taken and `replace` is set, the one least recently sent
+    // (V5:3.3.2.3.4 lets a sender give an alias a new topic at any time, and
+    // the publish that does so carries the topic). No alias at all when the
+    // peer offered none, the topic is longer than an entry holds, or the table
+    // is full and `replace` is not set.
+    Choice chooseOutbound(const uint8_t* topic, uint16_t length, bool replace) const;
+
+    // The PUBLISH that carried `choice` is queued for the wire.
+    void confirmOutbound(const Choice& choice, const uint8_t* topic, uint16_t length);
 
     // The alias already agreed for this topic, or 0 if there is none.
     uint16_t lookupOutbound(const uint8_t* topic, uint16_t length) const;
 
-    // Takes the next free alias for this topic, or 0 when the table is full,
-    // the peer offered none, or the topic is longer than an entry holds (the
-    // topic then simply goes in full). The caller then sends the topic AND the alias
-    // once; later publishes may send the alias with an empty topic.
-    // `searchFirst` false when the caller has already looked and missed.
-    uint16_t assignOutbound(const uint8_t* topic, uint16_t length,
-                            bool searchFirst = true);
+    // chooseOutbound() and confirmOutbound() in one, without replacement: the
+    // alias for this topic, a new one taken for it, or 0.
+    uint16_t assignOutbound(const uint8_t* topic, uint16_t length);
 
     // --- Inbound ---
 
@@ -124,16 +148,42 @@ public:
     uint16_t inboundMaximum() const { return _inboundMaximum; }
 
 private:
+    // ENTRY n IS ALIAS n + 1, in both tables. Outbound aliases are handed out
+    // in order and a replaced one keeps its number, so the entry for an alias
+    // is found by index - and an inbound alias, which the peer numbers, is
+    // within what we offered, so the same holds there. An empty topic is an
+    // unused entry: no mapping is ever made to an empty topic.
     struct Entry {
         MQ_BYTES(MQTT_ALIAS_TOPIC) topic;
-        uint16_t alias = 0;
-        bool inUse() const { return alias != 0; }
+        uint32_t lastSent = 0;   // outbound only: what replacement goes by
     };
 
+#if MQTT_LEAN
     Entry _outbound[MQTT_MAX_ALIASES];
     Entry _inbound[MQTT_MAX_ALIASES];
+    uint16_t _outboundUsed = 0;
+    size_t inboundSize() const { return MQTT_MAX_ALIASES; }
+#else
+    // Grown as aliases are used, so a connection that never uses one - most
+    // of a broker's - holds two empty vectors, whatever the maximum.
+    std::vector<Entry> _outbound;
+    std::vector<Entry> _inbound;
+    size_t inboundSize() const { return _inbound.size(); }
+#endif
+
+    uint16_t outboundUsed() const {
+#if MQTT_LEAN
+        return _outboundUsed;
+#else
+        return (uint16_t)_outbound.size();
+#endif
+    }
 
     uint16_t _outboundMaximum = 0;
     uint16_t _inboundMaximum = 0;
-    uint16_t _nextOutbound = 1;
+
+    // A count of confirmed sends, which orders the entries for replacement.
+    // Wrapping after four billion publishes misorders them once, for a
+    // moment: it decides which alias is replaced, never what one means.
+    uint32_t _sends = 0;
 };

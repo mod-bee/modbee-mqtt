@@ -103,7 +103,8 @@ lets a death certificate say what it is rather than only that it happened.
 
 **Topic Alias is deliberately not settable.** Aliases are negotiated per
 connection and `MqttAliases` owns the table; an application setting one by hand
-would be overwriting it.
+would be overwriting it. The client uses them on its own whenever the broker
+allows them - see [api.md](api.md).
 
 ### What happens to properties on a 3.1.1 connection
 
@@ -242,7 +243,7 @@ every one of them from the CONNACK rather than from your configuration.
 | --- | --- |
 | Maximum Packet Size | 8,192, clamped to the receive buffer |
 | Receive Maximum | 32 |
-| Topic Alias Maximum | 8 |
+| Topic Alias Maximum | 64 |
 
 `maximumPacketSize` is clamped to the receive buffer rather than trusted,
 because advertising more than you can hold is a promise broken at the worst

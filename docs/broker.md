@@ -251,7 +251,7 @@ These are the library's defaults. `modbee-mqtt serve` sets its own, from
 `modbee.yaml` or its flags: `max-packet` 65536 (both buffers and the
 advertised Maximum Packet Size), `max-retained` 10000, `receive-maximum` 1024 (`receiveMaximum`; a client
 pipelining a burst to several shards has more in flight than to one, and MQTT.js
-does not keep to it), `max-connect-rate` 1000 (new connections a second, the
+does not keep to it), `topic-alias-maximum` 64 (`topicAliasMaximum`, 0 to 256), `max-connect-rate` 1000 (new connections a second, the
 whole server's: a storm past it waits in the kernel's backlog), `queue` 1000 (its slots in blocks of sixteen, taken as a
 backlog needs them, so the limit costs a session nothing until it is used),
 `max-session-expiry` 3600 (`maximumSessionExpiry`, below) - and it can
@@ -372,7 +372,7 @@ falls back to `begin()`.
 | `maximumPacketSize` | 8192 | `0x95` Packet too large |
 | `maximumQos` | 2 | `0x9B` QoS not supported; SUBACK never grants above it |
 | `retainAvailable` | true | `0x9A` Retain not supported |
-| `topicAliasMaximum` | 8 | `0x94` Topic Alias invalid |
+| `topicAliasMaximum` | 64 (at most 256 on a host, 8 on a board) | `0x94` Topic Alias invalid |
 | `wildcardSubscriptionAvailable` | true | `0xA2` in the SUBACK |
 | `subscriptionIdentifiersAvailable` | true | `0xA1` |
 | `sharedSubscriptionAvailable` | always built; set it false to refuse | `0x9E` |

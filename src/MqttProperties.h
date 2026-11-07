@@ -151,6 +151,7 @@ struct MqttProperties {
 
     bool has(uint8_t identifier) const;
     void markPresent(uint8_t identifier);
+    void markAbsent(uint8_t identifier);
     void clear() { *this = MqttProperties(); }
 
     bool addUserProperty(const MqttSpan& key, const MqttSpan& value);

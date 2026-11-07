@@ -127,8 +127,12 @@ struct MqttBrokerConfig {
     bool retainAvailable = true;
 
     // [V5:3.2.2.3.8] How many inbound topic aliases we will accept. Zero
-    // refuses them all, which is legal and is what most brokers do.
-    uint16_t topicAliasMaximum = 8;
+    // refuses them all, which is legal. 64 by default: a Sparkplug gateway
+    // publishes a data topic for itself and one for each device behind it,
+    // and with 8 a gateway of more than a few devices sent most of them in
+    // full. Capped at what the alias table holds (MQTT_MAX_ALIASES: 256 on a
+    // host, 8 on a board); a host's table grows only as aliases are used.
+    uint16_t topicAliasMaximum = 64;
 
     // Whether WE use aliases on the messages we send, bounded by the client's
     // own Topic Alias Maximum. Off by default: it saves bytes and it is one

@@ -1471,6 +1471,19 @@ void MqttClient::serviceQueue() {
             _operations.concludeByOpId(op->opId, MqttResult::PacketTooLarge);
             continue;
         }
+
+        // A TOPIC ALIAS, when the peer allows them [V5:3.3.2.3.4]: the first
+        // publish to a topic on this connection carries the topic and an
+        // alias, later ones the alias alone. On a cellular link that is most
+        // of a small message - a Sparkplug topic is sixty bytes, a value thirty.
+        //
+        // `needed` stays the size WITHOUT it, because that is what is kept for
+        // a resend: an alias belongs to the connection it was given on, and a
+        // publish replayed after a reconnect has to carry its topic.
+        MqttAliases::Choice alias;
+        if (op->kind == MqttOpKind::Publish) {
+            alias = chooseAlias(*op, packet, needed);
+        }
 #if MQTT_LEAN
         // On a board the resend copy goes in the byte area, into the room the
         // publish reserved when it was queued. One going out again after a
@@ -1524,8 +1537,28 @@ void MqttClient::serviceQueue() {
         noteTransmitted();
         const uint32_t mark = _link.transmitMark();
 
+        // Queued, so the mapping is the peer's from here on.
+        if (alias.alias != 0) {
+            _aliases.confirmOutbound(alias, op->topic.data(), (uint16_t)op->topic.size());
+        }
+
         if (op->kind == MqttOpKind::Publish && op->qos > MQ_QOS_0) {
-            _session.storeOutbound(packetId, op->qos, encoded, encodedLength);
+            if (alias.alias != 0) {
+                // What went out leaned on this connection's alias, so the copy
+                // kept is encoded again as if there were none: the full topic,
+                // no alias property. Only a QoS 1 or 2 publish that used an
+                // alias pays for the second encode.
+                dropAlias(*op, packet);
+                uint8_t* space = _session.storeOutboundSpace(packetId, op->qos, needed);
+                size_t written = 0;
+                if (space != nullptr &&
+                    (codec().encode(space, needed, packet, written) != MqttError::None ||
+                     written != needed)) {
+                    _session.releaseOutbound(packetId);
+                }
+            } else {
+                _session.storeOutbound(packetId, op->qos, encoded, encodedLength);
+            }
 
             // The SESSION's copy is marked sent too, not just the operation's.
             //
@@ -1553,6 +1586,43 @@ void MqttClient::serviceQueue() {
             }
         }
     }
+}
+
+// What a publish carries for its topic: see serviceQueue(). Applied to the
+// packet when an alias is chosen, and the size of the packet WITH it checked
+// against the peer's Maximum Packet Size - an alias is three bytes, and the
+// publish that gives it a topic is three bytes longer than one without. One
+// that would not fit goes without.
+MqttAliases::Choice MqttClient::chooseAlias(const MqttOperation& op, MqttPacket& packet,
+                                            size_t plainSize) {
+    MqttAliases::Choice choice;
+    if (_activeVersion != MqttVersion::V5 || _aliases.outboundMaximum() == 0) return choice;
+    if (op.topic.empty() || op.topic.size() > 0xFFFF) return choice;
+
+    choice = _aliases.chooseOutbound(op.topic.data(), (uint16_t)op.topic.size(), true);
+    if (choice.alias == 0) return choice;
+
+    MQ_PROPERTIES(packet, packet.publish).topicAlias = choice.alias;
+    MQ_PROPERTIES(packet, packet.publish).markPresent(MQ_PROP_TOPIC_ALIAS);
+    if (choice.aliasOnly) packet.publish.topic.length = 0;
+
+    // Our own transmit buffer too: a packet that fitted only without the
+    // alias would otherwise be refused by the link on every poll, and since
+    // nothing is confirmed until it is queued, chosen the same way each time.
+    const size_t withAlias = codec().size(packet);
+    if (withAlias == 0 || !_capabilities.allowsPacketSize(withAlias) ||
+        (withAlias > plainSize && withAlias > _link.transmitLimit())) {
+        dropAlias(op, packet);
+        choice = MqttAliases::Choice();
+    }
+    return choice;
+}
+
+void MqttClient::dropAlias(const MqttOperation& op, MqttPacket& packet) {
+    MQ_PROPERTIES(packet, packet.publish).topicAlias = 0;
+    MQ_PROPERTIES(packet, packet.publish).markAbsent(MQ_PROP_TOPIC_ALIAS);
+    packet.publish.topic.data = op.topic.data();
+    packet.publish.topic.length = (uint32_t)op.topic.size();
 }
 
 // =============================================================================

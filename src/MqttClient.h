@@ -638,6 +638,13 @@ private:
     void serviceQueue();
     void serviceReconnect();
 
+    // The topic alias a publish goes out with, applied to `packet` (none when
+    // the peer allows none, or the packet would not fit with it), and taken
+    // off again. `plainSize` is the packet's size without one.
+    MqttAliases::Choice chooseAlias(const MqttOperation& op, MqttPacket& packet,
+                                    size_t plainSize);
+    void dropAlias(const MqttOperation& op, MqttPacket& packet);
+
     bool sendPacket(const MqttPacket& packet);
 
     void handlePacket(const MqttFixedHeader& header, const MqttPacket& packet);

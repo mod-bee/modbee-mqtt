@@ -841,7 +841,7 @@ uint32_t sessionExpiryInterval = 0;     // 5.0 only
 bool     hasSessionExpiry      = false;
 
 uint16_t receiveMaximum     = 0;        // 0: what the session tracks - 255 on a host, 16 on a board
-uint16_t topicAliasMaximum  = 0;        // how many aliases WE will accept, up to MQTT_MAX_ALIASES (8)
+uint16_t topicAliasMaximum  = 0;        // how many aliases WE will accept, up to MQTT_MAX_ALIASES (256 on a host, 8 on a board)
 uint32_t maximumPacketSize  = 0;        // 0: receiveBufferSize; never more than it
 
 MqttWillConfig will;
@@ -912,12 +912,21 @@ and drops it at once is retried at a doubling interval, not every second. A
 refused credential is separate: it waits `rejectedCredentialsRetryMs`.
 
 **`topicAliasMaximum` is capped at what the table holds.** The CONNECT
-advertises at most `MQTT_MAX_ALIASES` (8 by default), whatever is configured,
+advertises at most `MQTT_MAX_ALIASES` (256 on a host, 8 on a board), whatever is configured,
 so a broker is never invited to use an alias the client would refuse. On a
 board an alias's topic is held in `MQTT_ALIAS_TOPIC` bytes (128): a longer one
 is delivered under its full name, but not kept as a mapping, and a later
 message that sends that alias alone closes the connection with 0x94 rather
 than being delivered under a shortened topic.
+
+**The client sends aliases itself** whenever the broker's CONNACK allows them
+(a Topic Alias Maximum above 0), with nothing to configure: the first publish
+to a topic on a connection carries the topic and an alias, every later one the
+alias alone - on a Sparkplug topic, about sixty bytes a message. When every
+alias the broker allows is in use, the one sent least recently is given the
+new topic. The table starts empty on each connection, a resumed session
+included, and a QoS 1 or 2 publish resent after a reconnect carries its full
+topic. At 3.1.1 nothing changes.
 
 **`acknowledgementTimeoutMs` is not a retransmission timer.** MQTT sets no
 deadline by which a server must acknowledge a PUBLISH, so a broker that accepts

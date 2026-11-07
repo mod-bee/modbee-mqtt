@@ -184,6 +184,11 @@ public:
     // --- Outbound publishes ---
     bool storeOutbound(uint16_t packetId, uint8_t qos,
                        const uint8_t* encoded, size_t length);
+    // Room for `length` bytes of a publish to keep, for the caller to encode
+    // in place - when the copy to replay is not the bytes that went out (a
+    // topic alias, which must never be resent: MqttClient). Null when there
+    // is no free slot or no room; release with releaseOutbound().
+    uint8_t* storeOutboundSpace(uint16_t packetId, uint8_t qos, size_t length);
     MqttStoredPublish* findOutbound(uint16_t packetId);
     void releaseOutbound(uint16_t packetId);
 

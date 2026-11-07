@@ -261,6 +261,18 @@
     #endif
 #endif
 
+// TOPIC ALIASES on a host (MqttAliases.h, MQTT_MAX_ALIASES): up to 256 each way,
+// where a board holds 8. A host's tables grow as aliases are used, so a
+// connection that uses none costs nothing for the higher ceiling; a broker
+// offers 64 unless configured otherwise (MqttBrokerConfig::topicAliasMaximum),
+// and a client uses as many as its peer allows, up to this. Not in a board's
+// build run on a host (MQTT_LEAN), whose tables are fixed arrays.
+#if defined(MQTT_PLATFORM_HOST) && !MQTT_LEAN
+    #ifndef MQTT_MAX_ALIASES
+        #define MQTT_MAX_ALIASES 256
+    #endif
+#endif
+
 #if MQTT_TLS_AVAILABLE && defined(MQTT_PLATFORM_HOST)
     #define MQTT_TLS_SOCKETS 1
 #else

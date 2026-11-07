@@ -127,8 +127,16 @@ size_t MqttSession::outboundCount() const {
 
 bool MqttSession::storeOutbound(uint16_t packetId, uint8_t qos,
                                 const uint8_t* encoded, size_t length) {
-    if (packetId == MQ_PACKET_ID_NONE || !encoded || length == 0) return false;
-    if (indexOfOutbound(packetId) >= 0) return false;   // already stored
+    if (!encoded) return false;
+    uint8_t* space = storeOutboundSpace(packetId, qos, length);
+    if (!space) return false;
+    memcpy(space, encoded, length);
+    return true;
+}
+
+uint8_t* MqttSession::storeOutboundSpace(uint16_t packetId, uint8_t qos, size_t length) {
+    if (packetId == MQ_PACKET_ID_NONE || length == 0) return nullptr;
+    if (indexOfOutbound(packetId) >= 0) return nullptr;   // already stored
 
     for (int i = 0; i < MQTT_SESSION_MAX_INFLIGHT; i++) {
         if (_outbound[i].inUse()) continue;
@@ -136,16 +144,17 @@ bool MqttSession::storeOutbound(uint16_t packetId, uint8_t qos,
         _outbound[i].qos = qos;
         _outbound[i].awaitingPubcomp = false;
         _outbound[i].sent = false;
-        _outbound[i].encoded.assign(encoded, encoded + length);
 #if MQTT_LEAN
-        if (_outbound[i].encoded.failed()) {   // the byte area is full
+        if (!_outbound[i].encoded.allocate(length)) {   // the byte area is full
             _outbound[i] = MqttStoredPublish();
-            return false;
+            return nullptr;
         }
+#else
+        _outbound[i].encoded.resize(length);
 #endif
-        return true;
+        return _outbound[i].encoded.data();
     }
-    return false;
+    return nullptr;
 }
 
 MqttStoredPublish* MqttSession::findOutbound(uint16_t packetId) {
