@@ -30,6 +30,7 @@ const MqttCodecV311 g_brokerCodecV311;
 // How many packets one connection may have processed in a single poll before
 // the broker moves on to the next. See serviceConnection.
 const size_t kPacketsPerPoll = 8;
+const size_t kDeliveriesPerPass = 256;
 
 // How many waiting connections one poll may accept, per listener. See
 // acceptNew(): one at a time made a connection storm O(N squared), a drain
@@ -255,6 +256,7 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
                                 _config.maxQueuedBytesTotal);
 #if defined(MQTT_PLATFORM_HOST)
         session.attachQueuedCount(&_queuedMessages);
+        session.attachCongestedCount(&_congestedSessions);
 #endif
         session.attachLoginCounts(&_sessionsPerLogin);
 #if defined(MQTT_PLATFORM_HOST)
@@ -562,14 +564,16 @@ void MqttBroker::unwatch(MqttBrokerConnection& connection) {
 }
 
 void MqttBroker::afterService(MqttBrokerConnection& connection) {
-    connection.readable = false;
+    const bool held = connection.heldBack;
+    connection.heldBack = false;
+    if (!held) connection.readable = false;
     if (!connection.inUse()) return;
 
     // Buffered input relists only when it can be acted on. Part of a packet
     // used to relist every poll, so one peer that sent four bytes and stopped
     // kept the shard from ever sleeping; the socket - or the TLS engine's own
     // buffer, hasBufferedInput() - says when the rest has come.
-    bool again = connection.closing || connection.watchedHandle < 0 ||
+    bool again = held || connection.closing || connection.watchedHandle < 0 ||
                  connection.link.actionable() ||
                  connection.transport->hasBufferedInput();
 
@@ -765,6 +769,34 @@ uint32_t MqttBroker::egress(const MqttSpan& topic, const MqttSpan& payload, uint
     message.context = context;
     message.confirm = _routingConfirm;
     return _onEgress(_egressContext, message, deferral);
+}
+
+// A session that has taken nothing for this long is a slow consumer, and the
+// rest of the broker does not wait for it.
+const mq_time_t kSlowConsumerMs = 250;
+
+bool MqttBroker::roomFor(const MqttSpan& topic) {
+#if defined(MQTT_PLATFORM_HOST)
+    if (_congestedSessions == 0) return true;
+    const mq_time_t now = mq_millis();
+    if (!_routeIndex.configured() && _indexBuiltAt != _subscriptionRevision) {
+        rebuildSubscriptionIndex();
+    }
+    gatherCandidates(topic);
+    for (size_t candidate = 0; candidate < _routeCandidates.size(); candidate++) {
+        const MqttBrokerSession& session = _sessions[_routeCandidates[candidate]];
+        if (!session.inUse() || !session.congested() || !session.connected) continue;
+        if (mq_elapsed(session.lastSentAt, now) >= kSlowConsumerMs) continue;
+        for (size_t index = 0; index < session.subscriptionCount(); index++) {
+            const MqttBrokerSubscription* subscription = session.subscriptionAt(index);
+            if (subscription == nullptr || !subscription->inUse() || subscription->shared()) continue;
+            if (mq_topicMatches(asSpan(subscription->effective), topic)) return false;
+        }
+    }
+#else
+    (void)topic;
+#endif
+    return true;
 }
 
 size_t MqttBroker::publishForwarded(const MqttBrokerRouted& message, size_t* droppedOut) {
@@ -1543,6 +1575,32 @@ void MqttBroker::serviceConnection(MqttBrokerConnection& connection) {
         // implement, so trying one and falling back to the other would report
         // a 3.1.1 client as a malformed packet. The one byte that decides is
         // read on its own first.
+#if defined(MQTT_PLATFORM_HOST)
+        // A PUBLISH waits, unread, while the shards' rings are full
+        // (pauseIngress) or a subscriber that is behind would have to drop it,
+        // until there is room. Only PUBLISH: acknowledgements and pings still
+        // go, or a QoS 1 subscriber could never free its window. What waits
+        // fills the link's bounded buffer, and then TCP slows the publisher.
+        // A topic carried only by its alias is not looked at.
+        if (header.type == MQ_PKT_PUBLISH && _ingressPaused && connection.connectSeen) {
+            connection.heldBack = true;
+            break;
+        }
+        if (header.type == MQ_PKT_PUBLISH && _congestedSessions != 0 && connection.connectSeen) {
+            const uint8_t* body = connection.link.rawPacket() + header.headerLength;
+            if (header.remainingLength >= 2) {
+                MqttSpan topic;
+                topic.length = ((uint32_t)body[0] << 8) | body[1];
+                topic.data = body + 2;
+                if (topic.length != 0 && topic.length + 2 <= header.remainingLength &&
+                    !roomFor(topic)) {
+                    connection.heldBack = true;
+                    break;
+                }
+            }
+        }
+#endif
+
         const MqttCodec* useCodec = &codecFor(connection.version);
         if (!connection.connectSeen && header.type == MQ_PKT_CONNECT) {
             uint8_t level = 0;
@@ -1596,7 +1654,7 @@ void MqttBroker::serviceConnection(MqttBrokerConnection& connection) {
         }
 #endif
 
-        MqttPacket packet;
+        MqttPacket& packet = _received;      // the decoder resets what it uses
         const MqttError error = connection.link.take(*useCodec, header, packet);
 
         if (error != MqttError::None) {
@@ -3356,7 +3414,10 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
 
     // Bounded per pass. A session holding sixty messages must not monopolise
     // the poll: every other connection in the plant is waiting behind it.
-    for (size_t pass = 0; pass < 32; pass++) {
+    // Up to 256 a pass, while the link takes them: 32 left a subscriber that
+    // could read hundreds of thousands a second waiting a whole pass of the
+    // loop - every other connection, the epoll round, the sweeps - per 32.
+    for (size_t pass = 0; pass < kDeliveriesPerPass; pass++) {
         // Nothing new goes out while the transmit queue still holds bytes.
         // Encoding a second packet into a full queue would fail halfway and
         // leave the delivery marked sent when it was not.
@@ -3369,13 +3430,15 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         // anything new: the peer is holding a packet identifier open until it
         // arrives. [V5:4.3.3]
         MqttBrokerDelivery* owed = nullptr;
-        // queuedExtent(), not queueCapacity(): this runs first on every one of
-        // up to 32 passes, before it is even known whether there is anything
-        // to send, so at the default depth it was up to 2,048 slot visits per
-        // connection per poll - almost all of them on empty slots.
-        for (size_t index = 0; index < session->queuedExtent() && owed == nullptr; index++) {
-            MqttBrokerDelivery* candidate = session->deliveryAt(index);
-            if (candidate && candidate->inUse() && candidate->pubrelOwed) owed = candidate;
+        // Looked for only while one may be owed (a PUBREC arrived, or a resumed
+        // session): this ran first on every pass, a walk of the queue before
+        // each message, for the QoS 2 exchanges almost no session has.
+        if (session->mayOwePubrel()) {
+            for (size_t index = 0; index < session->queuedExtent() && owed == nullptr; index++) {
+                MqttBrokerDelivery* candidate = session->deliveryAt(index);
+                if (candidate && candidate->inUse() && candidate->pubrelOwed) owed = candidate;
+            }
+            if (owed == nullptr) session->noPubrelOwed();
         }
         if (owed != nullptr) {
 #if defined(MQTT_PLATFORM_HOST)
@@ -3422,7 +3485,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         uint16_t packetId = MQ_PACKET_ID_NONE;
         if (next->qos > MQ_QOS_0) {
             packetId = next->packetId != MQ_PACKET_ID_NONE
-                           ? next->packetId : session->allocatePacketId();
+                           ? next->packetId : session->allocatePacketId(*next);
             if (packetId == MQ_PACKET_ID_NONE) return;   // try again next poll
 #if defined(MQTT_PLATFORM_HOST)
             // A KEPT SESSION'S IDENTIFIER IS ON DISK BEFORE THE PUBLISH IS ON
@@ -3440,7 +3503,8 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
 #endif
         }
 
-        MqttPacket packet;
+        MqttPacket& packet = _delivery;
+        packet.clearFor(MQ_PKT_PUBLISH);
         packet.header.type = MQ_PKT_PUBLISH;
         packet.publish.qos = next->qos;
         packet.publish.retain = next->retain;
@@ -3568,6 +3632,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         session->traffic.messagesOut++;
 #endif
 
+        session->lastSentAt = now;     // keeping up: see MqttBrokerSession::congested()
         if (next->qos == MQ_QOS_0) {
             // Nothing acknowledges a QoS 0 delivery, so reaching the wire is
             // its conclusion.
@@ -4006,6 +4071,7 @@ void MqttBroker::handleAck(MqttBrokerConnection& connection,
 
         delivery->awaitingPubcomp = true;
         delivery->pubrelOwed = true;
+        session->notePubrelOwed();
 #if defined(MQTT_PLATFORM_HOST)
         session->journalDelivery(*delivery);
 #endif

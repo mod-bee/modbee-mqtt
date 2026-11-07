@@ -235,7 +235,7 @@ void renderBrokerMetrics(const ShardedBrokerStatus& s, std::string& out) {
     metric(out, "modbee_sessions_expired_total", "counter", "Sessions ended by expiry.", t.sessionsExpired);
     metric(out, "modbee_shards", "gauge", "Brokers, one per thread.", s.shards);
     metric(out, "modbee_handoffs_total", "counter", "Connections handed to the shard owning their session.", t.handedOff);
-    metric(out, "modbee_mailbox_full_total", "counter", "Messages a full inter-shard ring refused.", s.mailboxFull);
+    metric(out, "modbee_mailbox_full_total", "counter", "Messages that waited for room in a full inter-shard ring (their publishers held back meanwhile).", s.mailboxFull);
     out += "# HELP modbee_shard_connections Client connections open now, per shard.\n"
            "# TYPE modbee_shard_connections gauge\n";
     for (size_t i = 0; i < s.connectionsPerShard.size(); i++) {

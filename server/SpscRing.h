@@ -56,6 +56,14 @@ public:
         return true;
     }
 
+    // Consumer side: the next value, left in place; null when there is none.
+    const T* peek() const {
+        const size_t head = _head.load(std::memory_order_relaxed);
+        const size_t tail = _tail.load(std::memory_order_acquire);
+        if (head == tail) return nullptr;
+        return &_slots[head & _mask];
+    }
+
     bool empty() const {
         return _head.load(std::memory_order_acquire) == _tail.load(std::memory_order_acquire);
     }

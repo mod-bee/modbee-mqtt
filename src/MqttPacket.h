@@ -342,4 +342,33 @@ struct MqttPacket {
 
     uint8_t type() const { return header.type; }
     void clear() { *this = MqttPacket(); }
+
+    // Only the part a packet of this type uses, which is all a decoder writes.
+    // clear() rebuilt the whole of it - every kind, each with its own property
+    // set on a host - for every packet decoded: an eighth of a broker's time
+    // on a busy connection.
+    void clearFor(uint8_t type) {
+        switch (type) {
+        case MQ_PKT_CONNECT:     connect = MqttConnect(); break;
+        case MQ_PKT_CONNACK:     connack = MqttConnAck(); break;
+        case MQ_PKT_PUBLISH:     publish = MqttPublish(); break;
+        case MQ_PKT_PUBACK:
+        case MQ_PKT_PUBREC:
+        case MQ_PKT_PUBREL:
+        case MQ_PKT_PUBCOMP:     ack = MqttPubAck(); break;
+        case MQ_PKT_SUBSCRIBE:   subscribe = MqttSubscribe(); break;
+        case MQ_PKT_SUBACK:
+        case MQ_PKT_UNSUBACK:    suback = MqttSubAck(); break;
+        case MQ_PKT_UNSUBSCRIBE: unsubscribe = MqttUnsubscribe(); break;
+        case MQ_PKT_PINGREQ:
+        case MQ_PKT_PINGRESP:    break;
+        case MQ_PKT_DISCONNECT:  disconnect = MqttDisconnect(); break;
+        case MQ_PKT_AUTH:        auth = MqttAuth(); break;
+        default:                 clear(); return;
+        }
+#if MQTT_LEAN
+        properties = MqttProperties();
+#endif
+        header = MqttFixedHeader();
+    }
 };

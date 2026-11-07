@@ -59,7 +59,7 @@ MqttError checkReason(uint8_t reason, uint8_t packetType) {
 MqttError MqttCodecV5::decode(const MqttFixedHeader& header,
                               const uint8_t* body, size_t length,
                               MqttPacket& out) const {
-    out.clear();
+    out.clearFor(header.type);
     out.header = header;
 
     if (!mq_packetTypeIsDefined(header.type, MqttVersion::V5)) {

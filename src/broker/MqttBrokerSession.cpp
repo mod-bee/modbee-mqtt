@@ -9,6 +9,8 @@
 
 #include "MqttBrokerSession.h"
 
+#include <algorithm>
+
 
 #include <string.h>
 #include "../MqttNoExcept.h"
@@ -318,8 +320,22 @@ void MqttBrokerSession::charge(MqttBrokerDelivery& entry) {
 #if defined(MQTT_PLATFORM_HOST)
     _queuedCount++;
     if (_queuedCountTotal) ++*_queuedCountTotal;
+    updateCongestion();
 #endif
 }
+
+#if defined(MQTT_PLATFORM_HOST)
+void MqttBrokerSession::updateCongestion() {
+    const bool nearFull = _queuedCount * 10 >= _maxQueued * 9 ||
+                          (_maxQueuedBytes != 0 && _queuedBytes * 10 >= _maxQueuedBytes * 9);
+    if (nearFull == _congested) return;
+    _congested = nearFull;
+    if (_congestedTotal) {
+        if (nearFull) ++*_congestedTotal;
+        else if (*_congestedTotal > 0) --*_congestedTotal;
+    }
+}
+#endif
 
 #if defined(MQTT_PLATFORM_HOST)
 void MqttBrokerSession::setQueueLimit(size_t maxQueued) {
@@ -347,30 +363,51 @@ void MqttBrokerSession::discard(MqttBrokerDelivery& entry) {
 #if defined(MQTT_PLATFORM_HOST)
         if (_queuedCount > 0) _queuedCount--;
         if (_queuedCountTotal && *_queuedCountTotal > 0) --*_queuedCountTotal;
+        updateCongestion();
 #endif
         entry.charged = 0;
     }
+    if (entry.packetId != MQ_PACKET_ID_NONE && entry.packetId != entry.slot + 1 && _foreignIds > 0) {
+        _foreignIds--;
+    }
     entry.release();
     if (entry.payload.capacity() > kKeptPayloadBytes) std::vector<uint8_t>().swap(entry.payload);
+    _freeSlots.push_back(entry.slot);
 }
 
 MqttBrokerDelivery* MqttBrokerSession::freeSlot(size_t& index) {
     reserveQueue();
-    // The first free one, so what is queued stays at the front and the scans
-    // that run for every message sent (nextUnsent(), findByPacketId()) walk
-    // only as far as the queue goes deep (_queueExtent).
-    for (index = 0; index < _queue.size(); index++) {
-        if (!_queue[index].inUse()) return &_queue[index];
+    // A slot discard() freed, if it is still free (one may be listed twice).
+    while (!_freeSlots.empty()) {
+        index = _freeSlots.back();
+        _freeSlots.pop_back();
+        if (index < _queue.size() && !_queue[index].inUse()) {
+            _queue[index].slot = (uint32_t)index;
+            return &_queue[index];
+        }
+    }
+    // Nothing is live at or above the extent.
+    if (_queueExtent < _queue.size()) {
+        index = _queueExtent;
+        _queue[index].slot = (uint32_t)index;
+        return &_queue[index];
     }
 #if defined(MQTT_PLATFORM_HOST)
-    // Every slot taken and room under the limit: twice the slots, in new
-    // blocks - nothing already queued moves.
+    // Every slot taken and the queue under its limit: another block.
     if (_queue.size() < _maxQueued) {
         index = _queue.size();
         _queue.growTo(2 * index < _maxQueued ? 2 * index : _maxQueued);
+        _queue[index].slot = (uint32_t)index;
         return &_queue[index];
     }
 #endif
+    // A slot freed some other way than discard(): the walk, as it always was.
+    for (index = 0; index < _queue.size(); index++) {
+        if (!_queue[index].inUse()) {
+            _queue[index].slot = (uint32_t)index;
+            return &_queue[index];
+        }
+    }
     return nullptr;
 }
 
@@ -401,6 +438,7 @@ MqttBrokerDelivery* MqttBrokerSession::reserveDelivery(size_t bytes) {
 
 void MqttBrokerSession::commitDelivery(MqttBrokerDelivery& entry) {
     entry.sequence = _nextSequence++;
+    ordered(entry);
     charge(entry);
 #if defined(MQTT_PLATFORM_HOST)
     journalDelivery(entry);
@@ -422,7 +460,9 @@ bool MqttBrokerSession::enqueue(const MqttBrokerDelivery& message) {
     size_t index = 0;
     if (MqttBrokerDelivery* entry = freeSlot(index)) {
         *entry = message;
+        entry->slot = (uint32_t)index;      // the copy brought the source's
         entry->sequence = _nextSequence++;
+        ordered(*entry);
         charge(*entry);
         if (index + 1 > _queueExtent) _queueExtent = index + 1;
 #if defined(MQTT_PLATFORM_HOST)
@@ -464,27 +504,74 @@ bool MqttBrokerSession::queueFull() const {
     return true;
 }
 
+void MqttBrokerSession::ordered(const MqttBrokerDelivery& entry) {
+    if (_orderStale) return;     // rebuilt from the slots at the next look
+    QueueOrder order;
+    order.slot = entry.slot;
+    order.sequence = entry.sequence;
+    _unsent[entry.qos > MQ_QOS_0 ? 1 : 0].push_back(order);
+}
+
+bool MqttBrokerSession::orderValid(const QueueOrder& order) const {
+    if (order.slot >= _queue.size()) return false;
+    const MqttBrokerDelivery& entry = _queue[order.slot];
+    return entry.inUse() && !entry.sent && entry.sequence == order.sequence;
+}
+
+void MqttBrokerSession::rebuildOrder() {
+    _unsent[0].clear();
+    _unsent[1].clear();
+    std::vector<QueueOrder> all;
+    size_t foreign = 0;
+    for (size_t index = 0; index < _queueExtent; index++) {
+        const MqttBrokerDelivery& entry = _queue[index];
+        if (!entry.inUse()) continue;
+        if (entry.packetId != MQ_PACKET_ID_NONE && entry.packetId != entry.slot + 1) foreign++;
+        if (entry.sent) continue;
+        QueueOrder order;
+        order.slot = (uint32_t)index;
+        order.sequence = entry.sequence;
+        all.push_back(order);
+    }
+    std::sort(all.begin(), all.end(),
+              [](const QueueOrder& a, const QueueOrder& b) { return a.sequence < b.sequence; });
+    for (const QueueOrder& order : all) {
+        _unsent[_queue[order.slot].qos > MQ_QOS_0 ? 1 : 0].push_back(order);
+    }
+    _foreignIds = foreign;      // counted exactly, now and then
+    _orderStale = false;
+}
+
 MqttBrokerDelivery* MqttBrokerSession::nextUnsent(bool allowQos12) {
     // The one place the extent is pulled back in, because this runs on the
     // delivery path and so is the scan that would otherwise keep paying for a
     // queue that was deep once and is not any more.
     while (_queueExtent > 0 && !_queue[_queueExtent - 1].inUse()) _queueExtent--;
+    if (_orderStale) rebuildOrder();
 
     // Oldest first. [V5:4.6] requires messages on one topic to be delivered in
     // the order they were received, and the queue is filled in that order, so
-    // "the earliest unsent entry" is the whole of the ordering rule.
-    MqttBrokerDelivery* oldest = nullptr;
-    for (size_t index = 0; index < _queueExtent; index++) {
-        MqttBrokerDelivery& entry = _queue[index];
-        if (!entry.inUse() || entry.sent) continue;
-        if (!allowQos12 && entry.qos > MQ_QOS_0) continue;
-        if (oldest == nullptr || entry.sequence < oldest->sequence) oldest = &entry;
+    // "the earliest unsent entry" is the whole of the ordering rule - each
+    // class's is the front of its list.
+    for (OrderList& list : _unsent) {
+        while (!list.empty() && !orderValid(list.front())) list.pop_front();
     }
-    return oldest;
+    MqttBrokerDelivery* zero = _unsent[0].empty() ? nullptr : &_queue[_unsent[0].front().slot];
+    MqttBrokerDelivery* higher =
+        !allowQos12 || _unsent[1].empty() ? nullptr : &_queue[_unsent[1].front().slot];
+    if (zero == nullptr) return higher;
+    if (higher == nullptr) return zero;
+    return higher->sequence < zero->sequence ? higher : zero;
 }
 
 MqttBrokerDelivery* MqttBrokerSession::findByPacketId(uint16_t packetId) {
     if (packetId == MQ_PACKET_ID_NONE) return nullptr;
+    // Its own slot, where the session gave it the identifier.
+    const size_t slot = (size_t)packetId - 1;
+    if (slot < _queue.size() && _queue[slot].inUse() && _queue[slot].packetId == packetId) {
+        return &_queue[slot];
+    }
+    if (_foreignIds == 0) return nullptr;
     for (size_t index = 0; index < _queueExtent; index++) {
         MqttBrokerDelivery& entry = _queue[index];
         if (entry.inUse() && entry.packetId == packetId) return &entry;
@@ -510,9 +597,14 @@ void MqttBrokerSession::markAllUnsent() {
     for (size_t index = 0; index < _queueExtent; index++) {
         MqttBrokerDelivery& entry = _queue[index];
         if (!entry.inUse()) continue;
-        if (entry.awaitingPubcomp) entry.pubrelOwed = true;
-        else entry.sent = false;
+        if (entry.awaitingPubcomp) {
+            entry.pubrelOwed = true;
+            _mayOwePubrel = true;
+        } else {
+            entry.sent = false;
+        }
     }
+    _orderStale = true;
 }
 
 // =============================================================================
@@ -540,6 +632,19 @@ uint16_t MqttBrokerSession::allocatePacketId() {
         }
     }
     return MQ_PACKET_ID_NONE;
+}
+
+uint16_t MqttBrokerSession::allocatePacketId(const MqttBrokerDelivery& entry) {
+    const uint32_t own = entry.slot + 1;
+    if (own <= MQ_PACKET_ID_MAX && (_foreignIds == 0 || !packetIdInUse((uint16_t)own))) {
+        return (uint16_t)own;
+    }
+    // Taken by a restored identifier: any free one, counted as foreign (an
+    // over-count, if the send then fails, only costs walks until the next
+    // exact count in rebuildOrder()).
+    const uint16_t id = allocatePacketId();
+    if (id != MQ_PACKET_ID_NONE) _foreignIds++;
+    return id;
 }
 
 void MqttBrokerSession::releasePacketId(uint16_t packetId) {
@@ -595,8 +700,11 @@ bool MqttBrokerSession::restoreDelivery(const MqttBrokerDelivery& message) {
     size_t index = 0;
     if (MqttBrokerDelivery* entry = freeSlot(index)) {
         *entry = message;
+        entry->slot = (uint32_t)index;
         entry->charged = 0;
         charge(*entry);
+        if (entry->packetId != MQ_PACKET_ID_NONE && entry->packetId != index + 1) _foreignIds++;
+        _orderStale = true;      // restored in any order: sorted at the next look
         // Later messages are numbered after every one restored, whatever
         // order the store hands them over in.
         if (entry->sequence >= _nextSequence) _nextSequence = entry->sequence + 1;

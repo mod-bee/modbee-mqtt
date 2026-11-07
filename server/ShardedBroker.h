@@ -24,7 +24,8 @@
 // routes it to its sessions - retained messages are stored on every shard as
 // they pass. At QoS 1 and 2 the PUBACK waits until every shard has reported,
 // so "no matching subscribers" and "quota exceeded" are true of the whole
-// server. A ring that is full counts as that shard refusing the message.
+// server. A message for a ring that is full waits, and the shard reads no
+// PUBLISH until it has gone: TCP slows its publishers (backpressure).
 //
 // TLS. Every shard can run a TLS listener beside the plain one, on a port of
 // its own shared the same way. The shards share one TLS context, so a session
@@ -181,7 +182,7 @@ struct ShardedBrokerConfig {
 struct ShardedBrokerStatus {
     MqttBrokerStatus total;            // summed across shards
     size_t shards = 0;
-    uint64_t mailboxFull = 0;          // messages a full ring made a shard refuse
+    uint64_t mailboxFull = 0;          // messages that waited for room in a full ring
     uint64_t skipped = 0;              // sends avoided: nobody on that shard could want it
     std::vector<size_t> connectionsPerShard;
 };

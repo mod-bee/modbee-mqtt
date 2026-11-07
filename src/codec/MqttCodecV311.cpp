@@ -60,7 +60,7 @@ inline bool hasAnyProperty(const MqttProperties& properties) {
 MqttError MqttCodecV311::decode(const MqttFixedHeader& header,
                                 const uint8_t* body, size_t length,
                                 MqttPacket& out) const {
-    out.clear();
+    out.clearFor(header.type);
     out.header = header;
 
     // AUTH does not exist at this version, so type 15 is reserved and a packet

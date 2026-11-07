@@ -163,6 +163,12 @@ struct MqttBrokerDelivery {
     // silently become "newest first" for one pass.
     uint64_t sequence = 0;
 
+    // Its index in the session's queue, set by the session whenever the slot
+    // is handed out (not by release(), and not by a copy into it). What lets
+    // a delivery be found by its packet identifier without a walk: the
+    // identifier the session gives it is this plus one.
+    uint32_t slot = 0;
+
     // The bytes this entry holds against the session's and the broker's
     // budget (MqttBrokerSession::limitQueueBytes), refunded by discard().
     size_t charged = 0;
@@ -425,6 +431,17 @@ public:
     // Messages queued now, here and - through `total` - in every session.
     void attachQueuedCount(size_t* total) { _queuedCountTotal = total; }
     size_t queuedCount() const { return _queuedCount; }
+
+    // BEHIND, BUT KEEPING UP: its queue nine-tenths full while its connection
+    // still takes what it is sent. What the broker holds a publisher back for
+    // - not reading its next PUBLISH, not taking a forwarded one - rather than
+    // filling this queue and dropping the rest. `total` counts them across the
+    // broker's sessions, so nothing is checked while none is. A session whose
+    // connection has taken nothing for a while is a slow consumer, not this:
+    // its own messages are refused at its limit, and nobody waits for it.
+    void attachCongestedCount(size_t* total) { _congestedTotal = total; }
+    bool congested() const { return _congested; }
+    mq_time_t lastSentAt = 0;           // the last delivery its connection took
     // The cap on messages held, changed while the broker runs. Lowered, the
     // queue keeps what it holds and refuses (and counts) new messages until it
     // is under the cap; raised, it grows to it as a backlog needs - reserved up
@@ -457,8 +474,18 @@ public:
     void releaseDelivery(uint16_t packetId);
     void markAllUnsent();
 
+    // A PUBREL may be owed (a PUBREC arrived, or a reconnect resumed a QoS 2
+    // exchange): the delivery path looks for one only while this is set, and
+    // clears it when its look finds none.
+    void notePubrelOwed() { _mayOwePubrel = true; }
+    bool mayOwePubrel() const { return _mayOwePubrel; }
+    void noPubrelOwed() { _mayOwePubrel = false; }
+
     // --- Packet identifiers, per session [V5:MQTT-2.2.1-3] ---
     uint16_t allocatePacketId();
+    // For this delivery: its slot plus one when that is free - always, unless
+    // a restored session brought identifiers of its own - else the next free.
+    uint16_t allocatePacketId(const MqttBrokerDelivery& entry);
     void releasePacketId(uint16_t packetId);
     bool packetIdInUse(uint16_t packetId) const;
 
@@ -639,6 +666,66 @@ private:
 
     uint16_t _nextPacketId = 1;
     uint64_t _nextSequence = 1;
+
+#if defined(MQTT_PLATFORM_HOST)
+    bool _congested = false;
+    size_t* _congestedTotal = nullptr;
+    void updateCongestion();
+#endif
+
+    // NOTHING ON THE DELIVERY PATH WALKS THE QUEUE.
+    //
+    // nextUnsent() walked every slot for the lowest unsent sequence, freeSlot()
+    // from the first slot for a free one, allocatePacketId() the queue once
+    // per candidate, findByPacketId() it for every acknowledgement, and the
+    // PUBREL check it again before each send: five walks a message, so a
+    // subscriber with a deep queue - a busy one - was the slowest. Now:
+    //
+    //   _unsent      each class's unsent deliveries in sequence order, QoS 0
+    //                and QoS 1/2 apart (a QoS 0 one may pass a QoS 1 one that
+    //                has no quota, [V5:MQTT-4.6.0-6]). Entries go stale when
+    //                sent or discarded and are dropped from the front; the
+    //                (slot, sequence) pair tells a stale one from a reused slot.
+    //                Rebuilt once after markAllUnsent() or a restore.
+    //   _freeSlots   slots discard() freed, checked when taken.
+    //   _foreignIds  deliveries whose identifier is not their slot plus one (a
+    //                restored session, or the slot's own taken): only while
+    //                there are any does an identifier need a walk.
+    struct QueueOrder {
+        uint32_t slot;
+        uint64_t sequence;
+    };
+    // A vector read from `head`, compacted when half of it is spent: empty, it
+    // allocates nothing - a std::deque allocated its map in every one of a
+    // server's 100,000 reserved sessions, about 110 MB for nothing.
+    struct OrderList {
+        std::vector<QueueOrder> items;
+        size_t head = 0;
+        bool empty() const { return head == items.size(); }
+        const QueueOrder& front() const { return items[head]; }
+        void pop_front() {
+            if (++head == items.size()) {
+                items.clear();
+                head = 0;
+            } else if (head >= 64 && head * 2 >= items.size()) {
+                items.erase(items.begin(), items.begin() + (std::ptrdiff_t)head);
+                head = 0;
+            }
+        }
+        void push_back(const QueueOrder& order) { items.push_back(order); }
+        void clear() {
+            std::vector<QueueOrder>().swap(items);
+            head = 0;
+        }
+    };
+    OrderList _unsent[2];
+    std::vector<uint32_t> _freeSlots;
+    size_t _foreignIds = 0;
+    bool _orderStale = false;
+    bool _mayOwePubrel = false;
+    void ordered(const MqttBrokerDelivery& entry);
+    void rebuildOrder();
+    bool orderValid(const QueueOrder& order) const;
 
     int indexOfSubscription(const MqttSpan& filter) const;
 };

@@ -639,22 +639,16 @@ uint32_t ShardedBroker::Shard::forwardToShards(const MqttBrokerRouted& routed, u
         envelope.deferral = deferral;
         envelope.message = message;
         envelope.groups = groupsFor[to];
-        if (shard.post(to, envelope)) {
-            parties++;
-            continue;
-        }
-        delete groupsFor[to];
-        // THE RING IS FULL, so that shard does not get this message. Said so,
-        // not hidden: counted, and - for a PUBLISH that is waiting on its
-        // PUBACK - reported as a refusal by that shard, so a publisher whose
-        // message reached nobody is told 0x97, not success. (Reported before
-        // the broker knows how many parties there are; it waits for both.)
+        parties++;
+        if (shard.overflow.empty() && shard.post(to, envelope)) continue;
+        // THE RING IS FULL: the message waits, in order, behind anything
+        // already waiting, and this shard reads no more PUBLISHes until it has
+        // gone (run(): pauseIngress) - so the publisher is slowed by TCP, as a
+        // broker under load should slow it. It was dropped here, and a QoS 1
+        // publisher told 0x97, or a QoS 0 one nothing at all. Counted still.
         shard.mailboxFull.fetch_add(1, std::memory_order_relaxed);
-        unref(message);
-        if (deferral != 0) {
-            shard.broker.concludeDeferred(deferral, 1, 1);
-            parties++;
-        }
+        shard.overflow.push_back(std::make_pair(to, envelope));
+        shard.broker.pauseIngress(true);
     }
     return deferral != 0 ? parties : 0;
 }
@@ -667,7 +661,19 @@ void ShardedBroker::Shard::drain(bool stopping) {
     for (size_t from = 0; from < inbox.size() && handled < kDrainBudget; from++) {
         if (from == index) continue;
         Envelope envelope;
-        while (handled < kDrainBudget && inbox[from]->pop(envelope)) {
+        for (;;) {
+            if (handled >= kDrainBudget) break;
+            // BACKPRESSURE: a forwarded message a subscriber here that is
+            // behind would have to drop stays in the ring until it has room;
+            // a full ring holds its publisher back (forwardToShards()).
+            if (!stopping && broker.congestedSessions() != 0) {
+                const Envelope* next = inbox[from]->peek();
+                if (next != nullptr && next->kind == Envelope::Forward &&
+                    !broker.roomFor(spanOf(next->message->topic))) {
+                    break;
+                }
+            }
+            if (!inbox[from]->pop(envelope)) break;
             handled++;
             switch (envelope.kind) {
             case Envelope::Forward: {
@@ -787,6 +793,9 @@ void ShardedBroker::run(Shard& shard) {
         // after replaceTls() returned is served the new certificate.
         shard.takeTlsContext();
         shard.takeChanges();
+        // Held back while a forwarded message waits for room in a ring.
+        shard.retryOverflow();
+        shard.broker.pauseIngress(!shard.overflow.empty());
         shard.broker.poll();
         shard.drain(false);
         if (_extension) _extension->service(shard.index, shard.broker);

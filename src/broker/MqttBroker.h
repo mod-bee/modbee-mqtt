@@ -515,6 +515,11 @@ struct MqttBrokerConnection {
     // read is worth a system call. A connection woken only because a message
     // was queued for it has nothing to read, and asking would be an EAGAIN.
     bool readable = false;
+    // Its next PUBLISH was left unread this pass - a subscriber it feeds is
+    // behind (MqttBroker::roomFor), or the shards' rings are full
+    // (pauseIngress): kept readable and listed again, since no new readiness
+    // will come for bytes already waiting.
+    bool heldBack = false;
 
     // On the list of slots with a delivery waiting for the session journal
     // (MqttBroker::journalKept). Like `queued`, it belongs to the slot, not
@@ -714,6 +719,19 @@ public:
     // has already been everywhere it needs to go. Returns how many sessions
     // matched; `dropped` how many of those a full queue refused.
     size_t publishForwarded(const MqttBrokerRouted& message, size_t* dropped);
+
+    // BACKPRESSURE. Whether a message on `topic` can be queued without dropping
+    // it for a subscriber that is behind but keeping up (a congested session,
+    // MqttBrokerSession::congested()). True at once while no session is. A
+    // shard leaves a forwarded message in its ring while this is false, and a
+    // connection's PUBLISH is left unread: TCP then slows its publisher, as a
+    // broker under load should, where it used to be acknowledged and dropped.
+    bool roomFor(const MqttSpan& topic);
+    size_t congestedSessions() const { return _congestedSessions; }
+    // No connection's PUBLISH is taken while paused (acknowledgements and
+    // pings are, and what is owed is still sent): set by a shard while a
+    // forwarded message waits for room in another shard's ring.
+    void pauseIngress(bool paused) { _ingressPaused = paused; }
 
     // A connection handed over by another broker, with the bytes it had
     // already read. False if there is no slot for it, in which case the
@@ -1008,6 +1026,17 @@ private:
     size_t _queuedBytes = 0;             // every session's queue, together
 #if defined(MQTT_PLATFORM_HOST)
     size_t _queuedMessages = 0;          // and in messages
+    size_t _congestedSessions = 0;       // MqttBrokerSession::congested()
+    bool _ingressPaused = false;
+
+    // ONE PACKET EACH WAY, reused: the one a connection's next packet is
+    // decoded into (serviceConnection) and the one a delivery is built in
+    // (deliverQueued). A packet is several kilobytes on a host - a property
+    // set for every kind - and constructing a fresh one for each, zeroing all
+    // of it, was a third of a busy connection's time. Neither function runs
+    // inside itself, and each resets the part it uses (MqttPacket::clearFor).
+    MqttPacket _received;
+    MqttPacket _delivery;
 #endif
     std::unordered_map<std::string, uint32_t> _sessionsPerLogin;
     uint32_t _indexBuiltAt = 0xFFFFFFFFu;
