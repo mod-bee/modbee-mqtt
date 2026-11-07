@@ -54,6 +54,8 @@ MqttSparkplugHost::MqttSparkplugHost(MqttClient& shared) MQ_NOEXCEPT
 
 MqttSparkplugHost::~MqttSparkplugHost() {
     if (_begun && !_shared) _client.end();
+    // Its STATE death's completion names this host - see MqttSparkplugNode.
+    _client.forgetCompletions(this);
     _client.detach(*this);
 }
 

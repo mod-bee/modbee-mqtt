@@ -37,6 +37,9 @@ MqttSparkplugNode::~MqttSparkplugNode() {
     // bound to goes away with _net. A shared one is its owner's; the node
     // only leaves it, and its Will with it.
     if (_begun && !_shared) _client.end();
+    // Its subscriptions' completions name this node. A shared client concludes
+    // them later - when its connection closes - and must not call into it.
+    _client.forgetCompletions(this);
     _client.detach(*this);
     if (_points != nullptr) {
         for (size_t index = 0; index < _pointCount; index++) {

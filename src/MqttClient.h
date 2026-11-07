@@ -431,6 +431,11 @@ public:
 
     // --- Handlers ---
     void onMessage(MqttMessageFn handler, void* context);
+
+    // No completion handler is called with `context` again: what it queued
+    // still goes, and concludes without a call. For an object that passed
+    // itself as the context and is being destroyed while this client lives on.
+    void forgetCompletions(const void* context) { _operations.forgetContext(context); }
     void onSessionEstablished(MqttSessionFn handler, void* context);
     void onStateChange(MqttStateFn handler, void* context);
 

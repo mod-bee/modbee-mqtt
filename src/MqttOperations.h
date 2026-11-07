@@ -234,6 +234,13 @@ public:
     // session cannot carry the work forward, and when the client is ended.
     void concludeAll(MqttResult result);
 
+    // Every completion owed to `context` - queued, in flight or deferred - is
+    // dropped: the operations go on, and conclude without calling anybody.
+    // For an object that hands itself as the context and is going away while
+    // the client stays (MqttSparkplugNode, MqttSparkplugHost on a shared
+    // client): its handler would otherwise run on freed memory later.
+    void forgetContext(const void* context);
+
     // Concludes every SENT operation whose acknowledgement is overdue.
     //
     // NOTHING IS RESENT. [V5:MQTT-4.4.0-1] forbids that outside a session

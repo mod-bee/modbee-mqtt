@@ -338,6 +338,19 @@ void MqttOperations::concludeAll(MqttResult result) {
     }
 }
 
+void MqttOperations::forgetContext(const void* context) {
+    if (context == nullptr) return;
+    for (size_t i = 0; i < slots(); i++) {
+        if (_ops[i].context == context) {
+            _ops[i].onComplete = nullptr;
+            _ops[i].context = nullptr;
+        }
+    }
+    for (size_t i = 0; i < _deferred.size(); i++) {
+        if (_deferred[i].context == context) _deferred[i].handler = nullptr;
+    }
+}
+
 void MqttOperations::concludeSent(MqttResult result) {
     const uint32_t live = mark();
     for (int i = 0; i < (int)slots(); i++) {
