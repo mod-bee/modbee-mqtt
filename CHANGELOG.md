@@ -11,6 +11,36 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.3]
+
+The client sends MQTT 5 topic aliases: on a cellular link a Sparkplug topic was most of every small message.
+
+Defaults that change on upgrade: the server offers 64 topic aliases a connection (was 8).
+
+### Changed
+
+- **The MQTT client uses topic aliases** whenever the broker's CONNACK allows them (Topic Alias Maximum above 0) -
+  every connection the server makes (`Connections.Put`, `modbee-mqtt connect`), its Sparkplug edge node and host
+  included. The first publish to a topic on a connection carries the topic and an alias, every later one the alias
+  alone: a value alone in a message on a Sparkplug topic of 62 bytes is 62 bytes smaller. When every alias the broker
+  allows is in use, the one sent least recently is given the new topic. The table starts empty on every connection,
+  a resumed session included; a QoS 1 or 2 publish resent after a reconnect carries its full topic; at MQTT 3.1.1
+  nothing changes. Nothing to configure, and nothing changes for a broker that offers no aliases.
+- **The server offers 64 topic aliases** a connection (`serve --topic-alias-maximum`, `broker: topic-alias-maximum`,
+  0 to 256; the library's `MqttBrokerConfig::topicAliasMaximum`), was 8: a gateway sends a data topic for itself and
+  one for each device. A host's alias table holds up to 256 (`MQTT_MAX_ALIASES`, a board's 8) and grows only as
+  aliases are used, so a connection that uses none costs less memory than before.
+
+### Fixed
+
+- With `useOutboundTopicAliases` on, a broker delivery that had to wait for room in the transmit buffer was sent
+  again by its alias alone, though the topic had never gone with it; the subscriber closed the connection with 0x94.
+  An alias is now recorded only once the publish carrying it is queued.
+- A Sparkplug edge node or host removed from a connection (`DeleteEdgeNode`, `DeleteHost`) while one of its
+  subscriptions was still unanswered could crash the server when that connection later closed: the connection's
+  client finished the subscription by calling into the removed node. A node or host now has the client forget it
+  first (`MqttClient::forgetCompletions`).
+
 ## [0.1.2]
 
 A gateway's broker closed to devices listens on nothing.

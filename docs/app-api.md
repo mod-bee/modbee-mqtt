@@ -510,6 +510,6 @@ MODBEE_API=unix:/run/modbee/api.sock node authority.js
 ```
 
 ```
-modbee-mqtt 0.1.2 (API 1.0, authority) at unix:/run/modbee/api.sock
+modbee-mqtt 0.1.3 (API 1.0, authority) at unix:/run/modbee/api.sock
 asked about "acme/pump-07" (client pump-07): allowed
 ```
