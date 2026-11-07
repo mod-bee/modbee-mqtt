@@ -734,6 +734,17 @@ public:
     // it until it has seen the node stay born afterwards.
     bool publishRecords(const MqttSparkplugRecord* records, size_t count, bool historical);
 
+    // WHETHER A VALUE IS NEWS, for a caller sending a run of a metric's values
+    // through publishRecords() - several of the same metric, each with its own
+    // timestamp - by the rules report by exception keeps: a value the same as
+    // the one before it, or within the metric's deadband of it, is not; a
+    // change of quality is, whatever the value. "The one before it" is
+    // `previous` - the last of this metric the caller is already sending - or,
+    // when null, the value last published. A metric never published, or one a
+    // host wrote, is news.
+    bool isNewsAfter(size_t index, const MqttSparkplugValue& value, int32_t quality,
+                     const MqttSparkplugRecord* previous) const;
+
     // The timestamp this node stamps a message with now: UTC milliseconds, or
     // uptime while no clock is set (see clockIsSet()).
     uint64_t timestamp() const { return utcNow(); }
@@ -1047,6 +1058,10 @@ private:
     // Whether a point is "changed" for report by exception: its value differs
     // from the one last published by more than its deadband.
     bool pointChanged(size_t index) const;
+    // Whether `value` is past the metric's deadband from `reference`: always,
+    // without a deadband or for what a deadband cannot measure.
+    bool pastDeadband(size_t index, const MqttSparkplugValue& value,
+                      const MqttSparkplugValue& reference) const;
     // Whether it must stay on its change list: never published, a report
     // owed, or a value other than the one last published.
     bool pointOwed(size_t index) const;

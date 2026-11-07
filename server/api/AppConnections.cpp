@@ -474,10 +474,13 @@ struct AppConnections::EdgeNode {
     // A metric's current value - what the next NDATA, or the next birth,
     // carries - its text in `values`. Whether it changed.
     bool setCurrent(size_t index, MqttSparkplugValue value, const std::string& text, uint64_t at) {
+        // The text it replaces lives until setAt() has compared the two: the
+        // library's current value still points into it.
+        std::string previous;
         if (value.isSpan() && !value.isNull) {
             if (!values[index]) values[index].reset(new std::string());
-            std::string owned = text;           // a buffer of its own: see `values`
-            values[index]->swap(owned);
+            previous = text;                    // a buffer of its own: see `values`
+            values[index]->swap(previous);
             value.as.bytes.data = (const uint8_t*)values[index]->data();
             value.as.bytes.length = (uint32_t)values[index]->size();
         }
@@ -2888,6 +2891,31 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
         // history, and was kept as history itself.) A dead link the node has
         // not noticed yet is the replay window's (startEdgeNode).
         const bool born = node.isBorn();
+
+        // Kept, to go as history once it is born: every value while it is not,
+        // and one that could not go live now (the replay window first, the link's
+        // queue full) while it is.
+        auto keep = [&](const AppSparkplugSet& set, size_t index, int32_t quality) {
+            if (e->spec.historyMax == 0) return;
+            const AppMessage message = keptValue(device, set, quality);
+            makeRoom(*e, message.topic.size() + message.payload.size());
+            uint64_t ignored = 0;
+            if (_outbox.push(e->first[index] ? e->firstKey() : e->key(), message, ignored)) {
+                e->history++;
+                e->historyBytes += message.topic.size() + message.payload.size();
+                kept++;
+            }
+        };
+
+        // EVERY VALUE GIVEN, IN ORDER. Several of one metric - a second of a
+        // fast tag, gathered into one call - each go as their own entry with
+        // their own timestamp, in one DDATA (or NDATA) where they fit: only the
+        // last of each used to go, as the metric's current value, and the reply
+        // counted the rest as sent. Each is held to the deadband, and to "the
+        // same value again is not news", against the one before it.
+        std::vector<MqttSparkplugRecord> live;
+        std::vector<const AppSparkplugSet*> liveSets;
+        std::map<size_t, const AppSparkplugSet*> last;   // the last given of each metric
         for (AppSparkplugSet& set : values) {
             const int index = node.indexOf(e->device(device), set.name.c_str());
             if (index < 0) {
@@ -2914,47 +2942,66 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
                 }
             }
             if (set.timestamp == 0) set.timestamp = (uint64_t)utcNowMs();
-            // Its quality moves with it, or stays what it was.
-            const bool qualityMoves = set.hasQuality && set.quality != node.qualityOf((size_t)index);
-            const bool moves = set.value.differsFrom(node.valueAt((size_t)index));
+            const size_t at = (size_t)index;
             if (born) {
-                // The same value again is not news: nothing to send, and not
-                // history either (it used to be kept, and sent as history).
-                if (!moves && !qualityMoves) {
-                    sent++;
-                    continue;
+                MqttSparkplugRecord record;
+                record.index = at;
+                record.value = set.value;           // a text's span is set.text, alive for the call
+                record.timestamp = set.timestamp;
+                const MqttSparkplugRecord* previous = nullptr;
+                for (auto r = live.rbegin(); r != live.rend(); ++r) {
+                    if (r->index == at) {
+                        previous = &*r;
+                        break;
+                    }
                 }
-                if (moves && !e->setCurrent((size_t)index, set.value, set.text, set.timestamp)) {
-                    refused.push_back(set.name + ": " + mq_sparkplugErrorName(node.lastPayloadError()));
-                    continue;
-                }
-                if (qualityMoves) {
-                    node.qualityAt((size_t)index, set.quality);
-                    e->valuesChanged = true;
-                }
-                sent++;
+                // Its quality moves with it, or stays what it was.
+                record.quality = set.hasQuality ? set.quality
+                                                : previous ? previous->quality : node.qualityOf(at);
+                last[at] = &set;
+                // Not news: neither sent nor kept as history (it used to be kept).
+                if (!node.isNewsAfter(at, record.value, record.quality, previous)) continue;
+                live.push_back(record);
+                liveSets.push_back(&set);
                 continue;
             }
             // Not born: its current value all the same - the NBIRTH carries the
             // newest, as current, where it carried the one from before the outage
             // and the newer ones only as history (which a host files and does not
-            // show) - and kept, to go as history once it is born.
-            e->setCurrent((size_t)index, set.value, set.text, set.timestamp);
-            if (qualityMoves) {
-                node.qualityAt((size_t)index, set.quality);
+            // show) - and kept, every one, to go as history once it is born.
+            e->setCurrent(at, set.value, set.text, set.timestamp);
+            if (set.hasQuality && set.quality != node.qualityOf(at)) {
+                node.qualityAt(at, set.quality);
                 e->valuesChanged = true;
             }
-            if (e->spec.historyMax == 0) continue;
-            const AppMessage message = keptValue(device, set, node.qualityOf((size_t)index));
-            makeRoom(*e, message.topic.size() + message.payload.size());
-            uint64_t ignored = 0;
-            if (_outbox.push(e->first[(size_t)index] ? e->firstKey() : e->key(), message, ignored)) {
-                e->history++;
-                e->historyBytes += message.topic.size() + message.payload.size();
-                kept++;
+            keep(set, at, node.qualityOf(at));
+        }
+        if (!born) return;
+
+        // In as few messages as they fit: a payload grows to its records, and
+        // a run longer than this is a second message rather than one past what
+        // a host was told it may receive.
+        const size_t perMessage = 500;
+        size_t from = 0;
+        while (from < live.size()) {
+            const size_t n = std::min(live.size() - from, perMessage);
+            if (!node.publishRecords(&live[from], n, false)) break;
+            sent += (uint32_t)n;
+            from += n;
+        }
+        for (; from < live.size(); from++) keep(*liveSets[from], live[from].index, live[from].quality);
+
+        // Each metric's current value - what the next birth carries - is the
+        // last one given, whether it went or a deadband held it.
+        for (const auto& given : last) {
+            const AppSparkplugSet& set = *given.second;
+            e->setCurrent(given.first, set.value, set.text, set.timestamp);   // false: unchanged
+            if (set.hasQuality && set.quality != node.qualityOf(given.first)) {
+                node.qualityAt(given.first, set.quality);
+                e->valuesChanged = true;
             }
         }
-        if (sent != 0) node.publishChanged();
+        if (!last.empty()) node.publishChanged();
     });
     return found;
 }

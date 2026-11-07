@@ -1217,10 +1217,30 @@ bool MqttSparkplugNode::pointChanged(size_t index) const {
         return false;
     }
 
+    return pastDeadband(index, stateValue(index), publishedValue(index));
+}
+
+bool MqttSparkplugNode::isNewsAfter(size_t index, const MqttSparkplugValue& value,
+                                    int32_t quality,
+                                    const MqttSparkplugRecord* previous) const {
+    if (index >= _pointCount) return false;
+    const PointState& state = _state[index];
+    if (previous == nullptr) {
+        if (!(state.flags & kEverPublished)) return true;
+        if (state.flags & (kReportNext | kQualityOwed)) return true;
+    }
+    if (state.flags & kHeld) return false;
+    const int32_t wasQuality = previous ? previous->quality : _points[index].quality;
+    if (quality != wasQuality) return true;
+    const MqttSparkplugValue reference = previous ? previous->value : publishedValue(index);
+    if (!value.differsFrom(reference)) return false;
+    return pastDeadband(index, value, reference);
+}
+
+bool MqttSparkplugNode::pastDeadband(size_t index, const MqttSparkplugValue& value,
+                                     const MqttSparkplugValue& published) const {
     // No deadband, or nothing a deadband can measure: any change is a change.
-    if (!(state.flags & kDeadband)) return true;
-    const MqttSparkplugValue value = stateValue(index);
-    const MqttSparkplugValue published = publishedValue(index);
+    if (!(_state[index].flags & kDeadband)) return true;
     if (!value.isNumeric() || value.isNull || published.isNull) return true;
 
     // The deadband itself is in the metric's record: read only for a value

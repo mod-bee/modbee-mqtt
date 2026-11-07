@@ -745,10 +745,29 @@ void sparkplugEdgeNode(Server& server) {
         sparkplug->SetValues(&c, request, &reply);
         return reply;
     };
+    // Several values of the one metric in one call, as a gateway gathers a
+    // second of a fast tag: every one goes, not only the last.
+    auto setTemps = [&](const std::vector<std::pair<double, uint64_t>>& run) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugValuesRequest request;
+        request.set_edge_node("gw");
+        for (const auto& v : run) {
+            v1::SparkplugMetric* m = request.add_metrics();
+            m->set_name("Temp");
+            m->mutable_value()->set_double_value(v.first);
+            m->set_timestamp(v.second);
+        }
+        v1::SparkplugValuesReply reply;
+        sparkplug->SetValues(&c, request, &reply);
+        return reply;
+    };
     fleet.until([&] { return false; }, 300);
     uint32_t kept = 0;
     for (int i = 1; i <= 3; i++) kept += setTemp(i, 1793000000000ull + (uint64_t)i).kept();
     equal<uint32_t>("its host away: three values kept", kept, 3);
+    equal<uint32_t>("  three more of it in one call: each kept",
+                    setTemps({{4, 1793000000004ull}, {5, 1793000000005ull}, {6, 1793000000006ull}}).kept(), 3);
     Client& host = fleet.make("ph-host");
     ok(fleet.connected(host), "the primary host comes online");
     host.publish("spBv1.0/STATE/ph", "{\"online\":true,\"timestamp\":1793000000000}", MQ_QOS_1, true);
@@ -769,10 +788,10 @@ void sparkplugEdgeNode(Server& server) {
                    if (m.is_historical()) history.push_back(m.value().double_value());
                }
            }
-           return history.size() >= 3;
+           return history.size() >= 6;
        }),
        "  what it kept is sent, is_historical");
-    ok(history == std::vector<double>({1, 2, 3}), "  in order, as it was set");
+    ok(history == std::vector<double>({1, 2, 3, 4, 5, 6}), "  in order, as it was set - all three of the one call");
     const v1::SparkplugEdgeNodeRef ref = [] { v1::SparkplugEdgeNodeRef r; r.set_id("gw"); return r; }();
     {
         v1::SparkplugValuesReply reply = setTemp(21.5, 0);
@@ -789,6 +808,52 @@ void sparkplugEdgeNode(Server& server) {
            return false;
        }),
        "  an NDATA, live");
+    {
+        // Born, five of it in one call, one the same as the one before: four
+        // entries in one NDATA, in order, each with its own timestamp.
+        const uint64_t t0 = 1793000100000ull;
+        const v1::SparkplugValuesReply reply =
+            setTemps({{30, t0}, {31, t0 + 100}, {31, t0 + 200}, {32, t0 + 300}, {33, t0 + 400}});
+        equal<uint32_t>("born, five of one metric in one call: four sent (one was the same again)", reply.sent(), 4);
+        std::vector<double> got;
+        std::vector<uint64_t> at;
+        ok(fleet.until([&] {
+               for (const check::Got& g : watcher.got) {
+                   if (g.topic != "spBv1.0/plant2/NDATA/gw-9") continue;
+                   const v1::SparkplugMessage read = decode(g);
+                   got.clear();
+                   at.clear();
+                   for (const v1::SparkplugMetric& m : read.payload().metrics()) {
+                       if (m.is_historical()) continue;
+                       got.push_back(m.value().double_value());
+                       at.push_back(m.timestamp());
+                   }
+                   if (got.size() == 4) return true;
+               }
+               return false;
+           }),
+           "  one NDATA carries all four");
+        ok(got == std::vector<double>({30, 31, 32, 33}), "  in the order given");
+        ok(at == std::vector<uint64_t>({t0, t0 + 100, t0 + 300, t0 + 400}), "  each with its own timestamp");
+        const size_t birthsBefore = births("spBv1.0/plant2/NBIRTH/gw-9");
+        grpc::ClientContext c;
+        authorize(c);
+        v1::Empty none;
+        sparkplug->RebirthEdgeNode(&c, ref, &none);
+        ok(fleet.until([&] {
+               if (births("spBv1.0/plant2/NBIRTH/gw-9") <= birthsBefore) return false;
+               const check::Got* newest = nullptr;
+               for (const check::Got& g : watcher.got) {
+                   if (g.topic == "spBv1.0/plant2/NBIRTH/gw-9") newest = &g;
+               }
+               const v1::SparkplugMessage birth = decode(*newest);
+               for (const v1::SparkplugMetric& m : birth.payload().metrics()) {
+                   if (m.name() == "Temp") return m.value().double_value() == 33;
+               }
+               return false;
+           }),
+           "  and the current value, in the next NBIRTH, is the last one given");
+    }
 
     // A host's write: the application reads it on the connection, by name.
     uint64_t runAlias = 0;
@@ -1521,7 +1586,7 @@ void sparkplugStructures(Server& server) {
     }
     {
         const v1::SparkplugValuesReply again = set(std::vector<v1::SparkplugMetric>(1, values[3]));
-        ok(again.sent() == 1 && again.kept() == 0, "the same text again: nothing to send, and not kept as history");
+        ok(again.sent() == 0 && again.kept() == 0, "the same text again: nothing sent, and not kept as history");
         grpc::ClientContext c;
         authorize(c);
         v1::SparkplugEdgeNodeRef ref;

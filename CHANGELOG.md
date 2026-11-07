@@ -11,6 +11,19 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Sparkplug.SetValues` sent only the last of several values of one metric.** A gateway that gathers a second of
+  values into one call lost every value of a tag that changed more than once in that second - on the host's live view
+  and in its history - while the reply counted them all as sent. Each value now goes, in order, with its own
+  timestamp, in one NDATA/DDATA where they fit (the same metric more than once, by its alias); the deadband and "the
+  same value again is not sent" hold for each against the one before it; the metric's current value, which the next
+  birth carries, is the last one given. One that cannot go live at that moment (the replay window first, the link's
+  queue full) is kept and sent as history rather than dropped. Not born, every value was already kept.
+- **`SparkplugValuesReply.sent` counts what was published**: a value held back by its deadband, or the same as the one
+  before it, is no longer counted (it was "set and published, deadbands may hold some back").
+- Setting a text metric to a new value could read the text it replaced after freeing it.
+
 ## [0.1.3]
 
 The client sends MQTT 5 topic aliases: on a cellular link a Sparkplug topic was most of every small message.
