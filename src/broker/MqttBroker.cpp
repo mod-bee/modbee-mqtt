@@ -201,10 +201,18 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     // pays a few hundred bytes and a gateway for a thousand pays a few kB.
     size_t buckets = 16;
     while (buckets < _config.maxSessions * 2) buckets *= 2;
+#if defined(MQTT_PLATFORM_HOST)
+    // A host routes through _routeIndex; these are the board's index, never
+    // built there. The marks grow with the sessions (growSessions()).
+    std::vector<uint32_t>(1, 0).swap(_bucketStart);
+    _routeMark.assign(_config.reserveUpFront || _config.maxSessions < kSlotBlock
+                          ? _config.maxSessions : (size_t)kSlotBlock, 0);
+#else
     _bucketStart.assign(buckets + 1, 0);
+    _routeMark.assign(_config.maxSessions, 0);
+#endif
     _bucketSessions.clear();
     _wildcardSessions.clear();
-    _routeMark.assign(_config.maxSessions, 0);
     _routeGeneration = 0;
     _subscriptionRevision = 0;
     _queuedBytes = 0;
@@ -218,29 +226,49 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     // ONE MORE THAN CONFIGURED. The extra slot never serves; it is where a
     // connection arriving at a full broker is told 0x89 Server Busy instead of
     // being left to time out. See MqttBrokerConnection::refuseOnly.
+    //
+    // ON A HOST, BUILT AS THEY ARE NEEDED. Both tables reserve their whole
+    // limit - address space, which costs nothing until it is touched, and
+    // which keeps every slot where it is, so pointers and indices into them
+    // stay good - and construct slots a block at a time as clients arrive
+    // (growConnections(), growSessions()). A server sized for 100,000 clients
+    // built every slot at start: 1.2 kB each, about 150 MB before anybody
+    // connected. reserveUpFront builds them all, as before.
     _connections.clear();
 #if defined(MQTT_PLATFORM_HOST)
     // Room for raising the limit later without moving a slot: reserved, not
     // built (setMaxConnections).
     std::vector<MqttBrokerConnection>().swap(_connections);
     _connections.reserve(_config.connectionCapacity + 1);
+    const size_t connectionsBuilt =
+        _config.reserveUpFront || _config.maxConnections < kSlotBlock ? _config.maxConnections
+                                                                      : (size_t)kSlotBlock;
+#else
+    const size_t connectionsBuilt = _config.maxConnections;
 #endif
-    _connections.resize(_config.maxConnections + 1);
+    _connections.resize(connectionsBuilt + 1);
     for (MqttBrokerConnection& connection : _connections) {
         connection = MqttBrokerConnection();
     }
 #if defined(MQTT_PLATFORM_HOST)
     _freeConnections.clear();
     _freeConnections.reserve(_config.maxConnections);
-    for (size_t index = _config.maxConnections; index > 0; index--) {
+    for (size_t index = connectionsBuilt; index > 0; index--) {
         _freeConnections.push_back((uint32_t)(index - 1));
     }
 #endif
 
     _sessions.clear();
-    _sessions.resize(_config.maxSessions);
 #if defined(MQTT_PLATFORM_HOST)
-    _sessionIndex.configure(_sessions.size(), _sessions.data(), &MqttBroker::identifierOf);
+    std::vector<MqttBrokerSession>().swap(_sessions);
+    _sessions.reserve(_config.maxSessions);
+    _sessions.resize(_config.reserveUpFront || _config.maxSessions < kSlotBlock
+                         ? _config.maxSessions : (size_t)kSlotBlock);
+#else
+    _sessions.resize(_config.maxSessions);
+#endif
+#if defined(MQTT_PLATFORM_HOST)
+    _sessionIndex.configure(_config.maxSessions, _sessions.data(), &MqttBroker::identifierOf);
     _routeIndex.configure(buckets,
                           _config.reserveUpFront
                               ? _config.maxSessions * _config.maxSubscriptionsPerSession : 0);
@@ -248,24 +276,7 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     _sharePrunedAt = 0;
     _sharePrunedRevision = 0;
 #endif
-    for (MqttBrokerSession& session : _sessions) {
-        session.configure(_config.maxSubscriptionsPerSession,
-                          _config.maxQueuedPerSession, _config.reserveUpFront);
-        session.attachSubscriptionRevision(&_subscriptionRevision);
-        session.limitQueueBytes(_config.maxQueuedBytesPerSession, &_queuedBytes,
-                                _config.maxQueuedBytesTotal);
-#if defined(MQTT_PLATFORM_HOST)
-        session.attachQueuedCount(&_queuedMessages);
-        session.attachCongestedCount(&_congestedSessions);
-#endif
-        session.attachLoginCounts(&_sessionsPerLogin);
-#if defined(MQTT_PLATFORM_HOST)
-        session.attachIndex(&_sessionIndex, (uint32_t)(&session - _sessions.data()));
-        session.attachRoutes(&_routeIndex);
-        session.attachJournal(_journal);
-        session.attachConfirm(_onConfirm, _confirmContext);
-#endif
-    }
+    for (MqttBrokerSession& session : _sessions) prepareSession(session);
 
     _retained.configure(_config.maxRetained);
 
@@ -280,6 +291,57 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     _housekeptAt = 0;
 #endif
 }
+
+void MqttBroker::prepareSession(MqttBrokerSession& session) {
+    session.configure(_config.maxSubscriptionsPerSession,
+                      _config.maxQueuedPerSession, _config.reserveUpFront);
+    session.attachSubscriptionRevision(&_subscriptionRevision);
+    session.limitQueueBytes(_config.maxQueuedBytesPerSession, &_queuedBytes,
+                            _config.maxQueuedBytesTotal);
+#if defined(MQTT_PLATFORM_HOST)
+    session.attachQueuedCount(&_queuedMessages);
+    session.attachCongestedCount(&_congestedSessions);
+#endif
+    session.attachLoginCounts(&_sessionsPerLogin);
+#if defined(MQTT_PLATFORM_HOST)
+    session.attachIndex(&_sessionIndex, (uint32_t)(&session - _sessions.data()));
+    session.attachRoutes(&_routeIndex);
+    session.attachJournal(_journal);
+    session.attachConfirm(_onConfirm, _confirmContext);
+#endif
+}
+
+#if defined(MQTT_PLATFORM_HOST)
+// The next block of sessions, enough to include `index`: within the
+// reservation begin() made, so no session moves.
+void MqttBroker::growSessions(size_t index) {
+    const size_t built = _sessions.size();
+    if (index < built) return;
+    size_t target = built + kSlotBlock;
+    if (target < index + 1) target = index + 1;
+    if (target > _config.maxSessions) target = _config.maxSessions;
+    _sessions.resize(target);
+    if (_routeMark.size() < target) _routeMark.resize(target, 0);
+    for (size_t at = built; at < target; at++) prepareSession(_sessions[at]);
+}
+
+// The next block of connection slots, the refusing one kept last. False when
+// every slot the limit allows is built.
+bool MqttBroker::growConnections() {
+    const size_t built = _connections.size();      // with the refusing slot
+    if (built == 0) return false;
+    const size_t serving = built - 1;
+    if (serving >= _config.maxConnections || serving >= _config.connectionCapacity) return false;
+    size_t target = serving + kSlotBlock;
+    if (target > _config.maxConnections) target = _config.maxConnections;
+    if (target > _config.connectionCapacity) target = _config.connectionCapacity;
+    _connections.resize(target + 1);
+    for (size_t index = target; index > built; index--) _freeConnections.push_back((uint32_t)(index - 1));
+    // The old refusing slot serves now - once it is not refusing somebody.
+    if (!_connections[built - 1].inUse()) _freeConnections.push_back((uint32_t)(built - 1));
+    return true;
+}
+#endif
 
 void MqttBroker::end() {
     for (MqttBrokerConnection& connection : _connections) {
@@ -1348,6 +1410,8 @@ MqttBrokerConnection* MqttBroker::freeConnection() {
         }
         _freeConnections.pop_back();     // stale - never expected, and harmless
     }
+    // Every slot built is taken, and the limit allows more: the next block.
+    if (_liveConnections < _config.maxConnections && growConnections()) return freeConnection();
 #else
     for (size_t index = 0; index < serving; index++) {
         if (!_connections[index].inUse()) {
@@ -1485,6 +1549,14 @@ void MqttBroker::serviceConnection(MqttBrokerConnection& connection) {
     const mq_time_t now = mq_millis();
 
     connection.link.serviceTransmit();
+
+    // One write for the pass: every acknowledgement and delivery it makes is
+    // appended, and sent when this returns, by whichever path.
+    struct Uncork {
+        MqttLink& link;
+        ~Uncork() { link.uncork(); }
+    } uncork{connection.link};
+    connection.link.cork();
 
     // Read and dispatch whole packets - but a BOUNDED number of them.
     //
@@ -2076,7 +2148,8 @@ MqttBrokerSession* MqttBroker::freeSession() {
 #if defined(MQTT_PLATFORM_HOST)
     if (_sessionIndex.configured()) {
         const uint32_t index = _sessionIndex.takeFree();
-        if (index == MqttSessionIndex::kNone || index >= _sessions.size()) return nullptr;
+        if (index == MqttSessionIndex::kNone || index >= _config.maxSessions) return nullptr;
+        growSessions(index);
         return &_sessions[index];
     }
 #endif
@@ -3418,10 +3491,14 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
     // could read hundreds of thousands a second waiting a whole pass of the
     // loop - every other connection, the epoll round, the sweeps - per 32.
     for (size_t pass = 0; pass < kDeliveriesPerPass; pass++) {
-        // Nothing new goes out while the transmit queue still holds bytes.
-        // Encoding a second packet into a full queue would fail halfway and
-        // leave the delivery marked sent when it was not.
-        if (connection.link.transmitPending() != 0) {
+        // Corked (serviceConnection), each delivery is appended for the pass's
+        // one write, and stops only when the transport pushed back - or when
+        // send() finds no room, which commits nothing and leaves the delivery
+        // unsent. Otherwise nothing new goes out while the transmit queue
+        // still holds bytes.
+        if (connection.link.corked()) {
+            if (connection.link.backpressured()) return;
+        } else if (connection.link.transmitPending() != 0) {
             connection.link.serviceTransmit();
             if (connection.link.transmitPending() != 0) return;
         }
@@ -4513,7 +4590,8 @@ bool MqttBroker::setMaxConnections(size_t limit) {
     if (limit == 0) limit = 1;
     if (limit > _config.connectionCapacity) return false;
     const size_t built = _connections.size();
-    if (limit + 1 > built) {
+    // Built as they are needed (growConnections()), unless reserved up front.
+    if (_config.reserveUpFront && limit + 1 > built) {
         // Within what begin() reserved, so no slot moves. The old reserve
         // becomes a serving slot - refusing someone, it comes back on the
         // stack when that ends - and the last new one is the reserve.

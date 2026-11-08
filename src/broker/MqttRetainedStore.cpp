@@ -55,19 +55,21 @@ size_t MqttRetainedStore::ownedBy(const std::string& owner) const {
 
 void MqttRetainedStore::configure(size_t maximum) {
     _owners.clear();
-    _messages.clear();
-    _messages.resize(maximum);
+    _maximum = maximum;
+    std::vector<MqttRetainedMessage>().swap(_messages);
 #if MQTT_RETAINED_INDEX
     _indexed = maximum >= kIndexFrom;
     _index.clear();
     _free.clear();
-    if (_indexed) {
-        _index.reserve(maximum);
-        _free.reserve(maximum);
-        // Highest first, so the lowest slot is handed out first - the order
-        // the walk would have used.
-        for (size_t index = maximum; index > 0; index--) _free.push_back((uint32_t)(index - 1));
-    }
+    // INDEXED, BUILT AS TOPICS ARE RETAINED: a slot is added when none is free
+    // (freeSlot()), up to the maximum. Every slot - 10,000 by default, each a
+    // string, a vector and a property set - was built at start, a couple of
+    // megabytes per broker for topics nobody had retained. Nothing holds a
+    // reference into the slots across a store (callers visit them), so the
+    // array may move as it grows.
+    if (!_indexed) _messages.resize(maximum);
+#else
+    _messages.resize(maximum);
 #endif
 }
 
@@ -113,7 +115,11 @@ int MqttRetainedStore::indexOf(const MqttSpan& topic) const {
 int MqttRetainedStore::freeSlot() {
 #if MQTT_RETAINED_INDEX
     if (_indexed) {
-        if (_free.empty()) return -1;
+        if (_free.empty()) {
+            if (_messages.size() >= _maximum) return -1;
+            _messages.emplace_back();
+            return (int)(_messages.size() - 1);
+        }
         const uint32_t slot = _free.back();
         _free.pop_back();
         return (int)slot;
@@ -199,7 +205,7 @@ void MqttRetainedStore::clear(const MqttSpan& topic) {
 }
 
 void MqttRetainedStore::clearAll() {
-    configure(_messages.size());
+    configure(_maximum);
 }
 
 size_t MqttRetainedStore::count() const {

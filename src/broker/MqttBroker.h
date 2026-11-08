@@ -1037,6 +1037,15 @@ private:
     // inside itself, and each resets the part it uses (MqttPacket::clearFor).
     MqttPacket _received;
     MqttPacket _delivery;
+
+    // Sessions and connection slots are built a block at a time on a host
+    // (see begin()).
+    static const size_t kSlotBlock = 256;
+    void prepareSession(MqttBrokerSession& session);
+#if defined(MQTT_PLATFORM_HOST)
+    void growSessions(size_t index);
+    bool growConnections();
+#endif
 #endif
     std::unordered_map<std::string, uint32_t> _sessionsPerLogin;
     uint32_t _indexBuiltAt = 0xFFFFFFFFu;

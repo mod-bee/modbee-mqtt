@@ -326,11 +326,13 @@ bool MqttLink::send(const MqttCodec& codec, const MqttPacket& packet,
     _transmitLength += written;
 
     _packetsSent++;
-    // Flushed now, but NOT shrunk now: the caller is still holding `encoded`,
-    // which points into this buffer.
-    _sending = true;
-    serviceTransmit();
-    _sending = false;
+    // Flushed now - unless corked - but NOT shrunk now: the caller is still
+    // holding `encoded`, which points into this buffer.
+    if (!_corked) {
+        _sending = true;
+        serviceTransmit();
+        _sending = false;
+    }
     return true;
 }
 

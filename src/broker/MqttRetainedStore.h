@@ -100,7 +100,7 @@ public:
     void clearAll();
 
     size_t count() const;
-    size_t capacity() const { return _messages.size(); }
+    size_t capacity() const { return _maximum; }
 
     // Messages matching a filter, for a subscription that has just arrived.
     // Expired ones are removed as they are found rather than returned.
@@ -151,6 +151,7 @@ public:
 
 private:
     std::vector<MqttRetainedMessage> _messages;
+    size_t _maximum = 0;
 
     int indexOf(const MqttSpan& topic) const;
     int freeSlot();

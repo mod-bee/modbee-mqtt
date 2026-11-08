@@ -180,6 +180,21 @@ public:
     size_t transmitPending() const { return _transmitLength - _transmitCursor; }
     bool transmitIdle() const { return _transmitCursor >= _transmitLength; }
 
+    // CORKED, send() only appends: the bytes go in one write when uncork() -
+    // or serviceTransmit() - is called. A broker servicing a connection corks
+    // it for the pass, so the PUBACKs and deliveries of a pass are one system
+    // call rather than one each (a write per packet was most of what a busy
+    // connection cost). serviceTransmit() always writes, corked or not.
+    void cork() { _corked = true; }
+    void uncork() {
+        if (!_corked) return;
+        _corked = false;
+        serviceTransmit();
+    }
+    bool corked() const { return _corked; }
+    // The transport refused bytes at the last write, which are still queued.
+    bool backpressured() const { return _backpressured; }
+
     MqttError lastEncodeError() const { return _lastEncodeError; }
 
     // --- Counters, for diagnostics and for tests ---
@@ -266,4 +281,5 @@ private:
     uint64_t _bytesReceived = 0;
     uint64_t _bytesRelieved = 0;
     bool _backpressured = false;   // the transport refused bytes still queued
+    bool _corked = false;
 };

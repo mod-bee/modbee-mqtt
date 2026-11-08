@@ -245,7 +245,7 @@ guessing.
 | `maxQueuedBytesPerSession`, `maxQueuedBytesTotal` | 0 (no cap) | The same in bytes - one client's queue, and every client's together. Each queued message is its own copy of topic and payload, and an offline session queues too, so the depth alone does not bound memory. A message past either is refused for that subscriber and counted as dropped. `modbee-mqtt serve` sets 1 MB and 64 MB. |
 | `maxRetained` | 256 | Retained topics. A new one past this is delivered but not kept, and refused with `0x97`. From 1024 up, on a host, topics are found through a hash index rather than a walk. |
 | `receiveBufferSize` / `transmitBufferSize` | 8192 | One whole packet each. |
-| `reserveUpFront` | true | Reserve every slot and buffer at `begin()`. False reserves a session's slots on first use and starts each connection's buffers at 512 bytes, growing them only when a packet needs it. The limits are unchanged. |
+| `reserveUpFront` | true | Reserve every slot and buffer at `begin()`. False, on a host, builds sessions and connection slots 256 at a time as clients arrive, retained topics one at a time as they are kept, a session's queue slots on first use, and each connection's buffers from 512 bytes, growing them only when a packet needs it. The limits are unchanged. `modbee-mqtt serve` sets it false: a server sized for 100,000 clients idles at about 40 MB. |
 
 These are the library's defaults. `modbee-mqtt serve` sets its own, from
 `modbee.yaml` or its flags: `max-packet` 65536 (both buffers and the
@@ -260,11 +260,14 @@ keep retained messages across a restart with `retained: store: file` or
 
 Everything is allocated once at `begin()` and never grows, so the memory the
 broker will use is knowable before it starts rather than discovered on a busy
-afternoon. On a host with `reserveUpFront` false, a session's queue is the one
-thing that grows: sixteen slots on its first message, more blocks of sixteen as a
-backlog needs them, up to `maxQueuedPerSession` - and blocks never move, so
-nothing the broker holds into the queue is left pointing at freed memory. Its
-bytes are still capped by `maxQueuedBytesPerSession` and `maxQueuedBytesTotal`.
+afternoon. On a host with `reserveUpFront` false, the tables grow with use
+instead, never past their limits: sessions and connection slots a block of 256 at
+a time (their whole limit is reserved as address space, which costs nothing until
+used, so no slot ever moves), retained topics one at a time, and a session's
+queue sixteen slots on its first message, more blocks of sixteen as a backlog
+needs them, up to `maxQueuedPerSession` - blocks never move, so nothing the
+broker holds into the queue is left pointing at freed memory. Its bytes are
+still capped by `maxQueuedBytesPerSession` and `maxQueuedBytesTotal`.
 
 **On a host, some of it can change while it runs** - what `modbee-mqtt serve`
 does for `Admin.PutListeners`. Call these on the broker's own thread, between
