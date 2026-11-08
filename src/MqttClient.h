@@ -649,6 +649,8 @@ private:
     void dropAlias(const MqttOperation& op, MqttPacket& packet);
 
     bool sendPacket(const MqttPacket& packet);
+    bool mayQueueMore() const;
+    static const size_t kCorkedBytesPerPoll = 16384;
 
     void handlePacket(const MqttFixedHeader& header, const MqttPacket& packet);
     void handleConnAck(const MqttPacket& packet);

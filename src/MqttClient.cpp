@@ -562,21 +562,39 @@ void MqttClient::poll() {
             _stable = true;
         }
         serviceTransmit();
-        serviceReceive();
-        if (_status.state != MqttState::Connected) return;   // receive may have closed us
-        serviceKeepAlive();
-        if (_status.state != MqttState::Connected) return;
-        // BEFORE serviceQueue(), deliberately. An operation given up on here
-        // frees a unit of the in-flight quota, and the very next thing this
-        // pass does is look for something to send - so a recovered slot is
-        // used on the same poll rather than the next one.
-        serviceAcknowledgements();
-        if (_status.state != MqttState::Connected) return;
-        if (_reissueOwed) {
-            _reissueOwed = false;
-            reissueSubscriptions();
+        // ONE WRITE FOR THE POLL. The acknowledgements it answers with and
+        // the publishes it sends are appended and go together when it ends -
+        // one TLS record and one segment where there was one of each per
+        // packet: on a metered link, about 22 bytes of TLS a message saved.
+        {
+            // The keepalive is told only of bytes this poll really wrote: told
+            // at the end of every poll, a client with nothing to say never
+            // pinged, and the broker closed it for silence (0x8D).
+            struct Uncork {
+                MqttClient& client;
+                uint64_t before;
+                ~Uncork() {
+                    client._link.uncork();
+                    if (client._link.bytesSent() != before) client.noteTransmitted();
+                }
+            } uncork{*this, (uint64_t)_link.bytesSent()};
+            _link.cork();
+            serviceReceive();
+            if (_status.state != MqttState::Connected) return;   // receive may have closed us
+            serviceKeepAlive();
+            if (_status.state != MqttState::Connected) return;
+            // BEFORE serviceQueue(), deliberately. An operation given up on here
+            // frees a unit of the in-flight quota, and the very next thing this
+            // pass does is look for something to send - so a recovered slot is
+            // used on the same poll rather than the next one.
+            serviceAcknowledgements();
+            if (_status.state != MqttState::Connected) return;
+            if (_reissueOwed) {
+                _reissueOwed = false;
+                reissueSubscriptions();
+            }
+            serviceQueue();
         }
-        serviceQueue();
         return;
 
     case MqttState::Disconnecting:
@@ -616,6 +634,15 @@ bool MqttClient::sendPacket(const MqttPacket& packet) {
 // keepalive measured from a moment that had not happened. So the keepalive is
 // told only when the link has nothing left to send; serviceTransmit() tells it
 // when a backlog finally drains.
+// Whether another packet may be appended now. Uncorked, only once what is
+// queued has gone; corked (poll()), while the transport has not pushed back,
+// up to a bound per poll - the link's buffer bounds it as well (send() then
+// fails and the operation keeps its place).
+bool MqttClient::mayQueueMore() const {
+    if (!_link.corked()) return _link.transmitPending() == 0;
+    return !_link.backpressured() && _link.transmitPending() < kCorkedBytesPerPoll;
+}
+
 void MqttClient::noteTransmitted() {
     if (_link.transmitIdle()) _keepAlive.noteSent(mq_millis());
 }
@@ -1345,7 +1372,7 @@ void MqttClient::serviceQueue() {
     // Anything the session is holding from before the reconnect goes first.
     // [V5:MQTT-4.4.0-1] requires the original Packet Identifiers, so these are
     // replayed from their stored bytes rather than rebuilt.
-    while (_link.transmitPending() == 0) {
+    while (mayQueueMore()) {
         MqttStoredPublish* stored = _session.nextUnsent();
         if (!stored) break;
 
@@ -1370,7 +1397,7 @@ void MqttClient::serviceQueue() {
         noteTransmitted();
     }
 
-    while (_link.transmitPending() == 0) {
+    while (mayQueueMore()) {
         MqttOperation* op = _operations.nextUnsent();
         if (!op) break;
 
