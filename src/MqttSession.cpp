@@ -337,6 +337,15 @@ size_t MqttSession::subscriptionCount() const {
     return count;
 }
 
+void MqttSession::forgetContext(const void* context) {
+    if (context == nullptr) return;
+    for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {
+        if (!_subscriptions[i].inUse() || _subscriptions[i].context != context) continue;
+        _subscriptions[i].onComplete = nullptr;
+        _subscriptions[i].context = nullptr;
+    }
+}
+
 const MqttStoredSubscription* MqttSession::subscriptionAt(size_t index) const {
     size_t seen = 0;
     for (int i = 0; i < MQ_SUBSCRIPTION_SLOTS; i++) {

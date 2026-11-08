@@ -224,6 +224,10 @@ public:
     void markSubscriptionEstablished(const uint8_t* filter, uint16_t length);
     size_t subscriptionCount() const;
     const MqttStoredSubscription* subscriptionAt(size_t index) const;
+    // No subscription keeps `context` as its completion's context: a
+    // reissue after a reconnect would otherwise hand it back to the client
+    // (MqttClient::forgetCompletions).
+    void forgetContext(const void* context);
 
     // Every subscription becomes unestablished again.
     //
