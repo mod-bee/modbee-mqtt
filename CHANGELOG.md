@@ -11,6 +11,45 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.4]
+
+Every value `Sparkplug.SetValues` is given goes, not only the last of each metric; and the server is several
+times faster and holds publishers back instead of dropping their messages - ahead of MonsterMQ Edge and MonsterMQ
+in every case of their own fan-out benchmark, on the same machine - and an idle server takes about 40 MB, was 216.
+
+Changes on upgrade: `SparkplugValuesReply.sent` counts only what was published; a full inter-shard ring or a
+subscriber that is behind slows its publishers (TCP) rather than losing messages, and `modbee_mailbox_full_total`
+counts messages that waited; `serve` builds its sessions and slots as clients arrive (`--reserve-up-front` as before).
+
+### Changed
+
+- **The server holds a publisher back instead of dropping its messages.** Publishers and subscribers on different
+  shards dropped most of a fast stream - 40 to 90% in a fan-out benchmark, QoS 1 included, after the publisher had
+  been acknowledged - because a shard took up to 4,096 forwarded messages at a time into subscriber queues of 1,000.
+  Now a forwarded message waits in its ring while a subscriber it is for is behind but keeping up, a full ring stops
+  the publishing shard taking PUBLISHes (acknowledgements and pings still go), and a PUBLISH a subscriber that is
+  behind would have to drop is left unread until it has room: TCP slows the publisher. A subscriber that has taken
+  nothing for 250 ms is a slow consumer and holds nobody back; its messages are refused at its queue limit, as before.
+  `modbee_mailbox_full_total` now counts messages that waited for a ring, not ones dropped.
+- **Faster delivery.** A session's queue is no longer walked for each message - to store it, find the next to send,
+  give it a packet identifier, find it again for its acknowledgement and look for an owed PUBREL - and up to 256
+  messages go to a connection a pass, not 32; each packet decoded resets only its own kind. In a fan-out benchmark
+  (N publishers x M subscribers, 64-byte payloads) on 4 shards: QoS 0 4x4 683K -> 1.0-1.3M deliveries a second and 1x16
+  720K -> 1.5-1.6M, QoS 1 4x4 367K -> 650K, with nothing dropped where 40-65% was.
+- **One write per connection per pass.** Every packet the server sent - each delivery, each PUBACK - was a system
+  call of its own. A connection's packets of a pass now go in one write. The same benchmark, 4 CPUs, against
+  MonsterMQ Edge 0.1.18 and MonsterMQ (Kotlin) on the same machine and limits, deliveries a second: QoS 0 1x1 1.14M
+  (676K, 249K), 4x4 4.5-5.0M (2.79M, 881K), 8x1 1.5-1.6M with none dropped (278K with 88% dropped, 342K), 1x16 4.6-4.9M
+  (1.41M, 293K); QoS 1 1x1 300K (190K, 157K), 4x4 1.26-1.45M (435K, 758K).
+- **The MQTT client writes once a poll** - every connection the server makes, the Sparkplug edge node and host
+  included. The acknowledgements a poll answers with and the publishes it sends go in one write, where each was a
+  write of its own: on TLS one record instead of one a packet (about 22 bytes each), and one TCP segment where several
+  fit - a gateway sending a DDATA for each of its devices in the same second sends them together.
+- **Memory grows with use.** `serve` built every session and connection slot it might ever hold at start - 1.2 kB
+  each, about 150 MB for its default 100,000 - and every retained slot (10,000 a shard), and sized its session index
+  and routing marks to the limit. They are now built as clients and retained topics arrive, never past the limits: an
+  idle `serve` on 4 shards takes about 40 MB, was 216 MB. `--reserve-up-front` builds them all, as before.
+
 ### Fixed
 
 - **`Sparkplug.SetValues` sent only the last of several values of one metric.** A gateway that gathers a second of
@@ -23,6 +62,9 @@ minor version may change the API or the configuration, and says how here.
 - **`SparkplugValuesReply.sent` counts what was published**: a value held back by its deadband, or the same as the one
   before it, is no longer counted (it was "set and published, deadbands may hold some back").
 - Setting a text metric to a new value could read the text it replaced after freeing it.
+- A Sparkplug edge node or host removed while one of its subscriptions was unanswered could still be called after a
+  reconnect: the client kept each subscription's completion to reissue it, and handed the removed one back. Forgotten
+  too now.
 
 ## [0.1.3]
 
