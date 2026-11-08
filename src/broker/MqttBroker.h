@@ -1026,7 +1026,8 @@ private:
     size_t _queuedBytes = 0;             // every session's queue, together
 #if defined(MQTT_PLATFORM_HOST)
     size_t _queuedMessages = 0;          // and in messages
-    size_t _congestedSessions = 0;       // MqttBrokerSession::congested()
+#endif
+    size_t _congestedSessions = 0;       // MqttBrokerSession::congested(), a host's
     bool _ingressPaused = false;
 
     // ONE PACKET EACH WAY, reused: the one a connection's next packet is
@@ -1045,7 +1046,6 @@ private:
 #if defined(MQTT_PLATFORM_HOST)
     void growSessions(size_t index);
     bool growConnections();
-#endif
 #endif
     std::unordered_map<std::string, uint32_t> _sessionsPerLogin;
     uint32_t _indexBuiltAt = 0xFFFFFFFFu;

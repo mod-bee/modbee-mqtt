@@ -3709,7 +3709,9 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
         session->traffic.messagesOut++;
 #endif
 
+#if defined(MQTT_PLATFORM_HOST)
         session->lastSentAt = now;     // keeping up: see MqttBrokerSession::congested()
+#endif
         if (next->qos == MQ_QOS_0) {
             // Nothing acknowledges a QoS 0 delivery, so reaching the wire is
             // its conclusion.
