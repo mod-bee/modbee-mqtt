@@ -508,6 +508,10 @@ message SparkplugEdgeNodeSpec {
   // Values a second it sends as history once born (default 1000; 0: as fast as the link takes them), in messages of
   // at most 64. Live values never wait for it: SetValues publishes them at once.
   optional uint32 history_rate = 12;
+  // Born again (an NBIRTH and its DBIRTHs: the same session and bdSeq) whenever a host's STATE comes online after
+  // this birth - at most once a second, hosts arriving together sharing it - so a node serving several hosts, none of
+  // them its primary, is learnt by one that comes online later. Off: born once a session, as Sparkplug says.
+  bool rebirth_on_host_online = 13;
 }
 // A Template definition the edge node publishes in its NBIRTH: the type of a PLC struct or UDT - its members (name,
 // datatype, default value; a member may itself be a Template instance, an array or a DataSet) and its parameters.

@@ -1974,6 +1974,22 @@ void MqttSparkplugNode::poll() {
         }
     }
 
+    // A HOST CAME ONLINE (rebirthOnHostOnline()): born again for it, at most
+    // once a second - hosts arriving together share the one.
+    // A birth refused for queue room is owed by rebirth() itself; one owed
+    // while not born or connected is dropped, since the next birth is for
+    // every host there is.
+    if (_hostRebirthOwed && !_disconnectAfterDeath && !_reconnectAfterOffline &&
+        !_cycleOwed &&
+        (_hostRebirths == 0 || mq_elapsed(_hostRebirthAt, mq_millis()) >= 1000)) {
+        _hostRebirthOwed = false;
+        if (_born && _client.isConnected()) {
+            _hostRebirthAt = mq_millis();
+            _hostRebirths++;
+            rebirth();
+        }
+    }
+
     // AN OWED DEVICE BIRTH GETS ANOTHER CHANCE - once a second after one was
     // refused, as the owed NBIRTH above does.
     //
@@ -2154,6 +2170,13 @@ bool MqttSparkplugNode::subscribeCommands() {
         } else {
             ok = false;
         }
+    }
+
+    // Every host's, to be born again for one that comes online
+    // (rebirthOnHostOnline()). It overlaps the primary's, which is harmless:
+    // a STATE given twice is the same timestamp, and changes nothing.
+    if (_rebirthOnHostOnline) {
+        ok = mq_accepted(_client.subscribe(MQ_SP_NAMESPACE "/STATE/+", MQ_QOS_1)) && ok;
     }
 
     return ok;
@@ -2532,6 +2555,7 @@ bool MqttSparkplugNode::publishBirth() {
 
     _born = true;
     _birthCount++;
+    _nodeBirthCount++;
     _lastBirthAt = mq_millis();
     _rebirthDeferred = false;   // this birth answers any request it held
     // A session that ended uncleanly left values that may never have
@@ -3187,6 +3211,19 @@ void MqttSparkplugNode::handleMessage(const MqttMessage& message) {
     }
 
     if (parts.isState()) {
+        // A host come online while we are born, and not to a retained STATE
+        // from before this birth: born again for it (rebirthOnHostOnline()).
+        // Its session is not ours to follow, so nothing else is done with it.
+        if (_rebirthOnHostOnline && !message.retain && _born &&
+            !(hasPrimaryHost() && _primaryHostId == parts.group)) {
+            bool online = false;
+            uint64_t timestamp = 0;
+            if (mq_sparkplugParseState(message.payload.data, message.payload.length,
+                                       online, timestamp) &&
+                online && !_hostRebirthOwed) {
+                _hostRebirthOwed = true;
+            }
+        }
         // Only the host we are watching. Another host's STATE is not ours to
         // act on, and acting on it is how a node gets stranded.
         if (!hasPrimaryHost()) return;

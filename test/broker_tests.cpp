@@ -177,8 +177,8 @@ struct Raw {
         p.connect.cleanStart = cleanStart;
         p.connect.keepAlive = keepAlive;
         if (expiry) {
-            p.connect.properties.sessionExpiryInterval = expiry;
-            p.connect.properties.markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
+            MQ_PROPERTIES(p, p.connect).sessionExpiryInterval = expiry;
+            MQ_PROPERTIES(p, p.connect).markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
         }
         return send(p) && next(MQ_PKT_CONNACK, ack);
     }

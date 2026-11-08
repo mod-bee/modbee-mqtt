@@ -429,6 +429,14 @@ offline as valid: NDEATH, reconnect to the same broker, and a new NBIRTH for
 the new host. Without a primary host, the node births as soon as it connects,
 which is what a single-broker site wants.
 
+**Several hosts, none of them primary:** a node is born once a session, and a
+host that comes online later sees no birth - and, with nothing to decode yet,
+no reason to ask for one. `node.rebirthOnHostOnline(true)` (before `connect()`)
+has the node watch `spBv1.0/STATE/+` and publish a rebirth - the same session
+and bdSeq, as an NCMD rebirth - when any host's online STATE arrives live, at
+most once a second (`node.hostRebirths()` counts them). The retained STATE of a
+host already online before the birth asks nothing. Off by default.
+
 `node.waitingFor()` says, in words, why a connected node has not birthed yet:
 for example `no STATE from primary host 'scada-1'`.
 
@@ -815,6 +823,8 @@ properties keeps the first ones and counts the rest in the payload's
 | `MQ_SP_HOST_METRIC_LIMIT` | 1,024 on a board, 65,536 on a host | `host.metricLimit()` to start with |
 | `MQ_SP_COMMAND_LIMIT` | 4 kB on a board, 1 MB on a host | `node.commandLimit()` to start with |
 | `MQ_SP_REBIRTH_HOLDOFF` | 2000 ms | `node.rebirthHoldoff()` to start with |
+| `MQ_SP_MAX_ID` | 48 on a board, 128 on a host | A group, node, device or host id, with its terminator: at most 47 bytes on a board, 127 on a host. Longer is refused (`mq_sparkplugIdProblem()` says why), never cut |
+| `MQ_SP_MAX_TOPIC` | 128 on a board, 512 on a host | The longest topic built or accepted |
 
 To change one, set it for the **whole build**, not with a `#define` in the
 sketch: the library's own files are compiled separately and would not see it.

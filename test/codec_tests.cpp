@@ -83,10 +83,10 @@ void connect(const MqttCodec& codec) {
     in.connect.will.qos = MQ_QOS_1;
     in.connect.will.retain = true;
     if (codec.version() == MqttVersion::V5) {
-        in.connect.properties.sessionExpiryInterval = 3600;
-        in.connect.properties.markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
-        in.connect.properties.receiveMaximum = 20;
-        in.connect.properties.markPresent(MQ_PROP_RECEIVE_MAXIMUM);
+        MQ_PROPERTIES(in, in.connect).sessionExpiryInterval = 3600;
+        MQ_PROPERTIES(in, in.connect).markPresent(MQ_PROP_SESSION_EXPIRY_INTERVAL);
+        MQ_PROPERTIES(in, in.connect).receiveMaximum = 20;
+        MQ_PROPERTIES(in, in.connect).markPresent(MQ_PROP_RECEIVE_MAXIMUM);
     }
     Wire wire;
     MqttPacket out;
@@ -99,9 +99,9 @@ void connect(const MqttCodec& codec) {
            text(out.connect.will.payload) == willPayload && out.connect.will.qos == 1 && out.connect.will.retain,
        "  Will: topic, binary payload, QoS 1, retain");
     if (codec.version() == MqttVersion::V5) {
-        ok(out.connect.properties.has(MQ_PROP_SESSION_EXPIRY_INTERVAL) &&
-               out.connect.properties.sessionExpiryInterval == 3600 &&
-               out.connect.properties.receiveMaximum == 20,
+        ok(MQ_PROPERTIES(out, out.connect).has(MQ_PROP_SESSION_EXPIRY_INTERVAL) &&
+               MQ_PROPERTIES(out, out.connect).sessionExpiryInterval == 3600 &&
+               MQ_PROPERTIES(out, out.connect).receiveMaximum == 20,
            "  properties: session expiry 3600, receive maximum 20");
     }
 
@@ -169,7 +169,7 @@ void publish(const MqttCodec& codec) {
         p.header.type = MQ_PKT_PUBLISH;
         p.publish.topic = span(topic);
         p.publish.payload = span(std::string("{}"));
-        MqttProperties& props = p.publish.properties;
+        MqttProperties& props = MQ_PROPERTIES(p, p.publish);
         props.contentType = span(type);
         props.markPresent(MQ_PROP_CONTENT_TYPE);
         props.responseTopic = span(response);
@@ -185,7 +185,7 @@ void publish(const MqttCodec& codec) {
         p.publish.payload = span(payload);
         MqttPacket o;
         const bool done = roundTrip(codec, p, wire, o);
-        const MqttProperties& got = o.publish.properties;
+        const MqttProperties& got = MQ_PROPERTIES(o, o.publish);
         ok(done && text(got.contentType) == type && text(got.responseTopic) == response &&
                text(got.correlationData) == correlation && got.messageExpiryInterval == 30 &&
                got.payloadFormatIndicator == 1 && got.userCount == 1 && text(got.user[0].key) == key &&
@@ -281,11 +281,11 @@ void control(const MqttCodec& codec) {
     auth.header.type = MQ_PKT_AUTH;
     auth.auth.reasonCode = 0x18;
     const std::string method = "SCRAM-SHA-256";
-    auth.auth.properties.authenticationMethod = span(method);
-    auth.auth.properties.markPresent(MQ_PROP_AUTHENTICATION_METHOD);
+    MQ_PROPERTIES(auth, auth.auth).authenticationMethod = span(method);
+    MQ_PROPERTIES(auth, auth.auth).markPresent(MQ_PROP_AUTHENTICATION_METHOD);
     if (codec.version() == MqttVersion::V5) {
         ok(roundTrip(codec, auth, wire, out) && out.auth.reasonCode == 0x18 &&
-               text(out.auth.properties.authenticationMethod) == method,
+               text(MQ_PROPERTIES(out, out.auth).authenticationMethod) == method,
            "AUTH: continue, with its method");
     } else {
         ok(codec.size(auth) == 0, "AUTH does not exist at 3.1.1: nothing to encode");

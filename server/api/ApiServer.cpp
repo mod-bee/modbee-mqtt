@@ -334,6 +334,7 @@ AppConnectionSpec specOf(const v1::ConnectionSpec& wire) {
     s.password = wire.password();
     s.tls = wire.tls().enabled();
     s.caPem = wire.tls().ca_pem();
+    s.serverName = wire.tls().server_name();
     s.certificatePem = wire.tls().certificate_pem();
     s.keyPem = wire.tls().key_pem();
     s.protocol = wire.protocol_version() == 4 ? 4 : 5;
@@ -386,6 +387,7 @@ void infoTo(const AppConnectionInfo& info, v1::ConnectionInfo& wire) {
     if (info.spec.hasUsername) s->set_username(info.spec.username);
     s->mutable_tls()->set_enabled(info.spec.tls);
     s->mutable_tls()->set_ca_pem(info.spec.caPem);
+    s->mutable_tls()->set_server_name(info.spec.serverName);
     s->mutable_tls()->set_certificate_pem(info.spec.certificatePem);
     s->set_protocol_version(info.spec.protocol);
     s->set_keepalive_seconds(info.spec.keepaliveSeconds);
@@ -2366,6 +2368,7 @@ void edgeInfoTo(const AppSparkplugEdgeNodeInfo& info, v1::SparkplugEdgeNodeInfo&
     s->set_history_max_bytes(info.spec.historyMaxBytes);
     s->set_history_max_age_ms(info.spec.historyMaxAgeMs);
     s->set_history_rate(info.spec.historyRate);
+    s->set_rebirth_on_host_online(info.spec.rebirthOnHostOnline);
     for (const AppSparkplugMetricDeclaration& m : info.spec.metrics) declarationTo(m, *s->add_metrics());
     for (const AppSparkplugTemplateDefinition& t : info.spec.templates) {
         v1::SparkplugTemplateDefinition* d = s->add_templates();
@@ -2453,6 +2456,7 @@ public:
         if (request->has_history_max_bytes()) spec.historyMaxBytes = request->history_max_bytes();
         if (request->has_history_max_age_ms()) spec.historyMaxAgeMs = request->history_max_age_ms();
         if (request->has_history_rate()) spec.historyRate = request->history_rate();
+        spec.rebirthOnHostOnline = request->rebirth_on_host_online();
         std::string error;
         for (const v1::SparkplugMetricDeclaration& d : request->metrics()) {
             AppSparkplugMetricDeclaration m;
@@ -2911,24 +2915,53 @@ public:
                                     v1::SparkplugCommandReply* reply) override {
         grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
         if (!ready(context, reactor)) return reactor;
-        std::string connection, error;
+        std::string connection, error = sparkplugIdRefusal("group", request->group());
+        if (error.empty()) error = sparkplugIdRefusal("node", request->node());
+        if (error.empty() && !request->device().empty()) error = sparkplugIdRefusal("device", request->device());
+        if (!error.empty()) {
+            reactor->Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error));
+            return reactor;
+        }
         std::vector<AppSparkplugNodeInfo> nodes;
         if (!_connections->hostConnection(request->host(), connection) ||
             !_connections->nodes(request->host(), request->group(), request->node(), nodes, error)) {
             reactor->Finish(grpc::Status(grpc::StatusCode::NOT_FOUND, "no host \"" + request->host() + "\""));
             return reactor;
         }
+        // Only to what is born now. An alias is good for the session of the birth that gave it, so a
+        // command to a node or device that has died since, or was never born to this host, could carry
+        // neither a name nor an alias its edge node knows: refused, naming what is not born, rather
+        // than sent and called delivered. Born again (Rebirth, or a lease of it), it can be written.
+        auto refuse = [reactor, reply](const std::string& why) {
+            reply->set_sent(false);
+            reactor->Finish(grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, why));
+            return reactor;
+        };
+        const std::string where = request->group() + "/" + request->node();
+        if (nodes.empty() || !nodes[0].online) return refuse("edge node \"" + where + "\" is not born");
+        const AppSparkplugNodeInfo& born = nodes[0];
+        if (!request->device().empty() &&
+            std::find(born.devicesOnline.begin(), born.devicesOnline.end(), request->device()) ==
+                born.devicesOnline.end()) {
+            return refuse("device \"" + request->device() + "\" of \"" + where + "\" is not born");
+        }
         // By the alias and at the datatype the birth gave each metric: a command names no metric its node
-        // gave an alias ([tck-id-payloads-alias-data-cmd-requirement]).
+        // gave an alias ([tck-id-payloads-alias-data-cmd-requirement]). One the birth did not give (a
+        // Node or Device Control metric it left out) goes by its name.
         v1::SparkplugPayload payload;
         payload.set_timestamp((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch()).count());
         for (const v1::SparkplugMetric& wanted : request->metrics()) {
+            if (wanted.name().empty()) return refuse("each metric of a Write is named");
             v1::SparkplugMetric* m = payload.add_metrics();
             *m = wanted;
-            if (nodes.empty()) continue;
-            for (const AppSparkplugMetricInfo& known : nodes[0].metrics) {
+            m->clear_alias();
+            for (const AppSparkplugMetricInfo& known : born.metrics) {
                 if (known.name != wanted.name() || known.device != request->device()) continue;
+                if (known.stale) {
+                    return refuse("metric \"" + wanted.name() + "\": its " +
+                                  (request->device().empty() ? "edge node" : "device") + " is not born");
+                }
                 if (m->datatype() == v1::DATATYPE_UNKNOWN) m->set_datatype((v1::SparkplugDataType)known.datatype);
                 if (known.hasAlias) {
                     m->set_alias(known.alias);

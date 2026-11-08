@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <set>
 #include <mutex>
 
 using check::Client;
@@ -543,6 +544,8 @@ void sparkplugHost(Server& server) {
                       std::chrono::system_clock::now().time_since_epoch()).count());
     node.declare("Level", MqttSparkplugDataType::Int8);
     node.declareWritable("Setpoint", MqttSparkplugDataType::Double);
+    node.addDevice("plc1");
+    node.declareWritableFor("plc1", "Speed", MqttSparkplugDataType::Double);
     MqttSparkplugValue level;
     level.type = MqttSparkplugDataType::Int8;
     node.connect();
@@ -595,6 +598,101 @@ void sparkplugHost(Server& server) {
     ok(run([&] { return setpointAt >= 0 && node.commandPendingAt((size_t)setpointAt); }) &&
            node.takeAt((size_t)setpointAt, written) && written.as.float64 == 42.5,
        "  the node has it: 42.5");
+
+    // Only to what is born now: a command its node could not read is refused, not called sent.
+    auto deviceBorn = [&] {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugNodesRequest request;
+        request.set_host("h");
+        v1::SparkplugNodesReply reply;
+        if (!sparkplug->ListNodes(&c, request, &reply).ok() || reply.nodes_size() != 1) return false;
+        for (const std::string& d : reply.nodes(0).devices_online()) {
+            if (d == "plc1") return true;
+        }
+        return false;
+    };
+    auto writeTo = [&](const std::string& group, const std::string& node, const std::string& device,
+                       const std::string& metric, v1::SparkplugCommandReply& reply) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugWriteRequest write;
+        write.set_host("h");
+        write.set_group(group);
+        write.set_node(node);
+        write.set_device(device);
+        v1::SparkplugMetric* m = write.add_metrics();
+        m->set_name(metric);
+        m->mutable_value()->set_double_value(7);
+        return sparkplug->Write(&c, write, &reply);
+    };
+    node.deviceOnline("plc1");
+    ok(run([&] { return deviceBorn(); }), "a device of the node is born");
+    {
+        v1::SparkplugCommandReply reply;
+        ok(writeTo("plant", "gw-1", "plc1", "Speed", reply).ok() && reply.sent(), "  Write to it: a DCMD, sent");
+    }
+    const int speedAt = node.indexOf("plc1", "Speed");
+    ok(run([&] { return speedAt >= 0 && node.commandPendingAt((size_t)speedAt); }) &&
+           node.takeAt((size_t)speedAt, written) && written.as.float64 == 7,
+       "  the node has it: 7");
+    node.deviceOffline("plc1");
+    ok(run([&] { return !deviceBorn(); }), "the device dies");
+    {
+        v1::SparkplugCommandReply reply;
+        const grpc::Status s = writeTo("plant", "gw-1", "plc1", "Speed", reply);
+        ok(s.error_code() == grpc::StatusCode::FAILED_PRECONDITION && !reply.sent() &&
+               s.error_message().find("\"plc1\"") != std::string::npos &&
+               s.error_message().find("not born") != std::string::npos,
+           "  Write to it now: refused, FAILED_PRECONDITION, \"device \"plc1\" ... is not born\"");
+    }
+    {
+        v1::SparkplugCommandReply reply;
+        const grpc::Status s = writeTo("plant", "gw-1", "plc9", "Speed", reply);
+        ok(s.error_code() == grpc::StatusCode::FAILED_PRECONDITION && !reply.sent(),
+           "  Write to a device never born: refused");
+    }
+    {
+        v1::SparkplugCommandReply reply;
+        const grpc::Status s = writeTo("plant", "gw-9", "", "Setpoint", reply);
+        ok(s.error_code() == grpc::StatusCode::FAILED_PRECONDITION &&
+               s.error_message().find("not born") != std::string::npos,
+           "  Write to a node never born: refused");
+    }
+    {
+        v1::SparkplugCommandReply reply;
+        const grpc::Status s = writeTo(std::string(130, 'g'), "gw-1", "", "Setpoint", reply);
+        ok(s.error_code() == grpc::StatusCode::INVALID_ARGUMENT &&
+               s.error_message().find("130 bytes") != std::string::npos &&
+               s.error_message().find("at most 127") != std::string::npos,
+           "  Write to a group of 130 bytes: INVALID_ARGUMENT, saying its length and the limit");
+    }
+    {
+        // A UUID and a prefix - 50 bytes - is a Sparkplug id here; past 127 is not, and the refusal says why.
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugHostSpec host;
+        host.set_id("long");
+        host.set_connection("local");
+        host.set_host_id(std::string(140, 'h'));
+        v1::SparkplugHostInfo info;
+        const grpc::Status s = sparkplug->PutHost(&c, host, &info);
+        ok(!s.ok() && s.error_message().find("140 bytes") != std::string::npos &&
+               s.error_message().find("at most 127") != std::string::npos,
+           "PutHost with a host_id of 140 bytes: refused, saying its length and the limit");
+        grpc::ClientContext c2;
+        authorize(c2);
+        v1::SparkplugEdgeNodeSpec edge;
+        edge.set_id("long");
+        edge.set_connection("local");
+        edge.set_group("plant");
+        edge.set_node("gw-1");
+        edge.add_devices("bad/device");
+        v1::SparkplugEdgeNodeInfo edgeInfo;
+        const grpc::Status e = sparkplug->PutEdgeNode(&c2, edge, &edgeInfo);
+        ok(!e.ok() && e.error_message().find("'/'") != std::string::npos,
+           "PutEdgeNode with a device \"bad/device\": refused, saying it has a '/'");
+    }
 
     const size_t births = seen(watcher, "spBv1.0/plant/NBIRTH/gw-1");
     {
@@ -1900,6 +1998,208 @@ void listenersLive(Server& server) {
 
 } // namespace
 
+void sparkplugRebirthForHosts(Server& server) {
+    section("an edge node born again for each host that comes online (rebirth_on_host_online)");
+    auto connections = v1::Connections::NewStub(server.channel());
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    Fleet fleet(server.broker.port());
+    Client& watcher = fleet.make("rebirth-watcher");
+    watcher.subscribe("spBv1.0/plant5/#", MQ_QOS_1);
+    Client& hosts = fleet.make("rebirth-hosts");
+    ok(fleet.connected(watcher) && fleet.connected(hosts) && fleet.until([&] { return watcher.subscribed >= 1; }),
+       "a watcher on the group");
+    const auto stamp = [] {
+        return std::to_string((uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+    // A host online already, its STATE retained: given to the node as it subscribes, before its birth.
+    hosts.publish("spBv1.0/STATE/early", "{\"online\":true,\"timestamp\":" + stamp() + "}", MQ_QOS_1, true);
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::ConnectionSpec edge;
+        edge.set_id("edge5");
+        edge.set_this_server(true);
+        edge.set_client_id("gw-5");
+        v1::ConnectionInfo info;
+        connections->Put(&c, edge, &info);
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeSpec spec;
+        spec.set_id("gw5");
+        spec.set_connection("edge5");
+        spec.set_group("plant5");
+        spec.set_node("gw-5");
+        spec.set_rebirth_on_host_online(true);
+        v1::SparkplugMetricDeclaration* temp = spec.add_metrics();
+        temp->set_name("Temp");
+        temp->set_datatype(v1::DATATYPE_DOUBLE);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, spec, &info).ok() && info.spec().rebirth_on_host_online(),
+           "PutEdgeNode, no primary host, rebirth_on_host_online");
+    }
+    const std::string births = "spBv1.0/plant5/NBIRTH/gw-5";
+    ok(fleet.until([&] { return seen(watcher, births) == 1; }), "  it is born");
+    fleet.until([] { return false; }, 1500);
+    ok(seen(watcher, births) == 1, "  once: the host online before its birth (a retained STATE) asks nothing");
+    hosts.publish("spBv1.0/STATE/late", "{\"online\":true,\"timestamp\":" + stamp() + "}", MQ_QOS_1, true);
+    ok(fleet.until([&] { return seen(watcher, births) == 2; }), "a host comes online later: the node is born again");
+    hosts.publish("spBv1.0/STATE/late", "{\"online\":false,\"timestamp\":" + stamp() + "}", MQ_QOS_1, true);
+    fleet.until([] { return false; }, 1500);
+    ok(seen(watcher, births) == 2, "  and its going offline asks nothing");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeRef ref;
+        ref.set_id("gw5");
+        v1::Empty none;
+        sparkplug->DeleteEdgeNode(&c, ref, &none);
+        grpc::ClientContext c2;
+        authorize(c2);
+        v1::ConnectionRef conn;
+        conn.set_id("edge5");
+        v1::DeleteConnectionReply deleted;
+        connections->Delete(&c2, conn, &deleted);
+    }
+    hosts.publish("spBv1.0/STATE/early", "", MQ_QOS_1, true);
+    hosts.publish("spBv1.0/STATE/late", "", MQ_QOS_1, true);
+    fleet.until([] { return false; }, 200);
+}
+
+void sparkplugHistoryAcrossRebirths(Server& server) {
+    section("what an edge node kept goes, every value, across rebirths and a redeclaration while it is sent");
+    auto connections = v1::Connections::NewStub(server.channel());
+    auto sparkplug = v1::Sparkplug::NewStub(server.channel());
+    Fleet fleet(server.broker.port());
+    Client& watcher = fleet.make("history-watcher");
+    watcher.subscribe("spBv1.0/plant6/#", MQ_QOS_1);
+    Client& primary = fleet.make("ph6-host");
+    ok(fleet.connected(watcher) && fleet.connected(primary) && fleet.until([&] { return watcher.subscribed >= 1; }),
+       "a watcher on the group");
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::ConnectionSpec edge;
+        edge.set_id("edge6");
+        edge.set_this_server(true);
+        edge.set_client_id("gw-6");
+        edge.set_keepalive_seconds(5);     // what was sent is confirmed after two keep-alives born
+        v1::ConnectionInfo info;
+        connections->Put(&c, edge, &info);
+    }
+    v1::SparkplugEdgeNodeSpec spec;
+    spec.set_id("gw6");
+    spec.set_connection("edge6");
+    spec.set_group("plant6");
+    spec.set_node("gw-6");
+    spec.set_primary_host_id("ph6");
+    spec.set_history_rate(0);              // as fast as the link takes it: some always queued
+    v1::SparkplugMetricDeclaration* level = spec.add_metrics();
+    level->set_name("Level");
+    level->set_datatype(v1::DATATYPE_DOUBLE);
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, spec, &info).ok() && !info.born(), "an edge node waiting for its primary host");
+    }
+    const int total = 3000;
+    uint32_t kept = 0;
+    for (int from = 1; from <= total; from += 500) {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugValuesRequest request;
+        request.set_edge_node("gw6");
+        for (int i = from; i < from + 500 && i <= total; i++) {
+            v1::SparkplugMetric* m = request.add_metrics();
+            m->set_name("Level");
+            m->mutable_value()->set_double_value(i);
+            m->set_timestamp(1793000000000ull + (uint64_t)i);
+        }
+        v1::SparkplugValuesReply reply;
+        sparkplug->SetValues(&c, request, &reply);
+        kept += reply.kept();
+    }
+    equal<uint32_t>("its host away: every value kept", kept, (uint32_t)total);
+    std::set<double> historical;
+    size_t decoded = 0;
+    auto decodeAll = [&] {
+        for (; decoded < watcher.got.size(); decoded++) {
+            const check::Got& g = watcher.got[decoded];
+            if (g.topic != "spBv1.0/plant6/NDATA/gw-6") continue;
+            grpc::ClientContext c;
+            authorize(c);
+            v1::SparkplugDecodeRequest request;
+            request.set_topic(g.topic);
+            request.set_payload(g.payload);
+            v1::SparkplugMessage out;
+            sparkplug->Decode(&c, request, &out);
+            for (const v1::SparkplugMetric& m : out.payload().metrics()) {
+                if (m.is_historical() && m.value().has_double_value()) historical.insert(m.value().double_value());
+            }
+        }
+    };
+    const v1::SparkplugEdgeNodeRef ref = [] { v1::SparkplugEdgeNodeRef r; r.set_id("gw6"); return r; }();
+    primary.publish("spBv1.0/STATE/ph6", "{\"online\":true,\"timestamp\":1793000000000}", MQ_QOS_1, true);
+    ok(fleet.until([&] { return seen(watcher, "spBv1.0/plant6/NBIRTH/gw-6") >= 1; }), "its host online: born");
+    // Rebirths while it sends: each withdraws what is still queued.
+    for (int i = 0; i < 4; i++) {
+        fleet.until([] { return false; }, 15);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::Empty none;
+        sparkplug->RebirthEdgeNode(&c, ref, &none);
+    }
+    {
+        // A redeclaration (one metric more) is a rebirth too.
+        v1::SparkplugMetricDeclaration* extra = spec.add_metrics();
+        extra->set_name("Extra");
+        extra->set_datatype(v1::DATATYPE_INT32);
+        grpc::ClientContext c;
+        authorize(c);
+        v1::SparkplugEdgeNodeInfo info;
+        ok(sparkplug->PutEdgeNode(&c, spec, &info).ok(), "  rebirths and a redeclaration while what it kept is sent");
+    }
+    ok(fleet.until([&] { return seen(watcher, "spBv1.0/plant6/NBIRTH/gw-6") >= 6; }), "  born six times");
+    size_t arrived = 0;
+    ok(fleet.until([&] {
+           decodeAll();
+           arrived = historical.size();
+           return arrived == (size_t)total;
+       }, 20000),
+       "  every value arrives, is_historical");
+    if (arrived != (size_t)total) std::printf("    (%zu of %d)\n", arrived, total);
+    v1::SparkplugEdgeNodeInfo info;
+    ok(fleet.until([&] {
+           grpc::ClientContext c;
+           authorize(c);
+           info = v1::SparkplugEdgeNodeInfo();
+           sparkplug->GetEdgeNode(&c, ref, &info);
+           return info.history() == 0;
+       }, 30000) && info.history_lost() == 0,
+       "  and nothing is counted lost; what it kept is empty once confirmed");
+    if (info.history() != 0 || info.history_lost() != 0) {
+        std::printf("    (%llu kept, %llu lost)\n", (unsigned long long)info.history(),
+                    (unsigned long long)info.history_lost());
+    }
+    {
+        grpc::ClientContext c;
+        authorize(c);
+        v1::Empty none;
+        sparkplug->DeleteEdgeNode(&c, ref, &none);
+        grpc::ClientContext c2;
+        authorize(c2);
+        v1::ConnectionRef conn;
+        conn.set_id("edge6");
+        v1::DeleteConnectionReply deleted;
+        connections->Delete(&c2, conn, &deleted);
+    }
+    primary.publish("spBv1.0/STATE/ph6", "", MQ_QOS_1, true);
+    fleet.until([] { return false; }, 200);
+}
+
 int main() {
     Server server;
     helloAndToken(server);
@@ -1910,6 +2210,8 @@ int main() {
     if (server.started) sparkplugEdgeNode(server);
     if (server.started) sparkplugStructures(server);
     if (server.started) sparkplugEdgeChanges(server);
+    if (server.started) sparkplugRebirthForHosts(server);
+    if (server.started) sparkplugHistoryAcrossRebirths(server);
     if (server.started) kafkaWithoutKafka(server);
     if (server.started) sessionCounters(server);
     if (server.started) listenersLive(server);

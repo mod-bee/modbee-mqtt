@@ -37,17 +37,27 @@
 // Longest topic this build will construct or accept.
 //
 // The specification sets no limit - MQTT's own is 65,535 - but a fixed buffer is
-// what lets a node build a topic inside a scan cycle without allocating. 128 is
-// four generous identifiers plus the namespace and separators, and anything
-// longer is refused by name rather than truncated: a truncated topic publishes
-// to the wrong place, which is worse than not publishing.
+// what lets a node build a topic inside a scan cycle without allocating. On a
+// board 128 is four generous identifiers plus the namespace and separators; on
+// a host, 512 holds three of the longest identifiers. Anything longer is
+// refused by name rather than truncated: a truncated topic publishes to the
+// wrong place, which is worse than not publishing.
 #ifndef MQ_SP_MAX_TOPIC
-#define MQ_SP_MAX_TOPIC 128
+    #if MQTT_LEAN
+    #define MQ_SP_MAX_TOPIC 128
+    #else
+    #define MQ_SP_MAX_TOPIC 512
+    #endif
 #endif
 
-// One identifier - group, node or device.
+// One identifier - group, node or device - with its terminator: at most 47
+// bytes on a board, 127 on a host (room for a UUID and a prefix).
 #ifndef MQ_SP_MAX_ID
-#define MQ_SP_MAX_ID 48
+    #if MQTT_LEAN
+    #define MQ_SP_MAX_ID 48
+    #else
+    #define MQ_SP_MAX_ID 128
+    #endif
 #endif
 
 // A parsed topic. The elements are copied rather than spanned, because a topic
@@ -84,6 +94,11 @@ struct MqttSparkplugTopicParts {
 // explicitly, but an empty element makes "a/b//d" - which parses as five
 // elements, one of them blank, and no Host Application will match it.
 bool mq_sparkplugValidId(const char* id);
+
+// Why `id` is not one, for a message: "is empty", "is too long" (past
+// MQ_SP_MAX_ID - 1 bytes), "has a '/', '+' or '#'" or "is not UTF-8"; nullptr
+// when it is valid.
+const char* mq_sparkplugIdProblem(const char* id);
 
 // --- Building ---
 //

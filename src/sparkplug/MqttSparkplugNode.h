@@ -426,6 +426,22 @@ public:
     bool hasPrimaryHost() const { return !_primaryHostId.empty(); }
     bool primaryHostOnline() const { return _primaryHostOnline; }
 
+    // --- Born again for every host that comes online. OFF by default ---
+    //
+    // A node is born once a session. A host that comes online later sees no
+    // birth and, with nothing to decode yet, has no reason to ask for one -
+    // so a node serving several hosts, none of them primary, is never learnt
+    // by a late one. On, the node also watches spBv1.0/STATE/+ and publishes
+    // a rebirth (the same session and bdSeq: what an NCMD rebirth does) when
+    // any host's online STATE arrives live - not the retained ones a new
+    // subscription is given, which were online before this birth - at most
+    // once a second, several hosts at once taking one. The primary host's own
+    // new session still cycles the session, as it must. Set before connect().
+    void rebirthOnHostOnline(bool on) { _rebirthOnHostOnline = on; }
+    bool rebirthOnHostOnline() const { return _rebirthOnHostOnline; }
+    // Rebirths it has published for a host that came online.
+    uint32_t hostRebirths() const { return _hostRebirths; }
+
     // --- Declaring metrics ---
     //
     // Returns the alias, or 0 on refusal - a full table, an invalid name, an
@@ -915,6 +931,9 @@ public:
 
     // Births and deaths published, for a function block to show.
     uint32_t birthCount() const { return _birthCount; }
+    // NBIRTHs alone: each starts a new picture, and withdraws the data still
+    // queued under the old one (rebirth()).
+    uint32_t nodeBirthCount() const { return _nodeBirthCount; }
 
     // The whole library, when this is not enough.
     MqttClient& client() { return _client; }
@@ -1296,6 +1315,13 @@ private:
     uint32_t _stateStale = 0;
     bool _lastStateOnline = false;
 
+    // rebirthOnHostOnline(): a host's live online STATE owes a rebirth, at
+    // most one a second.
+    bool _rebirthOnHostOnline = false;
+    bool _hostRebirthOwed = false;
+    uint32_t _hostRebirthAt = 0;
+    uint32_t _hostRebirths = 0;
+
     MqttResult _stateSubscribeRefused = MqttResult::Ok;
     MqttResult _commandSubscribeRefused = MqttResult::Ok;
     mutable char _waitText[160];
@@ -1393,6 +1419,7 @@ private:
     uint32_t _commandsRefused = 0;
     uint32_t _commandsApplied = 0;
     uint32_t _birthCount = 0;
+    uint32_t _nodeBirthCount = 0;
 
     uint32_t _tooLargeForServer = 0;
     uint32_t _serverWalks = 0;

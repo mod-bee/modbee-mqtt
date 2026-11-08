@@ -93,6 +93,7 @@ struct AppConnectionSpec {
     std::string password;        // never read back
     bool tls = false;
     std::string caPem;           // "" the system's trust store
+    std::string serverName;      // SNI and the name checked; "" the endpoint's host
     std::string certificatePem, keyPem;   // mutual TLS; the key never read back
     uint8_t protocol = 5;
     uint32_t keepaliveSeconds = 30;
@@ -138,6 +139,11 @@ struct AppConnectionInfo {
     uint64_t storedExpired = 0;             // their Message Expiry Interval ran out while they waited
     AppKafkaLinkStatus link;                // spec.kafka: what its link is doing
 };
+
+// "" when `id` is a Sparkplug id (group, node, device or host); else the
+// refusal, naming it, what it is and why: `host_id "x" is 50 bytes; a Sparkplug
+// id here is at most 127`.
+std::string sparkplugIdRefusal(const char* what, const std::string& id);
 
 // A Sparkplug B Host Application the server runs on one of its connections
 // (the library's MqttSparkplugHost, sharing the connection's client): STATE
@@ -235,6 +241,7 @@ struct AppSparkplugTemplateDefinition {
 struct AppSparkplugEdgeNodeSpec {
     std::string id, connection, group, node;
     std::string primaryHostId;             // "": born whenever connected
+    bool rebirthOnHostOnline = false;      // born again for each host whose STATE comes online
     std::vector<std::string> devices;
     std::vector<AppSparkplugMetricDeclaration> metrics;
     // What it keeps while not born - values, bytes, age; 0: no limit of that
@@ -425,6 +432,7 @@ private:
     void open(Connection& connection);
     void close(Connection& connection);
     void service(Connection& connection);
+    void subscribeFilters(Connection& connection, bool fresh);
     void forward(Connection& connection);     // what store and forward holds, to the other broker
     void store(Connection& connection, const AppPublish& message,
                std::function<void(const AppPublishResult&)> done);

@@ -210,14 +210,14 @@ bool MqttTlsTransport::startSession() {
     // SNI. Without it a broker serving several names has no way to choose a
     // certificate, and hands over whichever one is first - which then fails
     // hostname verification for reasons that look nothing like the cause.
-    SSL_set_tlsext_host_name((SSL*)_ssl, _host.c_str());
+    SSL_set_tlsext_host_name((SSL*)_ssl, nameChecked().c_str());
 
     if (_validate && !pinning()) {
         // Hostname verification, which is SEPARATE from chain verification and
         // is the half most often left out. A certificate can be perfectly
         // valid, signed by a CA we trust, and issued to somebody else.
         const mq_tls::HostnameCheck armed =
-            mq_tls::expectHostname((SSL*)_ssl, _host.c_str());
+            mq_tls::expectHostname((SSL*)_ssl, nameChecked().c_str());
         // Deferred rather than skipped - see expectHostname(). wolfSSL will
         // not take a hostname with no dot in it, so the comparison happens
         // against the peer's certificate in finishHandshake() instead.
@@ -313,8 +313,8 @@ bool MqttTlsTransport::finishHandshake() {
         // asked for, which is a separate question and the one more often
         // skipped.
         if (_validate && _checkHostAfterHandshake &&
-            !mq_tls::verifyPeerHostname((SSL*)_ssl, _host.c_str())) {
-            fail("the broker's certificate was not issued to " + _host);
+            !mq_tls::verifyPeerHostname((SSL*)_ssl, nameChecked().c_str())) {
+            fail("the broker's certificate was not issued to " + nameChecked());
             return false;
         }
         return true;

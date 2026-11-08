@@ -9,6 +9,7 @@
 #include "MqttClient.h"
 #include "sparkplug/MqttSparkplugHost.h"
 #include "sparkplug/MqttSparkplugNode.h"
+#include "sparkplug/MqttSparkplugTopic.h"
 #include "transport/MqttTcpTransport.h"
 #if MQTT_TLS_SOCKETS
 #include "transport/MqttTlsTransport.h"
@@ -208,6 +209,7 @@ std::string toJson(const AppConnectionSpec& s) {
     if (s.hasPassword) o.add("password", s.password);
     o.add("tls", s.tls);
     o.add("ca", s.caPem);
+    if (!s.serverName.empty()) o.add("serverName", s.serverName);
     o.add("certificate", s.certificatePem);
     o.add("key", s.keyPem);
     o.add("protocol", (long long)s.protocol);
@@ -271,6 +273,7 @@ bool fromJson(const json::Value& v, AppConnectionSpec& s) {
     s.password = v.str("password");
     s.tls = v.flag("tls");
     s.caPem = v.str("ca");
+    s.serverName = v.str("serverName");
     s.certificatePem = v.str("certificate");
     s.keyPem = v.str("key");
     s.protocol = (uint8_t)v.integer("protocol", 5);
@@ -443,6 +446,7 @@ struct AppConnections::EdgeNode {
     std::vector<Sent> sentHistory;
     uint32_t walksSeen = 0;      // the node's serverWalks() last acted on
     uint64_t sentUpTo[2] = {0, 0};   // by class: history_first's, then the rest
+    uint32_t birthsSeen = 0;     // the node's nodeBirthCount() the sent history went out under
     // history_rate: values it may send now, filled as time passes.
     double tokens = 0;
     Clock::time_point tokensAt;
@@ -692,6 +696,18 @@ struct AppConnections::Connection {
 #if MQTT_TLS_SOCKETS
     const MqttTlsTransport* tls = nullptr;
 #endif
+    // THE GROUPS' FILTERS FIRST IN EVERY SESSION. A host on the connection
+    // publishes its STATE birth as its session begins, and Sparkplug wants
+    // the namespace subscribed before that [tck-id-host-topic-phid-birth-sub-
+    // required]: a host that watches one group subscribes only that group,
+    // and the spBv1.0/# its consumers' groups want went after the STATE. A
+    // layer sees the session begin in the order it attached, so this one is
+    // attached before any host or edge node. Declared before the client,
+    // which is destroyed first and never reaches it again.
+    struct Filters : MqttClientHook {
+        Connection* connection = nullptr;
+        void sessionEstablished(bool) override { connection->owner->subscribeFilters(*connection, true); }
+    } filters;
     MqttClient client;
 
     AppConnectionState state = AppConnectionState::Connecting;
@@ -725,6 +741,7 @@ struct AppConnections::Connection {
 
     std::map<std::string, uint8_t> subscribed; // what the remote broker has been asked for, with its options
     bool filtersChanged = true;
+    bool filtersThisSession = false;       // subscribed as this session began
 
     // The first server, while connected to another: is it back?
     std::unique_ptr<MqttTcpTransport> probe;
@@ -1075,6 +1092,7 @@ void AppConnections::open(Connection& c) {
         // This server, over loopback: its own certificate, not checked.
         if (c.spec.thisServer) tls->setInsecureNoCertificateValidation();
         if (!c.spec.caPem.empty()) tls->setCaCertificate(c.spec.caPem.c_str());
+        tls->setExpectedHostname(c.spec.serverName.c_str());
         if (!c.spec.certificatePem.empty() && !_directory.empty()) {
             const std::string base = _directory + "/" + c.spec.id;
             writePrivate(base + ".crt", c.spec.certificatePem);
@@ -1116,6 +1134,8 @@ void AppConnections::open(Connection& c) {
     behaviour.transmitBufferSize = buffer;
     behaviour.initialBufferSize = c.spec.kafka ? 0 : kPacketStartBytes;
     c.client.begin(*c.transport, connection, behaviour);
+    c.filters.connection = &c;
+    c.client.attach(c.filters);                // before the host's and the edge node's
     c.client.onMessage(&Connection::received, &c);
     c.client.onSessionEstablished(&Connection::established, &c);
     c.state = AppConnectionState::Connecting;
@@ -1137,6 +1157,7 @@ void AppConnections::startEdgeNode(Connection& c) {
         node.group(e->spec.group.c_str());
         node.node(e->spec.node.c_str());
         if (!e->spec.primaryHostId.empty()) node.primaryHost(e->spec.primaryHostId.c_str());
+        node.rebirthOnHostOnline(e->spec.rebirthOnHostOnline);
         node.epochNow((uint64_t)utcNowMs());
         for (const std::string& d : e->spec.devices) node.addDevice(d.c_str());
         // The definitions first: an instance set later is checked against them.
@@ -1233,6 +1254,15 @@ void AppConnections::sendHistory(Connection& c) {
         e.tokens = 0;
         e.tokensAt = Clock::now();
         return;
+    }
+    // BORN AGAIN SINCE (a rebirth: a host asked, declarations changed). A
+    // rebirth withdraws the data still queued - history counted as sent among
+    // it - so what is not yet confirmed goes again after the new birth, in
+    // its order, as after a session that ended: a value twice, never a gap.
+    if (node.nodeBirthCount() != e.birthsSeen) {
+        e.birthsSeen = node.nodeBirthCount();
+        e.sentHistory.clear();
+        e.sentUpTo[0] = e.sentUpTo[1] = 0;
     }
     const Clock::time_point now = Clock::now();
     const std::chrono::seconds hold(2 * std::max<uint32_t>(c.spec.keepaliveSeconds, 5));
@@ -1569,6 +1599,28 @@ void AppConnections::close(Connection& c) {
     c.inClient.clear();
 }
 
+// What the groups on it want. As a session begins (`fresh`), every one, before
+// any host's or edge node's own; after, what changed. A filter asked for again
+// with other options is subscribed again: the remote broker replaces it.
+void AppConnections::subscribeFilters(Connection& c, bool fresh) {
+    c.filtersChanged = false;
+    if (fresh) {
+        c.subscribed.clear();
+        c.filtersThisSession = true;
+    }
+    const std::map<std::string, uint8_t> want = _hub.filtersFor(c.spec.id);
+    for (const auto& filter : want) {
+        auto had = c.subscribed.find(filter.first);
+        if (had == c.subscribed.end() || had->second != filter.second) {
+            c.client.subscribeWithOptions(filter.first.c_str(), filter.second);
+        }
+    }
+    for (const auto& filter : c.subscribed) {
+        if (!want.count(filter.first)) c.client.unsubscribe(filter.first.c_str());
+    }
+    c.subscribed = want;
+}
+
 void AppConnections::service(Connection& c) {
     const Clock::time_point now = Clock::now();
     c.client.poll();
@@ -1661,8 +1713,12 @@ void AppConnections::service(Connection& c) {
             c.reachedThisAttempt = true;
             c.stateBorn = false;
             c.upSince = now;
-            c.filtersChanged = true;
-            c.subscribed.clear();
+            // Subscribed as the session began (Connection::filters); again
+            // only if a group changed since.
+            if (!c.filtersThisSession) {
+                c.filtersChanged = true;
+                c.subscribed.clear();
+            }
             c.nextProbe = now + std::chrono::seconds((uint64_t)c.spec.primaryCheckSeconds
                                                      << std::min<uint32_t>(c.primaryFailures, 6));
             c.setState(AppConnectionState::Connected);
@@ -1713,22 +1769,8 @@ void AppConnections::service(Connection& c) {
     forward(c);
 
     // --- Subscriptions: what the groups on it want ---
-    if (c.filtersChanged) {
-        c.filtersChanged = false;
-        const std::map<std::string, uint8_t> want = _hub.filtersFor(c.spec.id);
-        // A filter asked for again with other options is subscribed again: the
-        // remote broker replaces the subscription.
-        for (const auto& filter : want) {
-            auto had = c.subscribed.find(filter.first);
-            if (had == c.subscribed.end() || had->second != filter.second) {
-                c.client.subscribeWithOptions(filter.first.c_str(), filter.second);
-            }
-        }
-        for (const auto& filter : c.subscribed) {
-            if (!want.count(filter.first)) c.client.unsubscribe(filter.first.c_str());
-        }
-        c.subscribed = want;
-    }
+    c.filtersThisSession = false;
+    if (c.filtersChanged) subscribeFilters(c, false);
 
     // --- Back to the first server, once it answers ---
     // Not while an edge node on it follows a primary host: where to be is then
@@ -2212,19 +2254,25 @@ AppSparkplugHostInfo hostInfoOf(const AppSparkplugHostSpec& spec, const AppConne
 
 } // namespace
 
+std::string sparkplugIdRefusal(const char* what, const std::string& id) {
+    const std::string refusal = std::string(what) + " \"" + id + "\" is not a Sparkplug id: ";
+    if (id.size() + 1 > MQ_SP_MAX_ID) {
+        return refusal + "it is " + std::to_string(id.size()) + " bytes, and one here is at most " +
+               std::to_string(MQ_SP_MAX_ID - 1);
+    }
+    if (id.find('\0') != std::string::npos) return refusal + "it has a NUL";
+    const char* problem = mq_sparkplugIdProblem(id.c_str());
+    return problem == nullptr ? "" : refusal + "it " + problem;
+}
+
 bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostInfo* info, std::string& error) {
     if (spec.id.empty() || spec.connection.empty()) {
         error = "a host needs an id and the connection it runs on";
         return false;
     }
-    if (!mq_sparkplugValidId(spec.hostId.c_str())) {
-        error = "host_id \"" + spec.hostId + "\" is not a Sparkplug id (no '/', '+' or '#')";
-        return false;
-    }
-    if (!spec.group.empty() && !mq_sparkplugValidId(spec.group.c_str())) {
-        error = "group \"" + spec.group + "\" is not a Sparkplug id";
-        return false;
-    }
+    error = sparkplugIdRefusal("host_id", spec.hostId);
+    if (error.empty() && !spec.group.empty()) error = sparkplugIdRefusal("group", spec.group);
+    if (!error.empty()) return false;
     bool ok = true;
     call([&] {
         auto on = _connections.find(spec.connection);
@@ -2418,6 +2466,10 @@ bool AppConnections::nodes(const std::string& host, const std::string& group, co
 bool AppConnections::rebirth(const std::string& host, const std::string& group, const std::string& node,
                              const std::string& device, std::string& error) {
     bool sent = false;
+    error = sparkplugIdRefusal("group", group);
+    if (error.empty()) error = sparkplugIdRefusal("node", node);
+    if (error.empty() && !device.empty()) error = sparkplugIdRefusal("device", device);
+    if (!error.empty()) return false;
     call([&] {
         auto spec = _hosts.find(host);
         if (spec == _hosts.end()) {
@@ -2438,7 +2490,7 @@ bool AppConnections::rebirth(const std::string& host, const std::string& group, 
             yes.as.boolean = true;
             sent = h.library->commandDevice(group.c_str(), node.c_str(), device.c_str(), "Device Control/Rebirth", yes);
         }
-        if (!sent) error = "it could not be sent (a group or node that is not a Sparkplug id?)";
+        if (!sent) error = "it could not be sent";
     });
     return sent;
 }
@@ -2470,6 +2522,7 @@ AppSparkplugEdgeNodeInfo edgeInfoOf(const AppSparkplugEdgeNodeSpec& spec, const 
         info.spec.group = spec.group;
         info.spec.node = spec.node;
         info.spec.primaryHostId = spec.primaryHostId;
+        info.spec.rebirthOnHostOnline = spec.rebirthOnHostOnline;
         info.spec.devices = spec.devices;
         info.spec.historyMax = spec.historyMax;
         info.spec.historyMaxBytes = spec.historyMaxBytes;
@@ -2508,14 +2561,15 @@ bool checkEdgeSpec(const AppSparkplugEdgeNodeSpec& spec, std::string& error) {
         error = "an edge node needs an id and the connection it runs on";
         return false;
     }
-    if (!mq_sparkplugValidId(spec.group.c_str()) || !mq_sparkplugValidId(spec.node.c_str())) {
-        error = "group and node are Sparkplug ids (no '/', '+' or '#')";
-        return false;
-    }
+    error = sparkplugIdRefusal("group", spec.group);
+    if (error.empty()) error = sparkplugIdRefusal("node", spec.node);
+    if (!error.empty()) return false;
     std::set<std::string> devices;
     for (const std::string& d : spec.devices) {
-        if (!mq_sparkplugValidId(d.c_str()) || !devices.insert(d).second) {
-            error = "device \"" + d + "\": a Sparkplug id (no '/', '+' or '#'), once";
+        error = sparkplugIdRefusal("device", d);
+        if (!error.empty()) return false;
+        if (!devices.insert(d).second) {
+            error = "device \"" + d + "\" is named twice";
             return false;
         }
     }
@@ -2562,7 +2616,7 @@ bool checkEdgeSpec(const AppSparkplugEdgeNodeSpec& spec, std::string& error) {
 // Born anew for these: they are its session's.
 bool sameSession(const AppSparkplugEdgeNodeSpec& a, const AppSparkplugEdgeNodeSpec& b) {
     return a.connection == b.connection && a.group == b.group && a.node == b.node &&
-           a.primaryHostId == b.primaryHostId;
+           a.primaryHostId == b.primaryHostId && a.rebirthOnHostOnline == b.rebirthOnHostOnline;
 }
 
 // The current values of one device's metrics (-1: the node's own), by name,
@@ -3146,6 +3200,7 @@ void AppConnections::saveHosts() {
         o.add("primaryHostId", n.primaryHostId).add("historyMax", (long long)n.historyMax);
         o.add("historyMaxBytes", (long long)n.historyMaxBytes).add("historyMaxAgeMs", (long long)n.historyMaxAgeMs);
         o.add("historyRate", (long long)n.historyRate);
+        if (n.rebirthOnHostOnline) o.add("rebirthOnHostOnline", true);
         o.raw("devices", json::array(n.devices));
         std::string metrics = "[";
         for (size_t i = 0; i < n.metrics.size(); i++) {
@@ -3194,6 +3249,7 @@ bool AppConnections::loadHosts(std::string& error) {
             n.historyMaxBytes = (uint64_t)v.integer("historyMaxBytes", 0);
             n.historyMaxAgeMs = (uint64_t)v.integer("historyMaxAgeMs", 0);
             n.historyRate = (uint32_t)v.integer("historyRate", 1000);
+            n.rebirthOnHostOnline = v.flag("rebirthOnHostOnline", false);
             v.strings("devices", n.devices);
             for (const json::Value& d : v["metrics"].items) {
                 AppSparkplugMetricDeclaration m;

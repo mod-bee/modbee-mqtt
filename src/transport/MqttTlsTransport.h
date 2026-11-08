@@ -52,6 +52,11 @@ public:
 
     void configure(const char* host, uint16_t port);
 
+    // The name the broker's certificate must be issued to, and sent as SNI,
+    // when it is not the host dialled: a broker reached at a site address or
+    // an IP whose certificate names the product. "" (the default): the host.
+    void setExpectedHostname(const char* name) { _expectedHostname = name ? name : ""; }
+
     // The same two as MqttTcpTransport: how long the host name's last known
     // addresses may be dialled when DNS does not answer (seconds, 24 hours
     // unless set, 0 never), and the kernel's give-up time for unacknowledged
@@ -123,6 +128,8 @@ public:
 
 private:
     std::string _host;
+    std::string _expectedHostname;
+    const std::string& nameChecked() const { return _expectedHostname.empty() ? _host : _expectedHostname; }
     uint16_t _port = 0;
 
     std::string _caFile;

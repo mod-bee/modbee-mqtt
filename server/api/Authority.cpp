@@ -216,6 +216,12 @@ struct Authority::Shard {
     struct Kept {
         std::string login;               // the CONNECT's user name, for revoke and forget
         AuthorityDecision decision;      // allowed, or a refusal; never Unavailable
+        // Revoke, Regrant and Forget name a login: the CONNECT's user name or
+        // the one the decision gave the session (a certificate's login, say).
+        // Kept under either, or a revoked login's allowance would still serve.
+        bool belongsTo(const std::string& who) const {
+            return who == login || (decision.hasLogin && who == decision.login);
+        }
         Clock::time_point fresh;         // answered from without asking until
         Clock::time_point stale;         // allowed: still serves while the application is away
         std::list<std::string>::iterator place;
@@ -272,7 +278,7 @@ struct Authority::Shard {
     size_t forgetLogin(const std::string& login) {
         size_t count = 0;
         for (auto at = kept.begin(); at != kept.end();) {
-            if (login.empty() || at->second.login == login) {
+            if (login.empty() || at->second.belongsTo(login)) {
                 order.erase(at->second.place);
                 at = kept.erase(at);
                 count++;
@@ -649,7 +655,7 @@ void Authority::service(uint32_t index, MqttBroker& broker) {
                                              &regrantFor, &made, &removed);
             change.removed = removed;
             for (auto& entry : shard.kept) {
-                if (entry.second.login != command->login || !entry.second.decision.allow) continue;
+                if (!entry.second.belongsTo(command->login) || !entry.second.decision.allow) continue;
                 entry.second.decision.scope = command->scope;
                 entry.second.fresh = Clock::now() + std::chrono::seconds(command->ttlSeconds);
                 entry.second.stale = entry.second.fresh + std::chrono::seconds(_config.staleForSeconds);

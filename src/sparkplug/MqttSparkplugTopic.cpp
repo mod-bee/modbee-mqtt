@@ -52,29 +52,31 @@ bool copyId(char* out, size_t capacity, const char* from, size_t length) {
 }  // namespace
 
 bool mq_sparkplugValidId(const char* id) {
-    if (id == nullptr) return false;
+    return mq_sparkplugIdProblem(id) == nullptr;
+}
+
+const char* mq_sparkplugIdProblem(const char* id) {
+    if (id == nullptr) return "is empty";
 
     const size_t length = strlen(id);
-    if (length == 0) return false;
-    if (length + 1 > MQ_SP_MAX_ID) return false;
+    if (length == 0) return "is empty";
+    if (length + 1 > MQ_SP_MAX_ID) return "is too long";
 
     for (size_t index = 0; index < length; index++) {
         const char value = id[index];
         // The three reserved characters.
         // [tck-id-topic-structure-namespace-valid-group-id] and siblings.
-        if (value == '+' || value == '/' || value == '#') return false;
-        // A NUL inside a UTF-8 string is refused by MQTT itself
-        // [V5:MQTT-1.5.4-2], and strlen would have stopped here anyway - this
-        // is here so the reason is written down rather than implied.
-        if (value == '\0') return false;
+        if (value == '+' || value == '/' || value == '#') return "has a '/', '+' or '#'";
     }
 
     // Valid UTF-8, using the library's own validator rather than a second
     // implementation. The specification says "a valid UTF-8 string", and MQTT
     // already requires that of every topic, so a topic element that fails this
     // would be refused by the transport anyway - but it is refused here, where
-    // the error can name the identifier.
-    return mq_validateUtf8((const uint8_t*)id, length) == MqttError::None;
+    // the error can name the identifier. (A NUL inside a UTF-8 string is
+    // refused by MQTT itself [V5:MQTT-1.5.4-2]; strlen stops at one.)
+    if (mq_validateUtf8((const uint8_t*)id, length) != MqttError::None) return "is not UTF-8";
+    return nullptr;
 }
 
 size_t mq_sparkplugBuildTopic(char* out, size_t capacity,

@@ -11,6 +11,52 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+Fixes found by the platform on 0.1.4: a Sparkplug command to something not born is refused instead of sent nameless,
+history is no longer lost to a rebirth while it is being sent, a host's STATE no longer goes before its consumers'
+subscriptions, and a revoked login's kept allowance goes with it.
+
+Changes on upgrade: `Sparkplug.Write` answers `FAILED_PRECONDITION` (`sent: false`) for a node or device that is not
+born now, where it sent the command and said `sent: true`; a Sparkplug id may be 127 bytes on the server, was 47;
+`ClientTls.server_name` is now the name checked.
+
+### Added
+
+- **`SparkplugEdgeNodeSpec.rebirth_on_host_online`** (and `MqttSparkplugNode::rebirthOnHostOnline()`): an edge node
+  serving several hosts, none of them its primary, is born again (the same session and bdSeq) when a host's STATE
+  comes online after its birth - at most once a second, hosts arriving together sharing one. A host that came online
+  later saw no birth and, with no data to decode, never asked for one. Off by default; the retained STATE of a host
+  already online asks nothing.
+
+### Fixed
+
+- **`Sparkplug.Write` sent a command its edge node could not read, and said it was delivered.** A write to a device
+  that had died, or to a node or device this host had no live birth of, went with the old session's alias and no
+  name - or, for a device never born, by a name it did not have - and answered `sent: true`. It is now refused,
+  `FAILED_PRECONDITION` and `sent: false`, naming the node, device or metric that is not born, so the caller can
+  lease or rebirth it and write again. A write's group, node and device are checked as Sparkplug ids first.
+- **History lost to a rebirth while it was being sent.** A rebirth - a host's request, `RebirthEdgeNode`, a
+  redeclaration, a host coming online - withdraws the data still queued, as Sparkplug requires, history the server
+  had already counted as sent among it; two keep-alives later that history left the disk, never sent and not counted
+  in `history_lost`. In a test of 3,000 kept values and five rebirths while they went, 320 never arrived. What was
+  sent and not yet confirmed now goes again after the new birth, in its order: a value may arrive twice, never not at
+  all.
+- **A host's STATE birth before its consumers' subscriptions.** On a managed connection, a host following one group
+  subscribed that group and published its STATE birth as the session began; the `spBv1.0/#` its consumers' groups
+  wanted went after, so the Eclipse Sparkplug TCK's SessionEstablishmentTest failed three assertions ("Namespace topic
+  filter is missing"). The groups' filters are now subscribed first in every session, before any host or edge node
+  on the connection.
+- **"Not a Sparkplug id" did not say why, and the server's limit was a board's.** Group, node, device and host ids
+  were refused past 47 bytes - a UUID and a prefix is a natural id, and Sparkplug sets no limit - with a message
+  naming only `/`, `+` and `#`. On the server an id may now be 127 bytes (a board's build keeps 47), and every refusal
+  - `PutHost`, `PutEdgeNode`, `PutDevice`, `Write`, `Rebirth` - names the id and says why: its length and the limit,
+  the character it has, empty, or not UTF-8 (`mq_sparkplugIdProblem()` in the library).
+- **`ClientTls.server_name` was not used.** The name checked, and sent as SNI, was always the endpoint's host, so a
+  panel reaching its gateway at a site address needed the gateway's certificate to name that address. It is now
+  `server_name` when set (`MqttTlsTransport::setExpectedHostname()`), the host when not.
+- **`Authority.Revoke` left a kept allowance of a login a decision named.** A decision kept for a CONNECT was filed
+  under the CONNECT's user name only, so revoking the login the decision gave the session - a certificate's, say -
+  left it to let the next CONNECT in without asking. It is now kept under both, for `Revoke`, `Regrant` and `Forget`.
+
 ## [0.1.4]
 
 Every value `Sparkplug.SetValues` is given goes, not only the last of each metric; and the server is several
