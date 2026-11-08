@@ -11,6 +11,8 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.5]
+
 Fixes found by the platform on 0.1.4: a Sparkplug command to something not born is refused instead of sent nameless,
 history is no longer lost to a rebirth while it is being sent, a host's STATE no longer goes before its consumers'
 subscriptions, and a revoked login's kept allowance goes with it.
@@ -633,7 +635,10 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mod-bee/modbee-mqtt/releases/tag/v0.1.0
