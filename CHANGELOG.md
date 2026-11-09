@@ -11,6 +11,16 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.6]
+
+A fix found by the platform on 0.1.5: a server edge node's live values that had not been proven delivered were lost
+when the server was killed, or the power cut, before it noticed its link had died. They are now kept on disk and
+sent after the restart, as history.
+
+Changes on upgrade: none to configure. `outbox.db` gains a table (an older server ignores it). An edge node proves
+delivery every second while values flow (an UNSUBSCRIBE of a filter it never subscribed, about 40 bytes, and its
+UNSUBACK); with `MODBEE_SESSIONS_SYNC=full`, each `SetValues` waits for one disk sync.
+
 ### Fixed
 
 - **A server edge node's live values lost when the server was killed on a link that had died unnoticed.** Values
@@ -24,7 +34,8 @@ minor version may change the API or the configuration, and says how here.
 - **Values that had arrived sent again after a link that died.** Delivery is now proven every second while values
   flow, not every half keep-alive, so after a link dies at most the last second's values may arrive twice; and a
   value sent as history from the outbox is no longer also held by the replay window, which sent it twice
-  (`MqttSparkplugNode::replayKeepsHistory(false)`; a node on a board still holds its history by default).
+  (`MqttSparkplugNode::replayKeepsHistory(false)`; a node on a board still holds its history by default). The
+  window also follows the edge node's `history_max_age`, as the outbox does.
 
 ### Added
 
@@ -656,7 +667,8 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.2...v0.1.3
