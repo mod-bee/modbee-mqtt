@@ -513,6 +513,11 @@ const MqttSparkplugPoint* MqttSparkplugNode::pointAt(size_t index) const {
     return &_points[index];
 }
 
+const char* MqttSparkplugNode::deviceOf(size_t index) const {
+    if (index >= _pointCount || _points[index].device < 0) return nullptr;
+    return _devices[(size_t)_points[index].device].id.c_str();
+}
+
 const MqttSparkplugPoint* MqttSparkplugNode::findPoint(const char* name) const {
     const int index = findPointIndex(name, -1);
     return index < 0 ? nullptr : &_points[index];
@@ -2105,6 +2110,17 @@ void MqttSparkplugNode::stateChanged(MqttState state, MqttResult reason) {
         _rebirthDeferred = false;
         // A probe on a connection that has gone proves nothing.
         _replayProbeInFlight = false;
+        // GONE PART WAY THROUGH A REPLAY: those sent again went to the back,
+        // behind the ones still owed, which are newer. The owed go behind
+        // them too, so the next replay is oldest first again.
+        if (_replayOwed && _replayOwedCount > 0) {
+            for (size_t moved = 0; moved < _replayOwedCount; moved++) {
+                const ReplayEntry entry = _replay[_replayFirst];
+                _replayFirst = (_replayFirst + 1) % _replayDepth;
+                _replay[(_replayFirst + _replayCount - 1) % _replayDepth] = entry;
+            }
+            _replayOwedCount = 0;
+        }
         _replayOwed = false;
         if (!_born) return;
         // NOT OURS: the link went. What the window still holds may be in a
@@ -2853,7 +2869,8 @@ bool MqttSparkplugNode::publishRecords(const MqttSparkplugRecord* records,
         _seq = sequenceBefore;
         return false;
     }
-    replayRecord(_outbound, device);
+    // History too, unless its caller keeps it (replayKeepsHistory()).
+    if (!historical || _replayHistory) replayRecord(_outbound, device);
 
     if (!historical) {
         // Live: what went is now the metric's value and its reference, so
@@ -2903,6 +2920,7 @@ void MqttSparkplugNode::withdrawData() {
 // arrives after everything written before it on the same connection.
 
 bool MqttSparkplugNode::replayWindow(size_t entries, uint32_t maxAgeMs) {
+    if (_replayCount > 0) replayTell(MqttSparkplugReplayEvent::Cleared, nullptr);
     mq_freeLarge(_replay);
     _replay = nullptr;
     _replayDepth = 0;
@@ -2928,7 +2946,65 @@ bool MqttSparkplugNode::replayWindow(size_t entries, uint32_t maxAgeMs) {
     return true;
 }
 
+void MqttSparkplugNode::replayTell(MqttSparkplugReplayEvent event,
+                                   const ReplayEntry* entry) {
+    if (_replayJournal == nullptr) return;
+    MqttSparkplugReplayChange change;
+    change.event = event;
+    if (entry != nullptr) {
+        change.serial = entry->serial;
+        change.point = entry->point;
+        change.timestamp = entry->timestamp;
+        change.quality = entry->quality;
+        if (entry->point < _pointCount) change.value.type = _points[entry->point].type;
+        change.value.isNull = entry->isNull != 0;
+        if (!change.value.isNull) mq_spSetBits(change.value, entry->bits);
+    }
+    _replayJournal(_replayJournalContext, change);
+}
+
+void MqttSparkplugNode::replayDropFront() {
+    replayTell(MqttSparkplugReplayEvent::Released, &_replay[_replayFirst]);
+    _replayFirst = (_replayFirst + 1) % _replayDepth;
+    _replayCount--;
+}
+
+bool MqttSparkplugNode::replayRestore(uint64_t serial, size_t point,
+                                      const MqttSparkplugValue& value,
+                                      uint64_t timestamp, int32_t quality) {
+    if (_replay == nullptr || _born || point >= _pointCount) return false;
+    if (value.isSpan() || value.type != _points[point].type) return false;
+    if (_replayCount == _replayDepth) {
+        replayDropFront();
+        _replayLost++;
+    }
+    ReplayEntry& entry = _replay[(_replayFirst + _replayCount) % _replayDepth];
+    entry.point = (uint32_t)point;
+    entry.timestamp = timestamp;
+    entry.isNull = value.isNull ? 1 : 0;
+    entry.bits = value.isNull ? 0 : mq_spBitsOf(value);
+    entry.epoch = _replayEpoch;
+    entry.quality = quality;
+    entry.serial = serial;
+    if (serial >= _replaySerial) _replaySerial = serial + 1;
+    _replayCount++;
+    // As a session that ended uncleanly leaves it: owed to the next birth.
+    _replayCarried = true;
+    return true;
+}
+
+bool MqttSparkplugNode::replayProveNow() {
+    if (_replay == nullptr || _replayCount == 0 || _replayProbeInFlight || _replayOwed) {
+        return false;
+    }
+    if (!_born || !_client.isConnected()) return false;
+    _replayProbedAt = mq_millis() - 0x7FFFFFFFu;   // due: replayService() sends it
+    replayService();
+    return _replayProbeInFlight;
+}
+
 void MqttSparkplugNode::replayForget() {
+    if (_replayCount > 0) replayTell(MqttSparkplugReplayEvent::Cleared, nullptr);
     _replayFirst = 0;
     _replayCount = 0;
     _replayOwedCount = 0;
@@ -2946,8 +3022,7 @@ void MqttSparkplugNode::replayKeep(size_t point, const MqttSparkplugValue& value
     }
     if (_replayCount == _replayDepth) {
         // FULL: the oldest goes - it is the likeliest to have arrived.
-        _replayFirst = (_replayFirst + 1) % _replayDepth;
-        _replayCount--;
+        replayDropFront();
         _replayLost++;
     }
     ReplayEntry& entry = _replay[(_replayFirst + _replayCount) % _replayDepth];
@@ -2957,7 +3032,9 @@ void MqttSparkplugNode::replayKeep(size_t point, const MqttSparkplugValue& value
     entry.bits = value.isNull ? 0 : mq_spBitsOf(value);
     entry.epoch = _replayEpoch;
     entry.quality = quality;
+    entry.serial = _replaySerial++;
     _replayCount++;
+    replayTell(MqttSparkplugReplayEvent::Held, &entry);
 }
 
 void MqttSparkplugNode::replayRecord(const MqttSparkplugPayload& payload,
@@ -3001,8 +3078,7 @@ void MqttSparkplugNode::replayProbed(void* context, MqttResult result,
     if (node->_replayOwed) return;
     while (node->_replayCount > 0 &&
            node->_replay[node->_replayFirst].epoch != node->_replayEpoch) {
-        node->_replayFirst = (node->_replayFirst + 1) % node->_replayDepth;
-        node->_replayCount--;
+        node->replayDropFront();
     }
 }
 
@@ -3070,8 +3146,7 @@ bool MqttSparkplugNode::replayFlush() {
             // A device gone for good (deviceOffline()) has no birth for its
             // history to follow: let go, and counted.
             _replayLost++;
-            _replayFirst = (_replayFirst + 1) % _replayDepth;
-            _replayCount--;
+            replayDropFront();
             _replayOwedCount--;
             continue;
         }
@@ -3132,14 +3207,17 @@ bool MqttSparkplugNode::replayFlush() {
         _outbound.clear();
         for (size_t index = 0; index < taken; index++) {
             ReplayEntry entry = _replay[_replayFirst];
-            _replayFirst = (_replayFirst + 1) % _replayDepth;
-            _replayCount--;
-            _replayOwedCount--;
             if (_replayMaxAge != 0 && now > entry.timestamp &&
                 now - entry.timestamp > _replayMaxAge) {
+                replayDropFront();
+                _replayOwedCount--;
                 _replayLost++;
                 continue;
             }
+            // Sent again, still held: the same serial, so a journal keeps it.
+            _replayFirst = (_replayFirst + 1) % _replayDepth;
+            _replayCount--;
+            _replayOwedCount--;
             entry.epoch = _replayEpoch;
             _replay[(_replayFirst + _replayCount) % _replayDepth] = entry;
             _replayCount++;

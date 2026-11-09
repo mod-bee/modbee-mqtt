@@ -495,7 +495,7 @@ seven simulated hours of cellular faults (`test_sparkplug_soak`) that was 6,772
 values of 240,704, gone without a trace.
 
 ```cpp
-node.replayWindow(64);          // before connect(): 64 values, 1.5 kB
+node.replayWindow(64);          // before connect(): 64 values, 2.5 kB
 node.replayWindow(64, 600000);  // ... and nothing older than ten minutes
 ```
 
@@ -519,12 +519,33 @@ and forward. The outage half - values recorded while the node cannot publish
 at all - is `MqttSparkplugHistory` with `publishRecords()`, below.
 
 **Off by default**, on a host and a board, because it changes what goes on the
-wire after a reconnect. 24 bytes a value, allocated once with
+wire after a reconnect. 40 bytes a value, allocated once with
 `mq_allocLarge()` (PSRAM first). Numbers, booleans and dates only: a text or
 other span value is not kept, and `replayLost()` counts it, as it counts a
 value pushed out of a full window, one too old to send, and one for a device
 that was taken offline. Each probe is about 40 bytes up and 5 down, at most
-once per probe interval and only while values are held.
+once per probe interval and only while values are held. What
+`publishRecords()` sends as history is held too, unless
+`replayKeepsHistory(false)` says its caller keeps it until the node has stayed
+born (held by both, it would go twice).
+
+**The window is memory.** A process killed, or a power cut, while the link was
+dead loses what it held. Where there is somewhere to keep it, the node tells a
+journal each change - a value held (with a serial number, larger than every
+one before it), a value let go, all of them let go - and a store that keeps the
+held ones gives them back after the restart:
+
+```cpp
+node.replayWindow(64);
+node.replayJournal(&told, &store);                // after replayWindow()
+for (const Kept& k : store.held())                // oldest first, by serial
+    node.replayRestore(k.serial, node.indexOf(k.device, k.name), k.value, k.timestamp, k.quality);
+node.connect();                                   // they go after the birth, as history
+```
+
+`replayProveNow()` asks for proof at once rather than at the next interval -
+before a goodbye, say, to know whether what is held arrived. The server's edge
+node does all of this with `outbox.db` (see the Application API).
 
 
 ### Changing settings while running

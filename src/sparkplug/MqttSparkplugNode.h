@@ -162,6 +162,29 @@ typedef void (*MqttSparkplugCommandFn)(const MqttSparkplugCommand& command);
 typedef void (*MqttSparkplugCommandContextFn)(void* context,
                                               const MqttSparkplugCommand& command);
 
+// --- The replay window, told to a store that outlives the process ---
+//
+// See MqttSparkplugNode::replayJournal(). Each value the window holds has a
+// serial number, larger than every one before it; it keeps that number while
+// it is held, sent again or not.
+enum class MqttSparkplugReplayEvent : uint8_t {
+    Held,       // `serial` is held: `point`, `value`, `timestamp`, `quality`
+    Released,   // `serial` is let go: proven delivered, or lost and counted
+    Cleared     // every value held is let go (a goodbye the node meant)
+};
+
+struct MqttSparkplugReplayChange {
+    MqttSparkplugReplayEvent event = MqttSparkplugReplayEvent::Held;
+    uint64_t serial = 0;
+    size_t point = 0;                      // the metric, by index (pointAt())
+    MqttSparkplugValue value;              // never a span: the window keeps none
+    uint64_t timestamp = 0;                // UTC milliseconds, when it was first sent
+    int32_t quality = MQ_SP_QUALITY_GOOD;
+};
+
+typedef void (*MqttSparkplugReplayFn)(void* context,
+                                      const MqttSparkplugReplayChange& change);
+
 // --- Writes waiting to be taken ---
 //
 // The writes to one metric that the application has not taken, oldest first:
@@ -484,6 +507,9 @@ public:
 
     size_t pointCount() const { return _pointCount; }
     const MqttSparkplugPoint* pointAt(size_t index) const;
+    // The device a metric belongs to, by its index: nullptr for a node
+    // metric or an index past pointCount().
+    const char* deviceOf(size_t index) const;
     const MqttSparkplugPoint* findPoint(const char* name) const;
     const MqttSparkplugPoint* findPointFor(const char* deviceId,
                                            const char* name) const;
@@ -747,7 +773,8 @@ public:
     // metric of another device or a value of the wrong type, or when nothing
     // could be queued. Published at QoS 0 like every NDATA/DDATA, so delivery
     // is the broker's best effort: a caller that must not lose a record keeps
-    // it until it has seen the node stay born afterwards.
+    // it until it has seen the node stay born afterwards. The replay window
+    // holds them too, unless replayKeepsHistory(false) says the caller does.
     bool publishRecords(const MqttSparkplugRecord* records, size_t count, bool historical);
 
     // WHETHER A VALUE IS NEWS, for a caller sending a run of a metric's values
@@ -827,9 +854,9 @@ public:
     // cannot publish at all - is MqttSparkplugHistory and publishRecords().
     //
     // OFF BY DEFAULT, on a host and a board: it changes what goes on the wire
-    // after a reconnect, which a host should be ready for. `entries` of 24
+    // after a reconnect, which a host should be ready for. `entries` of 40
     // bytes each, allocated here, once (mq_allocLarge: PSRAM first) - 64 is
-    // 1.5 kB - and `maxAgeMs`, if not zero, drops anything older than that
+    // 2.5 kB - and `maxAgeMs`, if not zero, drops anything older than that
     // when the time comes to send it. Numbers, booleans and dates only: a
     // text or other span value is not kept (replayLost() counts it). False,
     // and no window, without the memory. replayWindow(0) turns it off.
@@ -845,6 +872,38 @@ public:
     // How often to prove delivery while values are held; 0 (the default)
     // means half the keepalive.
     void replayProbe(mq_time_t milliseconds) { _replayProbeEvery = milliseconds; }
+    // Whether the window holds what publishRecords() sends as history (it
+    // does by default). A caller that keeps its own history until it is
+    // proven - a server's outbox - says false: held by both, it went twice.
+    void replayKeepsHistory(bool keep) { _replayHistory = keep; }
+    // Prove it now, not at the next interval: before a goodbye, say, so what
+    // the window holds is known delivered (replayHeld() goes to 0) or not.
+    // False when there is nothing to prove, a probe is already on its way,
+    // the node is not born on a connected link, or a replay is still going.
+    bool replayProveNow();
+
+    // WHAT THE WINDOW HOLDS, OUTSIDE THE PROCESS. The window is memory; a
+    // process killed, or a power cut, while the link was dead loses it - the
+    // values it held never reach the host. Where there is a store (a server's
+    // disk), `fn` is told each change, in order: a value held (its serial
+    // number, metric, value, time and quality), a value let go, every value
+    // let go. A store that keeps the held ones, and gives them back to
+    // replayRestore() when the process starts again, carries the window
+    // across the restart. Called from inside poll() and the publish calls;
+    // nullptr stops it. Set after replayWindow(), which tells no one.
+    void replayJournal(MqttSparkplugReplayFn fn, void* context) {
+        _replayJournal = fn;
+        _replayJournalContext = context;
+    }
+    // One value a journal kept, put back in the window as left by a session
+    // that ended uncleanly: it goes after the next birth, as history, like
+    // the rest. Oldest first, by serial; before connect(), with the metrics
+    // declared. Not told to the journal again (it has it); later values are
+    // numbered after it. False with no window, while born, for an index past
+    // pointCount(), a value of another type or a span. Full, the oldest goes,
+    // and the journal is told.
+    bool replayRestore(uint64_t serial, size_t point, const MqttSparkplugValue& value,
+                       uint64_t timestamp, int32_t quality);
 
     // --- Commands in. Callback AND pollable, because R4 ---
 
@@ -1133,6 +1192,7 @@ private:
     struct ReplayEntry {
         uint64_t bits = 0;
         uint64_t timestamp = 0;
+        uint64_t serial = 0;
         uint32_t point = 0;
         uint16_t epoch = 0;
         uint8_t isNull = 0;
@@ -1142,6 +1202,10 @@ private:
     void replayRecord(const MqttSparkplugPayload& payload, int16_t device);
     void replayKeep(size_t point, const MqttSparkplugValue& value,
                     uint64_t timestamp, int32_t quality);
+    // The front entry let go, the journal told.
+    void replayDropFront();
+    // Told to replayJournal(), if it is set.
+    void replayTell(MqttSparkplugReplayEvent event, const ReplayEntry* entry);
     // The metrics `removed` marks gone, the rest moved down (removeMetrics()).
     void compactPoints(const uint8_t* removed);
     void rebuildPointIndex();
@@ -1403,6 +1467,10 @@ private:
     mq_time_t _replayOwedAt = 0;
     uint32_t _replayedCount = 0;
     uint32_t _replayLost = 0;
+    uint64_t _replaySerial = 1;     // the next entry's
+    bool _replayHistory = true;     // replayKeepsHistory()
+    MqttSparkplugReplayFn _replayJournal = nullptr;
+    void* _replayJournalContext = nullptr;
 
     // The wall clock. `_epochAtBoot` is UTC milliseconds at the moment
     // mq_millis() read `_epochSetAt`, so now() is a subtraction away.

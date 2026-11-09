@@ -449,6 +449,12 @@ private:
     // written when its bdSeq moves, and at most once a second as values do.
     void saveEdgeState(EdgeNode& edge, bool now);
     void loadEdgeState(EdgeNode& edge);
+    // Its replay window on the disk (EdgeNode::journal): written before a
+    // SetValues is answered and after each service; put back in the window
+    // when it starts; proven delivered, or kept, before a goodbye.
+    void writeJournal(EdgeNode& edge);
+    void restoreReplay(EdgeNode& edge);
+    void settleReplay(Connection& connection);
     // A spec stored and applied: where it runs, born anew when its session
     // must change (connection, group, node, primary host), else its
     // declarations changed in the session it has.

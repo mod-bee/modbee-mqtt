@@ -50,7 +50,10 @@ bool ConnectionOutbox::open(const std::string& directory, bool syncFull, std::st
         !exec(_db, syncFull ? "PRAGMA synchronous=FULL" : "PRAGMA synchronous=NORMAL") ||
         !exec(_db, "CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY, connection BLOB, bytes INTEGER, "
                    "taken INTEGER, message BLOB);"
-                   "CREATE INDEX IF NOT EXISTS outbox_by_connection ON outbox(connection, id);")) {
+                   "CREATE INDEX IF NOT EXISTS outbox_by_connection ON outbox(connection, id);"
+                   "CREATE TABLE IF NOT EXISTS replay(node BLOB, serial INTEGER, device BLOB, name BLOB, "
+                   "type INTEGER, nullvalue INTEGER, bits INTEGER, at INTEGER, quality INTEGER, "
+                   "PRIMARY KEY(node, serial)) WITHOUT ROWID;")) {
         error = file + ": " + sqlite3_errmsg(_db);
         close();
         return false;
@@ -123,6 +126,71 @@ uint64_t ConnectionOutbox::dropAll(const std::string& connection) {
     s.text(1, connection);
     sqlite3_step(s.s);
     return (uint64_t)sqlite3_changes(_db);
+}
+
+bool ConnectionOutbox::replayApply(const std::string& node, const std::vector<ReplayChange>& changes) {
+    if (!_db) return false;
+    if (changes.empty()) return true;
+    if (!exec(_db, "BEGIN IMMEDIATE")) return false;
+    bool ok = true;
+    {
+        Statement held(_db, "INSERT OR REPLACE INTO replay(node, serial, device, name, type, nullvalue, bits, at, quality) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)");
+        Statement released(_db, "DELETE FROM replay WHERE node=? AND serial=?");
+        Statement cleared(_db, "DELETE FROM replay WHERE node=?");
+        for (const ReplayChange& c : changes) {
+            Statement& s = c.kind == ReplayChange::Held ? held : c.kind == ReplayChange::Released ? released : cleared;
+            sqlite3_reset(s.s);
+            s.text(1, node);
+            if (c.kind != ReplayChange::Cleared) s.number(2, (int64_t)c.value.serial);
+            if (c.kind == ReplayChange::Held) {
+                s.text(3, c.value.device);
+                s.text(4, c.value.name);
+                s.number(5, (int64_t)c.value.type);
+                s.number(6, c.value.isNull ? 1 : 0);
+                s.number(7, (int64_t)c.value.bits);
+                s.number(8, (int64_t)c.value.timestamp);
+                s.number(9, c.value.quality);
+            }
+            if (sqlite3_step(s.s) != SQLITE_DONE) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (!ok || !exec(_db, "COMMIT")) {
+        exec(_db, "ROLLBACK");
+        return false;
+    }
+    return true;
+}
+
+std::vector<ConnectionOutbox::Replay> ConnectionOutbox::replayHeld(const std::string& node) {
+    std::vector<Replay> out;
+    if (!_db) return out;
+    Statement s(_db, "SELECT serial, device, name, type, nullvalue, bits, at, quality FROM replay WHERE node=? "
+                     "ORDER BY serial");
+    s.text(1, node);
+    while (sqlite3_step(s.s) == SQLITE_ROW) {
+        Replay r;
+        r.serial = (uint64_t)sqlite3_column_int64(s.s, 0);
+        r.device = column(s.s, 1);
+        r.name = column(s.s, 2);
+        r.type = (uint32_t)sqlite3_column_int64(s.s, 3);
+        r.isNull = sqlite3_column_int64(s.s, 4) != 0;
+        r.bits = (uint64_t)sqlite3_column_int64(s.s, 5);
+        r.timestamp = (uint64_t)sqlite3_column_int64(s.s, 6);
+        r.quality = (int32_t)sqlite3_column_int64(s.s, 7);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+void ConnectionOutbox::replayDropAll(const std::string& node) {
+    if (!_db) return;
+    Statement s(_db, "DELETE FROM replay WHERE node=?");
+    s.text(1, node);
+    sqlite3_step(s.s);
 }
 
 ConnectionOutbox::Totals ConnectionOutbox::totals(const std::string& connection) {

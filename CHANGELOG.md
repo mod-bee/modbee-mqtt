@@ -11,6 +11,27 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A server edge node's live values lost when the server was killed on a link that had died unnoticed.** Values
+  published into a dead link before the keep-alive noticed (up to a keep-alive and a half) were held only in memory,
+  the replay window: a SIGKILL or a power cut in that time lost them, and nothing sent them after the restart. The
+  window is now written to `outbox.db` as it changes - in the same file, so under the same sync setting
+  (`MODBEE_SESSIONS_SYNC=full` survives a power cut) - before `SetValues` answers, and put back when the server
+  starts: after the next birth it goes oldest first, `is_historical`, at the times the values were first sent. A
+  server stopped on purpose (a service stop, a node replaced) waits up to 2 s for proof that what it holds arrived,
+  and keeps what is not proven the same way; it used to let it go.
+- **Values that had arrived sent again after a link that died.** Delivery is now proven every second while values
+  flow, not every half keep-alive, so after a link dies at most the last second's values may arrive twice; and a
+  value sent as history from the outbox is no longer also held by the replay window, which sent it twice
+  (`MqttSparkplugNode::replayKeepsHistory(false)`; a node on a board still holds its history by default).
+
+### Added
+
+- `MqttSparkplugNode::replayJournal()`, `replayRestore()`, `replayProveNow()`, `replayKeepsHistory()` and `deviceOf()`: the replay window
+  told to a store that outlives the process, and given back from it. A replay window entry is 40 bytes (was 32;
+  the docs said 24).
+
 ## [0.1.5]
 
 Fixes found by the platform on 0.1.4: a Sparkplug command to something not born is refused instead of sent nameless,

@@ -471,6 +471,46 @@ struct AppConnections::EdgeNode {
     int savedBdSeq = -1;
     bool valuesChanged = false, saveFailed = false;
     Clock::time_point savedAt;
+    // ITS REPLAY WINDOW, OUTSIDE THE PROCESS. What it published live and has
+    // not proven delivered (MqttSparkplugNode::replayWindow) is memory, and a
+    // link that dies without a word leaves up to a keep-alive and a half of it
+    // in a socket that led nowhere: killed then, or the power cut, it was
+    // lost - the window gone, nothing to send again. Every change to the
+    // window is told here (replayJournal) and written to outbox.db, under its
+    // synchronous setting, before the SetValues that caused it is answered;
+    // put back in the window when the node starts again, it goes after the
+    // next birth as history, as it would have had the process lived.
+    std::vector<ConnectionOutbox::ReplayChange> journal;     // told, not yet written
+    bool journalFailed = false;                              // said once
+    static void journaled(void* context, const MqttSparkplugReplayChange& change) {
+        EdgeNode& e = *static_cast<EdgeNode*>(context);
+        ConnectionOutbox::ReplayChange c;
+        c.value.serial = change.serial;
+        switch (change.event) {
+            case MqttSparkplugReplayEvent::Cleared:
+                e.journal.clear();                           // all of it goes: what was before, too
+                c.kind = ConnectionOutbox::ReplayChange::Cleared;
+                break;
+            case MqttSparkplugReplayEvent::Released:
+                c.kind = ConnectionOutbox::ReplayChange::Released;
+                break;
+            case MqttSparkplugReplayEvent::Held: {
+                const MqttSparkplugPoint* point = e.library->pointAt(change.point);
+                if (point == nullptr) return;
+                const char* device = e.library->deviceOf(change.point);
+                c.kind = ConnectionOutbox::ReplayChange::Held;
+                c.value.device = device ? device : "";
+                c.value.name = point->name.c_str();
+                c.value.type = (uint32_t)change.value.type;
+                c.value.isNull = change.value.isNull;
+                c.value.bits = change.value.isNull ? 0 : change.value.as.unsignedValue;
+                c.value.timestamp = change.timestamp;
+                c.value.quality = change.quality;
+                break;
+            }
+        }
+        e.journal.push_back(std::move(c));
+    }
     // What it keeps, by class: history_first's drain before the rest.
     std::string key() const { return "sparkplug-node:" + spec.id; }
     std::string firstKey() const { return "sparkplug-node-first:" + spec.id; }
@@ -1146,7 +1186,10 @@ void AppConnections::open(Connection& c) {
 }
 
 void AppConnections::startEdgeNode(Connection& c) {
-    if (c.edge) saveEdgeState(*c.edge, true);
+    if (c.edge) {
+        saveEdgeState(*c.edge, true);
+        writeJournal(*c.edge);               // what it held, the next one's to send
+    }
     c.edge.reset();
     for (const auto& one : _edgeNodes) {
         if (one.second.connection != c.spec.id) continue;
@@ -1197,8 +1240,23 @@ void AppConnections::startEdgeNode(Connection& c) {
             }
         }
         // What a link that died unnoticed swallowed, sent again after the next
-        // birth as history (MqttSparkplugNode::replayWindow): 4096 values, 128 kB.
-        node.replayWindow(4096);
+        // birth as history (MqttSparkplugNode::replayWindow): 4096 values,
+        // 160 kB - and on the disk, so a kill or a power cut does not lose
+        // it (EdgeNode::journal). What it held when the process ended goes
+        // back in first.
+        // Nothing older than its history_max_age, as for what the outbox keeps.
+        node.replayWindow(4096, (uint32_t)std::min<uint64_t>(e->spec.historyMaxAgeMs, 0xFFFFFFFFu));
+        // Proven every second while it holds values, not every half
+        // keep-alive: what was proven is never sent again, and what arrived
+        // but was not proven yet goes twice after a link that died. A second
+        // of that, not thirty - for an UNSUBSCRIBE and its UNSUBACK a second
+        // while values flow.
+        node.replayProbe(1000);
+        // What sendHistory() sends stays in the outbox until it is proven;
+        // the window holding it as well sent it twice.
+        node.replayKeepsHistory(false);
+        node.replayJournal(&EdgeNode::journaled, e.get());
+        restoreReplay(*e);
         e->tokensAt = Clock::now();
         node.connect();                            // its NDEATH is this connection's Will from now on
         c.edge = std::move(e);
@@ -1238,7 +1296,79 @@ void AppConnections::serviceEdgeNode(Connection& c) {
         e.dropping = false;
         e.droppedSince = 0;
     }
+    writeJournal(e);
     if (_edgeWatched) announceEdge(e, false);
+}
+
+void AppConnections::writeJournal(EdgeNode& e) {
+    if (e.journal.empty()) return;
+    if (_outbox.replayApply(e.spec.id, e.journal)) {
+        e.journalFailed = false;
+    } else if (!e.journalFailed) {
+        // Not kept for another try: told again and again, it grew without
+        // bound. The window still holds it; only a kill now would lose it.
+        e.journalFailed = true;
+        std::fprintf(stderr, "sparkplug edge node \"%s\": its replay window could not be written to outbox.db - "
+                             "what it holds now would not outlive a restart\n",
+                     e.spec.id.c_str());
+    }
+    e.journal.clear();
+}
+
+// What the window held when the process last ended - killed, or the power
+// cut, before the link it was writing to was known dead - back in the window:
+// it goes after the next birth, oldest first, is_historical at the times it
+// was first sent. A value whose metric is gone, or is another type now, is
+// let go. The newest of each metric becomes its current value, if it is newer
+// than the one kept.
+void AppConnections::restoreReplay(EdgeNode& e) {
+    MqttSparkplugNode& node = *e.library;
+    size_t restored = 0, lost = 0;
+    for (const ConnectionOutbox::Replay& r : _outbox.replayHeld(e.spec.id)) {
+        MqttSparkplugValue value;
+        value.type = (MqttSparkplugDataType)r.type;
+        value.isNull = r.isNull;
+        if (!r.isNull) value.as.unsignedValue = r.bits;
+        const int at = node.indexOf(e.device(r.device), r.name.c_str());
+        if (at < 0 || !node.replayRestore(r.serial, (size_t)at, value, r.timestamp, r.quality)) {
+            ConnectionOutbox::ReplayChange gone;
+            gone.kind = ConnectionOutbox::ReplayChange::Released;
+            gone.value.serial = r.serial;
+            e.journal.push_back(gone);
+            lost++;
+            continue;
+        }
+        restored++;
+        if (r.timestamp >= e.setAtMs[(size_t)at] && e.setCurrent((size_t)at, value, std::string(), r.timestamp)) {
+            node.qualityAt((size_t)at, r.quality);
+        }
+    }
+    writeJournal(e);
+    if (restored || lost) {
+        std::fprintf(stderr, "sparkplug edge node \"%s\": %zu values published before the restart were not proven "
+                             "delivered - they go again after its birth, as history%s\n",
+                     e.spec.id.c_str(), restored, lost ? " (some of a metric no longer declared were let go)" : "");
+    }
+}
+
+// A goodbye this server means - stopping, the node replaced or its connection
+// closed. The node's disconnect() lets its window go, as a goodbye on a
+// working link should: what went ahead of it arrived. But the link may be
+// dead without either end knowing yet. So the window is proven first, a
+// moment at most; what is not proven stays on the disk, and goes after the
+// next birth - this process's or the next one's.
+void AppConnections::settleReplay(Connection& c) {
+    if (!c.edge) return;
+    EdgeNode& e = *c.edge;
+    MqttSparkplugNode& node = *e.library;
+    const Clock::time_point until = Clock::now() + std::chrono::seconds(2);
+    while (node.replayHeld() > 0 && node.isBorn() && c.client.isConnected() && Clock::now() < until) {
+        node.replayProveNow();               // when none is on its way already
+        c.client.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (node.replayHeld() > 0) node.replayJournal(nullptr, nullptr);   // the disconnect does not let them go
+    writeJournal(e);
 }
 
 // Born again: what was kept goes, oldest first, history_first's before the
@@ -1565,13 +1695,17 @@ void AppConnections::serviceHostState(Connection& c) {
 void AppConnections::close(Connection& c) {
     // A host's STATE dies first, on purpose rather than by its Will.
     if (c.host || c.edge) {
+        settleReplay(c);                      // while the link is as it was
         if (c.host) c.host->library->disconnect();
         if (c.edge) c.edge->library->disconnect();
         for (int pass = 0; pass < 20 && c.client.isConnected(); pass++) {
             c.client.poll();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        if (c.edge) saveEdgeState(*c.edge, true);
+        if (c.edge) {
+            saveEdgeState(*c.edge, true);
+            writeJournal(*c.edge);
+        }
         c.host.reset();
         c.edge.reset();
     }
@@ -2779,8 +2913,10 @@ bool AppConnections::applyEdgeNode(const AppSparkplugEdgeNodeSpec& spec, std::st
         if (at == _connections.end()) continue;
         Connection& c = *at->second;
         if (c.edge) {
+            settleReplay(c);                  // what is not proven, the new one sends
             c.edge->library->disconnect();
             saveEdgeState(*c.edge, true);     // the new one moves on from its bdSeq
+            writeJournal(*c.edge);
             c.edge.reset();
         }
         startEdgeNode(c);
@@ -2906,6 +3042,7 @@ bool AppConnections::removeEdgeNode(const std::string& id) {
         }
         _outbox.dropAll("sparkplug-node:" + id);
         _outbox.dropAll("sparkplug-node-first:" + id);
+        _outbox.replayDropAll(id);
         if (!_directory.empty()) std::remove((_directory + "/" + edgeStateName(id)).c_str());
         _edgeNodes.erase(spec);
         saveHosts();
@@ -3056,6 +3193,8 @@ bool AppConnections::setValues(const std::string& id, const std::string& device,
             }
         }
         if (!last.empty()) node.publishChanged();
+        // What went live is on the disk before the application hears it went.
+        writeJournal(*e);
     });
     return found;
 }

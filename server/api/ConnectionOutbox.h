@@ -61,6 +61,29 @@ public:
     uint64_t dropAll(const std::string& connection);
     Totals totals(const std::string& connection);
 
+    // A SPARKPLUG EDGE NODE'S REPLAY WINDOW (MqttSparkplugNode::replayJournal):
+    // what it published live and has not proven delivered, kept here so a
+    // process killed, or a power cut, while the link was dead does not lose
+    // it. In the same file, so the same synchronous setting. By the edge
+    // node's id, in serial order.
+    struct Replay {
+        uint64_t serial = 0;
+        std::string device, name;
+        uint32_t type = 0;           // MqttSparkplugDataType
+        bool isNull = false;
+        uint64_t bits = 0;           // MqttSparkplugValue::as, all eight bytes
+        uint64_t timestamp = 0;
+        int32_t quality = 0;
+    };
+    struct ReplayChange {
+        enum Kind { Held, Released, Cleared } kind = Held;
+        Replay value;                // Released: its serial only
+    };
+    // In one transaction, in order; false when it could not be written.
+    bool replayApply(const std::string& node, const std::vector<ReplayChange>& changes);
+    std::vector<Replay> replayHeld(const std::string& node);
+    void replayDropAll(const std::string& node);
+
 private:
     sqlite3* _db = nullptr;
 };
