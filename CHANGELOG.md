@@ -11,6 +11,18 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+A Kafka link no longer echoes what it reads. A connection whose link is Kafka wrote EVERY message on its broker to its
+out-topic - those its in-topic had just delivered too. The guard only skipped a record going back to the very topic
+it came from, and a link reads one topic and writes another (`mqtt-messages` in, `mqtt-commands` out). Joined to a
+broker that copies every message it carries into Kafka - its published commands included - each record went round
+without end: a Sparkplug host on such a link sent its node's commands back to the node hundreds of times a second,
+and the node answered each with a birth. A link's out-mapping now carries only what a client publishes on the
+link's broker, never a message read from Kafka (`skipFromKafka`). Proven in `test_kafka_link` ("NO ECHO"): with a
+far broker configured as a site runs one, a command reaches the device once, a reading reaches the link once, and
+neither Kafka topic grows when nothing is published.
+
+Changes on upgrade: none to configure.
+
 ## [0.1.6]
 
 A fix found by the platform on 0.1.5: a server edge node's live values that had not been proven delivered were lost

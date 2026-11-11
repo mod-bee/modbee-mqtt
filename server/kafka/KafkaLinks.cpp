@@ -144,6 +144,7 @@ bool KafkaLinks::sectionFor(const std::string& id, const AppKafkaLinkSpec& link,
         m.allHeaders = true;
         m.acknowledgeOnKafka = true;
         m.messageTimeoutMs = 0;              // until Kafka has it
+        m.skipFromKafka = true;              // what it read never goes back out
         if (link.key.empty() || link.key == "topic") m.key = KafkaKeyMode::Topic;
         else if (link.key == "clientid") m.key = KafkaKeyMode::ClientId;
         else if (link.key == "none") m.key = KafkaKeyMode::None;

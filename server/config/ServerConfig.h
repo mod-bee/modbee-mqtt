@@ -154,6 +154,12 @@ struct MqttToKafkaConfig {
     // (0: until it is there; -1: the producer's 30 s).
     std::vector<std::string> excludeFilters;
     int messageTimeoutMs = -1;
+    // A link's own out-mapping carries only what a client publishes on the
+    // link's broker, never a message its in-mapping read from Kafka. Without
+    // it, a link reading one topic and writing another writes every record it
+    // reads to the far broker, which publishes it and - copying everything it
+    // carries - writes it back to the topic the link reads: a loop.
+    bool skipFromKafka = false;
     size_t line = 0;
 };
 

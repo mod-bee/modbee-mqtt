@@ -827,6 +827,8 @@ uint32_t KafkaPipe::offer(uint32_t shardIndex, MqttBroker& broker, const MqttBro
             mapping.kafkaTopic == origin->topic) {
             continue;
         }
+        // A link's out-mapping: nothing read from Kafka goes out again, whatever topic it came from.
+        if (mapping.skipFromKafka && origin != nullptr) continue;
         if (shard.route[m] == nullptr) continue;
         rd_kafka_topic_t* topic = shard.route[m]->handle;
 
