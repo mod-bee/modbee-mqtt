@@ -11,6 +11,10 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.7]
+
+Two fixes for a Sparkplug host on a Kafka link, found by the platform on 0.1.6 against a site broker.
+
 A Kafka link no longer echoes what it reads. A connection whose link is Kafka wrote EVERY message on its broker to its
 out-topic - those its in-topic had just delivered too. The guard only skipped a record going back to the very topic
 it came from, and a link reads one topic and writes another (`mqtt-messages` in, `mqtt-commands` out). Joined to a
