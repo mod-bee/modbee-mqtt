@@ -11,6 +11,10 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.8]
+
+One Sparkplug host for many groups on a shared broker, and a client that notices a link that only seems alive.
+
 A Sparkplug host answers for a list of groups, and only those. `SparkplugHostSpec.group` (one group, or every one) is
 now `groups`: the groups it answers for, none for every group. A host never acted on its group, only subscribed to
 it: whatever else reached its connection - through `spBv1.0/#` an application's consumer group asked for, or a Kafka
@@ -26,6 +30,15 @@ ONE host can answer for many groups and take one more without its nodes seeing i
 Changes on upgrade: `PutHost` / `ListHosts` carry `groups` (a list) in place of `group`; on the wire the field is
 the same (4), so a single group from an older client reads as a list of one. A state directory an earlier release
 wrote is read with its one group.
+
+A client that hears nothing from its broker for `MqttClientConfig::maxSilenceMs` ends the connection, however its own
+bytes are moving. The keep-alive put off its silence rule while our own backlog drained, taking that for the far
+end's TCP acknowledging it; a cellular modem's socket takes the bytes into its own buffer and says "sent" whether or
+not anything reaches the broker, so a dead path looked alive for as long as the device kept publishing (a field unit
+stayed "connected" to nobody for over an hour). `MqttClient::heardAgoMs()` says how long since anything arrived, for
+a supervisor to judge the link by the broker's side.
+
+Changes on upgrade: none; `maxSilenceMs` is 0 (off) unless set.
 
 ## [0.1.7]
 
