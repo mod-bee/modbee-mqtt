@@ -128,9 +128,22 @@ public:
     // EITHER direction, and a ping's deadline does not fall due while the link
     // is still moving. A link that has stopped moving altogether is still
     // ended after two intervals, as before.
+    //
+    // AND, WHERE THE APPLICATION SAYS SO, OUR OWN PROGRESS PUTS IT OFF ONLY SO
+    // FAR (maxSilence, off unless set). "Our backlog drained" is the far end's
+    // TCP acknowledging what it was sent on a socket the kernel owns - but on
+    // a cellular modem's socket it is not: the module takes the bytes into its
+    // own buffer and says "sent" whether or not anything reaches the broker,
+    // so a dead path looked alive for as long as the program kept publishing.
+    // With maxSilence set, that long with not one byte FROM the peer ends the
+    // connection whatever our side says. Off by default because a long upload
+    // over a slow link is legitimately silent from the far end until its
+    // acknowledgement (aLongUploadIsNotAKeepaliveTimeout); set it longer than
+    // the longest such upload the application makes.
     bool responseOverdue(mq_time_t now) const {
         if (!enabled()) return false;
         const mq_time_t heard = mq_elapsed(_lastReceivedAt, now);
+        if (_maxSilenceMs != 0 && heard >= _maxSilenceMs) return true;
         const mq_time_t moved = mq_elapsed(_lastProgressAt, now);
         const mq_time_t quiet = heard < moved ? heard : moved;
         if (quiet >= 2 * _intervalMs) return true;
@@ -139,10 +152,22 @@ public:
     }
 
     bool awaitingResponse() const { return _awaitingResponse; }
+
+    // How long since anything at all arrived from the peer (0 while off). The
+    // one sign of life the far end cannot fake from our side of the link.
+    mq_time_t heardAgo(mq_time_t now) const {
+        return enabled() ? mq_elapsed(_lastReceivedAt, now) : 0;
+    }
+
+    // Nothing from the peer for this long ends the connection, however our
+    // own bytes are moving (see responseOverdue). 0 = no such limit.
+    void maxSilence(mq_time_t milliseconds) { _maxSilenceMs = milliseconds; }
+    mq_time_t maxSilence() const { return _maxSilenceMs; }
     uint16_t intervalSeconds() const { return (uint16_t)(_intervalMs / 1000u); }
 
 private:
     mq_time_t _intervalMs = 0;
+    mq_time_t _maxSilenceMs = 0;   // survives begin(): a setting, not session state
     mq_time_t _lastSentAt = 0;
     mq_time_t _lastReceivedAt = 0;
     mq_time_t _lastProgressAt = 0;

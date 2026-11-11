@@ -937,6 +937,7 @@ void MqttClient::handleConnAck(const MqttPacket& packet) {
         effective = (ours == 0 || theirs < ours) ? theirs : ours;
     }
     _keepAlive.begin(effective, mq_millis());
+    _keepAlive.maxSilence(_behaviour.maxSilenceMs);
     _seenReceived = _link.bytesReceived();
     _seenRelieved = _link.bytesRelieved();
 

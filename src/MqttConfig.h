@@ -313,4 +313,16 @@ struct MqttClientConfig {
     // This one exists because a peer that accepts a TCP connection and then
     // says nothing is otherwise indistinguishable from a healthy one.
     mq_time_t connectTimeoutMs = 20000;
+
+    // The longest the broker may send nothing at all - not one byte - before
+    // the connection is ended, whatever our own sending looks like. 0 (the
+    // default) leaves it to the keep-alive's own rules, under which our
+    // backlog draining counts as the link being alive. Set it where that
+    // proof is weak: on a cellular modem the module takes our bytes into its
+    // own buffer and reports them sent whether or not they reach anyone, so a
+    // dead path looks alive for as long as the program keeps publishing. A
+    // healthy broker answers a PINGREQ inside one keep-alive interval, so
+    // three intervals is a safe choice unless a single upload of yours takes
+    // longer than that to cross the link.
+    mq_time_t maxSilenceMs = 0;
 };

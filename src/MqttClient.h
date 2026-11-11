@@ -497,6 +497,14 @@ public:
     // publish was on its way when it was not.
     bool isConnected() const { return _status.state == MqttState::Connected; }
 
+    // Milliseconds since anything arrived from the broker on this connection
+    // (0 when not connected or with keep-alive off). A watchdog's input that a
+    // link which only looks alive from this side - a modem taking our bytes
+    // into its own buffer - cannot satisfy.
+    mq_time_t heardAgoMs() const {
+        return isConnected() ? _keepAlive.heardAgo(mq_millis()) : 0;
+    }
+
     const MqttCapabilities& capabilities() const { return _capabilities; }
     MqttSession& session() { return _session; }
     const MqttSession& session() const { return _session; }
