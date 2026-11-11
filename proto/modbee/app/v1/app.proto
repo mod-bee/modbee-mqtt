@@ -609,7 +609,8 @@ message SparkplugHostSpec {
   string id = 1;                   // this server's name for it
   string connection = 2;           // the connection it runs on (one host each)
   string host_id = 3;              // its Sparkplug Host Application id: spBv1.0/STATE/<host_id>
-  string group = 4;                // the group it follows; "": every group
+  repeated string groups = 4;      // the groups it answers for, and only those; none: every group. Put again with
+                                   // only these changed, a running host keeps its session: no new STATE, no rebirths
   optional bool rebirth_on_gap = 5; // ask for rebirths as above; absent: true
   optional uint32 reorder_timeout_ms = 6;        // how long a gap waits for the missing message (default 2000; 0: none)
   optional uint32 rebirth_min_interval_ms = 7;   // per node (default 60000)

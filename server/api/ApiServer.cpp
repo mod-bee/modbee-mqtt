@@ -2419,7 +2419,7 @@ void hostSpecTo(const AppSparkplugHostSpec& spec, v1::SparkplugHostSpec& wire) {
     wire.set_id(spec.id);
     wire.set_connection(spec.connection);
     wire.set_host_id(spec.hostId);
-    wire.set_group(spec.group);
+    for (const std::string& g : spec.groups) wire.add_groups(g);
     wire.set_rebirth_on_gap(spec.rebirthOnGap);
     wire.set_reorder_timeout_ms(spec.reorderTimeoutMs);
     wire.set_rebirth_min_interval_ms(spec.rebirthMinIntervalMs);
@@ -2742,7 +2742,7 @@ public:
         spec.id = request->id();
         spec.connection = request->connection();
         spec.hostId = request->host_id();
-        spec.group = request->group();
+        spec.groups.assign(request->groups().begin(), request->groups().end());
         spec.rebirthOnGap = request->has_rebirth_on_gap() ? request->rebirth_on_gap() : true;
         if (request->has_reorder_timeout_ms()) spec.reorderTimeoutMs = request->reorder_timeout_ms();
         if (request->has_rebirth_min_interval_ms()) spec.rebirthMinIntervalMs = request->rebirth_min_interval_ms();

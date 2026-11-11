@@ -11,6 +11,22 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+A Sparkplug host answers for a list of groups, and only those. `SparkplugHostSpec.group` (one group, or every one) is
+now `groups`: the groups it answers for, none for every group. A host never acted on its group, only subscribed to
+it: whatever else reached its connection - through `spBv1.0/#` an application's consumer group asked for, or a Kafka
+link that carries a whole broker - was tracked, and a node of another group with no birth seen was asked to rebirth.
+On a broker several hosts share, that was a command to somebody else's node, paid for on its link. Now a message of a
+group the host does not answer for is not its own: never tracked, never asked to rebirth, never handed on with names
+(the library's `MqttSparkplugHost::watching()`, with `watchAlso()` / `unwatch()` beside `watch()`). And a host Put
+again with only its groups or limits changed keeps its session: a group added is subscribed and its nodes asked as
+they speak, a group removed unsubscribed and its nodes no longer followed - no new STATE, no rebirth of the rest. So
+ONE host can answer for many groups and take one more without its nodes seeing it go. Proven in `test_connections`
+("a host answers only for its groups") and `test_sparkplug_host`.
+
+Changes on upgrade: `PutHost` / `ListHosts` carry `groups` (a list) in place of `group`; on the wire the field is
+the same (4), so a single group from an older client reads as a list of one. A state directory an earlier release
+wrote is read with its one group.
+
 ## [0.1.7]
 
 Two fixes for a Sparkplug host on a Kafka link, found by the platform on 0.1.6 against a site broker.

@@ -701,7 +701,7 @@ void onMessage(const MqttSparkplugInbound& message) {
 int main() {
     host.hostId("scada-1");
     host.server("192.168.1.10");
-    host.watch();                      // every group; or host.watch("Plant")
+    host.watch();                      // every group; or host.watch("Plant"), then watchAlso("Mill") / unwatch("Plant")
     host.onMessage(&onMessage);
     host.connect();
 

@@ -122,13 +122,78 @@ bool MqttSparkplugHost::server(const char* host, uint16_t port) {
 
 bool MqttSparkplugHost::watch(const char* group) {
     if (group == nullptr) {
-        _watchGroup.clear();
+        _watchGroups.clear();
+        _watchAll = true;
         _watchSet = true;
         return true;
     }
     if (!mq_sparkplugValidId(group)) return false;
-    _watchGroup = group;
+    _watchGroups.assign(1, group);
+    _watchAll = false;
     _watchSet = true;
+    return true;
+}
+
+bool MqttSparkplugHost::watching(const char* group) const {
+    if (!_watchSet || _watchAll) return true;
+    if (group == nullptr) return false;
+    for (const std::string& one : _watchGroups) {
+        if (one == group) return true;
+    }
+    return false;
+}
+
+bool MqttSparkplugHost::watchAlso(const char* group) {
+    if (group == nullptr || !mq_sparkplugValidId(group)) return false;
+    if (_watchSet && _watchAll) return true;
+    if (_watchSet && watching(group)) return true;
+    _watchGroups.push_back(group);
+    _watchSet = true;
+    // A session under way subscribes it now; one still to come subscribes
+    // every group as it begins.
+    if (_client.isConnected() && buildWatchTopic(&_watchGroups.back())) {
+        _client.subscribe(_topic, MQ_QOS_1);
+    }
+    return true;
+}
+
+bool MqttSparkplugHost::unwatch(const char* group) {
+    if (group == nullptr) return false;
+    if (!_watchSet || _watchAll) return false;
+    size_t at = 0;
+    while (at < _watchGroups.size() && _watchGroups[at] != group) at++;
+    if (at == _watchGroups.size()) return true;
+    const std::string gone = _watchGroups[at];
+    _watchGroups.erase(_watchGroups.begin() + (long)at);
+    if (_client.isConnected() && buildWatchTopic(&gone)) _client.unsubscribe(_topic);
+    // Nothing more is heard from them here: not known to be online.
+    for (size_t index = 0; index < _nodeCount; index++) {
+        MqttSparkplugTrackedNode& tracked = _nodes[index];
+        if (tracked.group != gone) continue;
+        tracked.online = false;
+        tracked.hasSeq = false;
+        tracked.reordering = false;
+        tracked.rebirthAsked = false;
+    }
+    return true;
+}
+
+bool MqttSparkplugHost::buildWatchTopic(const std::string* group) {
+    const char* ns = MQ_SP_NAMESPACE;
+    const size_t nsLength = strlen(ns);
+    const size_t groupLength = group ? group->length() + 1 : 0;
+    if (nsLength + groupLength + 3 > sizeof _topic) return false;
+    size_t cursor = 0;
+    memcpy(_topic, ns, nsLength);
+    cursor = nsLength;
+    _topic[cursor++] = '/';
+    if (group) {
+        memcpy(_topic + cursor, group->c_str(), group->length());
+        cursor += group->length();
+        _topic[cursor++] = '/';
+    }
+    _topic[cursor++] = '#';
+    _topic[cursor] = '\0';
     return true;
 }
 
@@ -355,26 +420,14 @@ void MqttSparkplugHost::sessionEstablished(bool sessionPresent) {
     // [tck-id-host-topic-phid-birth-sub-required] ... and the appropriate
     // spBv1.0 topic(s) immediately after successfully connecting.
     if (_watchSet) {
-        size_t cursor = 0;
-        const char* ns = MQ_SP_NAMESPACE;
-        const size_t nsLength = strlen(ns);
-        if (nsLength + 4 < sizeof _topic) {
-            memcpy(_topic, ns, nsLength);
-            cursor = nsLength;
-            _topic[cursor++] = '/';
-            if (!_watchGroup.empty()) {
-                const size_t groupLength = _watchGroup.length();
-                if (cursor + groupLength + 3 < sizeof _topic) {
-                    memcpy(_topic + cursor, _watchGroup.c_str(), groupLength);
-                    cursor += groupLength;
-                    _topic[cursor++] = '/';
-                }
+        // QoS 1. A host that missed an NBIRTH at QoS 0 would have no
+        // alias table and would have to discard every NDATA that followed.
+        if (_watchAll) {
+            if (buildWatchTopic(nullptr)) _client.subscribe(_topic, MQ_QOS_1);
+        } else {
+            for (const std::string& group : _watchGroups) {
+                if (buildWatchTopic(&group)) _client.subscribe(_topic, MQ_QOS_1);
             }
-            _topic[cursor++] = '#';
-            _topic[cursor] = '\0';
-            // QoS 1. A host that missed an NBIRTH at QoS 0 would have no
-            // alias table and would have to discard every NDATA that followed.
-            _client.subscribe(_topic, MQ_QOS_1);
         }
     }
 
@@ -397,6 +450,7 @@ void MqttSparkplugHost::sessionEstablished(bool sessionPresent) {
     // what "data from a node with no birth" already does.
     for (size_t index = 0; index < _nodeCount; index++) {
         MqttSparkplugTrackedNode& tracked = _nodes[index];
+        if (!watching(tracked.group.c_str())) continue;   // a group it no longer answers for
         tracked.online = false;
         tracked.hasSeq = false;
         tracked.reordering = false;
@@ -1150,6 +1204,10 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
     // Commands are ours to send, not to receive. A host that acted on an NCMD
     // would be acting on its own traffic.
     if (mq_sparkplugIsCommand(parts.type)) return;
+
+    // Another host's nodes, on a broker they share: not this host's to track,
+    // to ask for a birth, or to hand on.
+    if (!watching(parts.group)) return;
 
     if (!decodeInbound(message.payload.data, message.payload.length)) {
         // [tck-id-operational-behavior-host-reordering-rebirth]'s sibling

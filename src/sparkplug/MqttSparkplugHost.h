@@ -49,6 +49,7 @@
 #include "../MqttOwnedTransport.h"
 
 #include <string>
+#include <vector>
 #include <type_traits>
 
 // HOW MANY NODES THIS HOST TRACKS, AND METRICS PER NODE: a limit each, set at
@@ -429,6 +430,20 @@ public:
     // a large plant wants.
     bool watch(const char* group = nullptr);
 
+    // A host that answers for several groups - and only those - on a broker
+    // other hosts' nodes share: one group more, or one fewer. Done at once
+    // while connected, with no new session: the STATE stays born, and no node
+    // of the groups it keeps is asked to birth again. Whatever arrives for a
+    // group it does not watch is not this host's: never tracked, never asked
+    // to birth, never handed on - a subscription another layer of the same
+    // client made brings it all the same. A group it stops watching has its
+    // nodes taken to be offline. On a host watching everything, watchAlso()
+    // changes nothing and unwatch() is refused.
+    bool watchAlso(const char* group);
+    bool unwatch(const char* group);
+    // Whether this host answers for the group's nodes.
+    bool watching(const char* group) const;
+
     // --- Whether to become the PRIMARY host ---
     //
     // A primary host is one that edge nodes gate their births on. Nothing in
@@ -624,8 +639,13 @@ private:
     MqttClientConfig _behaviour;
 
     std::string _hostId;
-    std::string _watchGroup;
+    // Unset (watch() never called): what the client is given. Set: every
+    // group (_watchAll), or the groups named.
     bool _watchSet = false;
+    bool _watchAll = false;
+    std::vector<std::string> _watchGroups;
+    // spBv1.0/# or spBv1.0/<group>/# into _topic; false if it does not fit.
+    bool buildWatchTopic(const std::string* group);
 
     // Chosen once, before the CONNECT, and used in both the Will and the birth.
     // [tck-id-payloads-state-birth-payload] requires them to match.

@@ -1586,7 +1586,8 @@ void AppConnections::startHost(Connection& c) {
         h->spec = one.second;
         h->library.reset(new MqttSparkplugHost(c.client));
         h->library->hostId(h->spec.hostId.c_str());
-        h->library->watch(h->spec.group.empty() ? nullptr : h->spec.group.c_str());
+        h->library->watch(h->spec.groups.empty() ? nullptr : h->spec.groups.front().c_str());
+        for (size_t g = 1; g < h->spec.groups.size(); g++) h->library->watchAlso(h->spec.groups[g].c_str());
         h->library->reorderTimeout(h->spec.reorderTimeoutMs);
         h->library->actAsPrimary(false);          // rebirths are asked here, with limits
         h->library->onMessage(&Host::inbound, h.get());
@@ -2401,13 +2402,45 @@ std::string sparkplugIdRefusal(const char* what, const std::string& id) {
     return problem == nullptr ? "" : refusal + "it " + problem;
 }
 
+// The same host on the same connection answering for other groups (or with
+// other limits): its session goes on. To or from every group it starts again.
+bool AppConnections::sameSessionOf(const AppSparkplugHostSpec& was, const AppSparkplugHostSpec& now) {
+    return was.connection == now.connection && was.hostId == now.hostId && !was.groups.empty() && !now.groups.empty();
+}
+
+// A running host takes its new groups and limits as they are: a group gone is
+// unsubscribed and its nodes no longer followed (when each was last asked to
+// birth is kept, so a group that comes back is not asked again sooner than
+// the limit), a group new is subscribed and its nodes asked as their messages
+// come - no STATE, no rebirth of the groups it keeps.
+void AppConnections::regroupHost(Host& h, const AppSparkplugHostSpec& spec) {
+    for (const std::string& g : h.spec.groups) {
+        if (std::find(spec.groups.begin(), spec.groups.end(), g) != spec.groups.end()) continue;
+        h.library->unwatch(g.c_str());
+        const std::string prefix = g + "/";
+        for (auto it = h.births.begin(); it != h.births.end();) {
+            it = it->first.compare(0, prefix.size(), prefix) == 0 ? h.births.erase(it) : std::next(it);
+        }
+        for (auto it = h.gapsSeen.begin(); it != h.gapsSeen.end();) {
+            it = it->first.compare(0, prefix.size(), prefix) == 0 ? h.gapsSeen.erase(it) : std::next(it);
+        }
+    }
+    for (const std::string& g : spec.groups) {
+        if (std::find(h.spec.groups.begin(), h.spec.groups.end(), g) == h.spec.groups.end()) h.library->watchAlso(g.c_str());
+    }
+    h.library->reorderTimeout(spec.reorderTimeoutMs);
+    h.spec = spec;
+}
+
 bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostInfo* info, std::string& error) {
     if (spec.id.empty() || spec.connection.empty()) {
         error = "a host needs an id and the connection it runs on";
         return false;
     }
     error = sparkplugIdRefusal("host_id", spec.hostId);
-    if (error.empty() && !spec.group.empty()) error = sparkplugIdRefusal("group", spec.group);
+    for (const std::string& g : spec.groups) {
+        if (error.empty()) error = sparkplugIdRefusal("group", g);
+    }
     if (!error.empty()) return false;
     bool ok = true;
     call([&] {
@@ -2439,8 +2472,13 @@ bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostI
         }
         auto had = _hosts.find(spec.id);
         const std::string before = had == _hosts.end() ? std::string() : had->second.connection;
+        const bool regroup = had != _hosts.end() && sameSessionOf(had->second, spec);
         _hosts[spec.id] = spec;
         saveHosts();
+        auto running = _connections.find(spec.connection);
+        if (regroup && running != _connections.end() && running->second->host) {
+            regroupHost(*running->second->host, spec);
+        } else {
         // Started again where it runs: its STATE born anew, its sessions followed afresh.
         for (const std::string& id : {before, spec.connection}) {
             auto at = _connections.find(id);
@@ -2451,6 +2489,7 @@ bool AppConnections::putHost(const AppSparkplugHostSpec& spec, AppSparkplugHostI
                 c.host.reset();
             }
             startHost(c);
+        }
         }
         auto at = _connections.find(spec.connection);
         if (info) {
@@ -3325,7 +3364,8 @@ void AppConnections::saveHosts() {
     for (const auto& one : _hosts) {
         const AppSparkplugHostSpec& h = one.second;
         json::Object o;
-        o.add("id", h.id).add("connection", h.connection).add("hostId", h.hostId).add("group", h.group);
+        o.add("id", h.id).add("connection", h.connection).add("hostId", h.hostId);
+        o.raw("groups", json::array(h.groups));
         o.add("rebirthOnGap", h.rebirthOnGap).add("reorderTimeoutMs", (long long)h.reorderTimeoutMs);
         o.add("rebirthMinIntervalMs", (long long)h.rebirthMinIntervalMs);
         text += (first ? "\n" : ",\n") + o.str();
@@ -3431,7 +3471,9 @@ bool AppConnections::loadHosts(std::string& error) {
         h.id = v.str("id");
         h.connection = v.str("connection");
         h.hostId = v.str("hostId");
-        h.group = v.str("group");
+        v.strings("groups", h.groups);
+        // A state directory an earlier release wrote: its one group.
+        if (h.groups.empty() && !v.str("group").empty()) h.groups.push_back(v.str("group"));
         h.rebirthOnGap = v.has("rebirthOnGap") ? v.flag("rebirthOnGap") : true;
         h.reorderTimeoutMs = (uint32_t)v.integer("reorderTimeoutMs", 2000);
         h.rebirthMinIntervalMs = (uint32_t)v.integer("rebirthMinIntervalMs", 60000);

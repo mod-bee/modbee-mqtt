@@ -486,7 +486,7 @@ void sparkplugHost(Server& server) {
         host.set_id("h");
         host.set_connection("local");
         host.set_host_id("platform");
-        host.set_group("plant");
+        host.add_groups("plant");
         host.set_reorder_timeout_ms(200);
         host.set_rebirth_min_interval_ms(0);
         v1::SparkplugHostInfo info;
@@ -1072,7 +1072,7 @@ void sparkplugEdgeChanges(Server& server) {
         host.set_id("h4");
         host.set_connection("host4");
         host.set_host_id("reader4");
-        host.set_group("plant4");
+        host.add_groups("plant4");
         v1::SparkplugHostInfo info;
         ok(sparkplug->PutHost(&c, host, &info).ok(), "a host in the server, following the group");
     }
@@ -1550,7 +1550,7 @@ void sparkplugStructures(Server& server) {
         host.set_id("h3");
         host.set_connection("host3");
         host.set_host_id("reader3");
-        host.set_group("plant3");
+        host.add_groups("plant3");
         v1::SparkplugHostInfo info;
         ok(sparkplug->PutHost(&c, host, &info).ok(), "a host in the server, following the group");
     }

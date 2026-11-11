@@ -157,7 +157,7 @@ struct AppSparkplugHostSpec {
     std::string id;                        // this server's name for it
     std::string connection;                // the connection it runs on
     std::string hostId;                    // spBv1.0/STATE/<hostId>
-    std::string group;                     // the group it follows; "": every group
+    std::vector<std::string> groups;       // the groups it answers for; none: every group
     bool rebirthOnGap = true;
     uint32_t reorderTimeoutMs = 2000;      // how long a gap waits for the missing message
     uint32_t rebirthMinIntervalMs = 60000;
@@ -441,6 +441,8 @@ private:
     void save();
     bool load(std::string& error);
     void startHost(Connection& connection);   // the host its spec puts on it, if any
+    static bool sameSessionOf(const AppSparkplugHostSpec& was, const AppSparkplugHostSpec& now);
+    void regroupHost(Host& host, const AppSparkplugHostSpec& spec);   // its new groups, its session kept
     void serviceHost(Connection& connection);
     void saveHosts();
     bool loadHosts(std::string& error);
