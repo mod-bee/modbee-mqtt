@@ -23,6 +23,16 @@ neither Kafka topic grows when nothing is published.
 
 Changes on upgrade: none to configure.
 
+A Sparkplug host on a Kafka link says online only once it can hear. Its online STATE went out as soon as its
+session on the link's broker was up, while the link was still joining its consumer group - and a link starts at the
+end of its topic. A node waiting for that host answers the online STATE with its birth at once, so the birth went
+by unread and the host never learned the node (it showed offline until something else made it birth again). The
+online STATE now waits until the link fetches its partitions at a position (`fetch_state` active in librdkafka's
+statistics, kept as `AppKafkaLinkStatus.reading`); the Will is armed as before. Proven in `test_kafka_link`: put
+in the order a platform puts them (host, STATE connection, link), the host now learns the node from its one birth.
+
+Changes on upgrade: none to configure. A host on a Kafka link comes online up to a statistics interval (5 s) later.
+
 ## [0.1.6]
 
 A fix found by the platform on 0.1.5: a server edge node's live values that had not been proven delivered were lost

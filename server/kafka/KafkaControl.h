@@ -42,6 +42,7 @@ struct KafkaMappingCounters {
     std::atomic<uint64_t> invalid{0};     //   could not be published (bad topic, ...)
     std::atomic<uint64_t> refused{0};     //   the broker could not take it (a queue or the retained store full)
     std::atomic<int64_t> lag{-1};         //   records behind the end of its partitions, at the last statistics; -1 not known
+    std::atomic<bool> fetching{false};    //   a partition fetching at a position (fetch_state active), at the last statistics
 };
 
 struct KafkaPipeStatus {
@@ -51,6 +52,7 @@ struct KafkaPipeStatus {
         uint64_t send = 0, success = 0, failed = 0, tooLarge = 0, latencyMicros = 0;
         uint64_t polled = 0, published = 0, invalid = 0, refused = 0;
         int64_t lag = -1;
+        bool fetching = false;
     };
     std::vector<Mapping> mappings;
     uint64_t heldAcknowledgements = 0;    // PUBACK/PUBRECs waiting on Kafka now

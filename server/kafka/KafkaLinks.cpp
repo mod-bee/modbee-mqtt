@@ -298,6 +298,7 @@ bool KafkaLinks::status(const std::string& id, AppKafkaLinkStatus& out) const {
             out.recordsIn += m.published;
             out.recordsInInvalid += m.invalid + m.refused;
             out.lag = m.lag;
+            out.reading = m.fetching;
         }
     }
     return true;

@@ -1678,7 +1678,9 @@ void AppConnections::serviceHostState(Connection& c) {
             s.asked = true;
             return;
         }
-        if (s.client.isConnected() && s.stateArmed && !s.stateBorn) {
+        // Online only once the link reads its partitions: a node answers the online STATE with its birth at
+        // once, and a link still joining its group starts at the end and never sees it.
+        if (s.client.isConnected() && s.stateArmed && !s.stateBorn && c.link.reading) {
             const std::string online = stateJson(true, s.stateTimestamp);
             if (mq_accepted(s.client.publish(s.stateTopic.c_str(), (const uint8_t*)online.data(), online.size(),
                                              MQ_QOS_1, true))) {

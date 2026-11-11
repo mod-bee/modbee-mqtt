@@ -73,6 +73,7 @@ struct AppKafkaLinkStatus {
     uint64_t recordsOut = 0, recordsOutFailed = 0;   // Kafka has them; refused or given up
     uint64_t recordsIn = 0, recordsInInvalid = 0;    // read and handed on; could not be
     int64_t lag = -1;                                // records not read yet; -1 not known
+    bool reading = false;                            // its partitions fetched at a position: what comes, it reads
     uint64_t held = 0;                               // publishes on it waiting for Kafka now
 };
 

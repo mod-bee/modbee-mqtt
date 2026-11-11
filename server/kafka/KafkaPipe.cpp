@@ -383,6 +383,10 @@ int KafkaPipe::Shard::onConsumerStatistics(rd_kafka_t*, char* json, size_t lengt
         known = true;
     }
     consumer.from->counters->lag.store(known ? lag : -1, std::memory_order_relaxed);
+    // Fetching at a position: what it reads from now on reaches it (a lag stays -1 on a quiet topic until a record
+    // is read, so it cannot say this).
+    consumer.from->counters->fetching.store(stats.find("\"fetch_state\":\"active\"") != std::string::npos,
+                                            std::memory_order_relaxed);
     return 0;
 }
 
@@ -1116,6 +1120,7 @@ KafkaPipeStatus KafkaPipe::status() const {
         m.invalid = from->counters->invalid.load();
         m.refused = from->counters->refused.load();
         m.lag = from->counters->lag.load();
+        m.fetching = from->counters->fetching.load();
         out.mappings.push_back(m);
     }
     for (const std::unique_ptr<Shard>& shard : _shards) out.heldAcknowledgements += shard->held.load();
