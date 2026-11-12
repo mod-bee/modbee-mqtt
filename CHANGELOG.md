@@ -11,6 +11,14 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+A key's allowance changes in place. `key.set` takes `uses` (how many more devices it may register: `0` closes it,
+`-1` no limit) and `approval`, beside `data`; only what is named changes, and the key, its rules and its site stay -
+so a site kept to exactly the devices it has is opened for one more and closes again by itself, and a key that is
+stolen while closed lets nobody in. Before, the only way to a new allowance was a new key, flashed into every device
+still to come. `modbee-mqtt key set <name> --uses 2` (or `unlimited`), `--approval manual`.
+
+Changes on upgrade: none.
+
 ## [0.1.8]
 
 One Sparkplug host for many groups on a shared broker, and a client that notices a link that only seems alive.

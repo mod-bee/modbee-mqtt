@@ -141,7 +141,7 @@ const std::vector<ArgSpec>& adminSpecs() {
                                  "with (certificate-login); \"\" clears it"},
         {"prefix", 0, true, "user list: only names starting with this"},
         {"approval", 0, true, "key create: auto (default) or manual - devices wait for approval"},
-        {"uses", 0, true, "key create: how many devices it may create (default unlimited)"},
+        {"uses", 0, true, "key create: how many devices it may create (default unlimited); key set: how many more (0 closes it, unlimited)"},
         {"days", 0, true, "key create: expires after this many days (default never)"},
         {"device", 0, true, "key create: the one device name it may create"},
         {"site", 0, true, "key create: the site its devices belong to; it registers again only those"},
@@ -367,12 +367,22 @@ int cmdKey(int argc, char** argv) {
         if (args.has("site")) request.add("site", args.get("site"));
         if (!data(args, request)) return 2;
     } else if (action == "set") {
-        if (name.empty() || !args.has("data")) {
-            std::fprintf(stderr, "usage: modbee-mqtt key set <name> --data name=value [--data ...]\n");
+        if (name.empty() || (!args.has("data") && !args.has("uses") && !args.has("approval"))) {
+            std::fprintf(stderr, "usage: modbee-mqtt key set <name> [--uses <more devices>|unlimited] [--approval auto|manual] [--data name=value ...]\n");
             return 2;
         }
         request.add("command", "key.set").add("name", name);
-        if (!data(args, request)) return 2;
+        if (args.has("uses")) {
+            if (args.get("uses") == "unlimited") {
+                request.add("uses", -1LL);
+            } else {
+                long long n = 0;
+                if (!args.getInt("uses", 0, 0, 1000000, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
+                request.add("uses", n);
+            }
+        }
+        if (args.has("approval")) request.add("approval", args.get("approval"));
+        if (args.has("data") && !data(args, request)) return 2;
     } else if (action == "list") {
         request.add("command", "key.list");
     } else if (action == "remove") {

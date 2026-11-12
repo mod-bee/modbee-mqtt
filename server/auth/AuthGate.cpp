@@ -858,13 +858,28 @@ std::string AuthGate::admin(const std::string& requestText) {
         return reply(request, true, o);
     }
     if (command == "key.set") {
-        // A key's data: what the devices it registers from now on are handed. Devices it registered already
-        // keep theirs (user.set data changes those).
+        // What a key may still do and what it hands its devices from now on - each only when named; the key
+        // itself, its rules and its site stay as they were made, so a device set up with it needs nothing new.
+        // `uses`: how many more devices it may register (0: none - closed, it refuses every registration until
+        // raised; -1: no limit). `approval`: whether each one waits to be let in. `data`: what each is handed;
+        // devices it registered already keep theirs (user.set data changes those).
         AuthKey k;
         if (!_store.findKey(request.str("name"), k)) return failure(request, "no key " + request.str("name"));
-        if (!request.has("data")) return failure(request, "key.set changes data - the request named none");
+        if (!request.has("data") && !request.has("uses") && !request.has("approval")) {
+            return failure(request, "key.set changes uses, approval or data - the request named none");
+        }
+        if (request.has("uses")) {
+            const long long uses = request.integer("uses", -2);
+            if (uses < -1) return failure(request, "uses is how many more devices it may register: 0 or more, or -1 for no limit");
+            k.usesLeft = uses;
+        }
+        if (request.has("approval")) {
+            const std::string approval = request.str("approval");
+            if (approval != "auto" && approval != "manual") return failure(request, "approval is auto or manual");
+            k.manualApproval = approval == "manual";
+        }
         std::string dataError;
-        if (!requestData(request, k.data, dataError)) return failure(request, dataError);
+        if (request.has("data") && !requestData(request, k.data, dataError)) return failure(request, dataError);
         if (_store.putKey(k, true) != AuthResult::Ok) return failure(request, "the login store could not be written");
         json::Object o;
         o.raw("key", describeKey(k));
