@@ -718,6 +718,14 @@ int main() {
 
 What the host does for you:
 
+- **Answers for its groups, and only those.** `watch("Plant")` narrows it to one
+  group; `watchAlso("Mill")` and `unwatch("Plant")` add and drop groups while it
+  runs, in the session it has - its STATE stays born and the groups it keeps are
+  not asked to birth again. Whatever reaches its client for a group it does not
+  watch (through a subscription of yours to `spBv1.0/#`, or a link that carries a
+  whole broker) is not its own: never tracked, never asked to birth - so several
+  hosts, and other people's nodes, can share one broker. `watching(group)` says
+  which it answers for; `watch()` with no group answers for every one.
 - **Announces itself** on `spBv1.0/STATE/<host id>`, with a retained Will
   that says offline, so nodes waiting for it as their primary host start and
   stop with it.

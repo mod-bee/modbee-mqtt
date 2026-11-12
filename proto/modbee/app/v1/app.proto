@@ -1256,13 +1256,13 @@ message SiteKey {
   string name = 1;
   string site = 2;
   bool manual_approval = 3;
-  uint32 uses = 4;                 // how many of the devices it let in may be online at once; 0: no limit
-  int64 expires_ms = 5;            // 0: never
+  optional int32 devices = 4;      // how many of the devices it let in may be online at once - any of them; 0: off
+                                   // (they are signed out and refused); absent or -1: no limit
+  int64 expires_ms = 5;            // signing up with it stops then (UTC ms); 0: never
   string device = 6;               // may register only this device
   repeated string publish = 7;
   repeated string subscribe = 8;
   map<string, string> data = 9;
-  uint32 used = 10;                // read only
 }
 message ListKeysReply {
   repeated SiteKey keys = 1;

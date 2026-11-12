@@ -116,6 +116,22 @@ On first boot the device:
 From then on it connects with its own login, and nobody ever types, records
 or looks up its secret.
 
+### How many devices at once
+
+A key can say how many of the devices it let in may be **online at the same
+time** - any of them (`--devices`):
+
+| `--devices` | What it means |
+| --- | --- |
+| `1` | One board at a time. While it is online, any other board with this key is refused - a second device signing up, or the same device's login on another board. When it goes offline, another may take its place |
+| `2` | Two at once; a third is refused until one goes |
+| `0` | The key is **off**: every device it let in is signed out now and refused, and nothing signs up with it, until you raise it again (`key set --devices`) |
+| left out | No limit |
+
+Nothing counts down: a device signing up again, or a replaced board, uses no
+"place" of its own - only being online does. A device counts against the key
+it last signed up with.
+
 **On an OpenPLC PLC** it is one block beside `MQTT_CLIENT`: `MQTT_PROVISION`,
 with the key on its `KEY` pin and the PLC's name as the client's `CLIENT_ID`.
 The login is kept in the block's retained memory. The modbee-openplc library's
@@ -129,8 +145,11 @@ page *13 Provisioning* has the whole of it.
 | A device's flash is wiped | It has no login, so it registers again |
 | You reset a device (`modbee-mqtt user reset`) | Its stored login is refused, so it registers again by itself - no site visit |
 | The broker's login store is lost, or restored from an old backup | Every device's login is refused at once. Each registers again with its key but **keeps its stored login** - it is replaced only when the broker issues a new one - and tries it again every five minutes, so a store that comes back lets the fleet straight back in, with nothing to approve |
+| A board is stolen or lost | Disable its login (`modbee-mqtt user disable tank-07`): it is signed out now and refused from then on, wherever it is. Nothing else changes - not the key, not another device. `user enable` lets the same login back in |
+| Someone copies the key | Nothing they can do while your boards are online: a key never signs a board up over one that is connected, and a key at its number of devices refuses the rest. Turn the key off (`key set --devices 0`) or limit it, and approve each device (`--approval manual`) |
+| You turn the key off (`key set --devices 0`) | Every device it let in is signed out and refused - and nothing signs up with it - until you raise it again; the same key then works again, nothing to flash |
 | You disable a device | It stays out: registering again does not undo it |
-| You remove the key (`modbee-mqtt key remove`) | No new device can register with it; devices already registered keep working |
+| You remove the key (`modbee-mqtt key remove`) | No new device can register with it; devices already registered keep working, counted against no key |
 | You issue a new key for the site | Devices keep working (they log in with their own login, not the key); a new or wiped device registers with the new key |
 | A key of **another** site is used with a device's name | Refused: a key registers again only devices of its own site, so one customer's key cannot take another's device |
 
@@ -147,12 +166,29 @@ not cleared by a refusal, only overwritten by a login the broker has issued.
 | --- | --- |
 | `--approval manual` | A new device waits until you approve it: `modbee-mqtt user list` shows it `pending`, `modbee-mqtt user approve tank-07` lets it in. Without this, devices are let in straight away |
 | `--devices 2` | At most 2 of the devices it let in may be online at once - any of them: a third is refused until one goes. `0` turns the key off: its devices are signed out and refused until it is raised (`key set --devices`). Without it, no limit |
-| `--days 30` | It stops working after 30 days |
+| `--days 30` | Signing up with it stops after 30 days (devices it let in keep working). Without it, a key never expires |
 | `--site north` | The site its devices belong to: a key registers again only devices of its own site, so one customer's key cannot take another's device. Keys without a site share one - a broker for a single site needs none |
 | `--device tank-07` | It may register only that one device - e.g. a key your platform creates for one device; that device's replacement board registers with the same key once the old one is offline |
 | `--data group=north-plant` | A value handed to each device it registers - repeat for more ([below](#what-a-key-hands-its-devices)) |
 
 `modbee-mqtt key list` shows every key; `modbee-mqtt key remove site-north` retires one.
+
+### Changing a key
+
+A key is flashed into devices that may be hard to reach, so **the key itself
+never changes**: what it allows does, in place.
+
+```bash
+docker compose exec modbee modbee-mqtt key set site-north --devices 3     # three online at once (unlimited: no limit)
+docker compose exec modbee modbee-mqtt key set site-north --devices 0     # off: its devices signed out and refused
+docker compose exec modbee modbee-mqtt key set site-north --approval manual
+docker compose exec modbee modbee-mqtt key set site-north --days 90       # stops 90 days from now
+docker compose exec modbee modbee-mqtt key set site-north --never-expires
+```
+
+Only what you name changes; the key, its rules and its site stay. Making a new
+key for a site is for one that has been lost to someone else - every device
+flashed with the old one then needs the new one before it can sign up again.
 
 ### What a key hands its devices
 

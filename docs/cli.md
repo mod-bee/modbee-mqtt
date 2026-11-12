@@ -59,7 +59,7 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee-mqtt admin` | The admin login, set on the server itself - added, or given a new password; it works at once, on a running server too |
 | `modbee-mqtt check` | Validate a `modbee.yaml` and report every problem with its line |
 | `modbee-mqtt user` | Device logins on a broker: `list`, `show`, `add`, `set`, `reset`, `disable`, `enable`, `approve`, `permissions`, `password`, `admin`, `remove` - live, no restart. `add` and `set` take `--fingerprint`, binding a login to one client certificate ([logins.md](logins.md#logging-in-with-a-certificate)) |
-| `modbee-mqtt key` | Provisioning keys, with which devices register themselves: `create`, `list`, `remove` |
+| `modbee-mqtt key` | Provisioning keys, with which devices register themselves: `create`, `list`, `set` (in place: `--devices` online at once, `0` off; `--approval`; `--days` / `--never-expires`; `--data`), `remove` |
 | `modbee-mqtt provision` | Register a device with a key from a computer, and print the login it was given |
 | `modbee-mqtt config` | A broker's settings, kept in its login database: `get`, `set`, `apply`, `check`, `reset` - applied at its next restart, which `--restart` asks for, except the TLS certificate, key and client CA, which apply at once (`broker.tls.cert-pem=@file`; [settings.md](settings.md)) |
 | `modbee-mqtt backup` | A copy of a broker's login database, and the settings kept in it |

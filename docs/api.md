@@ -899,6 +899,7 @@ mq_time_t reconnectMaximumMs = 60000;
 bool      autoReconnect      = true;
 mq_time_t connectTimeoutMs   = 20000;
 mq_time_t acknowledgementTimeoutMs = 60000;   // 0 = wait for ever
+mq_time_t maxSilenceMs       = 0;    // 0 = off; nothing from the broker this long ends the connection
 ```
 
 **The reconnect backoff.** Each attempt waits a delay drawn uniformly from
@@ -937,6 +938,19 @@ with the link up and keepalive passing. This bounds the wait: the operation is
 **given up on** with `AckTimeout`, the caller is told, and the quota is
 returned. Nothing is resent — [V5:MQTT-4.4.0-1] forbids that outside a session
 resume. Set it to `0` to wait indefinitely.
+
+**`maxSilenceMs` is for a link that only seems alive.** The keep-alive puts
+off its own deadline while our backlog drains, taking that as the far end's
+TCP acknowledging it. A cellular modem's socket says "sent" whether or not
+anything reaches the broker - the module takes the bytes into its own buffer -
+so a dead path looked alive for as long as the device kept publishing. With
+`maxSilenceMs` set, that long with not one byte from the broker ends the
+connection, however our own bytes move; the client reconnects as it would after
+any loss. Off by default, because a long upload over a slow link is
+legitimately silent from the far end until it is acknowledged: set it longer
+than the longest upload your device makes (three keep-alive intervals is a safe
+choice). `heardAgoMs()` says how long since anything arrived - a watchdog's
+input that only the broker can satisfy.
 
 **The buffers hold one whole packet each.** There is no hidden ceiling and no
 silent fragmentation: publishing a 60 kB payload means setting
