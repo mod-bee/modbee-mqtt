@@ -520,6 +520,7 @@ named `kafka-password`.
 | **Sessions**, and messages queued for a device that is away | memory, and where `sessions: store` says | **Yes**, with `store: file` |
 | **Consumer groups** of the Application API, and what they hold | memory, and beside the sessions | **Yes**, with `sessions: store: file` |
 | **Everything sent to Kafka** | Kafka, on disk (the `kafka-data` volume in the `*-kafka` examples) | Yes |
+| **The [diagnostics log](diagnostics.md)** - connections, refused logins and why, sign-ups, changes | `/var/lib/modbee/diagnostics.db` (beside `auth.db`), a week, 100 MB at most | **Yes**, on a volume at `/var/lib/modbee` |
 
 ### Retained messages
 

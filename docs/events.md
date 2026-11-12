@@ -51,7 +51,7 @@ dealt in order with each client's messages, rather than subscribing to them.
 | `$modbee/events/unsubscribed` | It removed a subscription it had | the same, and `filter` |
 | `$modbee/events/publish-refused` | A PUBLISH its rules do not allow was refused | `event`, `clientid`, `username`, `topic`, `reason` (what it was told, e.g. 135 Not authorized), `time` |
 | `$modbee/events/subscribe-refused` | A SUBSCRIBE its rules do not allow was refused | the same, with `filter` instead of `topic` |
-| `$modbee/events/connect-refused` | The server turned a CONNECT away itself: it is full (`reason` 137 Server busy), or the login already holds all its sessions (151 Quota exceeded) | `event`, `clientid`, `username`, `reason`, `address`, `time` |
+| `$modbee/events/connect-refused` | The server turned a CONNECT away itself: it is full (`reason` 137 Server busy), the login already holds all its sessions (151 Quota exceeded), the client id belongs to a session of another login (133 Client Identifier not valid), or its Will is on a topic its login may not publish to (135 Not authorized) | `event`, `clientid`, `username`, `reason`, `address`, `time` |
 | `$modbee/events/handshake-failed` | A TLS handshake failed before any CONNECT: a client certificate missing or not trusted, a protocol or cipher neither end shares, something that is not TLS on the TLS port. A connection that closes without sending anything - a port check - is not one | `event`, `clientid` (always `""`: it never said), `username` (`""`), `address`, `detail` (the TLS engine's words: `"TLS handshake failed: error:0A0000C7:SSL routines::peer did not return a certificate"`), `time` |
 
 ```json
@@ -92,7 +92,8 @@ dealt in order with each client's messages, rather than subscribing to them.
   over for it when it connects with `resumed: false`, and start over for every
   client at `started`.
 - A connection refused before it had a session - a wrong password, say - is
-  not an event.
+  not an event. The [diagnostics log](diagnostics.md) keeps it, with the
+  reason, and keeps every event here too, whether events are on or not.
 
 Each event is published at **QoS 1**, not retained, with the client's own id
 as its publisher. A client's events are published in the order they

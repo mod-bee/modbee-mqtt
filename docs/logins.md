@@ -449,6 +449,7 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 | `key.list`, `key.remove` | `name` for remove | `keys` |
 | `backup` | | `file` |
 | `status` | | counts of logins, accepted, refused, provisioned, and of logins by certificate: `certificate_accepted`, `certificate_refused` |
+| `log.list` | optional `client`, `login`, `kinds`, `since`, `until` (UTC ms), `limit` (up to 1000), `before`, or `after` to follow | `entries` of the [diagnostics log](diagnostics.md#reading-it), newest first, `next` when there are more, `dropped` |
 
 A user or key record never includes a secret or its hash. A user's
 `fingerprint` is a certificate's, which is public.
@@ -457,7 +458,9 @@ The same channel carries the server's **settings**: `config.get`,
 `config.check`, `config.set`, `config.apply` and `config.reset` read and
 change them, applied at the next restart ([settings.md](settings.md)). With
 `events:` turned on, an admin can also follow what clients do - connect, go,
-subscribe - on `$modbee/events/#` ([events.md](events.md)).
+subscribe - on `$modbee/events/#` ([events.md](events.md)). Every refused login, with its
+reason, every sign-up and its answer, and every change made here is kept in
+the [diagnostics log](diagnostics.md) - `modbee-mqtt log`, or `log.list`.
 
 The device side is just as open, for firmware that does not use this library:
 CONNECT with user name `$provision`, the key as password and the device's name

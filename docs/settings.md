@@ -22,7 +22,9 @@ and mappings (`Kafka.*`), which are kept ([kafka.md](kafka.md#changing-it-while-
 are applied the moment they are stored, with no restart
 ([below](#the-tls-material-applied-while-it-runs)), because a certificate is
 renewed every few months and a broker a plant depends on should not stop for
-it.
+it. So are the [diagnostics log](diagnostics.md)'s limits -
+`diagnostics.enabled`, `keep-days`, `max-size-mb` and `max-rows` - stored with
+`config.set` and taken by the running log at once ([below](#the-diagnostics-log-applied-while-it-runs)).
 
 ---
 
@@ -313,6 +315,31 @@ for later, and never the key:
 A password set as an override is stored in the database as written - unlike a
 login's secret, a setting has to be readable to be used - and goes into every
 backup of it. `password-file:` keeps it out.
+
+---
+
+## The diagnostics log, applied while it runs
+
+The [diagnostics log](diagnostics.md) - what happened to whom, kept on disk -
+is set in its own section:
+
+| Path | Default | |
+| --- | --- | --- |
+| `diagnostics.enabled` | `true` | Whether it records at all |
+| `diagnostics.keep-days` | `7` | Entries older than this go; `0` no age limit |
+| `diagnostics.max-size-mb` | `100` | The file stays at this size: the oldest entries make room for the new |
+| `diagnostics.max-rows` | `1000000` | At most this many entries; `0` no limit |
+| `diagnostics.file` | `""` | The file: `""` is `diagnostics.db` in the data folder, or beside the login database |
+
+```bash
+docker compose exec modbee modbee-mqtt config set diagnostics.keep-days=30 diagnostics.max-size-mb=500
+```
+
+The first four are applied by the running server as they are stored -
+a lower limit deletes the oldest entries at once - and never make
+`restart_required` true. `diagnostics.file` is where the log is opened, so it
+waits for the restart. Like any setting, each is also an environment variable
+(`MODBEE_DIAGNOSTICS_KEEP_DAYS`) or a line in `modbee.yaml`.
 
 ---
 

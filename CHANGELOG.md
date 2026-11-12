@@ -11,6 +11,25 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+A diagnostics log: when a device will not connect, the broker says why - afterwards. `modbee-mqtt serve` keeps every
+connection and how it ended, every refused login with its reason in words (wrong password, no such login, disabled,
+waiting for approval, its key off or its devices at once all online, a key's secret wrong or expired, the client id
+held by another login's session, the server full), every sign-up with a key and its answer (ok, pending, or refused
+and why), every login and key change made over `$modbee/admin` and what it set, subscriptions and refused publishes,
+failed TLS handshakes, the server starting and stopping, and its own warnings and errors (the Kafka pipe, kept
+connections, the retained and session stores, TLS) - whether client events are on or not. In its own SQLite file,
+`diagnostics.db` in the data folder (beside the login database; `/var/lib/modbee` in the Docker image), written by a
+thread of its own from a bounded queue, so the broker never waits on it: what it cannot keep up with is dropped and
+counted. Kept 7 days, at most 100 MB - near that, the oldest entries are deleted and new ones written over the space -
+and at most a million entries: `diagnostics: enabled, keep-days, max-size-mb, max-rows, file` in `modbee.yaml`, the
+environment, or `config.set`, which applies all but `file` at once. Read with `modbee-mqtt log` (`--client`,
+`--login`, `--kind`, `--since 2h`, `--until`, `--limit`, `--follow`, `--json`) - over MQTT with an admin login
+(`log.list`), or the file itself with `--data`, with the broker stopped too - and `Admin.ListLog` /
+`GET /v1/log` on the Application API ([docs/diagnostics.md](docs/diagnostics.md)).
+
+`$modbee/events/connect-refused` is also published when a CONNECT names a client id another login's session holds
+(133) or carries a Will on a topic its login may not publish to (135).
+
 A key's number is how many of its devices may be ONLINE AT ONCE, not a count of sign-ups left. `devices` (in
 `key.create`, `key.set` and `key.list`, `--devices`) replaces `uses`: 1 - one board at a time, any board; 2 - two at
 once, a third refused until one goes; 0 - the key is off: its devices are signed out and refused until it is raised;
@@ -26,6 +45,8 @@ read-only `used` is gone.
 
 Changes on upgrade: a key's `uses_left` is read as its devices at once (a key left with 1 lets one device be online).
 `uses` / `uses_left` / `--uses` are `devices` / `--devices`; `SiteKey.uses` is `SiteKey.devices`.
+A server with a data folder or a login database starts keeping `diagnostics.db` beside it, up to 100 MB;
+`diagnostics: enabled: false` (or `MODBEE_DIAGNOSTICS_ENABLED=false`) turns it off.
 
 ## [0.1.9]
 

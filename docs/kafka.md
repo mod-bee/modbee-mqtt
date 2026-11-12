@@ -550,6 +550,7 @@ modbee-mqtt kafka status
 | `sessions:` | `store` (`memory` or `file`), `directory` (default `/var/lib/modbee/sessions`), `sync` (`normal` or `full`) ([docker.md](docker.md#sessions)) |
 | `metrics:` | `enabled`, `address`, `port` (default 9464) |
 | `events:` | `enabled`: publish what clients do on `$modbee/events/...` ([events.md](events.md)) |
+| `diagnostics:` | The diagnostics log: `enabled` (`true`), `keep-days` (`7`), `max-size-mb` (`100`), `max-rows` (`1000000`), `file` (`""`: in the data folder) ([diagnostics.md](diagnostics.md)) |
 | `sparkplug:` | `aware`: keep every Sparkplug birth on `$sparkplug/certificates/...` ([app-api.md](app-api.md#sparkplug-b)) |
 | `kafka.clusters[]` | `id`, `bootstrap-servers`, `tls`, `authentication`, `properties` |
 | `kafka.mqtt-to-kafka[]` | `id`, `cluster`, `mqtt-topic-filters`, `kafka-topic`, `kafka-acks` (`zero`, `one`, `all`), `max-record-bytes` (1 MB), `key`, `headers`, `partition-strategy` (`key-based`, `uniform`), `acknowledge` (`kafka`, `routed`) |

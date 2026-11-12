@@ -54,7 +54,7 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee-mqtt sub` | Subscribe, print what the broker granted, then print what arrives |
 | `modbee-mqtt req` | MQTT 5 request/response: publish with a response topic and correlation data, wait for the matching reply |
 | `modbee-mqtt bench` | Load generator, Linux only: `conn`, `pub`, `sub` |
-| `modbee-mqtt serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe. `--data <folder>` keeps everything in that folder - logins, settings, retained messages, sessions - with no `modbee.yaml` |
+| `modbee-mqtt serve` | The broker, Linux and Windows: one `MqttBroker` per core behind one port, with the Kafka pipe. `--data <folder>` keeps everything in that folder - logins, settings, retained messages, sessions, the diagnostics log - with no `modbee.yaml` |
 | `modbee-mqtt service` | `serve` as a service - systemd on Linux, a Windows service on Windows: `install` (and start), `start`, `stop`, `status`, `uninstall`. With nothing else, it keeps everything in one folder (`serve --data`) ([releases.md](releases.md#installing-it)) |
 | `modbee-mqtt admin` | The admin login, set on the server itself - added, or given a new password; it works at once, on a running server too |
 | `modbee-mqtt check` | Validate a `modbee.yaml` and report every problem with its line |
@@ -64,6 +64,7 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee-mqtt config` | A broker's settings, kept in its login database: `get`, `set`, `apply`, `check`, `reset` - applied at its next restart, which `--restart` asks for, except the TLS certificate, key and client CA, which apply at once (`broker.tls.cert-pem=@file`; [settings.md](settings.md)) |
 | `modbee-mqtt backup` | A copy of a broker's login database, and the settings kept in it |
 | `modbee-mqtt restore` | Put a backup of the login database back, with the broker stopped |
+| `modbee-mqtt log` | The [diagnostics log](diagnostics.md): who connected and how they went, who was refused and why, sign-ups and their answers, what admins changed, the server's warnings - `--client`, `--login`, `--kind`, `--since 2h`, `--until`, `--limit`, `--follow`, `--json`. Over MQTT with an admin login, or the file itself with `--data` (the broker may be stopped) - [below](#the-diagnostics-log) |
 | `modbee-mqtt --version` | The version, the TLS engine this build was compiled with - `modbee-mqtt 0.1.9 (TLS: wolfSSL)` - and what else is inside: the Kafka pipe with its librdkafka's features, and the Application API with its gRPC, or `not built` |
 
 **Exit codes, for scripts:**
@@ -296,6 +297,47 @@ The TLS figures already include the engine releasing its idle record
 buffers; without that, OpenSSL is 63 KB. At a million devices TLS is most of
 the memory, so size the host for it.
 
+## The diagnostics log
+
+When a device will not connect, `modbee-mqtt log` says why: every connection
+and how it ended, every refused login with its reason in words, every
+sign-up and its answer, every change an admin made, and the server's own
+warnings - kept on disk for a week ([diagnostics.md](diagnostics.md)).
+
+```bash
+modbee-mqtt log --client tank-01 --since 2h          # one device, the last two hours
+modbee-mqtt log --kind connect-refused,signup        # every refusal and sign-up
+modbee-mqtt log --login acme-site -f                 # one login, then new entries as they come
+modbee-mqtt log --since 2026-11-12 --until "2026-11-12 08:00" --json
+sudo modbee-mqtt log --data /var/lib/modbee-mqtt     # the file itself, the broker running or not
+docker compose exec modbee modbee-mqtt log -n 50     # in a stack: the server's own admin login
+```
+
+```
+2026-11-12 09:14:03.120  connect-refused     client tank-01 (its login) from 10.0.4.7:51544 - [134] Bad User Name or Password: wrong password
+2026-11-12 09:14:40.882  signup              client press-3 (its login) - refused: the provisioning key's 1 device(s) at once are online (key "line-2")
+2026-11-12 09:15:02.004  connected           client tank-01 (its login) from 10.0.4.7:51602 (a new session)
+2026-11-12 09:31:44.517  disconnected        client tank-01 (its login) from 10.0.4.7:51602 - [141] the server closed it - Keep Alive timeout: nothing heard from it for one and a half keep-alives
+```
+
+| Option | |
+| --- | --- |
+| `--client ID`, `--login NAME` | That client id, that login - exactly |
+| `--kind K,...` | Those kinds only, comma-separated or repeated ([the kinds](diagnostics.md#what-it-keeps)) |
+| `--since`, `--until` | A time ago - `90s`, `30m`, `2h`, `7d` - or a time: `2026-11-12`, `"2026-11-12 08:00"` (your local time; end it with `Z` for UTC) |
+| `-n`, `--limit N` | The newest `N` (100), printed oldest first |
+| `-f`, `--follow` | Then each new entry as it is written, until Ctrl-C |
+| `-j`, `--json` | One JSON object a line: `id`, `time` (UTC ms), `kind`, `clientid`, `login`, `address`, `reason_code`, `reason`, `detail` |
+| `--data FOLDER`, `--file PATH` | Read the file on this machine instead of asking over MQTT |
+
+**Where it reads from.** With an admin login (`-u`, `-P`, `-h` ...; in a
+container, the server's own), it asks the broker over MQTT - `log.list` on
+`$modbee/admin`, so it works across the world and needs a broker with a login
+database. With `--data` or `--file` it reads the file itself, on the server's
+machine, with the broker running or stopped. With neither, on a server
+installed with `modbee-mqtt service install`, it reads the file in the service's
+data folder. Over the Application API: `modbee-mqtt log list` (`Admin.ListLog`).
+
 ## The Application API, from the command line
 
 Every call of the [Application API](app-api.md) is a command: the same
@@ -384,6 +426,7 @@ modbee-mqtt messages consume --group console --filters 'plant/#' --count 10
 | `modbee-mqtt logins backup` | `Admin.Backup` | `POST /v1/backups` |
 | `modbee-mqtt events get` | `Admin.GetEvents` | `GET /v1/events` |
 | `modbee-mqtt events set` | `Admin.PutEvents` | `PUT /v1/events` |
+| `modbee-mqtt log list` | `Admin.ListLog` | `GET /v1/log` |
 | `modbee-mqtt kafka-clusters put` | `Kafka.PutCluster` | `PUT /v1/kafka-clusters/{id}` |
 | `modbee-mqtt kafka-clusters get` | `Kafka.GetCluster` | `GET /v1/kafka-clusters/{id}` |
 | `modbee-mqtt kafka-clusters list` | `Kafka.ListClusters` | `GET /v1/kafka-clusters` |

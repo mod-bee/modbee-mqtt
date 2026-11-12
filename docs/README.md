@@ -46,6 +46,7 @@ Windows; none of it is part of the Arduino library.
 | [logins.md](logins.md) | **Device logins**: a login per device, managed live; devices that register themselves with a key; what each may publish and subscribe to; backups |
 | [settings.md](settings.md) | **Settings over MQTT**: the server's settings kept beside the logins, read and changed with `modbee-mqtt config` or from your own platform, applied at a restart it can ask for |
 | [events.md](events.md) | **Client events**: who connected, who went, and what each device subscribes to, published on `$modbee/events/...` and kept in Kafka if you like |
+| [diagnostics.md](diagnostics.md) | **The diagnostics log**: every connection and how it ended, every refused login and why, sign-ups, admin changes and the server's warnings - kept on disk for a week, read with `modbee-mqtt log` |
 | [cli.md](cli.md) | The `modbee-mqtt` command: publish, subscribe, request/response (to a broker, or to Kafka), benchmark, serve, manage logins, and every Application API call. In the Docker image; built from source on a computer |
 
 ## Understanding it

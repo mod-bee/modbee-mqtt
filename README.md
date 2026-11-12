@@ -52,6 +52,7 @@ the Arduino library.
 | **`modbee-mqtt serve`** | The broker as a server: one broker per CPU core, behind one port. Configured with one `modbee.yaml`, or with flags alone (`--data`, `--api`, `--set path=value`) |
 | **Kafka pipe** | MQTT to Apache Kafka and back, with messages passed through untouched. A publisher's PUBACK comes back only once Kafka has the message. Clusters and mappings changed while it runs ([kafka.md](docs/kafka.md)) |
 | **Device logins** | A login per device, added, reset and removed while it runs - or devices that register themselves with a provisioning key for their site - with per-device topic permissions (strict, or open to every topic for a login without rules: `authentication.default-topics`) |
+| **Diagnostics log** | Why a device will not connect, answered afterwards: every connection and how it ended, every refused login and its reason in words, sign-ups and their answers, admin changes and the server's warnings - kept on disk for a week (100 MB at most, the oldest written over), read with `modbee-mqtt log`, over MQTT or the Application API ([diagnostics.md](docs/diagnostics.md)) |
 | **Retained messages that survive a restart** | Kept in memory as always, and in a file or a compacted Kafka topic as well, with one setting |
 | **Application API** | Your application beside the server, over gRPC (and REST for admin): consumer groups sharing devices' messages, publishing to devices, connections to other brokers or over Kafka with store and forward, a Sparkplug B host or edge node in the server, and managing sessions, logins, listeners and the Kafka pipe live ([app-api.md](docs/app-api.md)) |
 | **`modbee-mqtt` command** | Publish, subscribe, request/response - to a broker or to Kafka - and benchmark from a terminal; every Application API call as a command ([cli.md](docs/cli.md)) |
@@ -335,6 +336,7 @@ host on a broker you do not own that passes the Eclipse TCK
 | [logins.md](docs/logins.md) | **Device logins**: a login per device, devices that register themselves, permissions, backups |
 | [settings.md](docs/settings.md) | The server's settings, changed over MQTT and applied at a restart |
 | [events.md](docs/events.md) | What clients do - connect, go, subscribe - as messages, and in Kafka |
+| [diagnostics.md](docs/diagnostics.md) | **Why a device will not connect**: the diagnostics log - connections, refusals and their reasons, sign-ups, changes - and `modbee-mqtt log` |
 | [kafka-apps.md](docs/kafka-apps.md) | **Your own app on Kafka** - reading device data and sending commands, from Node.js, Python or anything else |
 | [cli.md](docs/cli.md) | The `modbee-mqtt` command, and the Application API from the command line |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The five layers, and why |

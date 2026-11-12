@@ -15,7 +15,7 @@ The server answers all seven of its services:
 | `Sparkplug` | **Sparkplug B, decoded and encoded** - [below](#sparkplug-b) |
 | `Authority` | **Your application decides who may log in, and what each login may do** - [below](#logins-decided-by-your-application) |
 | `Kafka` | **The Kafka pipe's clusters and mappings, changed while it runs** - [below](#kafka) |
-| `Admin` | **Logins, site keys, sessions, kicks, retained messages, listeners, TLS, counters, settings, events, backups** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
+| `Admin` | **Logins, site keys, sessions, kicks, retained messages, listeners, TLS, counters, settings, events, backups, the diagnostics log** - [below](#administration-and-rest), and the same calls as JSON over HTTP |
 
 Every call is also a command - `modbee-mqtt sessions list`, `modbee-mqtt listeners set --port 1884` - with the
 call's own fields as its flags ([cli.md](cli.md#the-application-api-from-the-command-line)), and the server is
@@ -23,7 +23,7 @@ started with flags alone (`serve --api unix:<path> --api-token-file <file> --aut
 
 `Hello`'s `features` lists what a server serves (`authority`, `messages`, `connections`, `admin`), and what
 it added since (`connections.subscriptions`: subscription options on a connection; `admin.listeners`:
-`PutListeners`; `events.handshake`; `sparkplug.codec`; `sparkplug.host`; `sparkplug.edge`; `sparkplug.structures` - the edge node's templates, arrays and DataSets; `sparkplug.aware`; `kafka`: the `Kafka` service; `connections.kafka`: a connection over Kafka; `admin.backup`: `Backup`; `events.live`: `GetEvents` and `PutEvents`; the edge node's
+`PutListeners`; `events.handshake`; `sparkplug.codec`; `sparkplug.host`; `sparkplug.edge`; `sparkplug.structures` - the edge node's templates, arrays and DataSets; `sparkplug.aware`; `kafka`: the `Kafka` service; `connections.kafka`: a connection over Kafka; `admin.backup`: `Backup`; `events.live`: `GetEvents` and `PutEvents`; `admin.log`: `ListLog`; the edge node's
 `sparkplug.edge.quality` - a Quality with each value, `sparkplug.edge.properties` - properties in its births,
 `sparkplug.edge.devices` - `PutDevice`, `DeleteDevice` and `PutEdgeNode` changed in the session,
 `sparkplug.edge.history-limits` - `history_max_bytes` and `history_max_age_ms`, `sparkplug.edge.history-rate`,
@@ -315,6 +315,7 @@ running server, without restarting it:
 | `Stats` | The server's counters: connections, sessions, messages in and out, what is queued right now (`queued_messages`, `queued_bytes`), logins asked of your application and answered from its cache |
 | `Backup` | A copy of the login database, made now in its backups folder - what `modbee-mqtt backup` does over MQTT - and its file named; with `contents: true`, its bytes too, for an application on another machine. A restore is `modbee-mqtt restore`, with the server stopped: a running server cannot have its database replaced under it |
 | `GetEvents` `PutEvents` | [Client events](events.md) on or off, live. Not kept: a lasting change is `serve --events` or `SetSettings` `events.enabled` |
+| `ListLog` | The [diagnostics log](diagnostics.md): every connection and how it ended, every refused login with its reason in words, sign-ups and their answers, changes made by admins, the server's warnings - kept on disk for a week, with client events on or off. Newest first, a page at a time (`page_size` 100, at most 1000; `next_page_token`); filtered by `client_id`, `login`, `kinds`, `since_ms`, `until_ms`. `after_id` instead returns the entries after that one, oldest first - to follow it (`0`: from the oldest). Each `LogEntry`: `id`, `time_ms`, `kind`, `client_id`, `login`, `address`, `reason_code` (where there is one), `reason`, `detail`; `dropped` counts what the server could not keep up with. A login refused is kept whether the logins are in the database or the file; one your application decides (`--authority`) is the application's. A server without a log: `FAILED_PRECONDITION` |
 | `GetSettings` `CheckSettings` `SetSettings` `ApplySettings` `ResetSettings` | The settings kept in the login database - what `modbee-mqtt config` does over MQTT ([settings.md](settings.md)): single settings by their path (`set`, `remove`), or a whole `modbee.yaml` (`document`), validated as the file is and applied at the next start, or at once with `restart`; the TLS material is applied live. A change that would not load is `INVALID_ARGUMENT`, naming the setting; `CheckSettings` answers with the problems instead. Without a login database, `FAILED_PRECONDITION` |
 
 ### REST
@@ -352,6 +353,7 @@ curl -X POST localhost:9464/v1/sessions/pump-1:kick
 | `GET /v1/listeners` · `PUT /v1/listeners` · `PUT /v1/listeners/tls` | `GetListeners` · `PutListeners` · `PutTls` |
 | `GET /v1/stats` · `GET /v1/health` | `Stats` · health |
 | `POST /v1/backups` · `GET` · `PUT /v1/events` | `Backup` · `GetEvents` · `PutEvents` |
+| `GET /v1/log?clientId=&login=&kinds=a,b&sinceMs=&untilMs=&pageSize=&pageToken=&afterId=` | `ListLog` |
 | `GET` · `PUT` · `DELETE /v1/kafka-clusters/{id}`, `/v1/kafka-mappings/{id}` · `GET /v1/kafka-status` | `Kafka.*` |
 | `GET /v1/settings` · `PATCH` · `PUT /v1/settings` · `POST /v1/settings:check` · `POST /v1/settings:reset` | `GetSettings` · `SetSettings` · `ApplySettings` · `CheckSettings` · `ResetSettings` |
 | `GET /v1/connections` · `GET` · `PUT` · `DELETE /v1/connections/{id}` · `POST /v1/connections/{id}:reconnect` | `Connections.*` (`Watch` is gRPC only) |
