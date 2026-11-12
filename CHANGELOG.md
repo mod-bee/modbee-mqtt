@@ -11,6 +11,8 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.10]
+
 A diagnostics log: when a device will not connect, the broker says why - afterwards. `modbee-mqtt serve` keeps every
 connection and how it ended, every refused login with its reason in words (wrong password, no such login, disabled,
 waiting for approval, its key off or its devices at once all online, a key's secret wrong or expired, the client id
@@ -771,7 +773,11 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.9...v0.1.10
+[0.1.9]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.3...v0.1.4

@@ -65,7 +65,7 @@ flash. A board can still be a broker - that is `MqttBroker`, in the library
 | `modbee-mqtt backup` | A copy of a broker's login database, and the settings kept in it |
 | `modbee-mqtt restore` | Put a backup of the login database back, with the broker stopped |
 | `modbee-mqtt log` | The [diagnostics log](diagnostics.md): who connected and how they went, who was refused and why, sign-ups and their answers, what admins changed, the server's warnings - `--client`, `--login`, `--kind`, `--since 2h`, `--until`, `--limit`, `--follow`, `--json`. Over MQTT with an admin login, or the file itself with `--data` (the broker may be stopped) - [below](#the-diagnostics-log) |
-| `modbee-mqtt --version` | The version, the TLS engine this build was compiled with - `modbee-mqtt 0.1.9 (TLS: wolfSSL)` - and what else is inside: the Kafka pipe with its librdkafka's features, and the Application API with its gRPC, or `not built` |
+| `modbee-mqtt --version` | The version, the TLS engine this build was compiled with - `modbee-mqtt 0.1.10 (TLS: wolfSSL)` - and what else is inside: the Kafka pipe with its librdkafka's features, and the Application API with its gRPC, or `not built` |
 
 **Exit codes, for scripts:**
 
