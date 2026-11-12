@@ -65,7 +65,7 @@ struct AuthKey {
     bool manualApproval = false;         // devices wait, pending, until approved
     std::vector<std::string> publish;    // what a device it creates may do
     std::vector<std::string> subscribe;
-    int64_t usesLeft = -1;               // -1: unlimited
+    int64_t devices = -1;                // devices it let in that may be online AT ONCE; 0: off; -1: no limit
     int64_t expires = 0;                 // UTC seconds; 0: never
     std::string device;                  // "" or the one device name it may create
     int64_t created = 0;
@@ -106,7 +106,6 @@ public:
     bool findKey(const std::string& name, AuthKey& out);
     bool listKeys(std::vector<AuthKey>& out);
     // One use of a key; false if it has none left.
-    bool spendKey(const std::string& name);
 
     // --- The server's own settings (ServerConfig.h, "Settings kept in the
     // database"), beside the logins so one file backs up both ---

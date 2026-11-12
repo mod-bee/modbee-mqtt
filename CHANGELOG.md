@@ -11,6 +11,18 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+A key's number is how many of its devices may be ONLINE AT ONCE, not a count of sign-ups left. `devices` (in
+`key.create`, `key.set` and `key.list`, `--devices`) replaces `uses`: 1 - one board at a time, any board; 2 - two at
+once, a third refused until one goes; 0 - the key is off: its devices are signed out and refused until it is raised;
+none - no limit. Nothing counts down, so a replaced board signs up with the same key, and nothing has to be raised:
+once the old board is offline. While a board is connected as a device, a board signing up again as it is refused - a
+device no longer takes over the session of a board still online, so a copy of a key cannot knock a working board off.
+A device the key let in counts on every CONNECT: with its key's number of the others online, it is refused
+(0x97 Quota exceeded); with its key off, 0x87.
+
+Changes on upgrade: a key's `uses_left` is read as its devices at once (a key left with 1 lets one device be online).
+`uses` / `uses_left` / `--uses` are `devices` / `--devices`.
+
 ## [0.1.9]
 
 A key's allowance and expiry change in place. `key.set` takes `uses` (how many more devices it may register: `0` closes it,

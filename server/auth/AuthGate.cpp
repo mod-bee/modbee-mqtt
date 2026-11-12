@@ -171,7 +171,7 @@ std::string describeKey(const AuthKey& k) {
         .add("approval", k.manualApproval ? "manual" : "auto")
         .raw("publish", json::array(k.publish))
         .raw("subscribe", json::array(k.subscribe))
-        .add("uses_left", (long long)k.usesLeft)
+        .add("devices", (long long)k.devices)
         .add("expires", (long long)k.expires)
         .add("device", k.device)
         .add("site", k.site)
@@ -223,6 +223,51 @@ bool AuthGate::begin(size_t shards, std::string& error) {
 
 void AuthGate::prepare(uint32_t shard, MqttBroker& broker) {
     broker.onAuthorise(&AuthGate::hook, _shards[shard].get());
+    broker.onConnection(&AuthGate::connectionHook, _shards[shard].get());
+}
+
+void AuthGate::connectionHook(void* context, const MqttSpan& clientIdSpan, bool connected, uint8_t) {
+    AuthGate& gate = *static_cast<Shard*>(context)->gate;
+    const std::string clientId = text(clientIdSpan);
+    if (clientId.empty()) return;
+    std::lock_guard<std::mutex> lock(gate._onlineMutex);
+    if (connected) {
+        auto pending = gate._connecting.find(clientId);
+        if (pending == gate._connecting.end()) return;
+        auto& entry = gate._online[clientId];
+        entry.first = pending->second;
+        entry.second++;
+        gate._connecting.erase(pending);
+        return;
+    }
+    auto at = gate._online.find(clientId);
+    if (at != gate._online.end() && --at->second.second == 0) gate._online.erase(at);
+}
+
+bool AuthGate::online(const std::string& username) {
+    std::lock_guard<std::mutex> lock(_onlineMutex);
+    for (const auto& one : _online) {
+        if (one.second.first == username) return true;
+    }
+    return false;
+}
+
+size_t AuthGate::onlineOf(const std::string& keyName, const std::string& except) {
+    std::vector<std::string> names;
+    {
+        std::lock_guard<std::mutex> lock(_onlineMutex);
+        for (const auto& one : _online) {
+            if (one.second.first != except && one.second.first != kProvisionUser) names.push_back(one.second.first);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    size_t n = 0;
+    for (const std::string& name : names) {
+        AuthUser u;
+        if (_store.findUser(name, u) && u.provisionedBy == keyName) n++;
+    }
+    return n;
 }
 
 bool AuthGate::hook(void* context, const MqttBrokerRequest& request, uint8_t& reasonCode) {
@@ -265,7 +310,7 @@ bool AuthGate::checkKey(const std::string& offered, const std::string& clientId,
         return false;
     }
     if (key.expires != 0 && nowSeconds() >= key.expires) return false;
-    if (key.usesLeft == 0) return false;
+    if (key.devices == 0) return false;     // the key is off
     if (!key.device.empty() && key.device != clientId) return false;
     return true;
 }
@@ -307,19 +352,10 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
                 std::lock_guard<std::mutex> lock(_provisioningMutex);
                 _provisioning[clientId] = keyName;
             }
-            // A device registering again under its own name - wiped, or
-            // replaced while the old one is still connected - takes the client
-            // identifier from that login's session. Only where this key may
-            // re-provision the login anyway (provision() below says the same),
-            // so it grants nothing the key did not have: the session is
-            // replaced, never resumed, and nobody else's is touched.
-            AuthUser existing;
-            AuthKey key;
-            if (ok && request.replaceSession != nullptr && _store.findUser(clientId, existing) &&
-                _store.findKey(keyName, key) && !existing.admin && !existing.provisionedBy.empty() &&
-                existing.enabled && existing.site == key.site) {
-                *request.replaceSession = true;
-            }
+            // A device registering again under its own name never takes the
+            // session of a board still connected as it: while that board is
+            // online the client identifier is its, and this CONNECT is refused
+            // - a copy of the key cannot knock a working board off.
         } else if (fixedLogin(_config.admins, request.userName, request.password) ||
                    fixedLogin(_config.logins, request.userName, request.password)) {
             ok = true;
@@ -331,6 +367,18 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
                 } else {
                     ok = auth::verify(user.hash, request.password.data, request.password.length);
                 }
+                // A device a key let in counts against that key's devices at once: off (0), it is refused;
+                // with the key's number of its other devices online, it waits for one to go.
+                AuthKey key;
+                if (ok && !user.provisionedBy.empty() && _store.findKey(user.provisionedBy, key)) {
+                    if (key.devices == 0) {
+                        ok = false;
+                        reasonCode = MQ_REASON_NOT_AUTHORIZED;
+                    } else if (key.devices > 0 && onlineOf(key.name, username) >= (size_t)key.devices) {
+                        ok = false;
+                        reasonCode = MQ_REASON_QUOTA_EXCEEDED;
+                    }
+                }
             } else {
                 // Hashed anyway, so an unknown name takes as long as a wrong
                 // password and the two cannot be told apart from outside.
@@ -339,6 +387,10 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
             }
         }
         (ok ? _accepted : _refused).fetch_add(1, std::memory_order_relaxed);
+        if (ok && !clientId.empty()) {
+            std::lock_guard<std::mutex> lock(_onlineMutex);
+            _connecting[clientId] = username;
+        }
         return ok;
     }
 
@@ -592,10 +644,11 @@ std::string AuthGate::provision(const std::string& clientId, const std::string& 
     }
     // Approved, its secret not collected yet: the device that waited takes it now.
     const bool collecting = exists && existing.hash.empty();
-    // A key's uses count the devices it lets in: a site key's new devices, and
-    // every claim of a key made for one device, which is then spent.
-    if ((!exists || (!key.device.empty() && !collecting)) && !_store.spendKey(keyName)) {
-        return refused("the provisioning key has no uses left");
+    // A device signing up again (a wiped login, a replaced board) does so only while no board is connected as it.
+    if (exists && online(name)) return refused("a board is connected as this device; it signs up again once that one is gone");
+    // A key's number is its devices AT ONCE: with that many of the devices it let in online, another waits.
+    if (key.devices > 0 && onlineOf(key.name, name) >= (size_t)key.devices) {
+        return refused("the provisioning key's " + std::to_string(key.devices) + " device(s) at once are online");
     }
 
     const std::string secret = auth::generateSecret(32);
@@ -824,8 +877,8 @@ std::string AuthGate::admin(const std::string& requestText) {
             !filtersOk(k.publish) || !filtersOk(k.subscribe)) {
             return failure(request, "publish and subscribe are lists of valid topic filters");
         }
-        k.usesLeft = request.integer("uses", -1);
-        if (k.usesLeft == 0 || k.usesLeft < -1) return failure(request, "uses is a positive number, or left out for unlimited");
+        k.devices = request.integer("devices", -1);
+        if (k.devices < -1) return failure(request, "devices is how many of its devices may be online at once: 0 (off) or more, or left out for no limit");
         const long long days = request.integer("days", 0);
         k.expires = days > 0 ? nowSeconds() + days * 86400 : request.integer("expires", 0);
         k.device = request.str("device");
@@ -866,8 +919,8 @@ std::string AuthGate::admin(const std::string& requestText) {
         // devices it registered already keep theirs (user.set data changes those).
         AuthKey k;
         if (!_store.findKey(request.str("name"), k)) return failure(request, "no key " + request.str("name"));
-        if (!request.has("data") && !request.has("uses") && !request.has("approval") && !request.has("expires") && !request.has("days")) {
-            return failure(request, "key.set changes uses, approval, expires or data - the request named none");
+        if (!request.has("data") && !request.has("devices") && !request.has("approval") && !request.has("expires") && !request.has("days")) {
+            return failure(request, "key.set changes devices, approval, expires or data - the request named none");
         }
         if (request.has("days")) {
             const long long days = request.integer("days", 0);
@@ -878,10 +931,12 @@ std::string AuthGate::admin(const std::string& requestText) {
             if (expires < 0) return failure(request, "expires is when it stops working, UTC seconds, or 0 for never");
             k.expires = expires;
         }
-        if (request.has("uses")) {
-            const long long uses = request.integer("uses", -2);
-            if (uses < -1) return failure(request, "uses is how many more devices it may register: 0 or more, or -1 for no limit");
-            k.usesLeft = uses;
+        bool off = false;
+        if (request.has("devices")) {
+            const long long devices = request.integer("devices", -2);
+            if (devices < -1) return failure(request, "devices is how many of its devices may be online at once: 0 (off) or more, or -1 for no limit");
+            off = devices == 0 && k.devices != 0;
+            k.devices = devices;
         }
         if (request.has("approval")) {
             const std::string approval = request.str("approval");
@@ -891,6 +946,18 @@ std::string AuthGate::admin(const std::string& requestText) {
         std::string dataError;
         if (request.has("data") && !requestData(request, k.data, dataError)) return failure(request, dataError);
         if (_store.putKey(k, true) != AuthResult::Ok) return failure(request, "the login store could not be written");
+        // Turned off: every device it let in that is online now is signed out (and refused from now on).
+        if (off) {
+            std::vector<std::string> names;
+            {
+                std::lock_guard<std::mutex> lock(_onlineMutex);
+                for (const auto& one : _online) names.push_back(one.second.first);
+            }
+            for (const std::string& name : names) {
+                AuthUser u;
+                if (_store.findUser(name, u) && u.provisionedBy == k.name) kick(name);
+            }
+        }
         json::Object o;
         o.raw("key", describeKey(k));
         return reply(request, true, o);

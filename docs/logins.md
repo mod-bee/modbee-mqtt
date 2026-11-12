@@ -125,7 +125,7 @@ page *13 Provisioning* has the whole of it.
 
 | Situation | What happens |
 | --- | --- |
-| A board is replaced | Flash the new one with the same name and a key of the same site. It registers, gets a new login, and the old board's login stops working |
+| A board is replaced | Flash the new one with the same name and a key of the same site. Once the old board is offline it registers, gets a new login, and the old board's login stops working. While a board is still connected as that device, a new one is refused - a copy of the key cannot knock a working board off |
 | A device's flash is wiped | It has no login, so it registers again |
 | You reset a device (`modbee-mqtt user reset`) | Its stored login is refused, so it registers again by itself - no site visit |
 | The broker's login store is lost, or restored from an old backup | Every device's login is refused at once. Each registers again with its key but **keeps its stored login** - it is replaced only when the broker issues a new one - and tries it again every five minutes, so a store that comes back lets the fleet straight back in, with nothing to approve |
@@ -146,10 +146,10 @@ not cleared by a refusal, only overwritten by a login the broker has issued.
 | Option | Means |
 | --- | --- |
 | `--approval manual` | A new device waits until you approve it: `modbee-mqtt user list` shows it `pending`, `modbee-mqtt user approve tank-07` lets it in. Without this, devices are let in straight away |
-| `--uses 50` | At most 50 devices may register with it |
+| `--devices 2` | At most 2 of the devices it let in may be online at once - any of them: a third is refused until one goes. `0` turns the key off: its devices are signed out and refused until it is raised (`key set --devices`). Without it, no limit |
 | `--days 30` | It stops working after 30 days |
 | `--site north` | The site its devices belong to: a key registers again only devices of its own site, so one customer's key cannot take another's device. Keys without a site share one - a broker for a single site needs none |
-| `--device tank-07` | It may register only that one device, and every claim uses it up (`--uses 1`: claimed once) - e.g. a key your platform creates for one device it is setting up or replacing |
+| `--device tank-07` | It may register only that one device - e.g. a key your platform creates for one device; that device's replacement board registers with the same key once the old one is offline |
 | `--data group=north-plant` | A value handed to each device it registers - repeat for more ([below](#what-a-key-hands-its-devices)) |
 
 `modbee-mqtt key list` shows every key; `modbee-mqtt key remove site-north` retires one.
@@ -408,8 +408,8 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 | `user.permissions` | `username`, `publish`, `subscribe` | |
 | `user.enable`, `user.disable`, `user.approve`, `user.remove` | `username` | |
 | `user.admin` | `username`, `admin` (true/false) | |
-| `key.create` | `name`; optional `site`, `approval` (`auto`/`manual`), `publish`, `subscribe`, `uses`, `days`, `device`, `data` | `key` - shown once |
-| `key.set` | `name`, and any of `uses` (how many more devices it may register: `0` closes it, `-1` no limit), `approval` (`auto`/`manual`), `expires` (UTC seconds, `0` never) or `days` (from now), `data` (the whole set; `{}` clears it) - only those named change; the key, its rules and its site stay | `key`, as it now is |
+| `key.create` | `name`; optional `site`, `approval` (`auto`/`manual`), `publish`, `subscribe`, `devices` (online at once), `days`, `device`, `data` | `key` - shown once |
+| `key.set` | `name`, and any of `devices` (how many of its devices may be online at once: `0` turns it off and signs them out, `-1` no limit), `approval` (`auto`/`manual`), `expires` (UTC seconds, `0` never) or `days` (from now), `data` (the whole set; `{}` clears it) - only those named change; the key, its rules and its site stay | `key`, as it now is |
 | `key.list`, `key.remove` | `name` for remove | `keys` |
 | `backup` | | `file` |
 | `status` | | counts of logins, accepted, refused, provisioned, and of logins by certificate: `certificate_accepted`, `certificate_refused` |

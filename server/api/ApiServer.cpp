@@ -494,7 +494,7 @@ void keyFrom(const json::Value& k, v1::SiteKey& key) {
     key.set_name(k.str("name"));
     key.set_site(k.str("site"));
     key.set_manual_approval(k.str("approval") == "manual");
-    const long long left = k.integer("uses_left", -1);
+    const long long left = k.integer("devices", -1);
     key.set_uses(left < 0 ? 0 : (uint32_t)left);
     key.set_expires_ms(k.integer("expires") * 1000);
     key.set_device(k.str("device"));
@@ -708,7 +708,7 @@ public:
             std::vector<std::string> subscribe(key.subscribe().begin(), key.subscribe().end());
             q.add("command", "key.create").add("name", key.name()).add("site", key.site());
             q.add("approval", key.manual_approval() ? "manual" : "auto");
-            if (key.uses() != 0) q.add("uses", (long long)key.uses());
+            if (key.uses() != 0) q.add("devices", (long long)key.uses());
             if (key.expires_ms() != 0) q.add("expires", (long long)(key.expires_ms() / 1000));
             if (!key.device().empty()) q.add("device", key.device());
             q.raw("publish", json::array(publish)).raw("subscribe", json::array(subscribe));

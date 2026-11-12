@@ -141,6 +141,11 @@ private:
     };
 
     static bool hook(void* context, const MqttBrokerRequest& request, uint8_t& reasonCode);
+    // A connection accepted or ended: who is online, for a key's "devices at once".
+    static void connectionHook(void* context, const MqttSpan& clientId, bool connected, uint8_t reasonCode);
+    // How many of the devices a key let in are online now - not counting `except` - and whether `name` is.
+    size_t onlineOf(const std::string& keyName, const std::string& except);
+    bool online(const std::string& username);
     bool authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t& reasonCode);
     const Compiled& permissions(Shard& shard, const std::string& username);
     bool fixedLogin(const std::vector<std::pair<std::string, std::string>>& list,
@@ -175,6 +180,11 @@ private:
     // client identifier - set at its CONNECT, read at its request.
     std::mutex _provisioningMutex;
     std::unordered_map<std::string, std::string> _provisioning;
+    // WHO IS ONLINE, across every shard: a client identifier accepted at CONNECT with its login (`_connecting`), then
+    // counted from the broker's own word that the connection is up until it says it ended (`_online`).
+    std::mutex _onlineMutex;
+    std::unordered_map<std::string, std::string> _connecting;
+    std::unordered_map<std::string, std::pair<std::string, uint32_t>> _online;
 
     std::atomic<uint64_t> _accepted{0}, _refused{0}, _provisioned{0}, _kicked{0};
     std::atomic<uint64_t> _certificateAccepted{0}, _certificateRefused{0};

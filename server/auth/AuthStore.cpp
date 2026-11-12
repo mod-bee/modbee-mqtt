@@ -93,7 +93,7 @@ void readKey(sqlite3_stmt* s, AuthKey& k) {
     k.manualApproval = sqlite3_column_int(s, 2) != 0;
     k.publish = splitLines(sqlite3_column_text(s, 3));
     k.subscribe = splitLines(sqlite3_column_text(s, 4));
-    k.usesLeft = sqlite3_column_int64(s, 5);
+    k.devices = sqlite3_column_int64(s, 5);
     k.expires = sqlite3_column_int64(s, 6);
     k.device = column(s, 7);
     k.created = sqlite3_column_int64(s, 8);
@@ -105,6 +105,7 @@ void readKey(sqlite3_stmt* s, AuthKey& k) {
 // store of shape 2 gains the column in place, its logins and keys kept.
 const char kSchema[] = "3";
 
+// `uses_left` holds a key's devices at once (its name from when it counted down).
 const char kKeyColumns[] = "name, hash, manual, publish, subscribe, uses_left, expires, device, created, site, data";
 
 struct Statement {
@@ -341,7 +342,7 @@ AuthResult AuthStore::putKey(const AuthKey& k, bool replace) {
     st.integer(3, k.manualApproval);
     st.text(4, joinLines(k.publish));
     st.text(5, joinLines(k.subscribe));
-    st.integer(6, k.usesLeft);
+    st.integer(6, k.devices);
     st.integer(7, k.expires);
     st.text(8, k.device);
     st.integer(9, k.created ? k.created : now());
@@ -430,24 +431,6 @@ bool AuthStore::listKeys(std::vector<AuthKey>& out) {
         out.push_back(k);
     }
     return true;
-}
-
-bool AuthStore::spendKey(const std::string& name) {
-    std::lock_guard<std::mutex> lock(_write);
-    if (!_writer) return false;
-    // Unlimited (-1) is left alone; a counted key goes down by one, and only
-    // while it has a use left - one statement, so two devices cannot both
-    // spend the last use.
-    Statement st(_writer, "UPDATE keys SET uses_left = uses_left - 1 WHERE name = ?1 AND uses_left > 0");
-    st.text(1, name);
-    if (st.step() != SQLITE_DONE) return false;
-    if (sqlite3_changes(_writer) == 1) {
-        changed();
-        return true;
-    }
-    Statement unlimited(_writer, "SELECT uses_left FROM keys WHERE name = ?1");
-    unlimited.text(1, name);
-    return unlimited.step() == SQLITE_ROW && sqlite3_column_int64(unlimited.s, 0) < 0;
 }
 
 bool AuthStore::restore(const std::string& fromPath, const std::string& toPath, std::string& error) {

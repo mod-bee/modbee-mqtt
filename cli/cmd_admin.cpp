@@ -141,7 +141,7 @@ const std::vector<ArgSpec>& adminSpecs() {
                                  "with (certificate-login); \"\" clears it"},
         {"prefix", 0, true, "user list: only names starting with this"},
         {"approval", 0, true, "key create: auto (default) or manual - devices wait for approval"},
-        {"uses", 0, true, "key create: how many devices it may create (default unlimited); key set: how many more (0 closes it, unlimited)"},
+        {"devices", 0, true, "key create / set: how many of its devices may be online at once (0: off; default / unlimited: no limit)"},
         {"days", 0, true, "key create / set: stops working this many days from now (default never)"},
         {"never-expires", 0, false, "key set: never stops working"},
         {"device", 0, true, "key create: the one device name it may create"},
@@ -356,9 +356,9 @@ int cmdKey(int argc, char** argv) {
         request.add("command", "key.create").add("name", name).add("approval", args.get("approval", "auto"));
         rules(args, request);
         long long n = 0;
-        if (args.has("uses")) {
-            if (!args.getInt("uses", 0, 1, 1000000000, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
-            request.add("uses", n);
+        if (args.has("devices")) {
+            if (!args.getInt("devices", 0, 0, 1000000000, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
+            request.add("devices", n);
         }
         if (args.has("days")) {
             if (!args.getInt("days", 0, 1, 36500, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
@@ -368,18 +368,18 @@ int cmdKey(int argc, char** argv) {
         if (args.has("site")) request.add("site", args.get("site"));
         if (!data(args, request)) return 2;
     } else if (action == "set") {
-        if (name.empty() || (!args.has("data") && !args.has("uses") && !args.has("approval") && !args.has("days") && !args.has("never-expires"))) {
-            std::fprintf(stderr, "usage: modbee-mqtt key set <name> [--uses <more devices>|unlimited] [--approval auto|manual] [--days <from now>|--never-expires] [--data name=value ...]\n");
+        if (name.empty() || (!args.has("data") && !args.has("devices") && !args.has("approval") && !args.has("days") && !args.has("never-expires"))) {
+            std::fprintf(stderr, "usage: modbee-mqtt key set <name> [--devices <at once>|unlimited] [--approval auto|manual] [--days <from now>|--never-expires] [--data name=value ...]\n");
             return 2;
         }
         request.add("command", "key.set").add("name", name);
-        if (args.has("uses")) {
-            if (args.get("uses") == "unlimited") {
-                request.add("uses", -1LL);
+        if (args.has("devices")) {
+            if (args.get("devices") == "unlimited") {
+                request.add("devices", -1LL);
             } else {
                 long long n = 0;
-                if (!args.getInt("uses", 0, 0, 1000000, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
-                request.add("uses", n);
+                if (!args.getInt("devices", 0, 0, 1000000, n)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
+                request.add("devices", n);
             }
         }
         if (args.has("approval")) request.add("approval", args.get("approval"));
@@ -412,10 +412,10 @@ int cmdKey(int argc, char** argv) {
                     "  themselves with it. `modbee-mqtt key remove %s` stops it working.)\n",
                     name.c_str(), reply.str("key").c_str(), name.c_str());
     } else if (action == "list") {
-        std::printf("%-20s %-12s %-9s %-10s %-12s %s\n", "KEY", "SITE", "APPROVAL", "USES LEFT", "DEVICE",
+        std::printf("%-20s %-12s %-9s %-10s %-12s %s\n", "KEY", "SITE", "APPROVAL", "AT ONCE", "DEVICE",
                     "DEVICES MAY PUBLISH / SUBSCRIBE; DATA");
         for (const json::Value& k : reply["keys"].items) {
-            const long long uses = k.integer("uses_left");
+            const long long uses = k.integer("devices");
             std::printf("%-20s %-12s %-9s %-10s %-12s %s / %s; %s\n", k.str("name").c_str(),
                         k.str("site").empty() ? "-" : k.str("site").c_str(), k.str("approval").c_str(),
                         uses < 0 ? "unlimited" : std::to_string(uses).c_str(),

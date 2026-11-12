@@ -1256,7 +1256,7 @@ message SiteKey {
   string name = 1;
   string site = 2;
   bool manual_approval = 3;
-  uint32 uses = 4;                 // 0: no limit
+  uint32 uses = 4;                 // how many of the devices it let in may be online at once; 0: no limit
   int64 expires_ms = 5;            // 0: never
   string device = 6;               // may register only this device
   repeated string publish = 7;
