@@ -20,8 +20,12 @@ device no longer takes over the session of a board still online, so a copy of a 
 A device the key let in counts on every CONNECT: with its key's number of the others online, it is refused
 (0x97 Quota exceeded); with its key off, 0x87.
 
+On the Application API, `SiteKey.devices` (absent: no limit; `0`: off) replaces `uses`, and `Admin.PutKey` on a key
+that exists changes it in place - its devices at once, approval, expiry and data (`PUT /v1/keys/{name}` again); the
+read-only `used` is gone.
+
 Changes on upgrade: a key's `uses_left` is read as its devices at once (a key left with 1 lets one device be online).
-`uses` / `uses_left` / `--uses` are `devices` / `--devices`.
+`uses` / `uses_left` / `--uses` are `devices` / `--devices`; `SiteKey.uses` is `SiteKey.devices`.
 
 ## [0.1.9]
 
