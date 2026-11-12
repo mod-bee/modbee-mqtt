@@ -361,6 +361,7 @@ installing to use it.
 # Inside a running stack: it reaches the broker on localhost:1883
 docker compose exec modbee modbee-mqtt sub -t 'plant/#' -v
 docker compose exec modbee modbee-mqtt pub -t plant/tank-01/level -m 4.25 -q 1
+docker compose exec modbee modbee-mqtt log --client tank-01 --since 1h   # why a device is not getting in
 
 # Anywhere, against any broker
 docker run --rm ghcr.io/mod-bee/modbee-mqtt pub --tls -h mqtt.example.com -t test -m hi -q 1

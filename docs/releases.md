@@ -70,6 +70,7 @@ and all of it is kept in one database in the data folder - `/var/lib/modbee-mqtt
 | Settings | `modbee-mqtt config set broker.port=8883 --restart -u admin -P ...` ([settings.md](settings.md)) |
 | The admin's password | `sudo modbee-mqtt admin` again - on the server, it works at once |
 | The service | `modbee-mqtt service status`, `stop`, `start`, `uninstall` |
+| Why a device will not connect | `sudo modbee-mqtt log --client tank-01` - every connection, refused login and its reason, sign-up and change, kept a week in `diagnostics.db` beside the logins ([diagnostics.md](diagnostics.md)) |
 
 Until there is an admin, the broker runs and lets nobody in, and its log
 says so. Every device needs a login of its own; retained messages and

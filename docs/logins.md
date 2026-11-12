@@ -219,6 +219,11 @@ updates); anything else is yours to name.
 
 ### A device that cannot register itself
 
+First, why: `modbee-mqtt log --client gateway-3 --kind signup,connect-refused`
+shows each attempt and the answer it got - the key's secret wrong, the key
+expired or off, its devices at once all online, a board already connected as
+that name ([diagnostics.md](diagnostics.md#why-a-login-is-refused)).
+
 Register it from a computer instead, with the same key, and configure the
 device with what comes back:
 
@@ -386,6 +391,11 @@ where the device came from and the certificate's fingerprint:
 ```
 modbee-mqtt serve: certificate login refused for "tank-01" from 10.0.4.7:51544 (certificate cfb913...84ae): the login is bound to a different certificate (its fingerprint)
 ```
+
+The [diagnostics log](diagnostics.md) keeps the same, as a `connect-refused`
+entry with the CN and fingerprint in its detail - and a handshake that failed
+(an expired certificate, one from another CA) as `handshake-failed`, with
+where it came from and what the TLS engine said.
 
 ### Binding a login to one certificate
 
