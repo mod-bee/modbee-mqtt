@@ -11,6 +11,8 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.9]
+
 A key's allowance and expiry change in place. `key.set` takes `uses` (how many more devices it may register: `0` closes it,
 `-1` no limit) and `approval`, beside `data`; only what is named changes, and the key, its rules and its site stay -
 so a site kept to exactly the devices it has is opened for one more and closes again by itself, and a key that is
