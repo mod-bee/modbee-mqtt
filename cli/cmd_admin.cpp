@@ -142,7 +142,8 @@ const std::vector<ArgSpec>& adminSpecs() {
         {"prefix", 0, true, "user list: only names starting with this"},
         {"approval", 0, true, "key create: auto (default) or manual - devices wait for approval"},
         {"uses", 0, true, "key create: how many devices it may create (default unlimited); key set: how many more (0 closes it, unlimited)"},
-        {"days", 0, true, "key create: expires after this many days (default never)"},
+        {"days", 0, true, "key create / set: stops working this many days from now (default never)"},
+        {"never-expires", 0, false, "key set: never stops working"},
         {"device", 0, true, "key create: the one device name it may create"},
         {"site", 0, true, "key create: the site its devices belong to; it registers again only those"},
         {"data", 0, true, "key create / set, user add / set: a value handed to the device, name=value; "
@@ -367,8 +368,8 @@ int cmdKey(int argc, char** argv) {
         if (args.has("site")) request.add("site", args.get("site"));
         if (!data(args, request)) return 2;
     } else if (action == "set") {
-        if (name.empty() || (!args.has("data") && !args.has("uses") && !args.has("approval"))) {
-            std::fprintf(stderr, "usage: modbee-mqtt key set <name> [--uses <more devices>|unlimited] [--approval auto|manual] [--data name=value ...]\n");
+        if (name.empty() || (!args.has("data") && !args.has("uses") && !args.has("approval") && !args.has("days") && !args.has("never-expires"))) {
+            std::fprintf(stderr, "usage: modbee-mqtt key set <name> [--uses <more devices>|unlimited] [--approval auto|manual] [--days <from now>|--never-expires] [--data name=value ...]\n");
             return 2;
         }
         request.add("command", "key.set").add("name", name);
@@ -382,6 +383,13 @@ int cmdKey(int argc, char** argv) {
             }
         }
         if (args.has("approval")) request.add("approval", args.get("approval"));
+        if (args.has("days")) {
+            long long days = 0;
+            if (!args.getInt("days", 0, 1, 36500, days)) { std::fprintf(stderr, "modbee-mqtt: %s\n", args.error().c_str()); return 2; }
+            request.add("days", days);
+        } else if (args.has("never-expires")) {
+            request.add("expires", 0LL);
+        }
         if (args.has("data") && !data(args, request)) return 2;
     } else if (action == "list") {
         request.add("command", "key.list");

@@ -409,7 +409,7 @@ or `{"id": "42", "ok": false, "error": "user tank-01 already exists"}`.
 | `user.enable`, `user.disable`, `user.approve`, `user.remove` | `username` | |
 | `user.admin` | `username`, `admin` (true/false) | |
 | `key.create` | `name`; optional `site`, `approval` (`auto`/`manual`), `publish`, `subscribe`, `uses`, `days`, `device`, `data` | `key` - shown once |
-| `key.set` | `name`, and any of `uses` (how many more devices it may register: `0` closes it, `-1` no limit), `approval` (`auto`/`manual`), `data` (the whole set; `{}` clears it) - only those named change; the key, its rules and its site stay | `key`, as it now is |
+| `key.set` | `name`, and any of `uses` (how many more devices it may register: `0` closes it, `-1` no limit), `approval` (`auto`/`manual`), `expires` (UTC seconds, `0` never) or `days` (from now), `data` (the whole set; `{}` clears it) - only those named change; the key, its rules and its site stay | `key`, as it now is |
 | `key.list`, `key.remove` | `name` for remove | `keys` |
 | `backup` | | `file` |
 | `status` | | counts of logins, accepted, refused, provisioned, and of logins by certificate: `certificate_accepted`, `certificate_refused` |

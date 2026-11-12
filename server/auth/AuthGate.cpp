@@ -861,12 +861,22 @@ std::string AuthGate::admin(const std::string& requestText) {
         // What a key may still do and what it hands its devices from now on - each only when named; the key
         // itself, its rules and its site stay as they were made, so a device set up with it needs nothing new.
         // `uses`: how many more devices it may register (0: none - closed, it refuses every registration until
-        // raised; -1: no limit). `approval`: whether each one waits to be let in. `data`: what each is handed;
+        // raised; -1: no limit). `approval`: whether each one waits to be let in. `expires`: when it stops working,
+        // UTC seconds (0: never), or `days` from now - set, extended, or taken away. `data`: what each is handed;
         // devices it registered already keep theirs (user.set data changes those).
         AuthKey k;
         if (!_store.findKey(request.str("name"), k)) return failure(request, "no key " + request.str("name"));
-        if (!request.has("data") && !request.has("uses") && !request.has("approval")) {
-            return failure(request, "key.set changes uses, approval or data - the request named none");
+        if (!request.has("data") && !request.has("uses") && !request.has("approval") && !request.has("expires") && !request.has("days")) {
+            return failure(request, "key.set changes uses, approval, expires or data - the request named none");
+        }
+        if (request.has("days")) {
+            const long long days = request.integer("days", 0);
+            if (days < 1) return failure(request, "days is how many days from now it stops working: 1 or more");
+            k.expires = nowSeconds() + days * 86400;
+        } else if (request.has("expires")) {
+            const long long expires = request.integer("expires", -1);
+            if (expires < 0) return failure(request, "expires is when it stops working, UTC seconds, or 0 for never");
+            k.expires = expires;
         }
         if (request.has("uses")) {
             const long long uses = request.integer("uses", -2);
