@@ -207,7 +207,8 @@ enum class MqttBrokerClientEventKind : uint8_t {
     // Refusals, so an application can say why a device is not getting through (host builds raise them):
     PublishRefused,                    // filter: the topic; reasonCode: what the PUBACK said (or would have)
     SubscribeRefused,                  // filter: the filter; reasonCode: what the SUBACK said
-    ConnectRefused,                    // the server is full, or the login holds all its sessions; reasonCode
+    ConnectRefused,                    // turned away by the server itself - full, the login's sessions all held, the
+                                       // client id another login's, a Will it may not publish; reasonCode, detail
     HandshakeFailed,                   // a TLS handshake failed, before any CONNECT: address, detail; no client id
 };
 
@@ -221,7 +222,10 @@ struct MqttBrokerClientEvent {
     bool resumed = false;              // Connected: an existing session was resumed (CONNACK session present)
 #if defined(MQTT_PLATFORM_HOST)
     MqttSpan address;                  // where the connection came from ("10.0.4.7:51544"), where there is one
-    MqttSpan detail;                   // HandshakeFailed: why, in the TLS engine's words
+    MqttSpan detail;                   // HandshakeFailed: why, in the TLS engine's words; ConnectRefused: what
+                                       // it was about (the login holding the client id, the Will's topic)
+    bool byClient = false;             // Disconnected: the client sent DISCONNECT (else the connection just closed,
+                                       // or the server closed it with reasonCode)
 #endif
 };
 
@@ -531,6 +535,9 @@ struct MqttBrokerConnection {
     // until retryConnect().
     bool parked = false;
     std::vector<uint8_t> parkedConnect;
+    // It sent DISCONNECT: what its Disconnected event says, apart from a
+    // connection that only closed.
+    bool sentDisconnect = false;
 #endif
 
     bool inUse() const { return transport != nullptr; }
@@ -837,12 +844,13 @@ private:
     void* _clientEventContext = nullptr;
     void clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSession& session,
                      const MqttSpan& filter, uint8_t qos, uint8_t reasonCode,
-                     bool resumed = false);
+                     bool resumed = false, const MqttBrokerConnection* connection = nullptr);
 #if defined(MQTT_PLATFORM_HOST)
     // A refusal, for a client that may have no session yet (a CONNECT turned away).
     uint64_t lastPacketMs(const MqttBrokerConnection& connection) const;
     void refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
-                      const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection = nullptr);
+                      const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection = nullptr,
+                      const MqttSpan& detail = MqttSpan());
 #endif
 
     // Assigned client identifiers are "auto-<n>". Per broker instance, never a

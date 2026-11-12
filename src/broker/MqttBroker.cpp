@@ -148,6 +148,7 @@ void MqttBrokerConnection::recycle() {
     watchedHandle = -1;
     watchingWrite = false;
     parked = false;
+    sentDisconnect = false;
     parkedConnect.clear();
 #endif
 }
@@ -440,7 +441,7 @@ void MqttBroker::onClientEvent(MqttBrokerClientEventFn handler, void* context) {
 
 void MqttBroker::clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSession& session,
                              const MqttSpan& filter, uint8_t qos, uint8_t reasonCode,
-                             bool resumed) {
+                             bool resumed, const MqttBrokerConnection* connection) {
     if (_onClientEvent == nullptr) return;
     MqttBrokerClientEvent event;
     event.kind = kind;
@@ -455,13 +456,20 @@ void MqttBroker::clientEvent(MqttBrokerClientEventKind kind, const MqttBrokerSes
         session.connectionSlot < _connections.size() && _connections[session.connectionSlot].transport != nullptr) {
         event.address = mq_topicSpan(_connections[session.connectionSlot].transport->peerName());
     }
+    if (connection != nullptr) {
+        if (connection->transport != nullptr) event.address = mq_topicSpan(connection->transport->peerName());
+        event.byClient = connection->sentDisconnect;
+    }
+#else
+    (void)connection;
 #endif
     _onClientEvent(_clientEventContext, event);
 }
 
 #if defined(MQTT_PLATFORM_HOST)
 void MqttBroker::refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& clientId, const MqttSpan& userName,
-                              const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection) {
+                              const MqttSpan& filter, uint8_t reasonCode, const MqttBrokerConnection* connection,
+                              const MqttSpan& detail) {
     if (_onClientEvent == nullptr) return;
     MqttBrokerClientEvent event;
     event.kind = kind;
@@ -475,6 +483,7 @@ void MqttBroker::refusalEvent(MqttBrokerClientEventKind kind, const MqttSpan& cl
             event.detail = mq_topicSpan(connection->transport->handshakeFailure());
         }
     }
+    if (detail.length != 0) event.detail = detail;
     _onClientEvent(_clientEventContext, event);
 }
 #endif
@@ -1874,7 +1883,7 @@ void MqttBroker::closeConnection(MqttBrokerConnection& connection,
             _onConnection(_connectionContext, asSpan(session->clientId()), false,
                           reasonCode);
         }
-        clientEvent(MqttBrokerClientEventKind::Disconnected, *session, MqttSpan(), 0, reasonCode);
+        clientEvent(MqttBrokerClientEventKind::Disconnected, *session, MqttSpan(), 0, reasonCode, false, &connection);
 
         // [V5:3.1.2.11.2] A Session Expiry Interval of 0 means the Session
         // ends when the Network Connection does. At 3.1.1 that is Clean
@@ -2723,6 +2732,10 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
             const uint8_t code = isV5 ? MQ_REASON_NOT_AUTHORIZED : MQ_RETURN_NOT_AUTHORIZED;
             sendConnAck(connection, code, false, nullptr);
             _status.refused++;
+#if defined(MQTT_PLATFORM_HOST)
+            refusalEvent(MqttBrokerClientEventKind::ConnectRefused, clientId, willUser, MqttSpan(),
+                         MQ_REASON_NOT_AUTHORIZED, &connection, request.will.topic);
+#endif
             closeConnection(connection, code, false, false);
             return;
         }
@@ -2752,6 +2765,10 @@ void MqttBroker::handleConnect(MqttBrokerConnection& connection,
             const uint8_t code = isV5 ? MQ_REASON_CLIENT_IDENTIFIER_NOT_VALID : MQ_RETURN_IDENTIFIER_REJECTED;
             sendConnAck(connection, code, false, nullptr);
             _status.refused++;
+#if defined(MQTT_PLATFORM_HOST)
+            refusalEvent(MqttBrokerClientEventKind::ConnectRefused, clientId, asSpan(owner), MqttSpan(),
+                         MQ_REASON_CLIENT_IDENTIFIER_NOT_VALID, &connection, asSpan(held->userName));
+#endif
             closeConnection(connection, code, false, false);
             return;
         }
@@ -4539,6 +4556,9 @@ void MqttBroker::handleDisconnect(MqttBrokerConnection& connection,
     // [V5:MQTT-3.14.4-1] "After sending a DISCONNECT packet the Client MUST
     // close the Network Connection", and the Server does not answer it. The
     // close here is ours, not a reply.
+#if defined(MQTT_PLATFORM_HOST)
+    connection.sentDisconnect = true;
+#endif
     closeConnection(connection, 0, false, willWanted);
 }
 

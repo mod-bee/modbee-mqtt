@@ -34,8 +34,12 @@
 // Events are queued in the broker's hook and published from the shard's own
 // service pass - never re-entering the broker from inside its handling of the
 // packet that caused them. A client's events happen on its home shard, in order.
+//
+// THE DIAGNOSTICS LOG sees every one of them too, published or not: the
+// broker has one client-event hook, and this is what holds it.
 
 #include "ShardedBroker.h"
+#include "DiagnosticsLog.h"
 
 #include <atomic>
 #include <memory>
@@ -58,6 +62,13 @@ public:
     // made at all. On by default; serve sets it from events: enabled.
     void enable(bool on) { _enabled.store(on, std::memory_order_relaxed); }
     bool enabled() const { return _enabled.load(std::memory_order_relaxed); }
+
+    // Every client event kept in this log as well, whether events are on or
+    // off (server/diagnostics/DiagnosticsLog.h). Null: none.
+    void keepIn(DiagnosticsLog* log) { _diagnostics.store(log, std::memory_order_release); }
+
+    // What the log keeps of an event: its kind and why, in words (exposed for tests).
+    static DiagnosticsEntry entryFor(const MqttBrokerClientEvent& event);
 
     // The document a server start becomes (exposed for tests).
     static std::string startedDocument(uint64_t timeMillis);
@@ -83,4 +94,5 @@ private:
     bool _announceStart = false;            // read and cleared on shard 0's own thread
     std::atomic<uint64_t> _published{0};
     std::atomic<bool> _enabled{true};
+    std::atomic<DiagnosticsLog*> _diagnostics{nullptr};
 };

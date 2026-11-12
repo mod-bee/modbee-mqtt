@@ -204,6 +204,20 @@ struct EventsSection {
     bool enabled = false;              // an events: section turns it on
 };
 
+// --- diagnostics: -------------------------------------------------------------
+//
+// The diagnostics log (server/diagnostics/DiagnosticsLog.h): what happened to
+// whom, kept in its own SQLite file for a week. On by default.
+struct DiagnosticsSection {
+    bool enabled = true;
+    // "": diagnostics.db in the data folder (serve --data), or beside the
+    // login database, or in /var/lib/modbee when that folder is there.
+    std::string file;
+    long long keepDays = 7;            // 0: no age limit
+    long long maxSizeMb = 100;         // the file stays under this; the oldest entries make room
+    long long maxRows = 1000000;       // 0: no row limit
+};
+
 // --- retained: ---------------------------------------------------------------
 //
 // Where retained messages are kept AS WELL AS memory, so a restart does not
@@ -335,6 +349,7 @@ struct ServerConfig {
     BrokerSection broker;
     MetricsSection metrics;
     EventsSection events;
+    DiagnosticsSection diagnostics;
     SparkplugSection sparkplug;
     RetainedSection retained;
     SessionsSection sessions;

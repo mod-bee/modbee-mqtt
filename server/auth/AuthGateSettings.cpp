@@ -26,6 +26,8 @@
 // certificate, its key, the client CA and the client-certificate mode
 // (TlsSettings.h) are applied to the running listeners as soon as they are
 // stored, and so never make restart_required true while TLS is being served.
+// So are the diagnostics log's limits and whether it records (diagnostics.*,
+// all but its file), which a running log takes as they are stored.
 
 #include "AuthGate.h"
 #include "AdminReply.h"
@@ -44,10 +46,15 @@ const char kOverridePrefix[] = "config.override.";
 // What the server was started from, as text that changes whenever anything a
 // restart would pick up changes. With `skipLive`, the settings a running
 // server applies by itself are left out - they never put it behind.
+bool isLiveDiagnosticsSetting(const std::string& path) {
+    return path == "diagnostics.enabled" || path == "diagnostics.keep-days" || path == "diagnostics.max-size-mb" ||
+           path == "diagnostics.max-rows";
+}
+
 std::string fingerprint(const StoredSettings& s, bool skipLive) {
     std::string out = s.hasDocument ? "doc:" + s.document : std::string("file");
     for (const auto& o : s.overrides) {
-        if (skipLive && isLiveTlsSetting(o.first)) continue;
+        if ((skipLive && isLiveTlsSetting(o.first)) || isLiveDiagnosticsSetting(o.first)) continue;
         out += "\n" + o.first + "=" + o.second;
     }
     return out;
@@ -204,6 +211,8 @@ bool AuthGate::applyTlsLive(const ServerConfig& effective, std::vector<ConfigPro
         return true;
     }
     if (!error.empty()) {
+        diagnostics::warning("tls", "modbee-mqtt serve: new TLS material was stored but not applied to the running "
+                                    "listener: %s\n", error.c_str());
         ConfigProblem p;
         p.path = "broker.tls";
         p.message = "stored, but not applied to the running listener: " + error;
@@ -314,6 +323,15 @@ std::string AuthGate::configCommand(const std::string& command, const json::Valu
         }
     }
     const bool tlsApplied = applyTlsLive(next, problems);
+    // The diagnostics log's limits, at once: the oldest entries go now if they are over the new ones.
+    if (_config.diagnostics != nullptr) {
+        DiagnosticsSettings d = _config.diagnostics->settings();
+        d.enabled = next.diagnostics.enabled;
+        d.keepDays = next.diagnostics.keepDays;
+        d.maxBytes = next.diagnostics.maxSizeMb * 1024 * 1024;
+        d.maxRows = next.diagnostics.maxRows;
+        _config.diagnostics->configure(d);
+    }
     const bool restartNeeded = behind(storedSettings(), next);
     const bool restarting = restartNeeded && request.flag("restart") && _config.restart != nullptr;
     if (restarting) _restartAfterReply = true;

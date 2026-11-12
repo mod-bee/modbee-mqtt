@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "KafkaPipe.h"
+#include "DiagnosticsLog.h"
 #include "KafkaCommon.h"
 #include "KafkaEnvelope.h"
 
@@ -349,7 +350,7 @@ void KafkaPipe::Shard::onError(rd_kafka_t*, int error, const char* reason, void*
     Shard& shard = *static_cast<Shard*>(opaque);
     if (error == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
         if (!shard.pipe->_brokersDown.exchange(true)) {
-            std::fprintf(stderr, "kafka: every broker is unreachable (%s) - publishers' acknowledgements wait\n",
+            diagnostics::warning("kafka", "kafka: every broker is unreachable (%s) - publishers' acknowledgements wait\n",
                          reason ? reason : "");
         }
     }
@@ -686,7 +687,7 @@ bool KafkaPipe::Shard::reconcile(std::string* error) {
     const auto failed = [&](const std::string& reason) {
         ok = false;
         if (error) *error = reason;
-        else std::fprintf(stderr, "kafka: %s\n", reason.c_str());
+        else diagnostics::warning("kafka", "kafka: %s\n", reason.c_str());
     };
 
     // PRODUCERS: one per cluster that something is produced to.
@@ -1042,7 +1043,7 @@ void KafkaPipe::Shard::consume(Consumer& consumer) {
             rd_kafka_error_t* stored = rd_kafka_offset_store_message(record);
             if (stored) rd_kafka_error_destroy(stored);
         } else if (record->err != RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-            std::fprintf(stderr, "kafka-to-mqtt %s: %s\n", from.config.id.c_str(),
+            diagnostics::warning("kafka", "kafka-to-mqtt %s: %s\n", from.config.id.c_str(),
                          rd_kafka_message_errstr(record));
         }
         rd_kafka_message_destroy(record);

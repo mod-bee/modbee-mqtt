@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "AppConnections.h"
+#include "DiagnosticsLog.h"
 
 #include "Json.h"
 #include "MqttClient.h"
@@ -967,6 +968,21 @@ struct AppConnections::Connection {
 
     void setState(AppConnectionState next, const std::string& error = std::string()) {
         if (next == state && error == lastError) return;
+        // Up, lost, backing off or refused - each change kept in the diagnostics log; a new attempt is not.
+        if (next != AppConnectionState::Connecting) {
+            DiagnosticsEntry e;
+            e.kind = "link";
+            e.clientId = spec.id;
+            e.login = spec.username;
+            e.reason = next == AppConnectionState::Connected ? std::string("connected")
+                       : error.empty()                       ? std::string("not connected")
+                                                             : error;
+            e.detail = next == AppConnectionState::Connected ? "up"
+                       : next == AppConnectionState::Waiting ? "lost - connecting again"
+                       : next == AppConnectionState::Refused ? "refused - tried again later"
+                                                             : "backing off";
+            diagnostics::note(std::move(e));
+        }
         state = next;
         if (!error.empty() || next == AppConnectionState::Connected) lastError = error;
         sinceMs = utcNowMs();
@@ -1290,7 +1306,7 @@ void AppConnections::serviceEdgeNode(Connection& c) {
     expireHistory(e);
     sendHistory(c);
     if (e.dropping && e.history == 0) {
-        std::fprintf(stderr, "sparkplug edge node \"%s\": what it kept has gone; %llu of its oldest values were "
+        diagnostics::warning("connections", "sparkplug edge node \"%s\": what it kept has gone; %llu of its oldest values were "
                              "dropped for room\n",
                      e.spec.id.c_str(), (unsigned long long)e.droppedSince);
         e.dropping = false;
@@ -1308,7 +1324,7 @@ void AppConnections::writeJournal(EdgeNode& e) {
         // Not kept for another try: told again and again, it grew without
         // bound. The window still holds it; only a kill now would lose it.
         e.journalFailed = true;
-        std::fprintf(stderr, "sparkplug edge node \"%s\": its replay window could not be written to outbox.db - "
+        diagnostics::warning("connections", "sparkplug edge node \"%s\": its replay window could not be written to outbox.db - "
                              "what it holds now would not outlive a restart\n",
                      e.spec.id.c_str());
     }
@@ -1345,7 +1361,7 @@ void AppConnections::restoreReplay(EdgeNode& e) {
     }
     writeJournal(e);
     if (restored || lost) {
-        std::fprintf(stderr, "sparkplug edge node \"%s\": %zu values published before the restart were not proven "
+        diagnostics::warning("connections", "sparkplug edge node \"%s\": %zu values published before the restart were not proven "
                              "delivered - they go again after its birth, as history%s\n",
                      e.spec.id.c_str(), restored, lost ? " (some of a metric no longer declared were let go)" : "");
     }
@@ -1476,7 +1492,7 @@ void AppConnections::makeRoom(EdgeNode& e, size_t bytes) {
         e.droppedSince++;
         if (!e.dropping) {
             e.dropping = true;
-            std::fprintf(stderr, "sparkplug edge node \"%s\": what it keeps is full (%llu values, %llu bytes) - "
+            diagnostics::warning("connections", "sparkplug edge node \"%s\": what it keeps is full (%llu values, %llu bytes) - "
                                  "its oldest values are dropped from now on\n",
                          s.id.c_str(), (unsigned long long)e.history, (unsigned long long)e.historyBytes);
         }
@@ -3515,7 +3531,7 @@ bool AppConnections::load(std::string& error) {
         AppConnectionSpec spec;
         if (!fromJson(one, spec)) continue;
         if (!idIsName(spec.id)) {
-            std::fprintf(stderr, "connections.json: \"%s\" is not a connection id any more (letters, digits and "
+            diagnostics::warning("connections", "connections.json: \"%s\" is not a connection id any more (letters, digits and "
                                  ". _ - : @) - not opened; Put it again under another\n", spec.id.c_str());
             continue;
         }

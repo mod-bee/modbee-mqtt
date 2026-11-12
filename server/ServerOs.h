@@ -36,6 +36,9 @@ bool replaceFile(const std::string& from, const std::string& to);
 // afterwards.
 bool makeDirectory(const std::string& path, int mode);
 
+// Whether `path` is a directory that is there now.
+bool isDirectory(const std::string& path);
+
 // The names in a directory (not "." or ".."); empty when it cannot be read.
 std::vector<std::string> listDirectory(const std::string& path);
 

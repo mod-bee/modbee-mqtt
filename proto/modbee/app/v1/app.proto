@@ -1189,6 +1189,11 @@ service Admin {
   rpc GetEvents(Empty) returns (EventsSetting);
   rpc PutEvents(EventsSetting) returns (EventsSetting);
 
+  // The diagnostics log (docs/diagnostics.md): what happened to whom - connections and why they ended, refused
+  // logins and why, sign-ups and their answers, changes made by admins, the server's own warnings - kept on disk for
+  // a week. Newest first, a page at a time; `after_id` follows it instead. No log: FAILED_PRECONDITION.
+  rpc ListLog(ListLogRequest) returns (ListLogReply);
+
   // The settings kept in the login database (serve --data, or authentication: database): what `modbee-mqtt config`
   // reads and changes. Validated as the file is; applied at the next start - or at once, with `restart` - but for
   // the TLS material, which is applied live. Authentication is the file's and the flags' alone. Without a login
@@ -1213,6 +1218,34 @@ message BackupReply {
 
 message EventsSetting {
   bool enabled = 1;
+}
+
+message ListLogRequest {
+  string client_id = 1;            // exactly this client id
+  string login = 2;                // exactly this login
+  repeated string kinds = 3;       // any of these kinds ("connect-refused", "signup", ...); none: every kind
+  int64 since_ms = 4;              // at or after (UTC ms); 0: no bound
+  int64 until_ms = 5;              // before; 0: no bound
+  uint32 page_size = 6;            // 100 by default, at most 1000
+  string page_token = 7;           // next_page_token of the page before: the older entries
+  optional uint64 after_id = 8;    // instead of a page: the entries after this one, oldest first - to follow
+                                   // it (0: from the oldest)
+}
+message LogEntry {
+  uint64 id = 1;                   // increases with every entry
+  int64 time_ms = 2;               // UTC
+  string kind = 3;
+  string client_id = 4;
+  string login = 5;
+  string address = 6;              // where the connection came from, where there is one
+  optional uint32 reason_code = 7; // the MQTT reason code, where there is one
+  string reason = 8;               // why, in words
+  string detail = 9;               // a topic, a filter, a key, what an admin changed
+}
+message ListLogReply {
+  repeated LogEntry entries = 1;
+  string next_page_token = 2;      // more: the next page, or (with after_id) the id to follow from
+  uint64 dropped = 3;              // entries the server could not keep up with since it started
 }
 
 message NameRef {

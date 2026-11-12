@@ -64,6 +64,7 @@ static const ApiCommand kApiCommands[] = {
     {"logins", "backup", "Admin.Backup", "POST /v1/backups"},
     {"events", "get", "Admin.GetEvents", "GET /v1/events"},
     {"events", "set", "Admin.PutEvents", "PUT /v1/events"},
+    {"log", "list", "Admin.ListLog", "GET /v1/log"},
 
     {"kafka-clusters", "put", "Kafka.PutCluster", "PUT /v1/kafka-clusters/{id}"},
     {"kafka-clusters", "get", "Kafka.GetCluster", "GET /v1/kafka-clusters/{id}"},

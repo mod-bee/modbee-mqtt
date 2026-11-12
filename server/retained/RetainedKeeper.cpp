@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "RetainedKeeper.h"
+#include "DiagnosticsLog.h"
 
 #include <cerrno>
 #include <chrono>
@@ -229,7 +230,7 @@ public:
                 // than not at all.
                 const std::string aside = _path + ".unreadable";
                 server_os::replaceFile(_path, aside);
-                std::fprintf(stderr, "modbee-mqtt serve: %s is not a retained-message file this "
+                diagnostics::error("retained", "modbee-mqtt serve: %s is not a retained-message file this "
                                      "version can read; moved it to %s and starting empty\n",
                              _path.c_str(), aside.c_str());
                 into.clear();
@@ -314,7 +315,7 @@ private:
         lock.lock();
         if (!ok) {
             if (_failures.fetch_add(1) == 0) {
-                std::fprintf(stderr, "modbee-mqtt serve: could not save retained messages to %s: %s "
+                diagnostics::error("retained", "modbee-mqtt serve: could not save retained messages to %s: %s "
                                      "(retrying; counted in the status line)\n",
                              _path.c_str(), why.c_str());
             }

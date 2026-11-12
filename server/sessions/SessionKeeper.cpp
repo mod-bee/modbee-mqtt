@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "SessionKeeper.h"
+#include "DiagnosticsLog.h"
 #include "ServerOs.h"
 
 #include "sqlite3.h"
@@ -736,7 +737,7 @@ struct SessionKeeper::Shard : public MqttSessionJournal {
         // The disk is full, or the file went: what is in memory still serves,
         // and this is counted and said once, rather than the broker stopping.
         if (failures.fetch_add(1, std::memory_order_relaxed) == 0) {
-            std::fprintf(stderr, "modbee-mqtt serve: the session store could not write shard %u: %s\n",
+            diagnostics::error("sessions", "modbee-mqtt serve: the session store could not write shard %u: %s\n",
                          index, sqlite3_errmsg(db));
         }
         exec(db, "ROLLBACK");

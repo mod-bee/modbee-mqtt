@@ -35,6 +35,7 @@ int cmdRestore(int argc, char** argv);
 int cmdService(int argc, char** argv);
 int cmdAdmin(int argc, char** argv);
 int cmdApi(int argc, char** argv);
+int cmdLog(int argc, char** argv);
 bool cliIsApiNoun(const char* noun);
 
 namespace {
@@ -59,10 +60,11 @@ void usage() {
         "  config   a broker's settings, stored beside its logins: get, set, apply, check, reset\n"
         "  provision  register a device with a provisioning key, and print its login\n"
         "  restore  put a backup of the login database back (broker stopped)\n"
+        "  log      the diagnostics log: who connected, who was refused and why, sign-ups, changes, warnings\n"
         "\n"
         "The Application API, one command for each call (--api, --token-file; --help lists the fields):\n"
         "  hello      authority  messages  groups  connections  logins  keys\n"
-        "  sessions   retained   listeners tls     stats        settings\n"
+        "  sessions   retained   listeners tls     stats        settings   log list\n"
         "\n"
         "  --version  the version, and the TLS engine this build uses\n"
         "\n"
@@ -114,6 +116,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(command, "restore") == 0) return cmdRestore(argc, argv);
     if (std::strcmp(command, "service") == 0) return cmdService(argc, argv);
     if (std::strcmp(command, "admin") == 0) return cmdAdmin(argc, argv);
+    if (std::strcmp(command, "log") == 0) return cmdLog(argc, argv);
     if (cliIsApiNoun(command)) return cmdApi(argc, argv);
 
     std::fprintf(stderr, "modbee-mqtt: unknown command '%s'\n\n", command);

@@ -16,6 +16,7 @@
 // listener. Topic permissions are not here: this answers who may connect.
 
 #include "ShardedBroker.h"
+#include "DiagnosticsLog.h"
 
 #include <broker/MqttBrokerAccounts.h>
 
@@ -50,7 +51,7 @@ public:
     }
 
     void prepare(uint32_t shard, MqttBroker& broker) override {
-        broker.onAuthorise(&MqttBrokerAccounts::hook, _tables[shard].get());
+        broker.onAuthorise(&ShardAccounts::hook, _tables[shard].get());
     }
 
     int waitHandle(uint32_t) override { return -1; }
@@ -71,6 +72,30 @@ public:
     }
 
 private:
+    // The table's own answer; a refused CONNECT is kept in the diagnostics
+    // log with its reason, told apart by which of the table's counts moved.
+    static bool hook(void* context, const MqttBrokerRequest& request, uint8_t& reasonCode) {
+        MqttBrokerAccounts& table = *static_cast<MqttBrokerAccounts*>(context);
+        const uint64_t unknown = table.refusedUnknown(), anonymous = table.refusedAnonymous(),
+                       password = table.refusedPassword(), disabled = table.refusedDisabled();
+        const bool ok = MqttBrokerAccounts::hook(context, request, reasonCode);
+        if (ok || request.action != MqttBrokerAction::Connect || DiagnosticsLog::installed() == nullptr) return ok;
+        const char* why = table.refusedAnonymous() != anonymous ? "no user name - every client logs in"
+                          : table.refusedPassword() != password ? "wrong password"
+                          : table.refusedDisabled() != disabled ? "the login is disabled"
+                          : table.refusedUnknown() != unknown   ? "no login has that name"
+                                                                : "";
+        DiagnosticsEntry e;
+        e.kind = "connect-refused";
+        if (request.clientId.length) e.clientId.assign((const char*)request.clientId.data, request.clientId.length);
+        if (request.userName.length) e.login.assign((const char*)request.userName.data, request.userName.length);
+        e.address = request.peerName ? request.peerName : "";
+        e.reasonCode = reasonCode;
+        e.reason = std::string(mq_reasonName(reasonCode, MQ_PKT_CONNACK)) + (*why ? std::string(": ") + why : "");
+        diagnostics::note(std::move(e));
+        return ok;
+    }
+
     std::vector<std::pair<std::string, std::string>> _accounts;
     std::vector<std::unique_ptr<MqttBrokerAccounts>> _tables;
 };

@@ -17,6 +17,7 @@ add_executable(modbee
     cmd_admin.cpp
     cmd_service.cpp
     cmd_api.cpp
+    cmd_log.cpp
     KafkaCli.cpp
     # The JSON the admin topics speak - plain C++, so the admin commands work
     # from any computer, not only where the server tier builds.

@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "ConnectionOutbox.h"
+#include "DiagnosticsLog.h"
 
 #include <cstdio>
 #include "GroupStore.h"
@@ -98,7 +99,7 @@ std::vector<ConnectionOutbox::Kept> ConnectionOutbox::next(const std::string& co
     // A row that will never read (a damaged file) is let go: kept, it held its
     // place at the head for ever, and enough of them stopped everything behind.
     for (uint64_t id : unreadable) {
-        std::fprintf(stderr, "outbox.db: message %llu of %s could not be read - dropped\n",
+        diagnostics::error("connections", "outbox.db: message %llu of %s could not be read - dropped\n",
                      (unsigned long long)id, connection.c_str());
         drop(id);
     }

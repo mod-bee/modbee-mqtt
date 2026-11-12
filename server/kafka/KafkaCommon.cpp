@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "KafkaCommon.h"
+#include "DiagnosticsLog.h"
 
 #include <cstdio>
 
@@ -14,8 +15,11 @@
 void kafkaOnLog(const rd_kafka_t* handle, int level, const char* facility, const char* text) {
     static const char* const kLevels[] = {"emerg", "alert", "crit", "error",
                                           "warning", "notice", "info", "debug"};
-    std::fprintf(stderr, "kafka %s [%s] %s: %s\n", (level >= 0 && level < 8) ? kLevels[level] : "log",
-                 rd_kafka_name(handle), facility, text);
+    const char* name = (level >= 0 && level < 8) ? kLevels[level] : "log";
+    // Warnings and worse are kept in the diagnostics log as well; the rest (a raised log_level) only said.
+    if (level >= 0 && level <= 3) diagnostics::error("kafka", "kafka %s [%s] %s: %s\n", name, rd_kafka_name(handle), facility, text);
+    else if (level == 4) diagnostics::warning("kafka", "kafka %s [%s] %s: %s\n", name, rd_kafka_name(handle), facility, text);
+    else std::fprintf(stderr, "kafka %s [%s] %s: %s\n", name, rd_kafka_name(handle), facility, text);
 }
 
 bool kafkaSet(rd_kafka_conf_t* conf, const char* name, const std::string& value, std::string& error) {

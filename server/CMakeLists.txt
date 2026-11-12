@@ -46,6 +46,15 @@ if(NOT MSVC)
     target_compile_options(modbee-sqlite PRIVATE -w)
 endif()
 
+# --- the diagnostics log: diagnostics: (server/diagnostics/) - its own SQLite file ---
+add_library(modbee-diagnostics STATIC diagnostics/DiagnosticsLog.cpp)
+target_link_libraries(modbee-diagnostics PUBLIC modbee-sqlite Threads::Threads)
+target_include_directories(modbee-diagnostics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/diagnostics)
+target_compile_features(modbee-diagnostics PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(modbee-diagnostics PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+endif()
+
 # --- modbee.yaml ---
 add_library(modbee-config STATIC
     config/ServerConfig.cpp
@@ -61,7 +70,8 @@ add_library(modbee-server STATIC
     ServerOs.cpp
     MetricsEndpoint.cpp
 )
-target_link_libraries(modbee-server PUBLIC modbee-mqtt Threads::Threads)
+# Every part of the server may say a warning into the diagnostics log.
+target_link_libraries(modbee-server PUBLIC modbee-mqtt modbee-diagnostics Threads::Threads)
 if(WIN32)
     target_link_libraries(modbee-server PUBLIC bcrypt)   # BCryptGenRandom (ServerOs.cpp)
 endif()

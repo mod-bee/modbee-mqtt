@@ -1064,6 +1064,15 @@ bool loadServerConfig(const std::string& yamlText, const ConfigSource& source,
     events.flag("enabled", out.events.enabled);
     if (events.present()) events.finish();
 
+    // Read whether or not the section is there, so MODBEE_DIAGNOSTICS_KEEP_DAYS alone changes it.
+    Section diagnostics = top.child("diagnostics");
+    diagnostics.flag("enabled", out.diagnostics.enabled);
+    diagnostics.text("file", out.diagnostics.file);
+    diagnostics.integer("keep-days", out.diagnostics.keepDays, 0, 3650);
+    diagnostics.integer("max-size-mb", out.diagnostics.maxSizeMb, 1, 1000000);
+    diagnostics.integer("max-rows", out.diagnostics.maxRows, 0, 1000000000);
+    if (diagnostics.present()) diagnostics.finish();
+
     // Read whether or not the section is there, so MODBEE_SPARKPLUG_AWARE alone turns it on.
     Section sparkplug = top.child("sparkplug");
     sparkplug.flag("aware", out.sparkplug.aware);

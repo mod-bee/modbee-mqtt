@@ -35,6 +35,13 @@ std::string quote(const std::string& in) {
     return out + "\"";
 }
 
+// "Not authorized: ..." - the reason code's name in the specification's words, and what it means here.
+std::string named(uint8_t code, uint8_t packet, const char* meaning) {
+    std::string out = mq_reasonName(code, packet);
+    if (meaning != nullptr && *meaning) out += std::string(": ") + meaning;
+    return out;
+}
+
 uint64_t nowMillis() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch()).count();
@@ -84,6 +91,78 @@ std::string BrokerEvents::startedDocument(uint64_t timeMillis) {
     return "{\"event\":\"started\",\"time\":" + std::to_string(timeMillis) + "}";
 }
 
+DiagnosticsEntry BrokerEvents::entryFor(const MqttBrokerClientEvent& e) {
+    DiagnosticsEntry out;
+    out.kind = topicFor(e.kind) + 15;     // after "$modbee/events/"
+    out.clientId = text(e.clientId);
+    out.login = text(e.userName);
+    out.address = text(e.address);
+    const std::string detail = text(e.detail);
+    switch (e.kind) {
+    case MqttBrokerClientEventKind::Connected:
+        out.detail = e.resumed ? "its session resumed" : "a new session";
+        break;
+    case MqttBrokerClientEventKind::Disconnected:
+        out.reasonCode = e.reasonCode;
+        if (e.reasonCode != 0) {
+            const char* meaning = e.reasonCode == MQ_REASON_SESSION_TAKEN_OVER
+                                      ? "another connection logged in with the same client id"
+                                  : e.reasonCode == MQ_REASON_KEEP_ALIVE_TIMEOUT
+                                      ? "nothing heard from it for one and a half keep-alives"
+                                  : e.reasonCode == MQ_REASON_NOT_AUTHORIZED
+                                      ? "its login was changed, disabled or removed, or its key turned off"
+                                  : e.reasonCode == MQ_REASON_SERVER_SHUTTING_DOWN ? "the server stopped"
+                                                                                  : "";
+            out.reason = "the server closed it - " + named(e.reasonCode, MQ_PKT_DISCONNECT, meaning);
+        } else {
+            out.reason = e.byClient ? "the client disconnected (DISCONNECT)"
+                                    : "the connection closed without a DISCONNECT";
+        }
+        break;
+    case MqttBrokerClientEventKind::Subscribed:
+        out.detail = text(e.filter) + " (QoS " + std::to_string(e.qos) + ")";
+        break;
+    case MqttBrokerClientEventKind::Unsubscribed:
+        out.detail = text(e.filter);
+        break;
+    case MqttBrokerClientEventKind::PublishRefused:
+        out.reasonCode = e.reasonCode;
+        out.reason = named(e.reasonCode, MQ_PKT_PUBACK,
+                           e.reasonCode == MQ_REASON_NOT_AUTHORIZED ? "its login may not publish to this topic" : "");
+        out.detail = text(e.filter);
+        break;
+    case MqttBrokerClientEventKind::SubscribeRefused:
+        out.reasonCode = e.reasonCode;
+        out.reason = named(e.reasonCode, MQ_PKT_SUBACK,
+                           e.reasonCode == MQ_REASON_NOT_AUTHORIZED ? "its login may not subscribe to this filter" : "");
+        out.detail = text(e.filter);
+        break;
+    case MqttBrokerClientEventKind::ConnectRefused:
+        out.reasonCode = e.reasonCode;
+        if (e.reasonCode == MQ_REASON_CLIENT_IDENTIFIER_NOT_VALID) {
+            out.reason = named(e.reasonCode, MQ_PKT_CONNACK,
+                               "the client id is held - a session of another login has it");
+            out.detail = "held by login \"" + detail + "\"";
+        } else if (e.reasonCode == MQ_REASON_NOT_AUTHORIZED) {
+            out.reason = named(e.reasonCode, MQ_PKT_CONNACK, "its Will is on a topic its login may not publish to");
+            out.detail = "Will topic " + detail;
+        } else {
+            out.reason = named(e.reasonCode, MQ_PKT_CONNACK,
+                               e.reasonCode == MQ_REASON_SERVER_BUSY
+                                   ? "the server is at its connections or sessions (max-connections, max-sessions)"
+                               : e.reasonCode == MQ_REASON_QUOTA_EXCEEDED
+                                   ? "the login holds all the sessions it may (max-sessions-per-login)"
+                                   : "");
+            out.detail = detail;
+        }
+        break;
+    case MqttBrokerClientEventKind::HandshakeFailed:
+        out.reason = detail.empty() ? std::string("the TLS handshake failed") : detail;
+        break;
+    }
+    return out;
+}
+
 bool BrokerEvents::begin(size_t shards, std::string&) {
     _shards.clear();
     _announceStart = true;
@@ -101,6 +180,7 @@ void BrokerEvents::prepare(uint32_t shard, MqttBroker& broker) {
 
 void BrokerEvents::onEvent(void* context, const MqttBrokerClientEvent& event) {
     Shard& shard = *static_cast<Shard*>(context);
+    if (DiagnosticsLog* log = shard.owner->_diagnostics.load(std::memory_order_acquire)) log->record(entryFor(event));
     if (!shard.owner->enabled()) return;
     // A connection refused before it had a session has no client to speak of - except one whose TLS handshake
     // failed, which never had a client id to give: its address is what there is.

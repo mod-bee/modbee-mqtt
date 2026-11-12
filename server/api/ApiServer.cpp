@@ -14,6 +14,7 @@
 #include "Json.h"
 #include "KafkaControl.h"
 #include "ShardedBroker.h"
+#include "DiagnosticsLog.h"
 #if MQTT_TLS_SOCKETS
 #include "transport/MqttCertificate.h"
 #endif
@@ -29,6 +30,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <map>
 #include <deque>
 #include <fstream>
@@ -521,7 +523,8 @@ public:
                                   "logins are not kept by this server (authentication: database)");
             return false;
         }
-        if (!json::parse(_s.logins->admin(request), reply) || !reply.flag("ok")) {
+        if (!json::parse(_s.logins->admin(request, std::string(), std::string(), "the Application API"), reply) ||
+            !reply.flag("ok")) {
             const std::string error = reply.str("error", "the login database did not answer");
             const grpc::StatusCode code =
                 error.find("no user") != std::string::npos || error.find("no key") != std::string::npos
@@ -569,7 +572,7 @@ public:
             if (change->has_document()) q.add("document", change->document());
             if (change->restart()) q.add("restart", true);
         }
-        if (!json::parse(_s.logins->admin(q.str()), answer)) {
+        if (!json::parse(_s.logins->admin(q.str(), std::string(), std::string(), "the Application API"), answer)) {
             status = grpc::Status(grpc::StatusCode::INTERNAL, "the settings store did not answer");
             return false;
         }
@@ -1025,6 +1028,56 @@ public:
         bytes << in.rdbuf();
         reply->set_size(bytes.str().size());
         if (request.contents()) reply->set_contents(bytes.str());
+        done(grpc::Status::OK);
+    }
+
+    void listLog(const v1::ListLogRequest& request, v1::ListLogReply* reply, Done done) {
+        if (_s.diagnostics == nullptr) {
+            return done(grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                     "this server keeps no diagnostics log (docs/diagnostics.md)"));
+        }
+        DiagnosticsQuery q;
+        q.clientId = request.client_id();
+        q.login = request.login();
+        for (const std::string& kind : request.kinds()) {
+            // REST gives them comma-separated in one value.
+            size_t from = 0;
+            while (from <= kind.size()) {
+                size_t comma = kind.find(',', from);
+                if (comma == std::string::npos) comma = kind.size();
+                if (comma > from) q.kinds.push_back(kind.substr(from, comma - from));
+                from = comma + 1;
+            }
+        }
+        q.sinceMs = request.since_ms();
+        q.untilMs = request.until_ms();
+        q.forward = request.has_after_id();
+        q.afterId = (int64_t)request.after_id();
+        if (!request.page_token().empty()) {
+            char* end = nullptr;
+            q.beforeId = std::strtoll(request.page_token().c_str(), &end, 10);
+            if (end == nullptr || *end != '\0' || q.beforeId <= 0) {
+                return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "page_token is not one this call gave"));
+            }
+        }
+        q.limit = request.page_size() == 0 ? 100 : std::min<uint32_t>(request.page_size(), 1000);
+        std::vector<DiagnosticsEntry> entries;
+        std::string error;
+        if (!_s.diagnostics->query(q, entries, error)) return done(grpc::Status(grpc::StatusCode::INTERNAL, error));
+        for (const DiagnosticsEntry& e : entries) {
+            v1::LogEntry* out = reply->add_entries();
+            out->set_id((uint64_t)e.id);
+            out->set_time_ms(e.timeMs);
+            out->set_kind(e.kind);
+            out->set_client_id(e.clientId);
+            out->set_login(e.login);
+            out->set_address(e.address);
+            if (e.reasonCode >= 0) out->set_reason_code((uint32_t)e.reasonCode);
+            out->set_reason(e.reason);
+            out->set_detail(e.detail);
+        }
+        if (!entries.empty() && entries.size() == q.limit) reply->set_next_page_token(std::to_string(entries.back().id));
+        reply->set_dropped(_s.diagnostics->status().dropped);
         done(grpc::Status::OK);
     }
 
@@ -1667,6 +1720,7 @@ public:
         if (_kafka) reply->add_features("kafka");           // Kafka.*, live
         if (_admin) reply->add_features("admin.backup");
         if (_admin) reply->add_features("events.live");    // Admin.PutEvents
+        if (_admin) reply->add_features("admin.log");      // Admin.ListLog
         reactor->Finish(grpc::Status::OK);
         return reactor;
     }
@@ -1730,6 +1784,7 @@ public:
     MODBEE_ADMIN_CALL(Stats, v1::Empty, v1::StatsReply, _core.stats(reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(Backup, v1::BackupRequest, v1::BackupReply, _core.backup(*request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(GetEvents, v1::Empty, v1::EventsSetting, _core.getEvents(reply, MODBEE_FINISH))
+    MODBEE_ADMIN_CALL(ListLog, v1::ListLogRequest, v1::ListLogReply, _core.listLog(*request, reply, MODBEE_FINISH))
     MODBEE_ADMIN_CALL(PutEvents, v1::EventsSetting, v1::EventsSetting, _core.putEvents(*request, reply, MODBEE_FINISH))
 
 #undef MODBEE_FINISH
@@ -3584,6 +3639,18 @@ int ApiServer::rest(const std::string& method, const std::string& target, const 
             auto out = made<v1::BackupReply>();
             run(r, out, [=](Done done) { core->backup(*r, out.get(), done); });
         }
+    } else if (collection == "log" && name.empty() && method == "GET") {
+        auto r = made<v1::ListLogRequest>();
+        r->set_client_id(query["clientId"]);
+        r->set_login(query["login"]);
+        if (!query["kinds"].empty()) r->add_kinds(query["kinds"]);
+        r->set_since_ms(std::strtoll(query["sinceMs"].c_str(), nullptr, 10));
+        r->set_until_ms(std::strtoll(query["untilMs"].c_str(), nullptr, 10));
+        r->set_page_size(number("pageSize"));
+        r->set_page_token(query["pageToken"]);
+        if (!query["afterId"].empty()) r->set_after_id(std::strtoull(query["afterId"].c_str(), nullptr, 10));
+        auto out = made<v1::ListLogReply>();
+        run(r, out, [=](Done done) { core->listLog(*r, out.get(), done); });
     } else if (collection == "events" && name.empty() && (method == "GET" || method == "PUT")) {
         if (method == "GET") {
             auto out = made<v1::EventsSetting>();

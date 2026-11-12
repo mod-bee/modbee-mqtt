@@ -298,20 +298,200 @@ bool AuthGate::isFixedAdmin(const std::string& username) const {
     return false;
 }
 
-bool AuthGate::checkKey(const std::string& offered, const std::string& clientId, std::string& keyName) {
+bool AuthGate::isFixedLogin(const std::string& username) const {
+    for (const auto& a : _config.logins) if (a.first == username) return true;
+    return false;
+}
+
+// --- The diagnostics log -------------------------------------------------------
+
+namespace {
+
+bool endsWith(const std::string& s, const char* tail) {
+    const size_t n = std::strlen(tail);
+    return s.size() >= n && s.compare(s.size() - n, n, tail) == 0;
+}
+
+// The admin commands that change something: each one that succeeds is kept, with what it named.
+bool changesSomething(const std::string& command) {
+    static const char* const kCommands[] = {
+        "user.add", "user.set", "user.remove", "user.enable", "user.disable", "user.approve", "user.reset",
+        "user.password", "user.permissions", "user.admin", "key.create", "key.set", "key.remove",
+        "config.set", "config.apply", "config.reset", nullptr};
+    for (const char* const* c = kCommands; *c; c++) if (command == *c) return true;
+    return false;
+}
+
+// "name=value" for one field of a request, appended to `out`: a secret as (set), a long text by its size, an
+// object field by field ("set broker.port=1884").
+void describeField(std::string& out, const std::string& name, const json::Value& v) {
+    const auto add = [&](const std::string& value) {
+        if (!out.empty()) out += ", ";
+        out += name + "=" + value;
+    };
+    const bool secret = endsWith(name, "password") || endsWith(name, "key-pem");
+    switch (v.type) {
+    case json::Value::Null: add("null"); break;
+    case json::Value::Bool: add(v.boolean ? "true" : "false"); break;
+    case json::Value::Number: {
+        char number[32];
+        if (v.number == (double)(long long)v.number) std::snprintf(number, sizeof number, "%lld", (long long)v.number);
+        else std::snprintf(number, sizeof number, "%g", v.number);
+        add(number);
+        break;
+    }
+    case json::Value::String:
+        add(secret ? std::string("(set)")
+            : v.text.size() > 120 || v.text.find('\n') != std::string::npos
+                ? "(" + std::to_string(v.text.size()) + " bytes)"
+                : v.text);
+        break;
+    case json::Value::Array: {
+        std::string items;
+        for (const json::Value& item : v.items) {
+            if (!items.empty()) items += " ";
+            items += item.type == json::Value::String ? item.text : std::string("...");
+        }
+        add("[" + items + "]");
+        break;
+    }
+    case json::Value::Object:
+        if (v.fields.empty()) add("{}");
+        for (const auto& field : v.fields) describeField(out, name + " " + field.first, field.second);
+        break;
+    }
+}
+
+} // namespace
+
+void AuthGate::noteRefusal(const MqttBrokerRequest& request, uint8_t code, const std::string& why,
+                           const std::string& detail) {
+    if (_config.diagnostics == nullptr) return;
+    DiagnosticsEntry e;
+    e.kind = "connect-refused";
+    e.clientId = text(request.clientId);
+    e.login = text(request.userName);
+    e.address = request.peerName ? request.peerName : "";
+    e.reasonCode = code;
+    e.reason = std::string(mq_reasonName(code, MQ_PKT_CONNACK)) + (why.empty() ? "" : ": " + why);
+    e.detail = detail;
+    _config.diagnostics->record(std::move(e));
+}
+
+void AuthGate::noteAdminChange(const std::string& requestText, const std::string& answer, const std::string& clientId,
+                               const std::string& login, const char* via) {
+    json::Value request, reply;
+    if (!json::parse(requestText, request) || request.type != json::Value::Object) return;
+    const std::string command = request.str("command");
+    if (!changesSomething(command) || !json::parse(answer, reply) || !reply.flag("ok")) return;
+    DiagnosticsEntry e;
+    e.kind = "admin";
+    e.clientId = clientId;
+    e.login = login;
+    const std::string target = request.str("username", request.str("name"));
+    e.reason = command + (target.empty() ? "" : " " + target);
+    std::string what;
+    for (const auto& field : request.fields) {
+        if (field.first == "id" || field.first == "command" || field.first == "username" || field.first == "name") {
+            continue;
+        }
+        describeField(what, field.first, field.second);
+    }
+    if (via != nullptr) what = std::string("over ") + via + (what.empty() ? "" : "; " + what);
+    e.detail = what;
+    _config.diagnostics->record(std::move(e));
+}
+
+// log.list: the diagnostics log, newest first, a page at a time - what `modbee-mqtt log` reads over MQTT.
+std::string AuthGate::listLog(const json::Value& request) {
+    if (_config.diagnostics == nullptr) {
+        return failure(request, "this server keeps no diagnostics log (docs/diagnostics.md)");
+    }
+    DiagnosticsQuery q;
+    q.clientId = request.str("client");
+    q.login = request.str("login");
+    if (request["kinds"].type == json::Value::Array) {
+        request.strings("kinds", q.kinds);
+    } else {
+        const std::string kinds = request.str("kinds");
+        size_t from = 0;
+        while (from < kinds.size()) {
+            size_t comma = kinds.find(',', from);
+            if (comma == std::string::npos) comma = kinds.size();
+            if (comma > from) q.kinds.push_back(kinds.substr(from, comma - from));
+            from = comma + 1;
+        }
+    }
+    q.sinceMs = request.integer("since", 0);
+    q.untilMs = request.integer("until", 0);
+    q.beforeId = request.integer("before", 0);
+    q.forward = request.has("after");
+    q.afterId = request.integer("after", 0);
+    long long limit = request.integer("limit", 100);
+    if (limit < 1) limit = 1;
+    if (limit > 1000) limit = 1000;
+    q.limit = (size_t)limit;
+    std::vector<DiagnosticsEntry> entries;
+    std::string error;
+    if (!_config.diagnostics->query(q, entries, error)) return failure(request, error);
+    // A page stays well inside what an admin client takes in one message; the rest is the next page.
+    const size_t kBudget = 200000;
+    std::string items = "[";
+    size_t shown = 0;
+    for (const DiagnosticsEntry& e : entries) {
+        json::Object o;
+        o.add("id", (long long)e.id).add("time", (long long)e.timeMs).add("kind", e.kind).add("clientid", e.clientId)
+            .add("login", e.login).add("address", e.address);
+        if (e.reasonCode >= 0) o.add("reason_code", (long long)e.reasonCode);
+        o.add("reason", e.reason).add("detail", e.detail);
+        const std::string one = o.str();
+        if (shown > 0 && items.size() + one.size() > kBudget) break;
+        items += (shown ? "," : "") + one;
+        shown++;
+    }
+    items += "]";
+    json::Object o;
+    o.raw("entries", items);
+    const DiagnosticsStatus status = _config.diagnostics->status();
+    o.add("dropped", (long long)status.dropped);
+    // More - older ones, or following, newer ones - when the page is full.
+    if (shown > 0 && (shown < entries.size() || entries.size() == q.limit)) {
+        o.add("next", (long long)entries[shown - 1].id);
+    }
+    return reply(request, true, o);
+}
+
+bool AuthGate::checkKey(const std::string& offered, const std::string& clientId, std::string& keyName,
+                        std::string& why) {
     // A key is "<name>.<secret>": the name finds the record, the secret is
     // checked against its hash.
     const size_t dot = offered.find('.');
-    if (dot == std::string::npos) return false;
-    keyName = offered.substr(0, dot);
-    AuthKey key;
-    if (!keyNameOk(keyName) || !_store.findKey(keyName, key)) return false;
-    if (!auth::verify(key.hash, (const uint8_t*)offered.data() + dot + 1, offered.size() - dot - 1)) {
+    if (dot == std::string::npos) {
+        why = "signing up: the password is not a key (<name>.<secret>)";
         return false;
     }
-    if (key.expires != 0 && nowSeconds() >= key.expires) return false;
-    if (key.devices == 0) return false;     // the key is off
-    if (!key.device.empty() && key.device != clientId) return false;
+    keyName = offered.substr(0, dot);
+    AuthKey key;
+    if (!keyNameOk(keyName) || !_store.findKey(keyName, key)) {
+        why = "signing up: no key is called \"" + keyName + "\"";
+        return false;
+    }
+    if (!auth::verify(key.hash, (const uint8_t*)offered.data() + dot + 1, offered.size() - dot - 1)) {
+        why = "signing up: the key's secret is wrong";
+        return false;
+    }
+    if (key.expires != 0 && nowSeconds() >= key.expires) {
+        why = "signing up: the key has expired";
+        return false;
+    }
+    if (key.devices == 0) {
+        why = "signing up: the key is turned off (devices 0)";
+        return false;
+    }
+    if (!key.device.empty() && key.device != clientId) {
+        why = "signing up: the key is for the device \"" + key.device + "\" only";
+        return false;
+    }
     return true;
 }
 
@@ -345,9 +525,13 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
         }
         reasonCode = MQ_REASON_BAD_USER_NAME_OR_PASSWORD;
         bool ok = false;
+        std::string why;            // a refusal, in words, for the diagnostics log
+        std::string detail;
         if (username == kProvisionUser) {
             std::string keyName;
-            ok = safeName(clientId) && checkKey(text(request.password), clientId, keyName);
+            if (!safeName(clientId)) why = "signing up: the client id is not a device name (empty, $, / + #)";
+            else ok = checkKey(text(request.password), clientId, keyName, why);
+            if (!keyName.empty()) detail = "key \"" + keyName + "\"";
             if (ok) {
                 std::lock_guard<std::mutex> lock(_provisioningMutex);
                 _provisioning[clientId] = keyName;
@@ -359,13 +543,17 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
         } else if (fixedLogin(_config.admins, request.userName, request.password) ||
                    fixedLogin(_config.logins, request.userName, request.password)) {
             ok = true;
+        } else if (isFixedAdmin(username) || isFixedLogin(username)) {
+            why = "wrong password (a login from the server's settings)";
         } else if (!username.empty()) {
             AuthUser user;
             if (_store.getUser(shard.index, username, user)) {
                 if (!user.enabled || user.pending) {
                     reasonCode = MQ_REASON_NOT_AUTHORIZED;
+                    why = !user.enabled ? "the login is disabled" : "the login is waiting for an admin to approve it";
                 } else {
                     ok = auth::verify(user.hash, request.password.data, request.password.length);
+                    if (!ok) why = "wrong password";
                 }
                 // A device a key let in counts against that key's devices at once: off (0), it is refused;
                 // with the key's number of its other devices online, it waits for one to go.
@@ -374,9 +562,12 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
                     if (key.devices == 0) {
                         ok = false;
                         reasonCode = MQ_REASON_NOT_AUTHORIZED;
+                        why = "its key \"" + key.name + "\" is turned off (devices 0)";
                     } else if (key.devices > 0 && onlineOf(key.name, username) >= (size_t)key.devices) {
                         ok = false;
                         reasonCode = MQ_REASON_QUOTA_EXCEEDED;
+                        why = "its key \"" + key.name + "\" has its " + std::to_string(key.devices) +
+                              " device(s) at once online";
                     }
                 }
             } else {
@@ -384,9 +575,13 @@ bool AuthGate::authorise(Shard& shard, const MqttBrokerRequest& request, uint8_t
                 // password and the two cannot be told apart from outside.
                 static const std::string kDecoy = auth::hashGenerated("decoy");
                 auth::verify(kDecoy, request.password.data, request.password.length);
+                why = "no login has that name";
             }
+        } else {
+            why = "no user name - every client logs in";
         }
         (ok ? _accepted : _refused).fetch_add(1, std::memory_order_relaxed);
+        if (!ok) noteRefusal(request, reasonCode, why, detail);
         if (ok && !clientId.empty()) {
             std::lock_guard<std::mutex> lock(_onlineMutex);
             _connecting[clientId] = username;
@@ -463,6 +658,8 @@ bool AuthGate::certificateLogin(Shard& shard, const MqttBrokerRequest& request, 
         _certificateRefused.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "modbee-mqtt serve: certificate login refused for \"%s\" from %s (certificate %s): %s\n",
                      name.c_str(), request.peerName ? request.peerName : "?", fingerprint.c_str(), why);
+        noteRefusal(request, code, std::string("certificate login: ") + why,
+                    "certificate CN \"" + name + "\", sha256 " + fingerprint);
         return false;
     };
     if (!offered.empty() && offered != name) {
@@ -557,7 +754,7 @@ void AuthGate::service(uint32_t shard, MqttBroker& broker) {
         std::string topic, body;
         if (r.admin) {
             topic = "$modbee/admin/" + r.clientId + "/reply";
-            body = admin(r.payload);
+            body = admin(r.payload, r.clientId, r.login);
         } else {
             std::string keyName;
             {
@@ -593,6 +790,28 @@ void AuthGate::stop(uint32_t, MqttBroker&) {
 
 std::string AuthGate::provision(const std::string& clientId, const std::string& keyName,
                                 const std::string& requestText) {
+    const std::string answer = signUp(clientId, keyName, requestText);
+    // Every sign-up and the answer it got, for the diagnostics log.
+    if (_config.diagnostics != nullptr) {
+        json::Value request, reply;
+        if (!requestText.empty()) json::parse(requestText, request);
+        json::parse(answer, reply);
+        DiagnosticsEntry e;
+        e.kind = "signup";
+        e.clientId = clientId;
+        e.login = request.type == json::Value::Object ? request.str("name", clientId) : clientId;
+        const std::string status = reply.str("status");
+        e.reason = status == "ok"        ? "ok - its login is ready"
+                   : status == "pending" ? "pending - waiting for an admin to approve it"
+                                         : "refused: " + reply.str("reason", "no reason given");
+        e.detail = keyName.empty() ? std::string() : "key \"" + keyName + "\"";
+        _config.diagnostics->record(std::move(e));
+    }
+    return answer;
+}
+
+std::string AuthGate::signUp(const std::string& clientId, const std::string& keyName,
+                             const std::string& requestText) {
     json::Value request;
     if (!requestText.empty() && !json::parse(requestText, request)) request = json::Value();
     json::Object body;
@@ -693,7 +912,16 @@ std::string AuthGate::refresh(const std::string& username) {
 
 // --- Admin -------------------------------------------------------------------
 
-std::string AuthGate::admin(const std::string& requestText) {
+std::string AuthGate::admin(const std::string& requestText) { return admin(requestText, std::string(), std::string()); }
+
+std::string AuthGate::admin(const std::string& requestText, const std::string& clientId, const std::string& login,
+                            const char* via) {
+    const std::string answer = answerAdmin(requestText);
+    if (_config.diagnostics != nullptr) noteAdminChange(requestText, answer, clientId, login, via);
+    return answer;
+}
+
+std::string AuthGate::answerAdmin(const std::string& requestText) {
     json::Value request;
     if (!json::parse(requestText, request) || request.type != json::Value::Object) {
         return failure(json::Value(), "the request is not a JSON object");
@@ -976,6 +1204,7 @@ std::string AuthGate::admin(const std::string& requestText) {
         return reply(request, true, o);
     }
     if (command.compare(0, 7, "config.") == 0) return configCommand(command, request);
+    if (command == "log.list") return listLog(request);
     if (command == "status") {
         const AuthGateStatus s = status();
         json::Object o;
@@ -1031,7 +1260,7 @@ void AuthGate::backupLoop() {
             due = std::chrono::steady_clock::now() + every;
             std::string path, error;
             if (!backupNow(path, error)) {
-                std::fprintf(stderr, "modbee-mqtt serve: the login store backup failed: %s\n", error.c_str());
+                diagnostics::error("logins", "modbee-mqtt serve: the login store backup failed: %s\n", error.c_str());
             }
         }
         lock.lock();

@@ -30,6 +30,7 @@ class AppAdmin;
 class AuthGate;
 class ShardedBroker;
 class KafkaControl;
+class DiagnosticsLog;
 
 struct ApiServerConfig {
     std::vector<std::string> addresses;   // "unix:/run/modbee/api.sock", "tcp://0.0.0.0:7660"
@@ -57,6 +58,7 @@ public:
         AuthGate* logins = nullptr;          // the login database, where logins are kept here
         ShardedBroker* server = nullptr;     // its listeners, TLS and status
         KafkaControl* kafka = nullptr;       // the kafka: section, changed live
+        DiagnosticsLog* diagnostics = nullptr;   // Admin.ListLog; null: the server keeps none
         // Client events, on or off while it runs (server/events/BrokerEvents.h).
         std::function<bool()> clientEvents;
         std::function<void(bool)> setClientEvents;

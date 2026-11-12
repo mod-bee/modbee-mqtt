@@ -27,6 +27,8 @@
 #include "BrokerEvents.h"
 #include "SparkplugAware.h"
 #include "SessionKeeper.h"
+#include "DiagnosticsLog.h"
+#include "ServerOs.h"
 #if defined(MODBEE_HAVE_APP_API)
 #include "Authority.h"
 #include "ApiServer.h"
@@ -57,7 +59,7 @@ namespace {
 const std::vector<ArgSpec>& serveSpecs() {
     static const std::vector<ArgSpec> specs = {
         {"config", 'C', true, "modbee.yaml to run (flags given as well override it)"},
-        {"data", 0, true, "keep everything in this folder - logins and settings (auth.db), retained messages, sessions; how `modbee-mqtt service` runs it"},
+        {"data", 0, true, "keep everything in this folder - logins and settings (auth.db), retained messages, sessions, the diagnostics log; how `modbee-mqtt service` runs it"},
         {"address", 'a', true, "address to listen on (default 0.0.0.0)"},
         {"port", 'p', true, "port (default 1883)"},
         {"no-plain", 0, false, "no plain-TCP listener (TLS only)"},
@@ -190,6 +192,7 @@ int cmdServe(int argc, char** argv) {
         c.sessions.store = SessionStore::File;
         c.sessions.directory = cliInFolder(data, "sessions");
         c.api.stateDirectory = data;
+        c.diagnostics.file = cliInFolder(data, "diagnostics.db");
     };
     keepIn(file);
     // SETTINGS STORED IN THE DATABASE, over the file (or the defaults, without
@@ -485,6 +488,33 @@ int cmdServe(int argc, char** argv) {
     std::unique_ptr<BrokerEvents> events(new BrokerEvents());
     events->enable(file.events.enabled);
     extensions.add(events.get());
+    // THE DIAGNOSTICS LOG: what happened to whom, kept on disk for a week (docs/diagnostics.md). In the data
+    // folder, beside the login database, or in /var/lib/modbee when it is there (the Docker image); anywhere else
+    // only where diagnostics.file names a file. A file that will not open is said, and the broker runs without.
+    DiagnosticsLog diagnosticsLog;
+    std::string diagnosticsPath = file.diagnostics.file;
+    if (diagnosticsPath.empty() && !file.authentication.database.empty()) {
+        const std::string& db = file.authentication.database;
+        const size_t slash = db.find_last_of("/\\");
+        diagnosticsPath = slash == std::string::npos ? "diagnostics.db" : db.substr(0, slash + 1) + "diagnostics.db";
+    }
+    if (diagnosticsPath.empty() && server_os::isDirectory("/var/lib/modbee")) diagnosticsPath = "/var/lib/modbee/diagnostics.db";
+    bool diagnosticsOn = false;
+    if (!diagnosticsPath.empty()) {
+        DiagnosticsSettings d;
+        d.enabled = file.diagnostics.enabled;
+        d.keepDays = file.diagnostics.keepDays;
+        d.maxBytes = file.diagnostics.maxSizeMb * 1024 * 1024;
+        d.maxRows = file.diagnostics.maxRows;
+        std::string why;
+        if (diagnosticsLog.start(diagnosticsPath, d, why)) {
+            diagnosticsOn = true;
+            DiagnosticsLog::install(&diagnosticsLog);
+            events->keepIn(&diagnosticsLog);
+        } else {
+            std::fprintf(stderr, "modbee-mqtt serve: %s - running without the diagnostics log\n", why.c_str());
+        }
+    }
     // SPARKPLUG AWARE: always there, so the API can turn it on while it runs.
     SparkplugAware aware(file.sparkplug.aware);
     extensions.add(&aware);
@@ -567,6 +597,7 @@ int cmdServe(int argc, char** argv) {
         }
         g.logins.push_back(std::make_pair(internalUser, internalPassword));
         internalLogin = true;
+        if (diagnosticsOn) g.diagnostics = &diagnosticsLog;
         gate.reset(new AuthGate(g));
         extensions.add(gate.get());
     } else {
@@ -615,7 +646,7 @@ int cmdServe(int argc, char** argv) {
 
     cliInstallSignalHandlers();
     if (!server.start(config)) {
-        std::fprintf(stderr, "modbee-mqtt serve: %s\n", server.lastError().c_str());
+        diagnostics::error("server", "modbee-mqtt serve: %s\n", server.lastError().c_str());
         return 3;
     }
 #if defined(MODBEE_HAVE_APP_API)
@@ -676,6 +707,7 @@ int cmdServe(int argc, char** argv) {
             events->enable(on);
             if (eventsHub) eventsHub->eventsEnabled(on);
         };
+        s.diagnostics = diagnosticsOn ? &diagnosticsLog : nullptr;
         s.sparkplugAware = [&aware] { return aware.enabled(); };
         s.setSparkplugAware = [&aware](bool on) { aware.enable(on); };
         if (!read || !api.start(c, s, why)) {
@@ -721,6 +753,24 @@ int cmdServe(int argc, char** argv) {
                     "names, without a password (certificate-login)\n");
     }
     if (events->enabled()) std::printf("modbee-mqtt serve: client events published on $modbee/events/...\n");
+    if (diagnosticsOn) {
+        const DiagnosticsSettings d = diagnosticsLog.settings();
+        std::printf("modbee-mqtt serve: diagnostics log in %s%s (kept %lld day(s), up to %lld MB)\n", diagnosticsPath.c_str(),
+                    d.enabled ? "" : " - off (diagnostics.enabled)", (long long)d.keepDays,
+                    (long long)(d.maxBytes / (1024 * 1024)));
+    } else if (diagnosticsPath.empty()) {
+        std::printf("modbee-mqtt serve: no diagnostics log - give --data, or diagnostics.file\n");
+    }
+    {
+        // THE SERVER STARTED, with what it serves: the first entry of each run.
+        DiagnosticsEntry started;
+        started.kind = "started";
+        started.reason = std::string("modbee-mqtt ") + MODBEE_VERSION;
+        started.detail = std::to_string(server.shardCount()) + " shard(s)";
+        if (config.plain) started.detail += ", port " + std::to_string(server.port());
+        if (config.tls.enabled) started.detail += ", tls " + std::to_string(server.tlsPort());
+        diagnostics::note(started);
+    }
 #if defined(MODBEE_HAVE_APP_API)
     for (const std::string& address : api.listening()) {
         std::printf("modbee-mqtt serve: Application API (gRPC) on %s\n", address.c_str());
@@ -858,12 +908,19 @@ int cmdServe(int argc, char** argv) {
         }
     }
     std::printf("modbee-mqtt serve: stopping\n");
+    {
+        DiagnosticsEntry stopped;
+        stopped.kind = "stopped";
+        stopped.reason = cliRestartRequested() ? "restarting to apply settings" : "asked to stop";
+        diagnostics::note(stopped);
+    }
     metrics.stop();      // first: its REST calls reach the Application API
 #if defined(MODBEE_HAVE_APP_API)
     api.stop();          // before the shards: its calls reach them
     if (connections) connections->stop();
 #endif
     server.stop();
+    diagnosticsLog.stop();     // last: what the shards said on the way out is written
     return 0;
 }
 

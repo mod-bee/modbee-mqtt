@@ -103,6 +103,16 @@ bool canWrite(const std::string& path, std::string& error) {
     return true;
 }
 
+bool isDirectory(const std::string& path) {
+#if defined(_WIN32)
+    struct _stat info;
+    return _stat(path.c_str(), &info) == 0 && (info.st_mode & _S_IFDIR) != 0;
+#else
+    struct stat info;
+    return ::stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+#endif
+}
+
 bool makeDirectory(const std::string& path, int mode) {
 #if defined(_WIN32)
     (void)mode;

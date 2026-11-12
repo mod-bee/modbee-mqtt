@@ -4,6 +4,7 @@
 // ADDITIONAL TERMS - see LICENSE. Commercial use requires a separate licence.
 
 #include "KafkaLinks.h"
+#include "DiagnosticsLog.h"
 #include "KafkaEnvelope.h"
 #include "KafkaPipe.h"
 #include "RetainedKeeper.h"
@@ -328,7 +329,7 @@ void KafkaLinks::clustersChanged(const ServerConfig& section) {
         if (signature == link.signature) continue;
         std::string why;
         if (!link.pipe->apply(next, why)) {
-            std::fprintf(stderr, "kafka connection %s: the cluster's change was not taken: %s\n", one.first.c_str(),
+            diagnostics::warning("connections", "kafka connection %s: the cluster's change was not taken: %s\n", one.first.c_str(),
                          why.c_str());
             continue;
         }

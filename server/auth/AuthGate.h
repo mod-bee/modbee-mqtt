@@ -42,6 +42,7 @@
 #include "AuthStore.h"
 #include "ServerConfig.h"
 #include "Json.h"
+#include "DiagnosticsLog.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -76,6 +77,10 @@ struct AuthGateConfig {
     // is made, before the server starts. Null: TLS is reported as not served
     // and a change to it waits for the restart.
     ShardedBroker* server = nullptr;
+    // The diagnostics log: every refused login with its reason, every sign-up
+    // and its answer, every change made on $modbee/admin; and log.list reads
+    // it. Not owned. Null: none of it is kept.
+    DiagnosticsLog* diagnostics = nullptr;
 };
 
 struct AuthGateStatus {
@@ -105,6 +110,10 @@ public:
     // The request handlers, callable directly (tests, and the CLI's own
     // offline commands): a request document in, a reply document out.
     std::string admin(const std::string& request);
+    // The same, saying who asked - kept in the diagnostics log with each
+    // change it makes; `via` ("the Application API") when not over MQTT.
+    std::string admin(const std::string& request, const std::string& clientId, const std::string& login,
+                      const char* via = nullptr);
     // A signed-in device asking again for its data (its login's), with no new secret.
     std::string refresh(const std::string& username);
     std::string provision(const std::string& clientId, const std::string& keyName,
@@ -151,7 +160,16 @@ private:
     bool fixedLogin(const std::vector<std::pair<std::string, std::string>>& list,
                     const MqttSpan& user, const MqttSpan& password) const;
     bool isFixedAdmin(const std::string& username) const;
-    bool checkKey(const std::string& offered, const std::string& clientId, std::string& keyName);
+    bool isFixedLogin(const std::string& username) const;
+    bool checkKey(const std::string& offered, const std::string& clientId, std::string& keyName, std::string& why);
+    std::string answerAdmin(const std::string& request);
+    std::string signUp(const std::string& clientId, const std::string& keyName, const std::string& request);
+
+    // --- The diagnostics log ---
+    void noteRefusal(const MqttBrokerRequest& request, uint8_t code, const std::string& why, const std::string& detail);
+    void noteAdminChange(const std::string& request, const std::string& answer, const std::string& clientId,
+                         const std::string& login, const char* via);
+    std::string listLog(const json::Value& request);
     bool certificateLogin(Shard& shard, const MqttBrokerRequest& request, uint8_t& reasonCode);
 
     // Closes every live connection of a login, on every shard.
