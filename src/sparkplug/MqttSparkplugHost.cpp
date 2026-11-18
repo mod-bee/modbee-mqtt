@@ -460,6 +460,7 @@ void MqttSparkplugHost::sessionEstablished(bool sessionPresent) {
 }
 
 bool MqttSparkplugHost::publishBirth() {
+    if (!_active) return false;     // stood down: an online STATE would be a lie
     char json[64];
     // The SAME timestamp that went into the Will.
     // [tck-id-payloads-state-birth-payload].
@@ -1193,7 +1194,11 @@ void MqttSparkplugHost::handleMessage(const MqttMessage& message) {
                                     timestamp)) {
             return;
         }
-        if (!online && _client.isConnected()) {
+        // NOT AFTER disconnect(): our own offline, echoed back on a shared
+        // client that stays connected, was read as stale and answered with
+        // online - retained - so nodes gated on this host kept publishing to
+        // a host that had stood down.
+        if (!online && _active && _client.isConnected()) {
             // A stale death certificate from a previous session of ours, or one
             // the server delivered late. We are here, so we say so again.
             publishBirth();

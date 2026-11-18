@@ -1969,7 +1969,7 @@ void MqttSparkplugNode::poll() {
         !_disconnectAfterDeath && !_reconnectAfterOffline && !_cycleOwed &&
         mq_elapsed(_owedTriedAt, mq_millis()) >= 1000) {
         _owedTriedAt = mq_millis();
-        if (_subscriptionsOwed) _subscriptionsOwed = !subscribeCommands();
+        if (_subscriptionsOwed) _subscriptionsOwed = subscribeCommands(_subscriptionsOwed);
         if (_birthOwed) {
             if (_born) {
                 _birthOwed = false;
@@ -2082,9 +2082,15 @@ void MqttSparkplugNode::sessionEstablished(bool sessionPresent) {
     _stateMessages = 0;
     _stateStale = 0;
     _lastStateOnline = false;
+    // _sawState and _lastStateAt are NOT reset here, though a host replaced
+    // by one whose clock is behind then waits for that clock to catch up: the
+    // node leaves its session when the host goes offline, and an online older
+    // than that offline arriving on the next session must still be refused
+    // [tck-id-message-flow-edge-node-birth-publish-phid-wait-timestamp] - the
+    // Eclipse TCK's PrimaryHostTest walks exactly that.
     _birthOwed = false;
     _owedTriedAt = mq_millis();
-    _subscriptionsOwed = !subscribeCommands();
+    _subscriptionsOwed = subscribeCommands(kSubscribeAll);
 
     if (hasPrimaryHost()) {
         // [tck-id-operational-behavior-edge-node-birth-sequence-wait] The Edge
@@ -2106,7 +2112,7 @@ void MqttSparkplugNode::stateChanged(MqttState state, MqttResult reason) {
     if (state == MqttState::Reconnecting || state == MqttState::Idle ||
         state == MqttState::Connecting) {
         _birthOwed = false;
-        _subscriptionsOwed = false;
+        _subscriptionsOwed = 0;
         _rebirthDeferred = false;
         // A probe on a connection that has gone proves nothing.
         _replayProbeInFlight = false;
@@ -2140,18 +2146,41 @@ void MqttSparkplugNode::stateChanged(MqttState state, MqttResult reason) {
     }
 }
 
-bool MqttSparkplugNode::subscribeCommands() {
-    bool ok = true;
+// What a refusal of a subscribe() means for trying it again: a filter the
+// broker cannot take on this connection (no wildcards, no shared
+// subscriptions) or that is not a filter at all will be refused every time.
+static bool mq_spRefusalPasses(MqttResult result) {
+    return result != MqttResult::NotSupportedByPeer &&
+           result != MqttResult::NotSupportedByProtocol &&
+           result != MqttResult::InvalidTopic &&
+           result != MqttResult::InvalidArgument;
+}
+
+uint8_t MqttSparkplugNode::subscribeCommands(uint8_t which) {
+    uint8_t owed = 0;
+    // One filter: owed again only if refused for a reason that may pass; a
+    // refusal that will not is recorded where status() reports it.
+    auto take = [&](uint8_t bit, MqttResult result, MqttResult* refused) {
+        if (mq_accepted(result)) return;
+        if (mq_spRefusalPasses(result)) {
+            owed |= bit;
+        } else if (refused != nullptr) {
+            *refused = result;
+        }
+    };
 
     // QoS 1, mandatory. [tck-id-message-flow-edge-node-ncmd-subscribe] "It MUST
     // subscribe on this topic with a QoS of 1." Not the library's QoS 0
     // default: a lost rebirth request is a node that never recovers.
-    if (mq_sparkplugNodeCommandFilter(_topic, sizeof _topic, _group.c_str(),
-                                      _node.c_str()) > 0) {
-        ok = mq_accepted(_client.subscribe(_topic, MQ_QOS_1, &commandSubscribed,
-                                           this)) && ok;
-    } else {
-        ok = false;
+    if (which & kSubscribeCommands) {
+        if (mq_sparkplugNodeCommandFilter(_topic, sizeof _topic, _group.c_str(),
+                                          _node.c_str()) > 0) {
+            take(kSubscribeCommands,
+                 _client.subscribe(_topic, MQ_QOS_1, &commandSubscribed, this),
+                 &_commandSubscribeRefused);
+        } else {
+            _commandSubscribeRefused = MqttResult::InvalidTopic;
+        }
     }
 
     // One filter for every device, not one per device.
@@ -2166,36 +2195,39 @@ bool MqttSparkplugNode::subscribeCommands() {
             break;
         }
     }
-    if (anyDeviceWritable) {
+    if ((which & kSubscribeDeviceCommands) && anyDeviceWritable) {
         if (mq_sparkplugDeviceCommandFilter(_topic, sizeof _topic,
                                             _group.c_str(),
                                             _node.c_str()) > 0) {
-            ok = mq_accepted(_client.subscribe(_topic, MQ_QOS_1)) && ok;
+            take(kSubscribeDeviceCommands, _client.subscribe(_topic, MQ_QOS_1),
+                 &_commandSubscribeRefused);
         } else {
-            ok = false;
+            _commandSubscribeRefused = MqttResult::InvalidTopic;
         }
     }
 
     // [tck-id-payloads-state-subscribe] equivalent for an edge node: it must
     // watch the primary host's STATE topic to know whether to birth at all.
-    if (hasPrimaryHost()) {
+    if ((which & kSubscribePrimaryState) && hasPrimaryHost()) {
         if (mq_sparkplugBuildStateTopic(_topic, sizeof _topic,
                                         _primaryHostId.c_str()) > 0) {
-            ok = mq_accepted(_client.subscribe(_topic, MQ_QOS_1, &stateSubscribed,
-                                               this)) && ok;
+            take(kSubscribePrimaryState,
+                 _client.subscribe(_topic, MQ_QOS_1, &stateSubscribed, this),
+                 &_stateSubscribeRefused);
         } else {
-            ok = false;
+            _stateSubscribeRefused = MqttResult::InvalidTopic;
         }
     }
 
     // Every host's, to be born again for one that comes online
     // (rebirthOnHostOnline()). It overlaps the primary's, which is harmless:
     // a STATE given twice is the same timestamp, and changes nothing.
-    if (_rebirthOnHostOnline) {
-        ok = mq_accepted(_client.subscribe(MQ_SP_NAMESPACE "/STATE/+", MQ_QOS_1)) && ok;
+    if ((which & kSubscribeAllState) && _rebirthOnHostOnline) {
+        take(kSubscribeAllState, _client.subscribe(MQ_SP_NAMESPACE "/STATE/+", MQ_QOS_1),
+             nullptr);
     }
 
-    return ok;
+    return owed;
 }
 
 // =============================================================================
@@ -2289,7 +2321,10 @@ bool MqttSparkplugNode::sizeBuffers() {
         // metric written longer since the last birth did exactly that, and
         // the reconnect it caused was one the host never saw die.
         _client.reserveTransmit(packet);
-        if (_client.isConnected() && _client.transmitCapacity() < largest + 512) {
+        // Not when the last try at that room failed for want of memory: a new
+        // connection would come back with the same buffer, and ask again.
+        if (_client.isConnected() && _client.transmitCapacity() < largest + 512 &&
+            !_client.transmitReservationShort()) {
             _restartOwed = true;
         }
     } else if (!_begun) {
@@ -2532,7 +2567,11 @@ bool MqttSparkplugNode::sendPayload(MqttSparkplugType type,
 }
 
 bool MqttSparkplugNode::publishBirth() {
-    if (!_client.isConnected()) {
+    // NOT AFTER disconnect(). On a shared client the connection stays up and
+    // the subscriptions with it, so an online STATE or a Rebirth NCMD arriving
+    // afterwards birthed the node again - with no Will armed, so the host
+    // would never see it die.
+    if (!_active || !_client.isConnected()) {
         _rebirthPending = false;
         return false;
     }
@@ -3279,6 +3318,9 @@ bool MqttSparkplugNode::rebirth() {
 // =============================================================================
 
 void MqttSparkplugNode::handleMessage(const MqttMessage& message) {
+    // A node that stood down (disconnect() on a shared client) acts on
+    // nothing - commands included - until it is begun or connected again.
+    if (!_active) return;
     MqttSparkplugTopicParts parts;
     if (!mq_sparkplugParseTopic((const char*)message.topic.data,
                                 message.topic.length, parts)) {

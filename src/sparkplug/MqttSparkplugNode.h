@@ -1095,7 +1095,13 @@ private:
     // node stands down without the completion, and may be destroyed then.
     bool publishNodeDeath(bool awaited = true);
     uint8_t goodbyeReason() const;
-    bool subscribeCommands();
+    // The subscriptions in `which` (kSubscribe*); returns those still owed -
+    // refused for a reason that may pass. One that cannot pass on this
+    // connection (the broker has no wildcards) is recorded, not owed.
+    static const uint8_t kSubscribeCommands = 1, kSubscribeDeviceCommands = 2,
+                         kSubscribePrimaryState = 4, kSubscribeAllState = 8,
+                         kSubscribeAll = 15;
+    uint8_t subscribeCommands(uint8_t which = kSubscribeAll);
 
     void advanceServer();
     bool connectInFlight() const;
@@ -1357,7 +1363,10 @@ private:
     // already "online", and nothing else would ever try again. poll() now
     // retries both, no more than once a second.
     bool _birthOwed = false;
-    bool _subscriptionsOwed = false;
+    // WHICH subscriptions are owed, one bit each (kSubscribe*): retrying all
+    // of them when one was refused re-subscribed the rest once a second for
+    // the whole session, and the broker re-sent the retained STATE each time.
+    uint8_t _subscriptionsOwed = 0;
     mq_time_t _owedTriedAt = 0;
 
     // AN OWED DBIRTH WAITS between tries. A DBIRTH refused for want of queue
