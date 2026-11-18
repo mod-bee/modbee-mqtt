@@ -57,6 +57,12 @@ void MqttLink::begin(MqttTransport& transport, size_t receiveCapacity,
     // which is what makes recycling a connection slot free.
     if (_receive.size() != receiveCapacity) _receive.resize(receiveCapacity);
     if (_transmit.size() != transmitCapacity) _transmit.resize(transmitCapacity);
+#if !MQTT_LINK_GROWS
+    // A board's buffers do not grow, so what was had is the limit: a size
+    // asked for and not allocated must not be reported as there.
+    if (_receive.size() < _receiveLimit) _receiveLimit = _receive.size();
+    if (_transmit.size() < _transmitLimit) _transmitLimit = _transmit.size();
+#endif
 
     _receiveStart = 0;
     _receiveLength = 0;

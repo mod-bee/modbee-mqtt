@@ -283,11 +283,39 @@ public:
     }
 
     // The contents are not kept: the link resizes an empty buffer.
-    void resize(size_t size) noexcept {
-        if (size == _size) return;
+    //
+    // NEVER LEFT WITH NOTHING when something would fit. The old buffer was
+    // freed before the new one was asked for, and a failed allocation left
+    // the link with no buffer at all: a node that asked for room for a larger
+    // birth never connected again, with nothing reporting why. Now: the new
+    // one alongside the old; failing that, the old freed and the new asked for
+    // again (the freed block may be what makes it fit); failing that, the old
+    // size back. Whether the size asked for was had is the return value.
+    bool resize(size_t size) noexcept {
+        if (size == _size) return true;
+        if (size == 0) {
+            delete[] _data;
+            _data = nullptr;
+            _size = 0;
+            return true;
+        }
+        uint8_t* fresh = new (std::nothrow) uint8_t[size];
+        if (fresh != nullptr) {
+            delete[] _data;
+            _data = fresh;
+            _size = size;
+            return true;
+        }
+        const size_t had = _size;
         delete[] _data;
-        _data = size ? new (std::nothrow) uint8_t[size] : nullptr;
-        _size = _data ? size : 0;
+        _data = new (std::nothrow) uint8_t[size];
+        if (_data != nullptr) {
+            _size = size;
+            return true;
+        }
+        _data = had ? new (std::nothrow) uint8_t[had] : nullptr;
+        _size = _data ? had : 0;
+        return false;
     }
     void swap(MqttHeapBytes& other) noexcept {
         uint8_t* data = _data; _data = other._data; other._data = data;

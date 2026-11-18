@@ -383,15 +383,22 @@ void MqttOperations::dispatch(MqttCompletionFn handler, void* context,
         // rather than nested. Without this the depth is unbounded: a handler
         // told its publish was superseded that publishes again supersedes the
         // publish that replaced it, and the chain runs until the stack is gone.
-        if (_deferred.size() < kMaxDrainPerDispatch * 4) {
-            Deferred owed;
-            owed.handler = handler;
-            owed.context = context;
-            owed.result = result;
-            owed.packetId = packetId;
-            _deferred.push_back(owed);
-        }
-        return;
+        //
+        // NONE IS DROPPED. Each is a real conclusion owed to somebody, and a
+        // caller never told keeps its slot - and its PLC block - waiting for
+        // ever. They were dropped past 256 (64 on a board, where the list is
+        // fixed): a handler that disconnected concluded every queued
+        // operation inside itself. Where the list can take no more, this one
+        // runs now, one level deeper - bounded, because every conclusion
+        // retires an operation, and a re-publishing chain stays one long.
+        Deferred owed;
+        owed.handler = handler;
+        owed.context = context;
+        owed.result = result;
+        owed.packetId = packetId;
+        const size_t before = _deferred.size();
+        _deferred.push_back(owed);
+        if (_deferred.size() > before) return;
     }
 
     // THE DEPTH IS RESTORED WHATEVER THE HANDLER DOES.

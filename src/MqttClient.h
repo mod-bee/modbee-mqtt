@@ -343,6 +343,9 @@ public:
     // transmitCapacity() says which.
     bool reserveTransmit(size_t bytes);
     size_t transmitCapacity() const { return _link.transmitLimit(); }
+    // The last time the link was down, the size reserveTransmit() asked for
+    // could not be allocated: a new connection would not bring it.
+    bool transmitReservationShort() const { return _transmitShort; }
 
     // --- Operations ---
     MqttResult publish(const char* topic, const uint8_t* payload, size_t length,
@@ -595,6 +598,7 @@ private:
 
     // reserveTransmit()'s request, applied while the link is down.
     size_t _transmitWanted = 0;
+    bool _transmitShort = false;
     void applyTransmitReservation();
 #if MQTT_LEAN
     // The board's byte area and queue slots, from _behaviour: begin(), and a

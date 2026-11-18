@@ -159,6 +159,7 @@ uint8_t* MqttSession::storeOutboundSpace(uint16_t packetId, uint8_t qos, size_t 
         _outbound[i].qos = qos;
         _outbound[i].awaitingPubcomp = false;
         _outbound[i].sent = false;
+        _outbound[i].order = _nextOrder++;
 #if MQTT_LEAN
         if (!_outbound[i].encoded.allocate(length)) {   // the byte area is full
             _outbound[i] = MqttStoredPublish();
@@ -198,6 +199,8 @@ bool MqttSession::promoteToPubrel(uint16_t packetId,
     // prevent. The publish's bytes are released with the assignment.
     stored->awaitingPubcomp = true;
     stored->sent = false;
+    // PUBRELs are sent again in the order they were first sent [V5:4.6].
+    stored->order = _nextOrder++;
     stored->encoded.assign(encoded, encoded + length);
     return true;
 }
@@ -209,10 +212,16 @@ void MqttSession::markAllUnsent() {
 }
 
 MqttStoredPublish* MqttSession::nextUnsent() {
+    // OLDEST FIRST, not lowest slot: A in slot 0, B in slot 1, A acknowledged
+    // and C stored into slot 0 - slot order resent C before B, which [V5:4.6]
+    // forbids. The comparison survives the counter wrapping.
+    MqttStoredPublish* oldest = nullptr;
     for (int i = 0; i < MQTT_SESSION_MAX_INFLIGHT; i++) {
-        if (_outbound[i].inUse() && !_outbound[i].sent) return &_outbound[i];
+        MqttStoredPublish& entry = _outbound[i];
+        if (!entry.inUse() || entry.sent) continue;
+        if (oldest == nullptr || (int32_t)(entry.order - oldest->order) < 0) oldest = &entry;
     }
-    return nullptr;
+    return oldest;
 }
 
 // =============================================================================

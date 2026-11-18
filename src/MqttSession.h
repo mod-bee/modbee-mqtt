@@ -94,6 +94,10 @@ struct MqttStoredPublish {
     // is what decides the DUP flag on a retransmission.
     bool sent = false;
 
+    // When it went out, as a count: a resumed session sends again oldest
+    // first [V5:4.6], which is not slot order once a slot has been reused.
+    uint32_t order = 0;
+
     MQ_AREA_BYTES encoded;
 
     bool inUse() const { return packetId != MQ_PACKET_ID_NONE; }
@@ -302,6 +306,7 @@ private:
     // a late acknowledgement for the previous owner would otherwise retire the
     // wrong operation.
     uint16_t _nextPacketId = 1;
+    uint32_t _nextOrder = 1;
 
     int indexOfOutbound(uint16_t packetId) const;
     int indexOfSubscription(const uint8_t* filter, uint16_t length) const;

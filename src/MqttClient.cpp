@@ -1419,6 +1419,12 @@ void MqttClient::serviceQueue() {
     while (mayQueueMore()) {
         MqttStoredPublish* stored = _session.nextUnsent();
         if (!stored) break;
+        // [V5:MQTT-4.9.0-2] A replay is in flight like any QoS 1/2 publish -
+        // a PUBREL too: its exchange is not finished until PUBCOMP - and the
+        // quota was reset by the reconnect. Replayed without it, sixteen could
+        // go to a broker that accepts ten (HiveMQ's default), which answers
+        // 0x93 and drops the connection, and the next reconnect did the same.
+        if (!_flow.canSendQos12()) break;
 
         // The DUP flag says this is a redelivery. [V5:MQTT-3.3.1-1] - "The DUP
         // flag MUST be set to 1 by the Client or Server when it attempts to
@@ -1429,6 +1435,7 @@ void MqttClient::serviceQueue() {
         }
         if (!_link.queue(stored->encoded.data(), stored->encoded.size())) break;
         stored->sent = true;
+        _flow.takeOne();
 
         // The operation this copy belongs to - kept as sent across the
         // reconnect, see establishSession() - has its deadline started again
@@ -1894,14 +1901,22 @@ void MqttClient::scheduleReconnect() {
     // what keeps a broker that stays away from being asked too often.
     const uint32_t seed = (_status.reconnects * 2654435761u + 1) ^
                           deviceSeed(_connection.clientId, this);
+    // NEVER NO WAIT, AND NEVER ONE THAT WRAPS. A reconnectInitialMs of 0
+    // doubled to 0 for ever - a connect attempt on every poll. A maximum of
+    // 2^31 ms or more let the doubling wrap to 0 and read as already past
+    // (mq_isFuture compares within half the clock). About twelve days is the
+    // longest a wait is allowed to be.
+    static const mq_time_t kLongestWait = (mq_time_t)0x40000000u;
+    mq_time_t ceiling = _behaviour.reconnectMaximumMs;
+    if (ceiling > kLongestWait) ceiling = kLongestWait;
+    if (ceiling < (mq_time_t)MQ_RECONNECT_FLOOR_MS) ceiling = (mq_time_t)MQ_RECONNECT_FLOOR_MS;
+    if (_reconnectDelay == 0) _reconnectDelay = (mq_time_t)MQ_RECONNECT_FLOOR_MS;
+    if (_reconnectDelay > ceiling) _reconnectDelay = ceiling;
     const mq_time_t least = _reconnectDelay < (mq_time_t)MQ_RECONNECT_FLOOR_MS
                                 ? _reconnectDelay : (mq_time_t)MQ_RECONNECT_FLOOR_MS;
     _reconnectAt = mq_millis() + least + spread(seed, _reconnectDelay - least + 1);
 
-    _reconnectDelay *= 2;
-    if (_reconnectDelay > _behaviour.reconnectMaximumMs) {
-        _reconnectDelay = _behaviour.reconnectMaximumMs;
-    }
+    _reconnectDelay = _reconnectDelay > ceiling / 2 ? ceiling : _reconnectDelay * 2;
 }
 
 void MqttClient::serviceReconnect() {
@@ -2105,6 +2120,14 @@ MqttResult MqttClient::subscribeWithOptions(const char* filter, uint8_t options,
     op.context = context;
     const MqttResult queued = _operations.add(op);
     if (mq_accepted(queued)) _session.markSubscriptionIssued(span.data, span.length);
+    if (queued == MqttResult::QueueFull) {
+        // The intent is already recorded, so it WILL go - it used to, at the
+        // next reconnect, after the caller had been told QueueFull. It goes
+        // as the queue drains instead (the reissue path), and the caller is
+        // told what is true: accepted, answer to follow.
+        _reissueOwed = true;
+        return MqttResult::Queued;
+    }
     return queued;
 }
 
@@ -2250,6 +2273,12 @@ void MqttClient::applyTransmitReservation() {
     _behaviour.transmitBufferSize = _transmitWanted;
     _link.begin(*_transport, _behaviour.receiveBufferSize, _behaviour.transmitBufferSize,
                 _behaviour.initialBufferSize);
+    // NOT HAD - a board short of memory. The link kept a buffer it could have
+    // (MqttHeapBytes::resize) and reports that size; the request stays, and
+    // is tried again the next time the link is down. Said, so a caller that
+    // asked for a new connection to get it does not ask again for ever.
+    _transmitShort = _link.transmitLimit() < _transmitWanted;
+    if (_transmitShort) _behaviour.transmitBufferSize = _link.transmitLimit();
 #if MQTT_LEAN
     sizeArea();
 #endif

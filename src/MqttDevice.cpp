@@ -414,7 +414,12 @@ void MqttDevice::serviceProvisioning() {
     }
     if (!_provisioning || !_client.isConnected()) return;
     const mq_time_t since = mq_elapsed(_provisionAskedAt, mq_millis());
-    if ((_provisionState == MqttProvisionState::Pending && since >= kPendingAskEveryMs) ||
+    // REGISTERING TOO: a request whose reply never came (lost, or the
+    // server's sign-up stalled) left the device connected with the key and
+    // waiting for as long as the connection lasted. Asked again at the pace
+    // a pending answer is, which is what an unanswered one looks like.
+    if (((_provisionState == MqttProvisionState::Pending ||
+          _provisionState == MqttProvisionState::Registering) && since >= kPendingAskEveryMs) ||
         (_provisionState == MqttProvisionState::Refused && since >= kRefusedRetryMs)) {
         provisionSession();
     }
