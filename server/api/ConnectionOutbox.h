@@ -53,11 +53,17 @@ public:
 
     // Kept, with its id; false when it could not be written.
     bool push(const std::string& connection, const AppMessage& message, uint64_t& id);
-    // The oldest `limit` after `afterId`, in order.
-    std::vector<Kept> next(const std::string& connection, uint64_t afterId, size_t limit);
+    // The oldest `limit` after `afterId`, in order. A row that will never
+    // read (a damaged file) is dropped on the way, and said in `lost` (its id
+    // and bytes; no message) - the caller counted it, and must stop counting
+    // it, and settle whoever waits on it.
+    std::vector<Kept> next(const std::string& connection, uint64_t afterId, size_t limit,
+                           std::vector<Kept>* lost = nullptr);
     void drop(uint64_t id);
-    // The oldest, given up to make room; false when there is none.
-    bool dropOldest(const std::string& connection, Kept* dropped);
+    // The oldest, given up to make room; false when there is none. Rows
+    // that would not read, dropped on the way, are said in `lost` - they made
+    // room too - and then `dropped` may be empty (id 0).
+    bool dropOldest(const std::string& connection, Kept* dropped, std::vector<Kept>* lost = nullptr);
     uint64_t dropAll(const std::string& connection);
     Totals totals(const std::string& connection);
 

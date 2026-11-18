@@ -389,10 +389,23 @@ void DiagnosticsLog::trim(bool ageToo) {
     };
     // Age.
     if (ageToo && s.keepDays > 0) run("DELETE FROM log WHERE time < ?", nowMs() - s.keepDays * 86400000LL);
-    // Rows: entries are deleted only from the oldest end, so the ids between the oldest and the newest are the count.
+    // Rows. The span of ids is never fewer than the rows, so it says when to look - but not how many to delete:
+    // the age delete goes by time, and after the clock stepped back newer ids carry older times, so it can leave
+    // gaps, and the span then counted rows that were gone and deleted more than max-rows asked. The boundary is
+    // the max-rows-th newest id itself.
     int64_t lo = 0, hi = 0;
     bounds(lo, hi);
-    if (s.maxRows > 0 && hi >= lo && hi != 0 && hi - lo + 1 > s.maxRows) run("DELETE FROM log WHERE id < ?", hi - s.maxRows + 1);
+    if (s.maxRows > 0 && hi >= lo && hi != 0 && hi - lo + 1 > s.maxRows) {
+        int64_t boundary = 0;
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(_db, "SELECT id FROM log ORDER BY id DESC LIMIT 1 OFFSET ?", -1, &st, nullptr) ==
+            SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, s.maxRows - 1);
+            if (sqlite3_step(st) == SQLITE_ROW) boundary = sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        if (boundary > 0) run("DELETE FROM log WHERE id < ?", boundary);
+    }
     // Size: the pages in use, not the file's length - freed pages are written over before the file grows.
     const int64_t maxPages = std::max<int64_t>(16, s.maxBytes / _pageSize);
     for (int pass = 0; pass < 4; pass++) {

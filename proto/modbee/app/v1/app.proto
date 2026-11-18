@@ -1227,7 +1227,7 @@ message ListLogRequest {
   int64 since_ms = 4;              // at or after (UTC ms); 0: no bound
   int64 until_ms = 5;              // before; 0: no bound
   uint32 page_size = 6;            // 100 by default, at most 1000
-  string page_token = 7;           // next_page_token of the page before: the older entries
+  string page_token = 7;           // next_page_token of the page before: the older entries (with after_id: the newer)
   optional uint64 after_id = 8;    // instead of a page: the entries after this one, oldest first - to follow
                                    // it (0: from the oldest)
 }

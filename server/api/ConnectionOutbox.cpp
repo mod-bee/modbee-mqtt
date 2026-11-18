@@ -80,28 +80,35 @@ bool ConnectionOutbox::push(const std::string& connection, const AppMessage& mes
 }
 
 std::vector<ConnectionOutbox::Kept> ConnectionOutbox::next(const std::string& connection, uint64_t afterId,
-                                                           size_t limit) {
+                                                           size_t limit, std::vector<Kept>* lost) {
     std::vector<Kept> out;
     if (!_db) return out;
     Statement s(_db, "SELECT id, bytes, message FROM outbox WHERE connection=? AND id>? ORDER BY id LIMIT ?");
     s.text(1, connection);
     s.number(2, (int64_t)afterId);
     s.number(3, (int64_t)limit);
-    std::vector<uint64_t> unreadable;
+    std::vector<Kept> unreadable;
     while (sqlite3_step(s.s) == SQLITE_ROW) {
         Kept k;
         k.id = (uint64_t)sqlite3_column_int64(s.s, 0);
         k.bytes = (size_t)sqlite3_column_int64(s.s, 1);
         const std::string blob = column(s.s, 2);
-        if (decodeAppMessage(blob.data(), (int)blob.size(), k.message)) out.push_back(std::move(k));
-        else unreadable.push_back(k.id);
+        if (decodeAppMessage(blob.data(), (int)blob.size(), k.message)) {
+            out.push_back(std::move(k));
+        } else {
+            k.message = AppMessage();
+            unreadable.push_back(std::move(k));
+        }
     }
     // A row that will never read (a damaged file) is let go: kept, it held its
     // place at the head for ever, and enough of them stopped everything behind.
-    for (uint64_t id : unreadable) {
+    // And SAID: dropped without a word, the caller went on counting it -
+    // against the store's limit, until every new message was refused.
+    for (const Kept& k : unreadable) {
         diagnostics::error("connections", "outbox.db: message %llu of %s could not be read - dropped\n",
-                     (unsigned long long)id, connection.c_str());
-        drop(id);
+                     (unsigned long long)k.id, connection.c_str());
+        drop(k.id);
+        if (lost) lost->push_back(k);
     }
     return out;
 }
@@ -113,9 +120,12 @@ void ConnectionOutbox::drop(uint64_t id) {
     sqlite3_step(s.s);
 }
 
-bool ConnectionOutbox::dropOldest(const std::string& connection, Kept* dropped) {
-    std::vector<Kept> oldest = next(connection, 0, 1);
-    if (oldest.empty()) return false;
+bool ConnectionOutbox::dropOldest(const std::string& connection, Kept* dropped, std::vector<Kept>* lost) {
+    if (dropped) *dropped = Kept();
+    std::vector<Kept> unreadable;
+    std::vector<Kept> oldest = next(connection, 0, 1, &unreadable);
+    if (lost) lost->insert(lost->end(), unreadable.begin(), unreadable.end());
+    if (oldest.empty()) return !unreadable.empty();     // what would not read made the room
     drop(oldest[0].id);
     if (dropped) *dropped = std::move(oldest[0]);
     return true;

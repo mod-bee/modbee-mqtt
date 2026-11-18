@@ -1055,9 +1055,18 @@ public:
         q.afterId = (int64_t)request.after_id();
         if (!request.page_token().empty()) {
             char* end = nullptr;
-            q.beforeId = std::strtoll(request.page_token().c_str(), &end, 10);
-            if (end == nullptr || *end != '\0' || q.beforeId <= 0) {
+            const long long token = std::strtoll(request.page_token().c_str(), &end, 10);
+            if (end == nullptr || *end != '\0' || token <= 0) {
                 return done(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "page_token is not one this call gave"));
+            }
+            // FOLLOWING (after_id), a page's token is its last entry, and the
+            // next page is what comes after it. Read as "older than" - the
+            // backward meaning - a pager that sent the same request back with
+            // the token got the first page again, less one, and stopped.
+            if (q.forward) {
+                if ((int64_t)token > q.afterId) q.afterId = (int64_t)token;
+            } else {
+                q.beforeId = (int64_t)token;
             }
         }
         q.limit = request.page_size() == 0 ? 100 : std::min<uint32_t>(request.page_size(), 1000);

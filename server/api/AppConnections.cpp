@@ -1201,6 +1201,13 @@ void AppConnections::open(Connection& c) {
     startEdgeNode(c);
 }
 
+// ROWS THE OUTBOX COULD NOT READ, and dropped (ConnectionOutbox::next). They
+// were counted when they were kept, so they stop being counted - kept, the
+// count reached the store's limit with nothing in it, and every new message
+// was refused until a restart - and whoever waits on one is answered.
+static void stopCounting(AppConnections::Connection& c, const std::vector<ConnectionOutbox::Kept>& lost);
+static void stopCounting(AppConnections::EdgeNode& e, const std::vector<ConnectionOutbox::Kept>& lost);
+
 void AppConnections::startEdgeNode(Connection& c) {
     if (c.edge) {
         saveEdgeState(*c.edge, true);
@@ -1240,8 +1247,13 @@ void AppConnections::startEdgeNode(Connection& c) {
         loadEdgeState(*e);
         for (const std::string& key : {e->key(), e->firstKey()}) {
             for (uint64_t after = 0;;) {
-                std::vector<ConnectionOutbox::Kept> page = _outbox.next(key, after, 1024);
-                if (page.empty()) break;
+                std::vector<ConnectionOutbox::Kept> lost;
+                std::vector<ConnectionOutbox::Kept> page = _outbox.next(key, after, 1024, &lost);
+                stopCounting(*e, lost);
+                if (page.empty()) {
+                    if (lost.empty()) break;
+                    continue;               // those are gone: the same look again
+                }
                 for (const ConnectionOutbox::Kept& k : page) {
                     AppSparkplugSet set;
                     if (!valueOfKept(k.message, set)) continue;
@@ -1432,11 +1444,17 @@ void AppConnections::sendHistory(Connection& c) {
     }
     std::vector<ConnectionOutbox::Kept> kept;
     int which = 0;
-    for (; which < 2 && kept.empty(); which++) {
-        kept = _outbox.next(which == 0 ? e.firstKey() : e.key(), e.sentUpTo[which], batch);
+    // history_first's first, and while any of it remains: a batch of it that
+    // would not read is looked at again, not taken to mean it is all sent -
+    // that sent ordinary history ahead of it.
+    while (which < 2) {
+        std::vector<ConnectionOutbox::Kept> lost;
+        kept = _outbox.next(which == 0 ? e.firstKey() : e.key(), e.sentUpTo[which], batch, &lost);
+        stopCounting(e, lost);
+        if (!kept.empty()) break;
+        if (lost.empty()) which++;
     }
     if (kept.empty()) return;
-    which--;
     std::vector<AppSparkplugSet> sets(kept.size());
     std::vector<MqttSparkplugRecord> records;
     std::vector<EdgeNode::Sent> sent;
@@ -1485,7 +1503,12 @@ void AppConnections::makeRoom(EdgeNode& e, size_t bytes) {
     while (full()) {
         // The oldest sample first; history_first's only when no sample is left.
         ConnectionOutbox::Kept dropped;
-        if (!_outbox.dropOldest(e.key(), &dropped) && !_outbox.dropOldest(e.firstKey(), &dropped)) break;
+        std::vector<ConnectionOutbox::Kept> lost;
+        const bool made = _outbox.dropOldest(e.key(), &dropped, &lost) ||
+                          _outbox.dropOldest(e.firstKey(), &dropped, &lost);
+        stopCounting(e, lost);
+        if (!made) break;
+        if (dropped.id == 0) continue;      // only rows that would not read; counted
         e.history -= std::min<uint64_t>(e.history, 1);
         e.historyBytes -= std::min<uint64_t>(e.historyBytes, dropped.bytes);
         e.historyLost++;
@@ -1509,7 +1532,10 @@ void AppConnections::expireHistory(EdgeNode& e) {
     for (int which = 0; which < 2; which++) {
         const std::string key = which == 0 ? e.firstKey() : e.key();
         for (;;) {
-            std::vector<ConnectionOutbox::Kept> page = _outbox.next(key, e.sentUpTo[which], 256);
+            std::vector<ConnectionOutbox::Kept> lost;
+            std::vector<ConnectionOutbox::Kept> page = _outbox.next(key, e.sentUpTo[which], 256, &lost);
+            stopCounting(e, lost);
+            if (page.empty() && !lost.empty()) continue;
             size_t gone = 0;
             for (const ConnectionOutbox::Kept& k : page) {
                 if ((uint64_t)k.message.brokerTimeMs >= cutoff) break;
@@ -2281,11 +2307,15 @@ void AppConnections::store(Connection& c, const AppPublish& message,
     // Full: the oldest makes room, or the new one is refused - as it was told.
     while (c.stored + 1 > c.spec.storeMaxMessages || c.storedBytes + bytes > c.spec.storeMaxBytes) {
         ConnectionOutbox::Kept oldest;
-        if (!c.spec.storeDropOldest || !_outbox.dropOldest(c.spec.id, &oldest)) {
+        std::vector<ConnectionOutbox::Kept> lost;
+        const bool made = c.spec.storeDropOldest && _outbox.dropOldest(c.spec.id, &oldest, &lost);
+        stopCounting(c, lost);
+        if (!made) {
             result.outcome = AppPublishOutcome::Refused;
             result.reasonCode = MQ_REASON_QUOTA_EXCEEDED;
             return done(result);
         }
+        if (oldest.id == 0) continue;       // only rows that would not read; counted
         c.stored = c.stored ? c.stored - 1 : 0;
         c.storedBytes -= std::min<uint64_t>(c.storedBytes, oldest.bytes);
         c.storedDropped++;
@@ -2330,7 +2360,10 @@ void AppConnections::forward(Connection& c) {
     if (c.stored <= c.inClient.size() || c.inClient.size() >= kWindow) return;
     if (Clock::now() < c.forwardAfter) return;          // the other broker's quota, waited out
     const int64_t now = utcNowMs();
-    for (ConnectionOutbox::Kept& k : _outbox.next(c.spec.id, 0, kWindow + c.inClient.size())) {
+    std::vector<ConnectionOutbox::Kept> lost;
+    std::vector<ConnectionOutbox::Kept> page = _outbox.next(c.spec.id, 0, kWindow + c.inClient.size(), &lost);
+    stopCounting(c, lost);
+    for (ConnectionOutbox::Kept& k : page) {
         if (c.inClient.size() >= kWindow) break;
         if (c.inClient.count(k.id)) continue;
         MqttOwnedProperties properties = k.message.properties;
@@ -2374,6 +2407,27 @@ void AppConnections::forward(Connection& c) {
         c.inClient.insert(k.id);
         c.sent.push_back(std::move(sent));
         c.messagesOut++;
+    }
+}
+
+static void stopCounting(AppConnections::Connection& c, const std::vector<ConnectionOutbox::Kept>& lost) {
+    for (const ConnectionOutbox::Kept& k : lost) {
+        c.stored = c.stored ? c.stored - 1 : 0;
+        c.storedBytes -= std::min<uint64_t>(c.storedBytes, k.bytes);
+        c.storedDropped++;
+        c.inClient.erase(k.id);
+        AppPublishResult gone;
+        gone.outcome = AppPublishOutcome::Refused;
+        gone.reasonCode = MQ_REASON_UNSPECIFIED_ERROR;
+        c.settle(k.id, gone);
+    }
+}
+
+static void stopCounting(AppConnections::EdgeNode& e, const std::vector<ConnectionOutbox::Kept>& lost) {
+    for (const ConnectionOutbox::Kept& k : lost) {
+        e.history -= std::min<uint64_t>(e.history, 1);
+        e.historyBytes -= std::min<uint64_t>(e.historyBytes, k.bytes);
+        e.historyLost++;
     }
 }
 

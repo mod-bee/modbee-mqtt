@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -284,6 +285,11 @@ private:
         if (waiting > 0) {
             rd_kafka_assign(consumer, assignment);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kLoadTimeoutMs);
+            // EACH PARTITION ONCE. librdkafka reports the end of a partition
+            // every time it reaches it again, so while another server writes
+            // to the topic one partition could count twice and the load end
+            // with another only part read - its retained messages missing.
+            std::set<int32_t> ended;
             while (waiting > 0) {
                 if (std::chrono::steady_clock::now() > deadline) {
                     complete = false;
@@ -292,7 +298,7 @@ private:
                 rd_kafka_message_t* record = rd_kafka_consumer_poll(consumer, 500);
                 if (record == nullptr) continue;
                 if (record->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-                    waiting--;
+                    if (ended.insert(record->partition).second) waiting--;
                 } else if (record->err != RD_KAFKA_RESP_ERR_NO_ERROR) {
                     error = std::string("reading the retained store topic ") + _topic + ": " +
                             rd_kafka_message_errstr(record);

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <deque>
 #include <iterator>
 #include <thread>
 
@@ -28,8 +29,13 @@ struct Outcome {
     MqttResult result = MqttResult::Queued;
 };
 
+// A DEQUE, so an outcome never moves: each publish's completion holds a
+// pointer to its own. The stream used to recycle a vector - wait for what was
+// outstanding, with a timeout, then clear it - and a completion arriving after
+// that timeout wrote into freed memory.
 struct Tally {
-    std::vector<Outcome> outcomes;
+    std::deque<Outcome> outcomes;
+    size_t submitted = 0;
     size_t concluded = 0;
     size_t failed = 0;
     bool json = false;
@@ -243,10 +249,7 @@ int cmdPub(int argc, char** argv) {
     tally.topic = args.get("topic");
     g_tally = &tally;
 
-    // Reserved up front: completions hold a pointer into this vector, so it
-    // must never reallocate once a publish is queued.
     const bool fromStdin = args.has("stdin-line");
-    tally.outcomes.reserve(fromStdin ? 1 : (size_t)count);
 
     const std::string topic = tally.topic;
     const bool retain = args.has("retain");
@@ -257,17 +260,13 @@ int cmdPub(int argc, char** argv) {
     // publish() SUPERSEDES a queued message to the same topic, which is right
     // for a setpoint and wrong for "send this ten times".
     auto send = [&](const std::vector<uint8_t>& payload) -> bool {
+        // A stream keeps only what is still outstanding: those at the front
+        // that have concluded are done with, and nothing points at them.
         if (fromStdin) {
-            if (tally.outcomes.size() == tally.outcomes.capacity()) {
-                // Wait for everything outstanding, then recycle the storage.
-                cli.pollUntil([&] { return tally.concluded == tally.outcomes.size(); },
-                              (mq_time_t)wait * 1000);
-                tally.outcomes.clear();
-                tally.concluded = 0;
-                tally.outcomes.reserve(256);
-            }
+            while (!tally.outcomes.empty() && tally.outcomes.front().done) tally.outcomes.pop_front();
         }
         tally.outcomes.push_back(Outcome());
+        tally.submitted++;
         Outcome* outcome = &tally.outcomes.back();
         outcome->index = ++index;
 
@@ -315,9 +314,9 @@ int cmdPub(int argc, char** argv) {
     }
 
     // Every message reaches a conclusion before the tool reports its own.
-    cli.pollUntil([&] { return tally.concluded == tally.outcomes.size(); },
+    cli.pollUntil([&] { return tally.concluded == tally.submitted; },
                   (mq_time_t)wait * 1000);
-    const size_t unanswered = tally.outcomes.size() - tally.concluded;
+    const size_t unanswered = tally.submitted - tally.concluded;
     if (unanswered > 0) {
         std::fprintf(stderr, "modbee-mqtt pub: %zu message(s) had no answer within %llds\n",
                      unanswered, wait);
