@@ -11,6 +11,53 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+The rest of the review that found 0.1.11's fixes: more ways the broker stayed busy or a message went twice, and
+the client, Sparkplug and the server's stores. Nothing to configure on upgrade.
+
+### Fixed
+
+- **A shard stayed busy while a subscriber was behind.** A publisher held back for it, and a message from another
+  shard waiting for it, were tried again on every pass without sleeping - for as long as the subscriber stayed
+  behind, which for one that is slow but alive (a cellular link) was continuously. They now wait, and go on when the
+  subscriber catches up, when the rings have room, or every 10 ms. A shard also drained the others' messages always
+  starting from the first, so one busy shard could hold up publishers on the rest.
+- **A retained topic sent twice.** One retained while a subscription's retained messages were still being sent (a
+  large store, or a queue that had filled) went to the subscriber as it was published, and then again with the
+  rest - at QoS 2 too. It goes once.
+- **A client sent publishes again out of order** after reconnecting to a kept session, once a slot had been reused;
+  and sent them without counting them against the broker's Receive Maximum, so a broker that allows fewer than
+  sixteen at once (HiveMQ's default is ten) could refuse them and drop the connection, again on every reconnect.
+- **A client with `reconnectInitialMs` 0 tried to connect on every poll** for as long as the broker was away. It now
+  waits at least 100 ms, doubling as before; and a `reconnectMaximumMs` of 2^31 ms or more no longer wraps to no
+  wait.
+- **A completion was never called** when a handler that ended the connection concluded more than 256 operations at
+  once (64 on a board) - the caller's slot waited for ever. None is dropped now.
+- **`subscribe()` said QueueFull while connected and subscribed anyway at the next reconnect.** It now says Queued,
+  and goes as soon as the queue has room.
+- **A board that could not allocate a larger send buffer was left with none**, and never connected again. It keeps
+  the buffer it had, and a Sparkplug node on a shared client no longer reconnects over and over asking for one it
+  cannot have.
+- **A Sparkplug node or host told to stop, on a client it shares, came back by itself.** A node answered a host's
+  online STATE or a Rebirth command with a birth (with no Will, so its death would never be seen); a host answered
+  its own offline STATE, echoed back, with online. Neither does now.
+- **A Sparkplug node re-subscribed everything once a second** for the whole session when one subscription was
+  refused on the client side (a broker without wildcard subscriptions, say), and the broker re-sent the retained
+  STATE each time. Only what can still succeed is tried again; what cannot is reported in its status.
+- **A device registering with a key waited for ever** if the reply to its request never came. It asks again every
+  30 seconds, as it does while the answer is pending.
+- **The Kafka retained store could finish loading with a partition only part read** while another server wrote to
+  the topic, and the retained messages in the rest were missing until the next restart.
+- **A connection's store refused every message, until a restart, after rows in `outbox.db` could not be read**
+  (a damaged file): they were dropped but still counted against its limits. They stop being counted, a sender
+  waiting on one is answered, and an edge node's history from before its first birth is no longer overtaken by later
+  history when some of it will not read.
+- **`modbee-mqtt pub --stdin-line` could write to freed memory** when a publish was answered after the wait for it
+  had timed out.
+- **`Admin.ListLog` (`GET /v1/log`) following with `after_id`** went back to the first page when given the
+  `next_page_token` it had returned. The token now carries on from there.
+- **The diagnostics log could delete more than `max-rows` asked** after the clock stepped back and the age limit had
+  taken entries out of the middle.
+
 ## [0.1.11]
 
 Fixes only: a broker that used a whole core while one client stayed connected, three more ways for it to stay busy
