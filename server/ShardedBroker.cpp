@@ -287,6 +287,17 @@ struct ShardedBroker::Shard {
     // pass. A forwarded MESSAGE is never parked here: a full ring is reported
     // as that shard refusing it.
     std::deque<std::pair<uint32_t, Envelope>> overflow;
+    // WAITING IS NOT WORK. The loop waits 0 ms while there is work, and both
+    // of these used to count as work while nothing could move: a forwarded
+    // message held in the inbox for a subscriber that is behind, and one in
+    // `overflow` for a ring that is full. A shard spun for as long as a
+    // subscriber stayed behind. Each is retried at the loop's own pace
+    // (20 ms) or sooner when something wakes it.
+    bool inboxWaiting = false;      // the last drain left only what has to wait
+    bool overflowMoved = false;     // retryOverflow() got something out this pass
+    // Where the next drain starts: always inbox 0 let one busy sender use the
+    // whole budget, and the others' rings filled and held their publishers.
+    size_t drainFrom = 0;
     // Reports to a publishing shard that wait for this shard's extension -
     // a session store committing what the message queued - in the order they
     // were made, with the hold each waits for.
@@ -408,6 +419,7 @@ struct ShardedBroker::Shard {
         while (!overflow.empty()) {
             if (!post(overflow.front().first, overflow.front().second)) return;
             overflow.pop_front();
+            overflowMoved = true;
         }
     }
 
@@ -658,7 +670,10 @@ void ShardedBroker::Shard::drain(bool stopping) {
     retryOverflow();
 
     size_t handled = 0;
-    for (size_t from = 0; from < inbox.size() && handled < kDrainBudget; from++) {
+    const size_t inboxes = inbox.size();
+    const size_t first = inboxes != 0 ? drainFrom++ % inboxes : 0;
+    for (size_t step = 0; step < inboxes && handled < kDrainBudget; step++) {
+        const size_t from = (first + step) % inboxes;
         if (from == index) continue;
         Envelope envelope;
         for (;;) {
@@ -752,6 +767,10 @@ void ShardedBroker::Shard::drain(bool stopping) {
             server->_inFlight.fetch_sub(1, std::memory_order_acq_rel);
         }
     }
+    // Under its budget, everything that could be taken was: what is left
+    // waits for a subscriber to catch up (roomFor), or arrived since - and
+    // that rang the eventfd.
+    inboxWaiting = handled < kDrainBudget;
 }
 
 void ShardedBroker::Shard::releaseHeld(bool all) {
@@ -793,6 +812,7 @@ void ShardedBroker::run(Shard& shard) {
         // after replaceTls() returned is served the new certificate.
         shard.takeTlsContext();
         shard.takeChanges();
+        shard.overflowMoved = false;
         // Held back while a forwarded message waits for room in a ring.
         shard.retryOverflow();
         shard.broker.pauseIngress(!shard.overflow.empty());
@@ -806,8 +826,9 @@ void ShardedBroker::run(Shard& shard) {
         // work no socket will announce: the broker's own, or an inbox with
         // something in it (the eventfd also wakes the wait, for envelopes
         // that arrive during it).
-        const bool busy = shard.broker.hasPendingWork() || !shard.inboxEmpty() ||
-                          !shard.overflow.empty() ||
+        const bool busy = shard.broker.hasPendingWork() ||
+                          (!shard.inboxEmpty() && !shard.inboxWaiting) ||
+                          (!shard.overflow.empty() && shard.overflowMoved) ||
                           (_extension && _extension->hasPendingWork(shard.index));
         shard.readiness.wait(busy ? 0 : 20);
     }

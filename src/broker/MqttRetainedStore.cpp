@@ -185,6 +185,7 @@ bool MqttRetainedStore::store(const MqttSpan& topic, const MqttSpan& payload,
     message.payload.assign(payload.data, payload.data + payload.length);
     message.qos = qos;
     message.storedAt = now;
+    message.sequence = ++_sequence;
 
     // One call, and it keeps everything a forwarded PUBLISH must carry -
     // including User Property, which a hand-written list here forgot.
@@ -257,7 +258,7 @@ bool hasWildcard(const MqttSpan& filter) {
 
 size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t now,
                                             size_t from, StepFn visit, void* context,
-                                            size_t budget) {
+                                            size_t budget, uint32_t storedUpTo) {
     const size_t end = _messages.size();
     if (visit == nullptr || from >= end) return kDone;
 
@@ -287,6 +288,8 @@ size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t no
             continue;
         }
         if (!mq_topicMatches(filter, asSpan(message.topic))) continue;
+        // Stored after the walk was owed: already sent as it was published.
+        if ((int32_t)(message.sequence - storedUpTo) > 0) continue;
 
         uint32_t remaining = 0;
         const bool hasRemaining = remainingExpiryOf(message, now, remaining);

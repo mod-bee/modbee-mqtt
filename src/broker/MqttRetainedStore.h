@@ -70,6 +70,12 @@ struct MqttRetainedMessage {
     // for ever.
     mq_time_t storedAt = 0;
 
+    // Which store this was, counting every store the broker has made
+    // (MqttRetainedStore::sequence()). A walk owed to a subscription skips
+    // what was stored after the subscription was made: that reached the
+    // subscriber as an ordinary message, and the walk sent it a second time.
+    uint32_t sequence = 0;
+
     // The login that stored it, for that login's quota. Empty: nobody's - a
     // store put back from elsewhere, or a broker without logins.
     std::string owner;
@@ -137,8 +143,15 @@ public:
                            uint32_t remainingExpiry, bool hasRemainingExpiry);
     // At most `budget` slots are looked at (0 = every one); what is returned
     // is where to go on from, as when `visit` declines.
+    // Only what was stored up to `storedUpTo` (sequence() when the walk was
+    // owed) is visited: a topic stored after it, into a slot ahead of the
+    // walk, went to the subscriber as an ordinary message already.
     size_t visitMatchingFrom(const MqttSpan& filter, mq_time_t now, size_t from,
-                             StepFn visit, void* context, size_t budget = 0);
+                             StepFn visit, void* context, size_t budget,
+                             uint32_t storedUpTo);
+
+    // How many stores this store has made; see MqttRetainedMessage::sequence.
+    uint32_t sequence() const { return _sequence; }
 
     // Whether this message has outlived its Message Expiry Interval.
     static bool hasExpired(const MqttRetainedMessage& message, mq_time_t now);
@@ -160,6 +173,7 @@ public:
 private:
     std::vector<MqttRetainedMessage> _messages;
     size_t _maximum = 0;
+    uint32_t _sequence = 0;     // never reset: clearAll() keeps counting
 
     int indexOf(const MqttSpan& topic) const;
     int freeSlot();

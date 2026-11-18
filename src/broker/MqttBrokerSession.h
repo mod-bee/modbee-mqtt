@@ -89,6 +89,8 @@ struct MqttBrokerSubscription {
     // queue's depth, which [MQTT-3.3.1-9] does not allow.
     bool retainedOwed = false;
     uint32_t retainedNext = 0;
+    uint32_t retainedUpTo = 0;      // the store's sequence() when it was owed
+    uint32_t retainedDropMark = 0;  // the session's messagesDropped then
 
 #if defined(MQTT_PLATFORM_HOST)
     // Granted wider than the session may receive (MqttBrokerRequest::narrow):
@@ -392,7 +394,7 @@ public:
     // matching it, from the start of the store. progress: the walk got to
     // `next`, or finished. retainedOwed(): how many subscriptions are still
     // owed some, so the broker can skip the question in one comparison.
-    void oweRetained(size_t index);
+    void oweRetained(size_t index, uint32_t storedUpTo);
     void retainedProgress(size_t index, size_t next, bool finished);
     size_t retainedOwed() const { return _retainedOwed; }
     // The last walk stopped because the next message did not fit - the

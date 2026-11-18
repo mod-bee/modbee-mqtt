@@ -268,12 +268,14 @@ void MqttBrokerSession::clearSubscriptions() {
     _retainedBlocked = false;
 }
 
-void MqttBrokerSession::oweRetained(size_t index) {
+void MqttBrokerSession::oweRetained(size_t index, uint32_t storedUpTo) {
     if (index >= _subscriptionsUsed) return;
     MqttBrokerSubscription& entry = _subscriptions[index];
     if (!entry.retainedOwed) _retainedOwed++;
     entry.retainedOwed = true;
     entry.retainedNext = 0;
+    entry.retainedUpTo = storedUpTo;
+    entry.retainedDropMark = messagesDropped;
 }
 
 void MqttBrokerSession::retainedProgress(size_t index, size_t next, bool finished) {

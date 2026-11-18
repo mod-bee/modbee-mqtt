@@ -284,6 +284,8 @@ void MqttBroker::begin(const MqttBrokerConfig& config) {
     _status = MqttBrokerStatus();
 #if defined(MQTT_PLATFORM_HOST)
     _work.clear();
+    _held.clear();
+    for (MqttBrokerConnection& slot : _connections) slot.onHeldList = false;
     _working.clear();
     _liveConnections = 0;
     _timerCursor = 0;
@@ -396,6 +398,8 @@ void MqttBroker::end() {
     _listeners.clear();
 #if defined(MQTT_PLATFORM_HOST)
     _work.clear();
+    _held.clear();
+    for (MqttBrokerConnection& slot : _connections) slot.onHeldList = false;
     _liveConnections = 0;
 #endif
 }
@@ -644,9 +648,18 @@ void MqttBroker::afterService(MqttBrokerConnection& connection) {
     // used to relist every poll, so one peer that sent four bytes and stopped
     // kept the shard from ever sleeping; the socket - or the TLS engine's own
     // buffer, hasBufferedInput() - says when the rest has come.
-    bool again = held || connection.closing || connection.watchedHandle < 0 ||
-                 connection.link.actionable() ||
-                 connection.transport->hasBufferedInput();
+    bool again = connection.closing || connection.watchedHandle < 0;
+    if (held) {
+        // Its PUBLISH is still in the buffer, so "a whole packet is waiting"
+        // is true and says nothing: it waits on the held list instead.
+        if (!connection.onHeldList) {
+            if (_held.empty()) _heldAt = mq_millis();
+            connection.onHeldList = true;
+            _held.push_back(slotOf(connection));
+        }
+    } else {
+        again = again || connection.link.actionable() || connection.transport->hasBufferedInput();
+    }
 
     const bool blocked = connection.link.transmitPending() != 0;
     // Waiting for the session journal: journalKept() relists it. Relisting it
@@ -703,6 +716,26 @@ void MqttBroker::sweepDeadlines(mq_time_t now) {
     }
 }
 
+const mq_time_t kHeldRetryMs = 10;
+
+void MqttBroker::releaseHeld(mq_time_t now) {
+    const bool freed = _congestedSessions < _heldCongestion || (_heldPaused && !_ingressPaused);
+    _heldCongestion = _congestedSessions;
+    _heldPaused = _ingressPaused;
+    if (_held.empty()) return;
+    if (!freed && mq_elapsed(_heldAt, now) < kHeldRetryMs) return;
+    std::vector<uint32_t> held;
+    held.swap(_held);
+    for (uint32_t slot : held) {
+        if (slot >= _connections.size()) continue;
+        MqttBrokerConnection& connection = _connections[slot];
+        connection.onHeldList = false;
+        if (!connection.inUse() || connection.closing) continue;
+        connection.readable = true;
+        queueWork(connection);
+    }
+}
+
 void MqttBroker::pollEvents(mq_time_t now) {
     // Ask the kernel - unless the daemon waiting on this set just did.
     if (!_readiness->takeFresh()) _readiness->wait(0);
@@ -723,6 +756,7 @@ void MqttBroker::pollEvents(mq_time_t now) {
 
     acceptNew();
     sweepDeadlines(now);
+    releaseHeld(now);
 
     // The pass in progress is separated from the next one, so whatever is
     // listed while servicing - by a delivery, a takeover, a close - waits
@@ -4319,9 +4353,15 @@ bool MqttBroker::continueRetained(MqttBrokerSession& session) {
         visit.subscription = subscription;
         visit.queuedAny = false;
         visit.blocked = false;
+        // What was stored after the subscription went to it as it was
+        // published, and the walk skips it - unless this session has dropped
+        // a message since: that may have been the one, and a retained value
+        // sent twice is better than one never sent.
+        const uint32_t upTo = session.messagesDropped == subscription->retainedDropMark
+                                  ? subscription->retainedUpTo : _retained.sequence();
         const size_t next = _retained.visitMatchingFrom(
             asSpan(subscription->effective), now, subscription->retainedNext,
-            &MqttBroker::visitRetained, &visit, kRetainedSlotsPerPass);
+            &MqttBroker::visitRetained, &visit, kRetainedSlotsPerPass, upTo);
         queuedAny = queuedAny || visit.queuedAny;
         blocked = blocked || visit.blocked;
         session.retainedProgress(index, next, next == MqttRetainedStore::kDone);
@@ -4499,7 +4539,7 @@ void MqttBroker::handleSubscribe(MqttBrokerConnection& connection,
             if (candidate->filter.size() == request.filters[index].filter.length &&
                 memcmp(candidate->filter.data(), request.filters[index].filter.data,
                        candidate->filter.size()) == 0) {
-                session->oweRetained(scan);
+                session->oweRetained(scan, _retained.sequence());
                 break;
             }
         }

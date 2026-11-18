@@ -524,6 +524,9 @@ struct MqttBrokerConnection {
     // (pauseIngress): kept readable and listed again, since no new readiness
     // will come for bytes already waiting.
     bool heldBack = false;
+    // On the held list (MqttBroker::_held): not relisted every pass while
+    // nothing that could free it has changed. Belongs to the slot.
+    bool onHeldList = false;
 
     // On the list of slots with a delivery waiting for the session journal
     // (MqttBroker::journalKept). Like `queued`, it belongs to the slot, not
@@ -893,6 +896,17 @@ private:
     MqttBrokerConfirmFn _onConfirm = nullptr;
     void* _confirmContext = nullptr;
     uint64_t _routingConfirm = 0;              // the confirm id of the message being routed
+    // CONNECTIONS HELD BACK (heldBack), waiting for room rather than relisted
+    // on every pass: that kept the thread from sleeping for as long as a
+    // subscriber stayed behind - continuously, for one slow but alive. Put
+    // back when a session stops being congested, when ingress resumes, or
+    // every kHeldRetryMs (a subscriber that stops reading stops counting
+    // after kSlowConsumerMs, and nothing announces that).
+    std::vector<uint32_t> _held;
+    size_t _heldCongestion = 0;
+    bool _heldPaused = false;
+    mq_time_t _heldAt = 0;
+    void releaseHeld(mq_time_t now);
     std::vector<uint32_t> _journalWaiting;    // connection slots with a delivery waiting for it
     void waitForJournal(MqttBrokerConnection& connection);
 
