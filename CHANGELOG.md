@@ -11,6 +11,40 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+Fixes only: a broker that used a whole core while one client stayed connected, three more ways for it to stay busy
+or lose a message, and a client that could stop sending on a link that was still up. Nothing to configure on upgrade.
+
+### Fixed
+
+- **A shard used a whole core for as long as a client that had been sent retained messages stayed connected.** On a
+  server (where the retained store holds 1,024 topics or more and grows as topics are retained), a subscription's
+  retained messages were never marked as all sent unless the store was full, so the broker came back to that
+  connection on every pass and never slept. Any subscription that asked for retained messages was enough, whether it
+  matched one or not. It stopped when the client disconnected and started again when it reconnected. Present since
+  0.1.4, when the retained store started growing as topics are retained.
+- **The same, while a retained message waited for room.** A retained message larger than the queued bytes left - the
+  session's (`queue-bytes`) or every session's together (`queue-bytes-total`), often held by sessions that are away - was
+  tried again on every pass, and counted as a dropped message each time, for as long as the bytes stayed spent. It
+  now waits without keeping the broker busy, uncounted, and goes once there is room.
+- **The broker stayed busy while a delivery waited for the session store's disk write** (a kept session's QoS 1 or 2
+  message), for as long as the write took, instead of waiting to be told it was done.
+- **A large message to a subscriber that was behind was dropped instead of waiting.** A delivery was judged too large
+  for the connection against its send buffer as it stood at that moment, not the size it may grow to - so a message
+  within the limit, behind others still waiting to go, was discarded (counted as dropped; at QoS 1 or 2, lost). It
+  now waits its turn. Since 0.1.4.
+- **A client stopped sending after sixteen QoS 1 or 2 publishes went unacknowledged** (eight SUBSCRIBEs) on one
+  connection. Each one given up on (`acknowledgementTimeoutMs`) kept its packet identifier, so the next had none to
+  use, and it and everything queued behind it waited for ever on a link that was up and answering pings. When every
+  identifier held belongs to something already given up on, the client now closes that connection and reconnects,
+  and what was queued goes on the new one. A kept session also no longer loses a SUBSCRIBE identifier each time the
+  link drops with one unanswered.
+- **A client whose broker stopped reading stayed in Disconnecting for ever** - and a Sparkplug edge node waiting for
+  it to finish never reconnected. It now gives up after `connectTimeoutMs`.
+- **A SUBSCRIBE that went unacknowledged gave back a unit of the broker's Receive Maximum it never took**, letting one
+  publish too many be in flight, which a strict broker answers by disconnecting.
+- **`MqttDevice` reports of a sensor that read NaN** were published on every scan with no deadband, and the return
+  from NaN to a number went unreported with one. NaN to NaN is now no change; to or from NaN always is.
+
 ## [0.1.10]
 
 A diagnostics log: when a device will not connect, the broker says why - afterwards. `modbee-mqtt serve` keeps every
