@@ -570,6 +570,7 @@ private:
     // backoff it had before it connected - a minute's wait after seven weeks
     // of good service.
     bool _stable = false;
+    bool _keepUnsent = false;     // the next close leaves unsent operations queued
 
     // The link's byte counters as the keepalive last saw them: bytes that
     // moved since are a sign of life even when no packet has finished - see
@@ -648,6 +649,8 @@ private:
     void serviceAcknowledgements();
     void serviceQueue();
     void serviceReconnect();
+    static bool idLive(void* context, uint16_t packetId);
+    bool closeIfIdsAbandoned();
 
     // The topic alias a publish goes out with, applied to `packet` (none when
     // the peer allows none, or the packet would not fit with it), and taken

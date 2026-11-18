@@ -483,11 +483,12 @@ void MqttClient::sendConnect() {
 // and event loop are alive, which a broker that answers every PINGREQ and
 // acknowledges nothing also satisfies.
 void MqttClient::serviceAcknowledgements() {
+    size_t publishes = 0;
     const size_t given =
         _operations.concludeOverdue(mq_millis(),
                                     _behaviour.acknowledgementTimeoutMs,
                                     MqttResult::AckTimeout,
-                                    (uint32_t)_link.bytesSent());
+                                    (uint32_t)_link.bytesSent(), &publishes);
     if (given == 0) return;
 
     // Counted as publish failures, because that is what they are from the
@@ -500,7 +501,10 @@ void MqttClient::serviceAcknowledgements() {
     // the peer's Receive Maximum is what actually stops the next publish, and
     // it is tracked separately from the queue. This is the half that turns a
     // permanent stall into a recoverable one.
-    for (size_t index = 0; index < given; index++) _flow.returnOne();
+    // Only a QoS 1/2 publish took one (QoS 0 concludes when written, and a
+    // SUBSCRIBE never took one): returning one per conclusion let a timed-out
+    // SUBSCRIBE put a publish past the peer's Receive Maximum.
+    for (size_t index = 0; index < publishes; index++) _flow.returnOne();
 }
 
 void MqttClient::poll() {
@@ -602,6 +606,13 @@ void MqttClient::poll() {
         if (_link.transmitIdle()) {
             // V5:3.14.4 - after sending a DISCONNECT we MUST close the Network
             // Connection and MUST NOT send anything more on it.
+            closeConnection(MqttResult::Ok);
+        } else if (_status.state == MqttState::Disconnecting &&
+                   mq_elapsed(_stateSince, mq_millis()) > _behaviour.connectTimeoutMs) {
+            // A peer that stopped reading keeps the socket open with a zero
+            // window, so the DISCONNECT never leaves and the transport never
+            // says it has gone. Without a limit the client stayed here - and a
+            // Sparkplug node waiting for Idle to reconnect waited with it.
             closeConnection(MqttResult::Ok);
         }
         return;
@@ -980,6 +991,10 @@ void MqttClient::establishSession(bool sessionPresent) {
         // Packet Identifier.
         _session.markAllUnsent();
         _operations.markAllUnsent();
+        // A SUBSCRIBE or UNSUBSCRIBE is sent again under a new identifier, so
+        // the old ones can never be answered. Kept, eight dropped connections
+        // with one unanswered used up every slot, and the queue stopped.
+        _session.clearControlIds();
 
         // BUT A PUBLISH THE SESSION IS REPLAYING IS NOT ALSO SENT AFRESH.
         //
@@ -1369,6 +1384,34 @@ void MqttClient::serviceKeepAlive() {
 // DRAINING THE QUEUE
 // =============================================================================
 
+// IDENTIFIERS GIVEN UP ON, AND NOTHING LEFT TO FREE THEM.
+//
+// An operation the peer never acknowledged is concluded (AckTimeout), but its
+// identifier stays held for the life of the connection - the peer may still
+// answer the original. Sixteen of them (eight SUBSCRIBEs) and no identifier is
+// left: the head of the queue waits for one, and everything behind it waits
+// too, on a link that is up and answering pings. The stall the timeout was
+// built to end, only later.
+//
+// When every identifier held is one nothing is waiting on any more, and the
+// connection has been up for a whole acknowledgement timeout - so a resumed
+// session's replays have had their chance - this connection cannot go on.
+// It is closed, and the reconnect starts its identifiers afresh. Not with the
+// timeout off: that is a choice to wait for ever.
+bool MqttClient::idLive(void* context, uint16_t packetId) {
+    return static_cast<MqttClient*>(context)->_operations.findByPacketId(packetId) != nullptr;
+}
+
+bool MqttClient::closeIfIdsAbandoned() {
+    const mq_time_t timeout = _behaviour.acknowledgementTimeoutMs;
+    if (timeout == 0) return false;
+    if (mq_elapsed(_stateSince, mq_millis()) < timeout) return false;
+    if (_session.holdsLiveId(&MqttClient::idLive, this)) return false;
+    _keepUnsent = true;
+    closeConnection(MqttResult::AckTimeout);
+    return true;
+}
+
 void MqttClient::serviceQueue() {
     // Anything the session is holding from before the reconnect goes first.
     // [V5:MQTT-4.4.0-1] requires the original Packet Identifiers, so these are
@@ -1413,7 +1456,10 @@ void MqttClient::serviceQueue() {
 
             if (op->qos > MQ_QOS_0) {
                 packetId = _session.allocatePacketId();
-                if (packetId == MQ_PACKET_ID_NONE) break;   // try again next poll
+                if (packetId == MQ_PACKET_ID_NONE) {
+                    if (closeIfIdsAbandoned()) return;
+                    break;   // try again next poll
+                }
             }
 
             // A publish queued before the connection existed could not know
@@ -1453,9 +1499,15 @@ void MqttClient::serviceQueue() {
 
         } else if (op->kind == MqttOpKind::Subscribe) {
             packetId = _session.allocatePacketId();
-            if (packetId == MQ_PACKET_ID_NONE) break;
+            if (packetId == MQ_PACKET_ID_NONE) {
+                if (closeIfIdsAbandoned()) return;
+                break;
+            }
             // Recorded, so a later publish cannot be handed the same one.
-            if (!_session.reserveControlId(packetId)) break;
+            if (!_session.reserveControlId(packetId)) {
+                if (closeIfIdsAbandoned()) return;
+                break;
+            }
             packet.header.type = MQ_PKT_SUBSCRIBE;
             packet.subscribe.packetId = packetId;
             packet.subscribe.count = 1;
@@ -1465,8 +1517,14 @@ void MqttClient::serviceQueue() {
 
         } else {
             packetId = _session.allocatePacketId();
-            if (packetId == MQ_PACKET_ID_NONE) break;
-            if (!_session.reserveControlId(packetId)) break;
+            if (packetId == MQ_PACKET_ID_NONE) {
+                if (closeIfIdsAbandoned()) return;
+                break;
+            }
+            if (!_session.reserveControlId(packetId)) {
+                if (closeIfIdsAbandoned()) return;
+                break;
+            }
             packet.header.type = MQ_PKT_UNSUBSCRIBE;
             packet.unsubscribe.packetId = packetId;
             packet.unsubscribe.count = 1;
@@ -1728,7 +1786,14 @@ void MqttClient::closeConnection(MqttResult reason) {
     // What was SENT has moved into the session and will be retransmitted if
     // the session survives. What was not has nowhere to go, and is concluded
     // now rather than left outstanding for ever.
-    _operations.concludeUnsent(MqttResult::ConnectionLost);
+    //
+    // Except when the client closed it to free its identifiers
+    // (closeIfIdsAbandoned): what was waiting behind them is what that was
+    // for, and it goes on the next connection, as a publish made before
+    // connect() does.
+    const bool keepUnsent = _keepUnsent;
+    _keepUnsent = false;
+    if (!keepUnsent) _operations.concludeUnsent(MqttResult::ConnectionLost);
 
     // A session that cannot outlive the connection takes everything with it.
     const bool sessionSurvives =
@@ -1736,7 +1801,8 @@ void MqttClient::closeConnection(MqttResult reason) {
         (_activeVersion == MqttVersion::V311 || _connection.hasSessionExpiry);
 
     if (!sessionSurvives) {
-        _operations.concludeAll(MqttResult::SessionLost);
+        if (keepUnsent) _operations.concludeSent(MqttResult::SessionLost);
+        else _operations.concludeAll(MqttResult::SessionLost);
         _session.resetProtocolState();
     }
 

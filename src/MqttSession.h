@@ -180,6 +180,16 @@ public:
     bool packetIdInUse(uint16_t packetId) const;
     bool reserveControlId(uint16_t packetId);
     void releaseControlId(uint16_t packetId);
+    // Every SUBSCRIBE/UNSUBSCRIBE identifier given back. On any new connection:
+    // those are never resent under their old identifiers (a resumed session
+    // sends them again under new ones), so no answer to an old one can come.
+    void clearControlIds();
+
+    // Whether any identifier this session holds - a stored publish's or a
+    // SUBSCRIBE's - is one `live` says something is still waiting on. When
+    // none is, nothing on this connection will ever give them back.
+    typedef bool (*IdLiveFn)(void* context, uint16_t packetId);
+    bool holdsLiveId(IdLiveFn live, void* context) const;
 
     // --- Outbound publishes ---
     bool storeOutbound(uint16_t packetId, uint8_t qos,

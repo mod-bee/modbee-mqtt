@@ -1039,8 +1039,16 @@ void MqttDevice::serviceReports(bool force) {
         double moved = value - report.lastValue;
         if (moved < 0.0) moved = -moved;
 
-        const bool farEnough = moved > report.deadband ||
-                               (report.deadband == 0.0 && moved != 0.0);
+        // NOT A NUMBER - a sensor read that failed - on either side. NaN to
+        // NaN is no change: compared as numbers it was a change on every
+        // scan, one publish a pass for as long as the sensor stayed failed.
+        // NaN to a number, or back, is always one: compared as numbers no
+        // deadband was ever crossed, and the recovery went unreported.
+        const bool wasNaN = report.lastValue != report.lastValue;
+        const bool isNaN = value != value;
+        const bool farEnough = (wasNaN || isNaN)
+            ? wasNaN != isNaN
+            : (moved > report.deadband || (report.deadband == 0.0 && moved != 0.0));
         const bool quietTooLong = report.atLeastEveryMs != 0 &&
             mq_elapsed(report.lastPublishedAt, now) >= report.atLeastEveryMs;
 

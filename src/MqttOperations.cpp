@@ -274,7 +274,9 @@ size_t MqttOperations::withdraw(const MQ_AREA_BYTES& topic,
 }
 
 size_t MqttOperations::concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
-                                       MqttResult result, uint32_t leftLink) {
+                                       MqttResult result, uint32_t leftLink,
+                                       size_t* publishesOut) {
+    if (publishesOut) *publishesOut = 0;
     if (timeoutMs == 0) return 0;   // no deadline; wait for ever, as before
 
     // THE SAME SNAPSHOT DISCIPLINE AS concludeAll(), and for the same reason:
@@ -298,6 +300,7 @@ size_t MqttOperations::concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
         }
         if (mq_elapsed(_ops[index].sentAt, now) < timeoutMs) continue;
 
+        if (publishesOut && _ops[index].kind == MqttOpKind::Publish) ++*publishesOut;
         retireAt(index, result);
         concluded++;
     }

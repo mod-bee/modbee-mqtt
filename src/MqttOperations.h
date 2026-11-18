@@ -260,8 +260,11 @@ public:
     // `leftLink` is how far the link has sent (MqttLink::bytesSent, as 32
     // bits): an operation whose last byte has not got that far yet is still
     // leaving, and its deadline starts again from `now`.
+    // `publishesOut`, when given, is told how many of them were QoS 1/2
+    // publishes - the only ones that held a unit of the peer's quota.
     size_t concludeOverdue(mq_time_t now, mq_time_t timeoutMs,
-                           MqttResult result, uint32_t leftLink);
+                           MqttResult result, uint32_t leftLink,
+                           size_t* publishesOut = nullptr);
 
     // Everything that has NOT been sent. Used when a connection drops: what
     // was sent has moved into the session and will be retransmitted, what was

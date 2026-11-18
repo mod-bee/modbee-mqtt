@@ -40,9 +40,7 @@ void MqttSession::resetProtocolState() {
     // until a client that had lost its link eight times at the wrong moment
     // connected, could not send its SUBSCRIBE, and with it at the head of the
     // queue sent nothing at all. Found by the field soak.
-    for (size_t i = 0; i < kMaxControlIds; i++) {
-        _controlIds[i] = MQ_PACKET_ID_NONE;
-    }
+    clearControlIds();
 
     // The subscriptions stay, but none of them is established any more: the
     // peer either never knew about them or has just forgotten them.
@@ -75,6 +73,23 @@ void MqttSession::releaseControlId(uint16_t packetId) {
     for (size_t i = 0; i < kMaxControlIds; i++) {
         if (_controlIds[i] == packetId) _controlIds[i] = MQ_PACKET_ID_NONE;
     }
+}
+
+void MqttSession::clearControlIds() {
+    for (size_t i = 0; i < kMaxControlIds; i++) {
+        _controlIds[i] = MQ_PACKET_ID_NONE;
+    }
+}
+
+bool MqttSession::holdsLiveId(IdLiveFn live, void* context) const {
+    if (live == nullptr) return true;
+    for (int i = 0; i < MQTT_SESSION_MAX_INFLIGHT; i++) {
+        if (_outbound[i].inUse() && live(context, _outbound[i].packetId)) return true;
+    }
+    for (size_t i = 0; i < kMaxControlIds; i++) {
+        if (_controlIds[i] != MQ_PACKET_ID_NONE && live(context, _controlIds[i])) return true;
+    }
+    return false;
 }
 
 uint16_t MqttSession::allocatePacketId() {
