@@ -1867,7 +1867,8 @@ void MqttClient::closeConnection(MqttResult reason) {
         reason != MqttResult::Cancelled && !credentialRejected) {
         scheduleReconnect();
         enterState(MqttState::Reconnecting, reason);
-    } else if (_behaviour.autoReconnect && !_stayDown && credentialRejected &&
+    } else if (_behaviour.autoReconnect && !_stayDown &&
+               reason != MqttResult::Cancelled && credentialRejected &&
                _behaviour.rejectedCredentialsRetryMs != 0) {
         // Slowly, but always - see rejectedCredentialsRetryMs. The network
         // backoff is not advanced: the next NETWORK fault still starts from
@@ -2286,6 +2287,17 @@ void MqttClient::applyTransmitReservation() {
 
 MqttResult MqttClient::disconnect(uint8_t reasonCode) {
     if (!_transport) return MqttResult::NotInitialised;
+    // Auto-reconnect is off for a deliberate disconnect: the application said
+    // to stop, and reconnecting would be the library overruling it.
+    // Down until connect() - see _stayDown. NOT autoReconnect = false, which
+    // used to be here and outlived the disconnect it was meant for.
+    //
+    // Before anything closes, on every path: a client that is not connected
+    // (waiting to retry, still dialling, or restarting) and one whose
+    // DISCONNECT could not be written are closed at once, and the close must
+    // see the stop - or it schedules the next attempt, and a stopped client
+    // goes on dialling the broker.
+    _stayDown = true;
     if (!isConnected()) {
         closeConnection(MqttResult::Cancelled);
         return MqttResult::Ok;
@@ -2308,11 +2320,6 @@ MqttResult MqttClient::disconnect(uint8_t reasonCode) {
         return MqttResult::Ok;
     }
 
-    // Auto-reconnect is off for a deliberate disconnect: the application said
-    // to stop, and reconnecting would be the library overruling it.
-    // Down until connect() - see _stayDown. NOT autoReconnect = false, which
-    // used to be here and outlived the disconnect it was meant for.
-    _stayDown = true;
     enterState(MqttState::Disconnecting);
     return MqttResult::Queued;
 }

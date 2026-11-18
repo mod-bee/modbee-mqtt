@@ -11,6 +11,16 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+A client told to stop while it was waiting to retry now stops. Nothing to configure on upgrade.
+
+### Fixed
+
+- **A stopped client went on dialling the broker.** `disconnect()` stood the client down only when it sent a
+  DISCONNECT. A client that was not connected - waiting to retry after a refused login or a lost link, or part way
+  through a restart - was closed without it, and after a refused login the close took the slow credential retry and
+  went back to Reconnecting: a PLC told to disconnect kept trying until it was restarted. A stop now stands the
+  client down on every path before anything closes, and a cancelled close never schedules another attempt.
+
 ## [0.1.12]
 
 The rest of the review that found 0.1.11's fixes: more ways the broker stayed busy or a message went twice, and
