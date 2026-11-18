@@ -120,11 +120,19 @@ public:
     //
     // Starts at slot `from`, and stops when `visit` returns false - that
     // message was NOT taken, and the walk resumes AT it. Returns the slot to
-    // resume from, or capacity() once every slot has been passed.
+    // resume from, or kDone once every slot has been passed.
+    //
+    // kDone, not a slot count: an indexed store grows its slots as topics are
+    // retained, so the end of the walk is neither capacity() nor a number the
+    // caller can know. Comparing with capacity() left every subscription of a
+    // store holding fewer topics than its maximum owed forever, and the
+    // connection relisted on every pass - a shard at 100% for as long as the
+    // subscriber stayed connected.
     //
     // A topic stored into a slot the walk has already passed is not missed:
     // it was published after the subscription existed, so it reached the
     // subscriber as an ordinary message.
+    static const size_t kDone = (size_t)-1;
     typedef bool (*StepFn)(void* context, const MqttRetainedMessage& message,
                            uint32_t remainingExpiry, bool hasRemainingExpiry);
     // At most `budget` slots are looked at (0 = every one); what is returned

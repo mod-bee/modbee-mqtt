@@ -649,12 +649,15 @@ void MqttBroker::afterService(MqttBrokerConnection& connection) {
                  connection.transport->hasBufferedInput();
 
     const bool blocked = connection.link.transmitPending() != 0;
-    if (!again && !blocked && connection.session != nullptr &&
+    // Waiting for the session journal: journalKept() relists it. Relisting it
+    // here too kept the thread from sleeping for as long as the disk took.
+    if (!again && !blocked && !connection.waitingForJournal && connection.session != nullptr &&
         connection.session->nextUnsent(connection.toPeer.canSendQos12()) != nullptr) {
         again = true;    // deliverQueued stopped at its bound with room to go on
     }
     if (!again && !blocked && connection.session != nullptr &&
-        connection.session->retainedOwed() != 0 && !connection.session->queueFull()) {
+        connection.session->retainedOwed() != 0 && !connection.session->queueFull() &&
+        !connection.session->retainedBlocked()) {
         again = true;    // retained messages still owed, and room to queue them
     }
     if (again) queueWork(connection);
@@ -688,7 +691,15 @@ void MqttBroker::sweepDeadlines(mq_time_t now) {
         // A listed connection is about to be serviced, which checks its
         // deadlines anyway.
         if (!connection.inUse() || connection.closing || connection.queued) continue;
-        if (checkDeadlines(connection, now) && connection.inUse()) queueWork(connection);
+        const bool due = checkDeadlines(connection, now);
+        if (!connection.inUse()) continue;
+        // A retained walk that stopped for want of room tries again here as
+        // well as on its own traffic: the room may be made by other sessions
+        // (the broker's total bytes), which nothing on this connection hears.
+        if (due || (connection.session != nullptr && connection.session->retainedBlocked() &&
+                    connection.session->retainedOwed() != 0)) {
+            queueWork(connection);
+        }
     }
 }
 
@@ -3692,7 +3703,7 @@ void MqttBroker::deliverQueued(MqttBrokerConnection& connection) {
             // out. A message that arrived just inside the limit can leave just
             // outside it.
             const bool tooBigForUs = needed == 0 ||
-                                     needed > connection.link.transmitCapacity();
+                                     needed > connection.link.transmitLimit();
 
             if (refusedByPeer || tooBigForUs) {
                 // The message is being DISCARDED, so its identifier goes back
@@ -4229,11 +4240,22 @@ bool MqttBroker::visitRetained(void* context, const MqttRetainedMessage& message
     MqttBrokerSession* session = visit->session;
 
     // Full: stop here, and pick this message up again when the queue drains.
-    if (session->queueFull()) return false;
+    if (session->queueFull()) {
+        visit->blocked = true;
+        return false;
+    }
 #if defined(MQTT_PLATFORM_HOST)
     // Through a narrowed subscription, only what the session may receive.
     if (subscription.narrowed && !broker.mayDeliver(*session, asSpan(message.topic))) return true;
 #endif
+    // Too large for the bytes left - this session's, or every session's
+    // together. queueFull() asks about one byte, so it said there was room;
+    // without this the walk stopped here on every pass, counting a drop each
+    // time, for as long as the bytes stayed spent.
+    if (!session->budgetAllows(message.topic.size() + message.payload.size())) {
+        visit->blocked = true;
+        return false;
+    }
 
     MqttBrokerDelivery delivery;
     delivery.topic = message.topic;
@@ -4266,7 +4288,10 @@ bool MqttBroker::visitRetained(void* context, const MqttRetainedMessage& message
 
     delivery.queuedAt = mq_millis();
 
-    if (!session->enqueue(delivery)) return false;
+    if (!session->enqueue(delivery)) {
+        visit->blocked = true;
+        return false;
+    }
     broker._status.retainedDelivered++;
     visit->queuedAny = true;
 #if defined(MQTT_PLATFORM_HOST)
@@ -4279,8 +4304,12 @@ bool MqttBroker::continueRetained(MqttBrokerSession& session) {
     if (session.retainedOwed() == 0) return false;
     const mq_time_t now = mq_millis();
     bool queuedAny = false;
+    bool blocked = false;
     for (size_t index = 0; index < session.subscriptionCount(); index++) {
-        if (session.queueFull()) break;
+        if (session.queueFull()) {
+            blocked = true;
+            break;
+        }
         const MqttBrokerSubscription* subscription = session.subscriptionAt(index);
         if (subscription == nullptr || !subscription->retainedOwed) continue;
 
@@ -4289,12 +4318,17 @@ bool MqttBroker::continueRetained(MqttBrokerSession& session) {
         visit.session = &session;
         visit.subscription = subscription;
         visit.queuedAny = false;
+        visit.blocked = false;
         const size_t next = _retained.visitMatchingFrom(
             asSpan(subscription->effective), now, subscription->retainedNext,
             &MqttBroker::visitRetained, &visit, kRetainedSlotsPerPass);
         queuedAny = queuedAny || visit.queuedAny;
-        session.retainedProgress(index, next, next >= _retained.capacity());
+        blocked = blocked || visit.blocked;
+        session.retainedProgress(index, next, next == MqttRetainedStore::kDone);
     }
+    // Blocked only if nothing went: a walk that queued something has room
+    // being made by its own deliveries, and is relisted by them.
+    session.setRetainedBlocked(blocked && !queuedAny && session.retainedOwed() != 0);
     return queuedAny;
 }
 

@@ -259,7 +259,7 @@ size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t no
                                             size_t from, StepFn visit, void* context,
                                             size_t budget) {
     const size_t end = _messages.size();
-    if (visit == nullptr || from >= end) return end;
+    if (visit == nullptr || from >= end) return kDone;
 
     size_t first = from, last = end;
     bool exact = false;     // one topic, found directly: done once looked at
@@ -268,7 +268,7 @@ size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t no
     // gone - is complete.
     if (_indexed && !hasWildcard(filter)) {
         const int found = indexOf(filter);
-        if (found < 0 || (size_t)found < from) return end;
+        if (found < 0 || (size_t)found < from) return kDone;
         first = (size_t)found;
         last = first + 1;
         exact = true;
@@ -292,7 +292,7 @@ size_t MqttRetainedStore::visitMatchingFrom(const MqttSpan& filter, mq_time_t no
         const bool hasRemaining = remainingExpiryOf(message, now, remaining);
         if (!visit(context, message, remaining, hasRemaining)) return index;
     }
-    return exact ? end : last;
+    return exact || last >= end ? kDone : last;
 }
 
 void MqttRetainedStore::visitMatching(const MqttSpan& filter, mq_time_t now,

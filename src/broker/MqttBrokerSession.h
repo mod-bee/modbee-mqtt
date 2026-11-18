@@ -395,6 +395,17 @@ public:
     void oweRetained(size_t index);
     void retainedProgress(size_t index, size_t next, bool finished);
     size_t retainedOwed() const { return _retainedOwed; }
+    // The last walk stopped because the next message did not fit - the
+    // queue's slots, or its bytes or the broker's total bytes, which
+    // queueFull() cannot judge for a message it has not seen. The broker
+    // retries on this connection's own traffic and on the deadline sweep, not
+    // on every pass: a pass that cannot make progress must not keep the
+    // thread from sleeping.
+    bool retainedBlocked() const { return _retainedBlocked; }
+    void setRetainedBlocked(bool blocked) { _retainedBlocked = blocked; }
+    // Whether a message of `bytes` fits the byte budgets, without counting a
+    // drop when it does not.
+    bool budgetAllows(size_t bytes) const { return withinBudget(bytes); }
 
     // --- The delivery queue ---
     bool enqueue(const MqttBrokerDelivery& message);
@@ -645,6 +656,7 @@ private:
     bool withinBudget(size_t bytes) const;
     void charge(MqttBrokerDelivery& entry);
     size_t _retainedOwed = 0;
+    bool _retainedBlocked = false;
 
     // NO LIVE DELIVERY SITS AT OR ABOVE THIS INDEX.
     //

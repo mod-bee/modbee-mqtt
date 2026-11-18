@@ -1184,6 +1184,7 @@ private:
         MqttBrokerSession* session;
         const MqttBrokerSubscription* subscription;
         bool queuedAny;
+        bool blocked;       // stopped because the next message did not fit
     };
     // False when the session's queue is full: that message was not taken,
     // and the walk resumes at it once there is room.

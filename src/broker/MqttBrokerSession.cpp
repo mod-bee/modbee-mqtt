@@ -265,6 +265,7 @@ void MqttBrokerSession::clearSubscriptions() {
     }
     _subscriptionsUsed = 0;
     _retainedOwed = 0;
+    _retainedBlocked = false;
 }
 
 void MqttBrokerSession::oweRetained(size_t index) {
