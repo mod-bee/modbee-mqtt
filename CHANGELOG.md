@@ -11,6 +11,8 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.12]
+
 The rest of the review that found 0.1.11's fixes: more ways the broker stayed busy or a message went twice, and
 the client, Sparkplug and the server's stores. Nothing to configure on upgrade.
 
@@ -856,7 +858,8 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.8...v0.1.9
