@@ -11,6 +11,10 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+## [0.1.14]
+
+A Sparkplug text metric keeps its own copy of the value it is given. Nothing to configure on upgrade.
+
 ### Fixed
 
 - **A Sparkplug text metric pointed at the caller's text.** `MqttSparkplugNode::setAt()` and `set()` kept a String
@@ -879,7 +883,8 @@ built from it, as downloads for Linux and Windows and as a Docker image.
   shows how to check one.
 - The Docker image: `ghcr.io/mod-bee/modbee-mqtt:0.1.0`, amd64 and arm64.
 
-[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/mod-bee/modbee-mqtt/compare/v0.1.10...v0.1.11
