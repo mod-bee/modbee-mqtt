@@ -699,8 +699,8 @@ MqttSparkplugValue MqttSparkplugNode::stateValue(size_t index) const {
     value.isNull = (state.flags & kValueNull) != 0;
     if (state.flags & kText) {
         const MqttSparkplugPointText& text = *_points[index].text;
-        value.as.bytes.data = text.data;
-        value.as.bytes.length = text.length;
+        value.as.bytes.data = text.value.size() > 0 ? text.value.data() : nullptr;
+        value.as.bytes.length = (uint32_t)text.value.size();
     } else {
         mq_spSetBits(value, state.value);
     }
@@ -722,44 +722,50 @@ MqttSparkplugValue MqttSparkplugNode::publishedValue(size_t index) const {
     return value;
 }
 
-void MqttSparkplugNode::storeValue(size_t index,
+bool MqttSparkplugNode::storeValue(size_t index,
                                    const MqttSparkplugValue& value) {
     PointState& state = _state[index];
+    if (state.flags & kText) {
+        // COPIED, never pointed at: the application's text may be a temporary
+        // and a host's is in a buffer that is reused. When the memory is not
+        // there the value stays as it was and outOfMemory() says so.
+        MqttSparkplugPointText& text = *_points[index].text;
+        if (value.isNull) {
+            text.value.clear();
+        } else if (!text.value.assign(value.as.bytes.data, value.as.bytes.length)) {
+            _outOfMemory = true;
+            return false;
+        }
+    } else {
+        state.value = value.isNull ? 0 : mq_spBitsOf(value);
+    }
     if (value.isNull) {
         state.flags |= kValueNull;
     } else {
         state.flags &= (uint16_t)~kValueNull;
     }
-    if (state.flags & kText) {
-        MqttSparkplugPointText& text = *_points[index].text;
-        text.data = value.isNull ? nullptr : value.as.bytes.data;
-        text.length = value.isNull ? 0 : value.as.bytes.length;
-    } else {
-        state.value = value.isNull ? 0 : mq_spBitsOf(value);
-    }
+    return true;
 }
 
 void MqttSparkplugNode::storeCommand(size_t index,
                                      const MqttSparkplugValue& value) {
-    if ((_state[index].flags & kText) == 0 || value.isNull) {
-        storeValue(index, value);
-        return;
-    }
-    // A host's text lives in the receive buffer, or in a queue slot that is
-    // reused: copied into the metric's own storage, and the span pointed there.
-    MqttSparkplugPointText& text = *_points[index].text;
-    const MqttSparkplugValue owned = text.command.keep(value);
-    if (owned.isNull) _outOfMemory = true;
-    storeValue(index, owned);
+    if (storeValue(index, value)) return;
+    // No room for a host's text: null, rather than the value it replaced
+    // dressed up as what the host wrote.
+    MqttSparkplugValue none = value;
+    none.isNull = true;
+    none.as.bytes.data = nullptr;
+    none.as.bytes.length = 0;
+    storeValue(index, none);
 }
 
 void MqttSparkplugNode::markPublished(size_t index) {
     PointState& state = _state[index];
     const bool isNull = (state.flags & kValueNull) != 0;
     if (state.flags & kText) {
-        // Owned: the application's buffer moves on, the copy does not.
+        // Its own copy: the value is written over, the published one is not.
         MqttSparkplugPointText& text = *_points[index].text;
-        if (!isNull && !text.published.assign(text.data, text.length)) {
+        if (!isNull && !text.published.assign(text.value.data(), text.value.size())) {
             _outOfMemory = true;
         }
     } else {
@@ -793,24 +799,21 @@ bool MqttSparkplugNode::putValue(size_t index, const MqttSparkplugValue& value,
         _lastPayloadError = MqttSparkplugError::TemplateReference;
         return false;
     }
-    // WHETHER IT CHANGED. Text handed over in the same buffer as last time - a
-    // PLC STRING - may have been rewritten in place, and a buffer compared
-    // with itself never differs, so that is compared with the copy last
-    // published instead.
+    // WHETHER IT CHANGED: against the node's own copy, so text rewritten in
+    // place in the same buffer - a PLC STRING - is still a change.
+    bool differs;
     if (!(state.flags & kText)) {
-        changed = mq_spBitsDiffer(value.isNull,
+        differs = mq_spBitsDiffer(value.isNull,
                                   value.isNull ? 0 : mq_spBitsOf(value),
                                   (state.flags & kValueNull) != 0, state.value);
-    } else if (!value.isNull && !(state.flags & kValueNull) &&
-               value.as.bytes.data != nullptr &&
-               value.as.bytes.data == _points[index].text->data) {
-        changed = !(state.flags & kEverPublished) ||
-                  value.differsFrom(publishedValue(index));
     } else {
-        changed = value.differsFrom(stateValue(index));
+        differs = value.differsFrom(stateValue(index));
     }
-    storeValue(index, value);
-    if (changed) markChanged(index);
+    // The same value again is already held: no copy.
+    if (!differs) return true;
+    if (!storeValue(index, value)) return false;
+    changed = true;
+    markChanged(index);
     return true;
 }
 

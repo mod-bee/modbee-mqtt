@@ -11,6 +11,15 @@ minor version may change the API or the configuration, and says how here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Sparkplug text metric pointed at the caller's text.** `MqttSparkplugNode::setAt()` and `set()` kept a String
+  (or bytes, array, DataSet or Template) value as a pointer into the buffer it was handed, not a copy. A PLC's
+  STRING expression - a CONCAT result, a literal - is a temporary, gone once the block's call returns, so the next
+  scan compared the new value with memory that had been handed back: wrong words in a birth or an NDATA, or a crash
+  on a board. The node now keeps its own copy of the value, and a value that cannot be copied for want of memory
+  is refused (`setAt()` returns false, `outOfMemory()` says so) instead of half-kept.
+
 ## [0.1.13]
 
 A client told to stop while it was waiting to retry now stops. Nothing to configure on upgrade.

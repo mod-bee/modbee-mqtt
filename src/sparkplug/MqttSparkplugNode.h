@@ -212,20 +212,19 @@ struct MqttSparkplugWriteQueue {
 // some. Each copy is as long as the value it holds - it was a 127-character
 // field on a board, which cut a longer value.
 struct MqttSparkplugPointText {
-    // The value: a span, as MqttSparkplugValue's - into the application's
-    // buffer (a PLC STRING), or into `command`.
-    const uint8_t* data = nullptr;
-    uint32_t length = 0;
+    // Owns the value, whoever gave it: the application or a host's write.
+    // It was a span into the application's buffer, and a PLC's STRING
+    // expression - a CONCAT result, a literal - is a temporary, gone once the
+    // block's call returns: the next scan compared with memory handed back
+    // (stack-use-after-return under ASan; wrong words or a crash on a board).
+    // A host's write would otherwise point into a receive buffer since reused.
+    MqttSparkplugBytes value;
 
-    // Owns the text of what was last published. A text value is a span into
-    // the application's buffer, and a span kept as "what was last published"
-    // moved with that buffer: the comparison was the buffer with itself, and
-    // a change that kept the length was never reported.
+    // Owns the text of what was last published. A span kept as "what was last
+    // published" moved with the application's buffer: the comparison was the
+    // buffer with itself, and a change that kept the length was never
+    // reported.
     MqttSparkplugBytes published;
-
-    // Owns the text of the value last written (or taken), so the value never
-    // points into a receive buffer that has since been reused.
-    MqttSparkplugBytes command;
 };
 
 // --- One declared metric ---
@@ -565,8 +564,9 @@ public:
     bool takeAt(size_t index, MqttSparkplugValue& into);
 
     // THE VALUE a metric holds now - what the next message would carry. A
-    // text value is a span: into the application's buffer, or one the node
-    // owns, good until the metric is next written. An index past pointCount()
+    // text value is a span into the node's own copy, good until the metric is
+    // next written. The text handed to setAt() or set() is copied, so it may
+    // be a temporary. An index past pointCount()
     // answers a value of type Unknown.
     MqttSparkplugValue valueAt(size_t index) const;
 
@@ -1154,7 +1154,7 @@ private:
     MqttSparkplugValue stateValue(size_t index) const;
     MqttSparkplugValue publishedValue(size_t index) const;
     // A value into the state table as it is: a text value's span kept.
-    void storeValue(size_t index, const MqttSparkplugValue& value);
+    bool storeValue(size_t index, const MqttSparkplugValue& value);
     // A host's value: its text copied into the metric's own storage first.
     void storeCommand(size_t index, const MqttSparkplugValue& value);
     // The value becomes what was last published; the report owed is paid.
